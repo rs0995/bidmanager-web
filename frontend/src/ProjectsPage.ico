@@ -1,0 +1,854 @@
+import { useState, useMemo, useEffect } from 'react';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import {
+  Search,
+  Plus,
+  Eye,
+  Edit3,
+  Copy,
+  ExternalLink,
+  Trash2,
+  FolderOpen,
+  X,
+  Save,
+  CheckSquare,
+  Square,
+  Columns3,
+} from 'lucide-react';
+import { api, type ChecklistItem, type Project } from '../lib/api';
+import { cn, formatINR } from '../lib/utils';
+import { TimeBadge, EmptyState, Spinner, Badge } from '../components/ui/shared';
+import { useAppStore } from '../lib/store';
+
+type ProjectColumn = {
+  key: string;
+  label: string;
+  width: number;
+  fixed?: boolean;
+};
+
+function sanitizeFolderLeaf(value: string, fallback = 'Project') {
+  const txt = String(value || '')
+    .replace(/[<>:"/\\|?*\x00-\x1F]+/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[. ]+$/g, '');
+  return txt || fallback;
+}
+
+const PROJECT_COLUMNS: ProjectColumn[] = [
+  { key: '_sr', label: '#', width: 56, fixed: true },
+  { key: 'source_tender_id', label: 'Tender ID', width: 160 },
+  { key: 'title', label: 'Name of Work', width: 320 },
+  { key: 'client_name', label: 'Client', width: 220 },
+  { key: 'project_value', label: 'Value', width: 140 },
+  { key: 'prebid', label: 'Prebid', width: 170 },
+  { key: 'deadline', label: 'Deadline', width: 170 },
+  { key: '_time_left', label: 'Time Left', width: 120 },
+  { key: 'status', label: 'Status', width: 110 },
+];
+
+export default function ProjectsPage({
+  onOpenProjectWorkspace,
+  archived = false,
+}: {
+  onOpenProjectWorkspace?: (projectId: number) => void;
+  archived?: boolean;
+}) {
+  const qc = useQueryClient();
+  const projectStatus = archived ? 'Archived' : 'Active';
+  const {
+    projectsTable,
+    setProjectsHiddenColumns,
+    setProjectsColumnOrder,
+    setProjectsColumnWidth,
+  } = useAppStore();
+
+  const [search, setSearch] = useState('');
+  const [selId, setSelId] = useState<number | null>(null);
+  const [selectedProjectIds, setSelectedProjectIds] = useState<number[]>([]);
+  const [projectFocusId, setProjectFocusId] = useState<number | null>(null);
+  const [lastProjectClickedId, setLastProjectClickedId] = useState<number | null>(null);
+  const [showForm, setShowForm] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
+  const [editMode, setEditMode] = useState(false);
+  const [formEditable, setFormEditable] = useState(true);
+  const [showColsMenu, setShowColsMenu] = useState(false);
+  const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const [form, setForm] = useState({
+    title: '',
+    client_name: '',
+    source_tender_id: '',
+    project_value: '',
+    prebid: '',
+    deadline: '',
+    description: '',
+    status: projectStatus,
+  });
+  const [newChecklistItem, setNewChecklistItem] = useState({
+    req_file_name: '',
+    description: '',
+    subfolder: 'Main',
+  });
+  const [confirmDelIds, setConfirmDelIds] = useState<number[]>([]);
+  const desktop = (window as Window & {
+    bidmanagerDesktop?: {
+      openPath?: (path: string) => Promise<{ ok: boolean; canceled?: boolean; message?: string }>;
+      ensureProjectFolders?: (path: string) => Promise<{ ok: boolean; path?: string; message?: string }>;
+      pathExists?: (path: string) => Promise<{ ok: boolean; exists?: boolean; isDir?: boolean; resolved?: string; message?: string }>;
+    };
+  }).bidmanagerDesktop;
+
+  const { data: projects, isLoading } = useQuery({
+    queryKey: ['projects', projectStatus, search],
+    queryFn: () => api.listProjects(search, projectStatus),
+  });
+  const { data: settings } = useQuery({
+    queryKey: ['settings'],
+    queryFn: api.getSettings,
+  });
+  const projectsEntryMode = String(settings?.projects_entry_mode || 'inline').toLowerCase() === 'popup' ? 'popup' : 'inline';
+  const selectedProject = useMemo(
+    () => (projects || []).find((p) => p.id === selId) || null,
+    [projects, selId]
+  );
+  const { data: checklist, isLoading: checklistLoading } = useQuery({
+    queryKey: ['project-checklist', selId],
+    queryFn: () => api.listChecklist(selId as number),
+    enabled: !!selId && showDetails,
+  });
+
+  const { data: allTenders } = useQuery({
+    queryKey: ['all-tenders-for-autofill'],
+    queryFn: async () => {
+      const ws = await api.listWebsites();
+      const results = await Promise.all(
+        ws.flatMap((w) => [
+          api.listTenders(w.id, { archived: false, limit: 5000 }),
+          api.listTenders(w.id, { archived: true, limit: 5000 }),
+        ])
+      );
+      return results.flat();
+    },
+    staleTime: 60000,
+    enabled: !archived,
+  });
+
+  const createProject = useMutation({
+    mutationFn: (d: typeof form) => api.createProject(d as any),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['projects'] });
+      qc.invalidateQueries({ queryKey: ['dashboard'] });
+      resetForm();
+    },
+  });
+  const updateProject = useMutation({
+    mutationFn: ({ id, data }: { id: number; data: Partial<Project> }) => api.updateProject(id, data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['projects'] });
+      resetForm();
+    },
+  });
+  const deleteProject = useMutation({
+    mutationFn: async (ids: number[]) => {
+      const uniqueIds = Array.from(new Set((ids || []).map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0)));
+      if (!uniqueIds.length) return { ok: true };
+      if (archived) {
+        await Promise.all(uniqueIds.map((id) => api.deleteProject(id)));
+      } else {
+        await Promise.all(uniqueIds.map((id) => api.archiveProject(id)));
+      }
+      return { ok: true };
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['projects'], refetchType: 'all' });
+      qc.invalidateQueries({ queryKey: ['dashboard'], refetchType: 'all' });
+      setSelId(null);
+      setSelectedProjectIds([]);
+      setProjectFocusId(null);
+      setLastProjectClickedId(null);
+      setConfirmDelIds([]);
+    },
+    onError: (err: any) => {
+      const msg = err?.message || String(err);
+      alert(`${archived ? 'Delete' : 'Archive'} failed: ${msg}`);
+    },
+  });
+  const restoreProjects = useMutation({
+    mutationFn: () => api.restoreProjectsFromFolders(),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ['projects'], refetchType: 'all' });
+      qc.invalidateQueries({ queryKey: ['dashboard'], refetchType: 'all' });
+      alert(
+        `Restore complete\nScanned: ${res.scanned_folders}\nCreated: ${res.created_projects}\nUpdated: ${res.updated_projects}\nChecklist restored: ${res.restored_checklist_items}`
+      );
+    },
+    onError: (err: any) => alert(`Restore failed: ${err?.message || String(err)}`),
+  });
+  const createChecklistItem = useMutation({
+    mutationFn: (payload: {
+      projectId: number;
+      req_file_name: string;
+      description: string;
+      subfolder: string;
+    }) =>
+      api.createChecklistItem(payload.projectId, {
+        req_file_name: payload.req_file_name,
+        description: payload.description,
+        subfolder: payload.subfolder,
+        status: 'Pending',
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['project-checklist', selId] });
+      setNewChecklistItem({ req_file_name: '', description: '', subfolder: 'Main' });
+    },
+  });
+  const updateChecklistItem = useMutation({
+    mutationFn: ({ itemId, data }: { itemId: number; data: Partial<ChecklistItem> }) =>
+      api.updateChecklistItem(itemId, data as any),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['project-checklist', selId] }),
+  });
+  const deleteChecklistItem = useMutation({
+    mutationFn: (itemId: number) => api.deleteChecklistItem(itemId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['project-checklist', selId] }),
+  });
+
+  const resetForm = () => {
+    setForm({
+      title: '',
+      client_name: '',
+      source_tender_id: '',
+      project_value: '',
+      prebid: '',
+      deadline: '',
+      description: '',
+      status: projectStatus,
+    });
+    setShowForm(false);
+    setEditMode(false);
+    setFormEditable(true);
+  };
+  const loadIntoForm = (p: Project) => {
+    setForm({
+      title: p.title || '',
+      client_name: p.client_name || '',
+      source_tender_id: p.source_tender_id || '',
+      project_value: p.project_value || '',
+      prebid: p.prebid || '',
+      deadline: p.deadline || '',
+      description: p.description || '',
+      status: p.status || 'Active',
+    });
+    setSelId(p.id);
+    setSelectedProjectIds([p.id]);
+    setProjectFocusId(p.id);
+    setLastProjectClickedId(p.id);
+    setEditMode(true);
+    setFormEditable(false);
+    setShowForm(true);
+  };
+  const handleSubmit = () => {
+    if (!form.title.trim()) return;
+    if (editMode && selId) updateProject.mutate({ id: selId, data: form as any });
+    else createProject.mutate(form);
+  };
+  const uf = (k: keyof typeof form, v: string) => setForm((f) => ({ ...f, [k]: v }));
+  const canEditForm = !editMode || formEditable;
+  const copyText = async (value: string) => {
+    try {
+      await navigator.clipboard.writeText(String(value || ''));
+    } catch {
+      // Ignore copy errors silently.
+    }
+  };
+
+  const handleFetch = () => {
+    if (archived) return;
+    const tid = form.source_tender_id.trim().toLowerCase();
+    if (!tid || !allTenders) return;
+    const match =
+      allTenders.find((t) => (t.tender_id || '').toLowerCase() === tid) ||
+      allTenders.find((t) => (t.tender_id || '').toLowerCase().includes(tid));
+    if (!match) return;
+    setForm((f) => ({
+      ...f,
+      title: f.title || match.title || '',
+      client_name: f.client_name || match.org_chain || '',
+      project_value: f.project_value || match.tender_value || '',
+      prebid: f.prebid || match.pre_bid_meeting_date || '',
+      deadline: f.deadline || match.closing_date || '',
+      description: f.description || match.work_description || match.title || '',
+    }));
+  };
+
+  const openSelectedProjectFolder = async () => {
+    if (!desktop?.openPath) {
+      alert('Open Folder is available in Electron desktop mode.');
+      return;
+    }
+    let rootFolder = '';
+    try {
+      const root = await api.getProjectsRootFolder(archived);
+      rootFolder = String(root?.root_folder || '').trim();
+    } catch {
+      // backward compatibility with older backend
+    }
+    const rootCandidates = archived
+      ? [rootFolder, 'backend/Archived Projects', 'Archived Projects'].filter(Boolean)
+      : [rootFolder, 'backend/My_Tender_Projects', 'My_Tender_Projects'].filter(Boolean);
+    if (archived) {
+      try {
+        const activeRoot = await api.getProjectsRootFolder(false);
+        const activeRootPath = String(activeRoot?.root_folder || '').trim();
+        if (activeRootPath) {
+          const normalized = activeRootPath.replace(/\\/g, '/').replace(/\/+$/, '');
+          const parent = normalized.split('/').slice(0, -1).join('/');
+          if (parent) rootCandidates.push(`${parent}/Archived Projects`);
+        }
+      } catch {
+        // ignore fallback failure
+      }
+    }
+    const projectCandidates: string[] = [];
+    let selectedSourceTenderId = '';
+    let selectedTitle = '';
+
+    if (selId) {
+      let latestProject: Project | null = null;
+      try {
+        await api.ensureProjectFolder(selId);
+      } catch {
+        // continue even if ensure call is unavailable on older backend
+      }
+      try {
+        latestProject = await api.getProject(selId);
+      } catch {
+        latestProject = null;
+      }
+      const currentProject = latestProject || selectedProject;
+      const directFolder = String(currentProject?.folder_path || '').trim();
+      if (directFolder) projectCandidates.push(directFolder);
+      const sourceTenderId = String(currentProject?.source_tender_id || '').trim();
+      const title = String(currentProject?.title || '').trim();
+      selectedSourceTenderId = sourceTenderId;
+      selectedTitle = title;
+      for (const root of rootCandidates) {
+        if (sourceTenderId) projectCandidates.push(`${root}/${sanitizeFolderLeaf(sourceTenderId, 'Project')}`);
+        if (title) projectCandidates.push(`${root}/${sanitizeFolderLeaf(title, 'Project')}`);
+      }
+    }
+
+    if (selId && desktop?.ensureProjectFolders) {
+      const baseRoot = rootCandidates[0] || (archived ? 'backend/Archived Projects' : 'backend/My_Tender_Projects');
+      const leaf = sanitizeFolderLeaf(selectedSourceTenderId || selectedTitle || `Project_${selId}`, `Project_${selId}`);
+      const ensureTarget = `${baseRoot}${baseRoot.endsWith('\\') || baseRoot.endsWith('/') ? '' : '/'}${leaf}`;
+      try {
+        const mk = await desktop.ensureProjectFolders(ensureTarget);
+        if (mk?.ok && mk.path) {
+          const ensuredPath = String(mk.path).trim();
+          projectCandidates.unshift(ensuredPath);
+          try {
+            await api.updateProject(selId, { folder_path: ensuredPath });
+          } catch {
+            // Keep physical folder even if DB path update fails.
+          }
+        }
+      } catch {
+        // ignore fallback errors
+      }
+    }
+
+    const orderedCandidates = Array.from(
+      new Set((selId ? projectCandidates : rootCandidates).map((x) => String(x || '').trim()).filter(Boolean))
+    );
+    if (!orderedCandidates.length) {
+      alert('Projects root folder is not available.');
+      return;
+    }
+
+    let lastMessage = '';
+    for (const candidate of orderedCandidates) {
+      const res = await desktop.openPath(candidate);
+      if (res?.ok) return;
+      lastMessage = String(res?.message || '');
+    }
+    if (lastMessage) {
+      alert(`Open folder failed: ${lastMessage}`);
+    } else {
+      alert('Open folder failed.');
+    }
+  };
+
+  const openProjectWorkspace = async (project: Project) => {
+    const pid = Number(project.id);
+    if (!Number.isFinite(pid) || pid <= 0) return;
+    if (onOpenProjectWorkspace) {
+      onOpenProjectWorkspace(pid);
+      return;
+    }
+    const base = `${window.location.origin}${window.location.pathname}`;
+    window.open(`${base}?projectId=${pid}`, '_blank', 'noopener,noreferrer');
+  };
+
+  const filtered = useMemo(() => {
+    if (!search.trim()) return projects || [];
+    const q = search.toLowerCase();
+    return (projects || []).filter(
+      (p) =>
+        (p.title || '').toLowerCase().includes(q) ||
+        (p.client_name || '').toLowerCase().includes(q) ||
+        (p.source_tender_id || '').toLowerCase().includes(q) ||
+        (p.description || '').toLowerCase().includes(q)
+    );
+  }, [projects, search]);
+
+  useEffect(() => {
+    const visibleIds = new Set(filtered.map((p) => p.id));
+    const nextSelected = selectedProjectIds.filter((id) => visibleIds.has(id));
+    if (nextSelected.length !== selectedProjectIds.length) {
+      setSelectedProjectIds(nextSelected);
+    }
+    if (selId !== null && !visibleIds.has(selId)) {
+      setSelId(nextSelected[0] ?? null);
+    }
+    if (projectFocusId !== null && !visibleIds.has(projectFocusId)) {
+      setProjectFocusId(nextSelected[0] ?? null);
+    }
+  }, [filtered, selectedProjectIds, selId, projectFocusId]);
+
+  const applyProjectRangeSelection = (project: Project, additive: boolean) => {
+    if (!lastProjectClickedId) return false;
+    const anchorIndex = filtered.findIndex((x) => x.id === lastProjectClickedId);
+    const currentIndex = filtered.findIndex((x) => x.id === project.id);
+    if (anchorIndex < 0 || currentIndex < 0) return false;
+    const start = Math.min(anchorIndex, currentIndex);
+    const end = Math.max(anchorIndex, currentIndex);
+    const rangeIds = filtered.slice(start, end + 1).map((x) => x.id);
+    const next = additive ? Array.from(new Set([...selectedProjectIds, ...rangeIds])) : rangeIds;
+    setSelectedProjectIds(next);
+    setSelId(project.id);
+    setProjectFocusId(project.id);
+    return true;
+  };
+
+  const handleProjectRowClick = (project: Project, evt: any) => {
+    setConfirmDelIds([]);
+    const ctrlLike = evt.ctrlKey || evt.metaKey;
+    if (evt.shiftKey) {
+      const didSelectRange = applyProjectRangeSelection(project, ctrlLike);
+      if (didSelectRange) {
+        setLastProjectClickedId(project.id);
+        return;
+      }
+    }
+    if (ctrlLike) {
+      const exists = selectedProjectIds.includes(project.id);
+      const next = exists ? selectedProjectIds.filter((id) => id !== project.id) : [...selectedProjectIds, project.id];
+      setSelectedProjectIds(next);
+      setSelId(project.id);
+      setProjectFocusId(project.id);
+      setLastProjectClickedId(project.id);
+      return;
+    }
+    if (selectedProjectIds.length === 1 && selectedProjectIds[0] === project.id) {
+      setSelectedProjectIds([]);
+      setSelId(null);
+      setProjectFocusId(project.id);
+      setLastProjectClickedId(project.id);
+      return;
+    }
+    setSelectedProjectIds([project.id]);
+    setSelId(project.id);
+    setProjectFocusId(project.id);
+    setLastProjectClickedId(project.id);
+  };
+
+  const onProjectsKeyDown = (evt: any) => {
+    if (filtered.length === 0) return;
+    const currentIndex = projectFocusId ? filtered.findIndex((p) => p.id === projectFocusId) : -1;
+    const key = evt.key;
+
+    if (key === 'ArrowDown' || key === 'ArrowUp' || key === 'Home' || key === 'End') {
+      evt.preventDefault();
+      let nextIndex = currentIndex < 0 ? 0 : currentIndex;
+      if (key === 'ArrowDown') nextIndex = Math.min(filtered.length - 1, nextIndex + 1);
+      if (key === 'ArrowUp') nextIndex = Math.max(0, nextIndex - 1);
+      if (key === 'Home') nextIndex = 0;
+      if (key === 'End') nextIndex = filtered.length - 1;
+      const nextProject = filtered[nextIndex];
+      if (!nextProject) return;
+      setProjectFocusId(nextProject.id);
+      return;
+    }
+
+    if (evt.code !== 'Space' && key !== ' ') return;
+    evt.preventDefault();
+
+    const focusedProject = (projectFocusId && filtered.find((p) => p.id === projectFocusId)) || filtered[0];
+    if (!focusedProject) return;
+    const ctrlLike = evt.ctrlKey || evt.metaKey;
+    if (evt.shiftKey) {
+      const didSelectRange = applyProjectRangeSelection(focusedProject, ctrlLike);
+      if (didSelectRange) {
+        setLastProjectClickedId(focusedProject.id);
+        return;
+      }
+    }
+    if (ctrlLike) {
+      const exists = selectedProjectIds.includes(focusedProject.id);
+      const next = exists
+        ? selectedProjectIds.filter((id) => id !== focusedProject.id)
+        : [...selectedProjectIds, focusedProject.id];
+      setSelectedProjectIds(next);
+    } else {
+      setSelectedProjectIds([focusedProject.id]);
+    }
+    setSelId(focusedProject.id);
+    setProjectFocusId(focusedProject.id);
+    setLastProjectClickedId(focusedProject.id);
+  };
+
+  const projectColOrder = useMemo(
+    () => (projectsTable.columnOrder?.length ? projectsTable.columnOrder : PROJECT_COLUMNS.map((c) => c.key)),
+    [projectsTable.columnOrder]
+  );
+  const projectHidden = useMemo(
+    () => new Set(projectsTable.hiddenColumns || []),
+    [projectsTable.hiddenColumns]
+  );
+  const orderedProjectCols = useMemo(() => {
+    const byKey = new Map(PROJECT_COLUMNS.map((c) => [c.key, c]));
+    return projectColOrder.map((k) => byKey.get(k)).filter(Boolean) as ProjectColumn[];
+  }, [projectColOrder]);
+  const visibleProjectCols = orderedProjectCols.filter((c) => c.fixed || !projectHidden.has(c.key));
+  const getProjectColWidth = (c: ProjectColumn) => {
+    const v = projectsTable.columnWidths?.[c.key];
+    return Number.isFinite(v) && v > 0 ? v : c.width;
+  };
+  const toggleProjectCol = (key: string) => {
+    const next = new Set(projectHidden);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    setProjectsHiddenColumns(Array.from(next));
+  };
+  const moveProjectCol = (from: number, to: number) => {
+    if (from === to) return;
+    const next = [...projectColOrder];
+    const [item] = next.splice(from, 1);
+    next.splice(to, 0, item);
+    setProjectsColumnOrder(next);
+  };
+  const startProjectColResize = (col: ProjectColumn, startX: number) => {
+    const min = col.key === '_sr' ? 48 : 90;
+    const startW = getProjectColWidth(col);
+    const onMove = (evt: MouseEvent) => {
+      const next = Math.max(min, startW + (evt.clientX - startX));
+      setProjectsColumnWidth(col.key, next);
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  useEffect(() => {
+    const iv = setInterval(() => qc.invalidateQueries({ queryKey: ['projects'] }), 60_000);
+    return () => clearInterval(iv);
+  }, [qc]);
+
+  const projectForm = (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold text-[var(--text)]">{editMode ? 'Tender Details' : 'New Project'}</h3>
+        <div className="flex items-center gap-2">
+          {editMode && (
+            <button onClick={() => setFormEditable((v) => !v)} className={cn('btn-ghost gap-1 text-xs', formEditable && 'bg-[var(--accent-bg)] text-[var(--accent)]')}>
+              <Edit3 size={12} />
+              {formEditable ? 'Editing On' : 'Edit'}
+            </button>
+          )}
+          <button onClick={resetForm} className="text-[var(--text-muted)]"><X size={16} /></button>
+        </div>
+      </div>
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-4">
+        <div className="lg:col-span-1">
+          <label className="mb-1 block text-xs text-[var(--text-muted)]">Tender ID</label>
+          <div className="flex gap-2">
+            <div className="relative flex-1">
+              <input value={form.source_tender_id} readOnly={!canEditForm} onChange={(e) => uf('source_tender_id', e.target.value)} placeholder="2025/PWD/MH/12345" className="input-field h-9 w-full pr-10 text-sm" />
+              <button onClick={() => copyText(form.source_tender_id)} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><Copy size={13} /></button>
+            </div>
+            <button onClick={handleFetch} disabled={!canEditForm} className="btn-secondary px-3 text-xs">Fetch</button>
+          </div>
+        </div>
+        <div>
+          <label className="mb-1 block text-xs text-[var(--text-muted)]">Client</label>
+          <div className="relative">
+            <input value={form.client_name} readOnly={!canEditForm} onChange={(e) => uf('client_name', e.target.value)} className="input-field h-9 w-full pr-10 text-sm" />
+            <button onClick={() => copyText(form.client_name)} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><Copy size={13} /></button>
+          </div>
+        </div>
+        <div>
+          <label className="mb-1 block text-xs text-[var(--text-muted)]">Value</label>
+          <div className="relative">
+            <input value={form.project_value} readOnly={!canEditForm} onChange={(e) => uf('project_value', e.target.value)} className="input-field h-9 w-full pr-10 text-sm" />
+            <button onClick={() => copyText(form.project_value)} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><Copy size={13} /></button>
+          </div>
+        </div>
+        <div>
+          <label className="mb-1 block text-xs text-[var(--text-muted)]">Status</label>
+          <div className="relative">
+            <select value={form.status} disabled={!canEditForm} onChange={(e) => uf('status', e.target.value)} className="input-field h-9 w-full pr-8 text-sm"><option>Active</option><option>Archived</option></select>
+            <button onClick={() => copyText(form.status)} className="absolute right-7 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><Copy size={13} /></button>
+          </div>
+        </div>
+      </div>
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+        <div>
+          <label className="mb-1 block text-xs text-[var(--text-muted)]">Prebid</label>
+          <div className="relative">
+            <input value={form.prebid} readOnly={!canEditForm} onChange={(e) => uf('prebid', e.target.value)} placeholder="15-Apr-2026 03:00 PM" className="input-field h-9 w-full pr-10 text-sm" />
+            <button onClick={() => copyText(form.prebid)} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><Copy size={13} /></button>
+          </div>
+        </div>
+        <div>
+          <label className="mb-1 block text-xs text-[var(--text-muted)]">Deadline</label>
+          <div className="relative">
+            <input value={form.deadline} readOnly={!canEditForm} onChange={(e) => uf('deadline', e.target.value)} placeholder="28-Apr-2026 05:00 PM" className="input-field h-9 w-full pr-10 text-sm" />
+            <button onClick={() => copyText(form.deadline)} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><Copy size={13} /></button>
+          </div>
+        </div>
+      </div>
+      <div>
+        <label className="mb-1 block text-xs text-[var(--text-muted)]">Title / Name of Work</label>
+        <div className="relative">
+          <input value={form.title} readOnly={!canEditForm} onChange={(e) => uf('title', e.target.value)} className="input-field h-9 w-full pr-10 text-sm" />
+          <button onClick={() => copyText(form.title)} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><Copy size={13} /></button>
+        </div>
+      </div>
+      <div>
+        <label className="mb-1 block text-xs text-[var(--text-muted)]">Description</label>
+        <div className="relative">
+          <textarea value={form.description} readOnly={!canEditForm} onChange={(e) => uf('description', e.target.value)} rows={2} className="input-field w-full py-2 pr-10 text-sm" style={{ minHeight: 60 }} />
+          <button onClick={() => copyText(form.description)} className="absolute right-2 top-3 text-[var(--text-muted)] hover:text-[var(--text)]"><Copy size={13} /></button>
+        </div>
+      </div>
+      <div className="flex justify-end gap-3">
+        <button onClick={resetForm} className="btn-ghost text-sm">Cancel</button>
+        <button onClick={handleSubmit} disabled={!form.title.trim() || (editMode && !canEditForm)} className="btn-primary gap-1.5 text-sm"><Save size={14} />{editMode ? 'Update' : 'Create'}</button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="border-b border-[var(--border)] bg-[var(--surface-0)] px-6 py-4">
+        <div className="flex items-center justify-between">
+          <h1 className="text-lg font-bold text-[var(--text)]">{archived ? 'Archived Projects' : 'Projects'}</h1>
+          <button onClick={openSelectedProjectFolder} className="btn-ghost gap-1 text-xs">
+            <FolderOpen size={13} />
+            Open Folder
+          </button>
+        </div>
+        <div className="mt-3 flex items-center gap-3">
+          <div className="relative max-w-sm flex-1">
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder={archived ? 'Search archived projects...' : 'Search projects...'}
+              className="input-field h-9 w-full text-sm"
+            />
+          </div>
+          <div className="relative">
+            <button onClick={() => setShowColsMenu((v) => !v)} className="btn-ghost gap-1.5 text-sm">
+              <Columns3 size={14} />
+              Columns
+            </button>
+            {showColsMenu && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setShowColsMenu(false)} />
+                <div className="card absolute right-0 top-9 z-50 max-h-80 w-64 overflow-auto border border-[var(--border)] p-2 shadow-xl">
+                  <p className="mb-1 border-b border-[var(--border)] px-2 pb-1 text-xs text-[var(--text-muted)]">
+                    Drag to reorder, toggle to show/hide
+                  </p>
+                  {orderedProjectCols
+                    .filter((c) => !c.fixed)
+                    .map((c, i) => (
+                      <div
+                        key={c.key}
+                        draggable
+                        onDragStart={() => setDragIdx(i)}
+                        onDragOver={(e) => e.preventDefault()}
+                        onDrop={() => {
+                          if (dragIdx !== null) {
+                            const nonFixed = orderedProjectCols.filter((x) => !x.fixed);
+                            const fromKey = nonFixed[dragIdx]?.key;
+                            const toKey = nonFixed[i]?.key;
+                            if (fromKey && toKey) {
+                              const fi = projectColOrder.indexOf(fromKey);
+                              const ti = projectColOrder.indexOf(toKey);
+                              if (fi >= 0 && ti >= 0) moveProjectCol(fi, ti);
+                            }
+                          }
+                          setDragIdx(null);
+                        }}
+                        className={cn(
+                          'flex cursor-grab items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-[var(--surface-1)]',
+                          dragIdx === i && 'opacity-50'
+                        )}
+                      >
+                        <span className="select-none cursor-grab text-[var(--text-muted)]">::</span>
+                        <input
+                          type="checkbox"
+                          checked={!projectHidden.has(c.key)}
+                          onChange={() => toggleProjectCol(c.key)}
+                          className="accent-[var(--accent)]"
+                        />
+                        <span className="flex-1">{c.label || c.key}</span>
+                      </div>
+                    ))}
+                </div>
+              </>
+            )}
+          </div>
+          {!archived && <button onClick={() => { resetForm(); setShowForm((v) => !v); }} className="btn-primary gap-1.5 text-sm"><Plus size={14} />New Project</button>}
+          {!archived && <button onClick={() => restoreProjects.mutate()} disabled={restoreProjects.isPending} className="btn-ghost gap-1.5 text-sm"><FolderOpen size={14} />{restoreProjects.isPending ? 'Restoring...' : 'Restore Folders'}</button>}
+          <button disabled={!selId} onClick={() => setShowDetails((v) => !v)} className="btn-ghost gap-1.5 text-sm"><Eye size={14} />{showDetails ? 'Hide Details' : 'Details'}</button>
+          <button disabled={!selId} onClick={() => { const p = filtered.find((x) => x.id === selId); if (p) openProjectWorkspace(p); }} className="btn-ghost gap-1.5 text-sm"><ExternalLink size={14} />Open Project</button>
+          {!archived && <button disabled={!selId} onClick={() => { const p = filtered.find((x) => x.id === selId); if (p) loadIntoForm(p); }} className="btn-secondary gap-1.5 text-sm"><Edit3 size={14} />Edit</button>}
+          <button
+            disabled={selectedProjectIds.length === 0}
+            onClick={() => {
+              const targets = selectedProjectIds.length ? selectedProjectIds : (selId ? [selId] : []);
+              setConfirmDelIds(Array.from(new Set(targets)));
+            }}
+            className="btn-danger gap-1.5 text-sm"
+          >
+            <Trash2 size={14} />
+            {archived ? 'Delete' : 'Archive'}
+          </button>
+        </div>
+      </div>
+
+      {!archived && showForm && projectsEntryMode === 'inline' && <div className="border-b border-[var(--border)] bg-[var(--surface-1)] px-6 py-4">{projectForm}</div>}
+
+      {confirmDelIds.length > 0 && (
+        <div className="flex items-center justify-between border-b border-rose-500/30 bg-rose-500/10 px-6 py-3">
+          <p className="text-sm text-rose-400">
+            {archived
+              ? `Delete ${confirmDelIds.length} project(s) permanently?`
+              : `Archive ${confirmDelIds.length} project(s)?`}
+          </p>
+          <div className="flex gap-2">
+            <button onClick={() => setConfirmDelIds([])} className="btn-ghost text-xs">Cancel</button>
+            <button onClick={() => deleteProject.mutate(confirmDelIds)} className="btn-danger gap-1 text-xs">
+              <Trash2 size={12} />
+              {archived ? 'Delete' : 'Archive'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {showDetails && selId && selectedProject && <div className="space-y-3 border-b border-[var(--border)] bg-[var(--surface-1)] px-6 py-4">
+        <div className="flex items-center justify-between"><h3 className="text-sm font-semibold text-[var(--text)]">Project Details: {selectedProject.title}</h3><Badge variant={selectedProject.status === 'Active' ? 'success' : 'muted'}>{selectedProject.status || 'Active'}</Badge></div>
+        <div className="grid grid-cols-1 gap-3 text-xs lg:grid-cols-4">
+          <div><span className="text-[var(--text-muted)]">Tender ID</span><p className="font-mono text-[var(--text)]">{selectedProject.source_tender_id || '-'}</p></div>
+          <div><span className="text-[var(--text-muted)]">Client</span><p className="text-[var(--text)]">{selectedProject.client_name || '-'}</p></div>
+          <div><span className="text-[var(--text-muted)]">Value</span><p className="text-[var(--text)]">{formatINR(selectedProject.project_value)}</p></div>
+          <div><span className="text-[var(--text-muted)]">Deadline</span><p className="text-[var(--text)]">{selectedProject.deadline || '-'}</p></div>
+        </div>
+        <div className="space-y-2 border-t border-[var(--border)] pt-2">
+          <h4 className="text-sm font-semibold text-[var(--text)]">Checklist</h4>
+          <div className="grid grid-cols-1 gap-2 lg:grid-cols-4">
+            <input value={newChecklistItem.req_file_name} onChange={(e) => setNewChecklistItem((v) => ({ ...v, req_file_name: e.target.value }))} placeholder="Required file" className="input-field h-8 text-xs" />
+            <input value={newChecklistItem.description} onChange={(e) => setNewChecklistItem((v) => ({ ...v, description: e.target.value }))} placeholder="Description" className="input-field h-8 text-xs" />
+            <input value={newChecklistItem.subfolder} onChange={(e) => setNewChecklistItem((v) => ({ ...v, subfolder: e.target.value }))} placeholder="Subfolder" className="input-field h-8 text-xs" />
+            <button disabled={!newChecklistItem.req_file_name.trim()} onClick={() => createChecklistItem.mutate({ projectId: selId, req_file_name: newChecklistItem.req_file_name.trim(), description: newChecklistItem.description.trim(), subfolder: newChecklistItem.subfolder.trim() || 'Main' })} className="btn-primary gap-1 text-xs"><Plus size={12} />Add Item</button>
+          </div>
+          {checklistLoading ? <div className="flex justify-center py-4"><Spinner size={16} className="text-[var(--accent)]" /></div> :
+            <table className="data-table"><thead><tr><th className="w-12">#</th><th>Required File</th><th>Description</th><th>Subfolder</th><th className="w-24 text-center">Done</th><th className="w-20 text-center">Action</th></tr></thead><tbody>
+              {(checklist || []).map((item) => (
+                <tr key={item.id}>
+                  <td className="text-[var(--text-muted)]">{item.sr_no}</td>
+                  <td className="text-sm">{item.req_file_name || '-'}</td>
+                  <td className="text-xs">{item.description || '-'}</td>
+                  <td className="text-xs">{item.subfolder || 'Main'}</td>
+                  <td className="text-center"><button onClick={() => updateChecklistItem.mutate({ itemId: item.id, data: { status: item.status === 'Completed' ? 'Pending' : 'Completed' } })} className={cn('inline-flex h-5 w-5 items-center justify-center rounded border', item.status === 'Completed' ? 'border-[var(--accent)] bg-[var(--accent)] text-white' : 'border-[var(--border)] hover:border-[var(--accent)]')}>{item.status === 'Completed' ? <CheckSquare size={12} /> : <Square size={12} />}</button></td>
+                  <td className="text-center"><button onClick={() => deleteChecklistItem.mutate(item.id)} className="text-rose-400"><Trash2 size={13} /></button></td>
+                </tr>
+              ))}
+              {(checklist || []).length === 0 && <tr><td colSpan={6}><EmptyState icon={Plus} title="No checklist items" description="Add first item above" /></td></tr>}
+            </tbody></table>}
+        </div>
+      </div>}
+
+      <div className="flex-1 overflow-auto" tabIndex={0} onKeyDown={onProjectsKeyDown}>
+        {isLoading ? (
+          <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>
+        ) : (
+          <table className="data-table" style={{ tableLayout: 'fixed', width: '100%' }}>
+            <thead>
+              <tr>
+                {visibleProjectCols.map((c) => (
+                  <th key={c.key} style={{ width: getProjectColWidth(c) }} className="relative">
+                    <div className="flex items-center">{c.label}</div>
+                    <div className="absolute right-0 top-0 h-full w-2 cursor-col-resize" onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); startProjectColResize(c, e.clientX); }} />
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((p, i) => (
+                <tr
+                  key={p.id}
+                  onClick={(e) => handleProjectRowClick(p, e)}
+                  onDoubleClick={() => openProjectWorkspace(p)}
+                  className={cn(
+                    'cursor-pointer',
+                    selectedProjectIds.includes(p.id) && 'row-selected',
+                    projectFocusId === p.id && 'ring-1 ring-[var(--accent)]/50'
+                  )}
+                >
+                  {visibleProjectCols.map((c) => {
+                    if (c.key === '_sr') return <td key={c.key} className="text-[var(--text-muted)]">{i + 1}</td>;
+                    if (c.key === 'source_tender_id') return <td key={c.key} className="font-mono text-xs text-[var(--accent)]">{p.source_tender_id || '-'}</td>;
+                    if (c.key === 'title') return <td key={c.key}><p className="text-sm text-[var(--text)] truncate">{p.title}</p>{p.description && <p className="mt-0.5 max-w-[300px] truncate text-xs text-[var(--text-muted)]">{p.description}</p>}</td>;
+                    if (c.key === 'project_value') return <td key={c.key} className="font-mono text-sm">{formatINR(p.project_value)}</td>;
+                    if (c.key === '_time_left') return <td key={c.key}><TimeBadge dateStr={p.deadline} /></td>;
+                    if (c.key === 'status') return <td key={c.key}><Badge variant={p.status === 'Active' ? 'success' : 'muted'}>{p.status}</Badge></td>;
+                    return <td key={c.key} className="text-sm">{String((p as any)[c.key] || '-')}</td>;
+                  })}
+                </tr>
+              ))}
+              {filtered.length === 0 && (
+                <tr>
+                  <td colSpan={visibleProjectCols.length}>
+                    <EmptyState
+                      icon={FolderOpen}
+                      title="No projects"
+                      description="Click '+ New Project' to start"
+                      action={<button onClick={() => { resetForm(); setShowForm(true); }} className="btn-primary gap-1.5 text-sm"><Plus size={14} />New Project</button>}
+                    />
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {!archived && showForm && projectsEntryMode === 'popup' && (
+        <>
+          <div className="fixed inset-0 z-40 bg-black/35" onClick={resetForm} />
+          <div className="fixed inset-0 z-50 flex items-start justify-center overflow-auto px-4 py-8">
+            <div className="card w-full max-w-5xl border border-[var(--border)] bg-[var(--surface-0)] p-5 shadow-2xl">
+              {projectForm}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

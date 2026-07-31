@@ -1,0 +1,1258 @@
+import { Fragment, useEffect, useMemo, useState } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Badge, EmptyState, Spinner } from '../components/ui/shared';
+import { api, type ChecklistItem, type Tender } from '../lib/api';
+import { cn } from '../lib/utils';
+import { BookOpen, ChevronLeft, ChevronRight, Copy, Download, FolderCog, FolderOpen, Link2, Paperclip, Pencil, Plus, RefreshCw, Save, Search, Trash2, X } from 'lucide-react';
+
+const FOLDER_ORDER = ['Ready Docs', 'Tender Docs', 'Working Docs'];
+
+function widenDateTimeGap(value: string) {
+  const txt = String(value || '').trim();
+  if (!txt) return '';
+  return txt.replace(/(\d{2}-[A-Za-z]{3}-\d{4})\s+(\d{1,2}:\d{2}\s*(?:AM|PM))/i, '$1   $2');
+}
+
+function normalizeValue2dp(value: string) {
+  const txt = String(value || '').trim();
+  if (!txt) return '';
+  const stripped = txt.replace(/[₹,\s]/g, '').replace(/Rs\.?/i, '').replace(/INR/i, '').trim();
+  if (!/^\d+(?:\.\d+)?$/.test(stripped)) return txt;
+  const n = Number(stripped);
+  if (!Number.isFinite(n)) return txt;
+  return n.toFixed(2);
+}
+
+function addIndianCommas(value: string) {
+  const txt = String(value || '').trim();
+  if (!txt) return '';
+  const stripped = txt.replace(/[₹,\s]/g, '').replace(/Rs\.?/i, '').replace(/INR/i, '').trim();
+  if (!/^\d+(?:\.\d+)?$/.test(stripped)) return txt;
+  const [intPart, decPart] = stripped.split('.');
+  let grouped = intPart;
+  if (intPart.length > 3) {
+    let tail = intPart.slice(-3);
+    let head = intPart.slice(0, -3);
+    while (head.length > 2) {
+      tail = `${head.slice(-2)},${tail}`;
+      head = head.slice(0, -2);
+    }
+    grouped = `${head},${tail}`.replace(/^,/, '');
+  }
+  return decPart !== undefined ? `${grouped}.${decPart}` : grouped;
+}
+
+const WORKSPACE_VIEW_KEY = (projectId: number) => `bm-workspace-view-${projectId}`;
+
+function sanitizeFolderLeaf(value: string, fallback = 'Project') {
+  const txt = String(value || '')
+    .replace(/[<>:"/\\|?*\x00-\x1F]+/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[. ]+$/g, '');
+  return txt || fallback;
+}
+
+function fileNameOnly(path: string) {
+  const txt = String(path || '');
+  if (!txt) return '';
+  const parts = txt.replace(/\\/g, '/').split('/');
+  return parts[parts.length - 1] || txt;
+}
+
+function sanitizeFileName(name: string) {
+  return String(name || '')
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function toFileUrl(localPath: string) {
+  const normalized = localPath.replace(/\\/g, '/');
+  return `file:///${encodeURI(normalized)}`;
+}
+
+function parseDeadlineText(input: string): Date | null {
+  const txt = String(input || '').trim();
+  if (!txt) return null;
+  const native = new Date(txt);
+  if (!Number.isNaN(native.getTime())) return native;
+  const m = txt.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})(?:\s+(\d{1,2}):(\d{2})\s*([AP]M))?$/i);
+  if (!m) return null;
+  const day = Number(m[1]);
+  const monTxt = m[2].toLowerCase();
+  const year = Number(m[3]);
+  const hh = Number(m[4] || '0');
+  const mm = Number(m[5] || '0');
+  const ampm = String(m[6] || '').toUpperCase();
+  const monMap: Record<string, number> = {
+    jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+    jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+  };
+  const month = monMap[monTxt];
+  if (month === undefined) return null;
+  let hour = hh;
+  if (ampm === 'PM' && hour < 12) hour += 12;
+  if (ampm === 'AM' && hour === 12) hour = 0;
+  const dt = new Date(year, month, day, hour, mm, 0, 0);
+  if (Number.isNaN(dt.getTime())) return null;
+  return dt;
+}
+
+function getTimeRemainingLabel(deadline: string) {
+  const target = parseDeadlineText(deadline);
+  if (!target) return 'Time Remaining: -';
+  const now = new Date();
+  let diff = target.getTime() - now.getTime();
+  if (diff <= 0) return 'Time Remaining: Expired';
+  const days = Math.floor(diff / (24 * 60 * 60 * 1000));
+  diff -= days * 24 * 60 * 60 * 1000;
+  const hours = Math.floor(diff / (60 * 60 * 1000));
+  diff -= hours * 60 * 60 * 1000;
+  const mins = Math.floor(diff / (60 * 1000));
+  if (days > 0) return `Time Remaining: ${days}d ${hours}h ${mins}m`;
+  if (hours > 0) return `Time Remaining: ${hours}h ${mins}m`;
+  return `Time Remaining: ${mins}m`;
+}
+
+export default function ProjectWorkspacePage({ projectId, embedded = false }: { projectId: number; embedded?: boolean }) {
+  const qc = useQueryClient();
+  const [docName, setDocName] = useState('');
+  const [desc, setDesc] = useState('');
+  const [folder, setFolder] = useState('Ready Docs');
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [infoEditable, setInfoEditable] = useState(false);
+  const [infoForm, setInfoForm] = useState({
+    source_tender_id: '',
+    title: '',
+    client_name: '',
+    project_value: '',
+    prebid: '',
+    deadline: '',
+  });
+  const [previewWidth, setPreviewWidth] = useState(330);
+  const [previewCollapsed, setPreviewCollapsed] = useState(false);
+  const [fetchingTenderInfo, setFetchingTenderInfo] = useState(false);
+  const [managedFolders, setManagedFolders] = useState<string[]>([]);
+  const [manageFoldersOpen, setManageFoldersOpen] = useState(false);
+  const [newFolderName, setNewFolderName] = useState('');
+  const [renameFrom, setRenameFrom] = useState('');
+  const [renameTo, setRenameTo] = useState('');
+  const [moveFrom, setMoveFrom] = useState('');
+  const [moveTo, setMoveTo] = useState('');
+  const [deleteFolderName, setDeleteFolderName] = useState('');
+  const [textPreview, setTextPreview] = useState('');
+  const [textPreviewError, setTextPreviewError] = useState('');
+  const [saveTemplateOpen, setSaveTemplateOpen] = useState(false);
+  const [saveTemplateForm, setSaveTemplateForm] = useState({ template_no: '', organization: '', template_name: '', description: '', notes: '' });
+  const [savingTemplate, setSavingTemplate] = useState(false);
+  const [applyTemplateOpen, setApplyTemplateOpen] = useState(false);
+  const [templateSearch, setTemplateSearch] = useState('');
+  const [corrigendumStatus, setCorrigendumStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
+  const [corrigendumMsg, setCorrigendumMsg] = useState('');
+
+  const desktop = (window as Window & {
+    bidmanagerDesktop?: {
+      openPath?: (path: string) => Promise<{ ok: boolean; canceled?: boolean; message?: string }>;
+      pathExists?: (path: string) => Promise<{ ok: boolean; exists?: boolean; isDir?: boolean; resolved?: string; message?: string }>;
+      pickPath?: (options?: { file?: boolean; title?: string }) => Promise<{ ok: boolean; canceled?: boolean; path?: string; message?: string }>;
+      renamePath?: (payload: { oldPath: string; newPath: string }) => Promise<{ ok: boolean; path?: string; message?: string }>;
+      deleteFile?: (path: string) => Promise<{ ok: boolean; message?: string }>;
+      copyFileToFolder?: (payload: { sourcePath: string; targetDir: string; targetName?: string }) => Promise<{ ok: boolean; path?: string; message?: string }>;
+      ensureProjectFolders?: (path: string) => Promise<{ ok: boolean; path?: string; message?: string }>;
+    };
+  }).bidmanagerDesktop;
+
+  const { data: project, isLoading: projectLoading } = useQuery({
+    queryKey: ['project', projectId],
+    queryFn: () => api.getProject(projectId),
+  });
+
+  const { data: checklist, isLoading: checklistLoading } = useQuery({
+    queryKey: ['project-checklist', projectId],
+    queryFn: () => api.listChecklist(projectId),
+  });
+
+  const { data: allTemplates } = useQuery({
+    queryKey: ['templates'],
+    queryFn: () => api.listTemplates(),
+    enabled: applyTemplateOpen,
+  });
+
+  const createItem = useMutation({
+    mutationFn: () => api.createChecklistItem(projectId, {
+      req_file_name: docName.trim(),
+      description: desc.trim(),
+      subfolder: folder,
+      status: 'Pending',
+    }),
+    onSuccess: () => {
+      setDocName('');
+      setDesc('');
+      qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+    },
+  });
+
+  const updateItem = useMutation({
+    mutationFn: (itemId: number) => api.updateChecklistItem(itemId, {
+      req_file_name: docName.trim(),
+      description: desc.trim(),
+      subfolder: folder,
+    }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['project-checklist', projectId] }),
+  });
+  const deleteItem = useMutation({
+    mutationFn: (itemId: number) => api.deleteChecklistItem(itemId),
+    onSuccess: () => {
+      setSelectedId(null);
+      setDocName('');
+      setDesc('');
+      qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+    },
+  });
+  const updateProjectInfo = useMutation({
+    mutationFn: () => api.updateProject(projectId, {
+      source_tender_id: infoForm.source_tender_id,
+      title: infoForm.title,
+      client_name: infoForm.client_name,
+      project_value: infoForm.project_value,
+      prebid: infoForm.prebid,
+      deadline: infoForm.deadline,
+    }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['project', projectId] });
+      qc.invalidateQueries({ queryKey: ['projects'] });
+      setInfoEditable(false);
+    },
+  });
+
+  const selectedItem = useMemo(
+    () => (checklist || []).find((x) => x.id === selectedId) || null,
+    [checklist, selectedId]
+  );
+
+  useEffect(() => {
+    if (!selectedItem) return;
+    setDocName(selectedItem.req_file_name || '');
+    setDesc(selectedItem.description || '');
+    setFolder(selectedItem.subfolder || 'Ready Docs');
+  }, [selectedItem?.id]);
+  useEffect(() => {
+    if (!project) return;
+    setInfoForm({
+      source_tender_id: String(project.source_tender_id || ''),
+      title: String(project.title || ''),
+      client_name: String(project.client_name || ''),
+      project_value: normalizeValue2dp(String(project.project_value || '')),
+      prebid: widenDateTimeGap(String(project.prebid || '')),
+      deadline: String(project.deadline || ''),
+    });
+  }, [project?.id]);
+
+  const folderOptions = useMemo(() => {
+    const names = new Set<string>(FOLDER_ORDER);
+    for (const f of managedFolders) {
+      const clean = String(f || '').trim();
+      if (clean) names.add(clean);
+    }
+    for (const row of checklist || []) {
+      const clean = String(row.subfolder || '').trim();
+      if (clean) names.add(clean);
+    }
+    const picked = String(folder || '').trim();
+    if (picked) names.add(picked);
+    return Array.from(names);
+  }, [managedFolders, checklist, folder]);
+
+  const grouped = useMemo(() => {
+    const source = checklist || [];
+    const map = new Map<string, ChecklistItem[]>();
+    for (const key of folderOptions) map.set(key, []);
+    for (const row of source) {
+      const key = (row.subfolder || 'Ready Docs').trim() || 'Ready Docs';
+      if (!map.has(key)) map.set(key, []);
+      map.get(key)!.push(row);
+    }
+    const ordered = [
+      ...FOLDER_ORDER.filter((k) => map.has(k)),
+      ...[...map.keys()].filter((k) => !FOLDER_ORDER.includes(k)).sort(),
+    ];
+    return ordered.map((name) => ({ name, rows: map.get(name) || [] }));
+  }, [checklist, folderOptions]);
+
+  const projectFolderPath = useMemo(() => {
+    const direct = String(project?.folder_path || '').trim();
+    if (direct) return direct;
+    const knownFolders = new Set<string>(
+      [...FOLDER_ORDER, ...managedFolders, ...(checklist || []).map((x) => String(x.subfolder || '').trim())]
+        .map((x) => String(x || '').trim().toLowerCase())
+        .filter(Boolean)
+    );
+    for (const row of checklist || []) {
+      const linked = String(row.linked_file_path || '').trim();
+      if (!linked) continue;
+      const normalized = linked.replace(/\\/g, '/');
+      const lower = normalized.toLowerCase();
+      for (const sub of knownFolders) {
+        const marker = `/${sub}/`;
+        const idx = lower.indexOf(marker);
+        if (idx > 0) return normalized.slice(0, idx).replace(/\/+$/, '');
+      }
+      const slash = normalized.lastIndexOf('/');
+      if (slash > 0) {
+        const parent = normalized.slice(0, slash).replace(/\/+$/, '');
+        const parts = parent.split('/');
+        const last = (parts[parts.length - 1] || '').trim().toLowerCase();
+        if (knownFolders.has(last)) {
+          const root = parts.slice(0, -1).join('/').replace(/\/+$/, '');
+          if (root) return root;
+        }
+        return parent;
+      }
+    }
+    return '';
+  }, [project?.folder_path, managedFolders, checklist]);
+
+  const openPath = async (path: string) => {
+    if (!path.trim()) return;
+    if (!desktop?.openPath) return;
+    await desktop.openPath(path);
+  };
+  const resolveExistingProjectFolder = async () => {
+    let latestProject: any = null;
+    try {
+      await api.ensureProjectFolder(projectId);
+    } catch {
+      // continue for older backend versions
+    }
+    try {
+      latestProject = await api.getProject(projectId);
+    } catch {
+      latestProject = null;
+    }
+    let rootFolder = '';
+    try {
+      const root = await api.getProjectsRootFolder();
+      rootFolder = String(root?.root_folder || '').trim();
+    } catch {
+      // backward compatibility with older backend
+    }
+    const rootCandidates = [rootFolder, 'backend/My_Tender_Projects', 'My_Tender_Projects'].filter(Boolean);
+    const sourceTenderId = String(latestProject?.source_tender_id || infoForm.source_tender_id || '').trim();
+    const title = String(latestProject?.title || infoForm.title || '').trim();
+    const candidates = Array.from(
+      new Set(
+        [
+          String(projectFolderPath || '').trim(),
+          String(latestProject?.folder_path || '').trim(),
+          ...rootCandidates.flatMap((root) => [
+            sourceTenderId ? `${root}/${sanitizeFolderLeaf(sourceTenderId, 'Project')}` : '',
+            title ? `${root}/${sanitizeFolderLeaf(title, 'Project')}` : '',
+          ]),
+        ].map((x) => String(x || '').trim()).filter(Boolean)
+      )
+    );
+    if (!desktop?.pathExists) {
+      return candidates[0] || '';
+    }
+    for (const candidate of candidates) {
+      const check = await desktop.pathExists(candidate);
+      if (check?.ok && check.exists && check.isDir) {
+        return String(check.resolved || candidate).trim();
+      }
+    }
+    if (desktop?.ensureProjectFolders) {
+      const baseRoot = rootFolder || 'backend/My_Tender_Projects';
+      const leaf = sanitizeFolderLeaf(sourceTenderId || title || `Project_${projectId}`, `Project_${projectId}`);
+      const target = `${baseRoot}${baseRoot.endsWith('\\') || baseRoot.endsWith('/') ? '' : '/'}${leaf}`;
+      const mk = await desktop.ensureProjectFolders(target);
+      if (mk?.ok && mk.path) {
+        const created = String(mk.path).trim();
+        try {
+          await api.updateProject(projectId, { folder_path: created });
+        } catch {
+          // Keep created folder even if DB path update fails on older backend.
+        }
+        return created;
+      }
+    }
+    return '';
+  };
+  const openProjectFolder = async () => {
+    if (!desktop?.openPath) {
+      alert('Open Folder is available in Electron desktop mode.');
+      return;
+    }
+    const existingProjectFolder = await resolveExistingProjectFolder();
+    let rootFolder = '';
+    try {
+      const root = await api.getProjectsRootFolder();
+      rootFolder = String(root?.root_folder || '').trim();
+    } catch {
+      // backward compatibility with older backend
+    }
+    const candidates = Array.from(new Set([existingProjectFolder].map((x) => String(x || '').trim()).filter(Boolean)));
+    if (!candidates.length) {
+      alert('Project folder is not available.');
+      return;
+    }
+    let lastMessage = '';
+    for (const candidate of candidates) {
+      const res = await desktop.openPath(candidate);
+      if (res?.ok) return;
+      lastMessage = String(res?.message || '');
+    }
+    alert(lastMessage ? `Open folder failed: ${lastMessage}` : 'Project folder is not available.');
+  };
+  const copyText = async (value: string) => {
+    try {
+      await navigator.clipboard.writeText(String(value || ''));
+    } catch {
+      // ignore copy failures
+    }
+  };
+  const uf = (k: keyof typeof infoForm, v: string) => setInfoForm((prev) => ({ ...prev, [k]: v }));
+
+  const handleSaveTemplate = async () => {
+    if (!saveTemplateForm.template_name.trim() || !saveTemplateForm.organization.trim()) return;
+    setSavingTemplate(true);
+    try {
+      await api.saveProjectAsTemplate(projectId, {
+        template_no: saveTemplateForm.template_no ? Number(saveTemplateForm.template_no) : undefined,
+        organization: saveTemplateForm.organization,
+        template_name: saveTemplateForm.template_name,
+        description: saveTemplateForm.description || undefined,
+        notes: saveTemplateForm.notes || undefined,
+      });
+      setSaveTemplateOpen(false);
+      setSaveTemplateForm({ template_no: '', organization: '', template_name: '', description: '', notes: '' });
+      qc.invalidateQueries({ queryKey: ['templates'] });
+      alert('Template saved successfully.');
+    } catch (err) {
+      alert(`Save template failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setSavingTemplate(false);
+    }
+  };
+
+  const handleApplyTemplate = async (templateId: number) => {
+    try {
+      const result = await api.applyTemplateToProject(projectId, templateId);
+      setApplyTemplateOpen(false);
+      qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+      alert(`Template applied. ${result.added} item(s) added.`);
+    } catch (err) {
+      alert(`Apply template failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const handleCheckCorrigendum = async () => {
+    const tid = infoForm.source_tender_id.trim();
+    if (!tid) {
+      alert('This project is not linked to a Tender ID.');
+      return;
+    }
+    setCorrigendumStatus('running');
+    setCorrigendumMsg('Checking active tender and syncing corrigendum files...');
+    try {
+      const res = await api.checkProjectCorrigendum(projectId);
+      if (!res.found || !res.tender) {
+        setCorrigendumStatus('error');
+        setCorrigendumMsg('Tender ID of this project was not found in Active Tenders.');
+        return;
+      }
+      if (res.source === 'corrigendum_sync_no_download') {
+        setCorrigendumStatus('error');
+        setCorrigendumMsg(res.message || 'Corrigendum download did not start.');
+        alert(res.message || 'Corrigendum download did not start.');
+        return;
+      }
+      setInfoForm((f) => ({
+        ...f,
+        source_tender_id: String(res.tender?.tender_id || f.source_tender_id || tid),
+        title: String(res.tender?.title || f.title || ''),
+        client_name: String(res.tender?.org_chain || f.client_name || ''),
+        project_value: normalizeValue2dp(String(res.tender?.tender_value || f.project_value || '')),
+        prebid: widenDateTimeGap(String(res.tender?.pre_bid_meeting_date || f.prebid || '')),
+        deadline: String(res.tender?.closing_date || f.deadline || ''),
+      }));
+      setCorrigendumStatus('done');
+      setCorrigendumMsg(`Corrigendum/Addendum/Pre-bid check completed. Synced files: ${res.files?.length || 0}`);
+      qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+      qc.invalidateQueries({ queryKey: ['project', projectId] });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('API 404') || msg.includes('API 405')) {
+        try {
+          setCorrigendumMsg('Fallback mode: checking tender and running update download...');
+          let tenderId: number | null = null;
+          try {
+            const result = await api.fetchTenderForProject(tid, false);
+            if (result.found && result.tender) tenderId = result.tender.id;
+          } catch {
+            // continue fallback
+          }
+          if (!tenderId) {
+            const local = await findLocalTender(tid);
+            if (local?.id) tenderId = Number(local.id);
+          }
+          if (!tenderId) {
+            setCorrigendumStatus('error');
+            setCorrigendumMsg('Tender not found in database for corrigendum check.');
+            return;
+          }
+          let ok = false;
+          try {
+            const job = await api.downloadSingleTender(tenderId, 'update');
+            ok = await waitForJob(job.job_id);
+          } catch (singleErr) {
+            const singleMsg = singleErr instanceof Error ? singleErr.message : String(singleErr);
+            if (singleMsg.includes('API 404') || singleMsg.includes('API 405')) {
+              const local = await findLocalTender(tid);
+              const websiteId = Number(local?.website_id || 0);
+              if (websiteId > 0) {
+                try {
+                  await api.patchTender(tenderId, { is_downloaded: true });
+                } catch {
+                  // Older backend may not support this route; continue.
+                }
+                const job = await api.downloadTenders(websiteId);
+                ok = await waitForJob(job.job_id);
+              } else {
+                throw singleErr;
+              }
+            } else {
+              throw singleErr;
+            }
+          }
+          if (!ok) {
+            setCorrigendumStatus('error');
+            setCorrigendumMsg('Corrigendum update download failed.');
+            return;
+          }
+          setCorrigendumStatus('done');
+          setCorrigendumMsg('Corrigendum check completed (legacy fallback mode).');
+          qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+          qc.invalidateQueries({ queryKey: ['project', projectId] });
+          return;
+        } catch (fallbackErr) {
+          const fb = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+          setCorrigendumStatus('error');
+          setCorrigendumMsg(`Fallback failed: ${fb}`);
+          return;
+        }
+      }
+      setCorrigendumStatus('error');
+      setCorrigendumMsg(`Error: ${msg}`);
+    }
+  };
+
+  const waitForJob = async (jobId: string, timeoutMs = 180000) => {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      const job = await api.getJob(jobId);
+      if (job?.status === 'completed') return true;
+      if (job?.status === 'failed') return false;
+      await new Promise((r) => setTimeout(r, 1200));
+    }
+    return false;
+  };
+  const findLocalTender = async (tenderId: string): Promise<Tender | null> => {
+    const tid = String(tenderId || '').trim().toLowerCase();
+    if (!tid) return null;
+    const sites = await api.listWebsites();
+    const grouped = await Promise.all(
+      sites.map(async (w) => {
+        const [active, archived] = await Promise.all([
+          api.listTenders(w.id, { archived: false, limit: 5000 }),
+          api.listTenders(w.id, { archived: true, limit: 5000 }),
+        ]);
+        return [...active, ...archived];
+      })
+    );
+    const all = grouped.flat();
+    const exact = all.find((t) => String(t.tender_id || '').trim().toLowerCase() === tid);
+    if (exact) return exact;
+    const partials = all.filter((t) => String(t.tender_id || '').toLowerCase().includes(tid));
+    if (!partials.length) return null;
+    partials.sort((a, b) => Number(Boolean(b.is_downloaded)) - Number(Boolean(a.is_downloaded)));
+    return partials[0] || null;
+  };
+  const inferSubfolderFromPath = (pathTxt: string, baseFolder: string) => {
+    const p = String(pathTxt || '').replace(/\\/g, '/').trim();
+    const base = String(baseFolder || '').replace(/\\/g, '/').replace(/\/+$/, '').trim();
+    if (!p) return folder || 'Ready Docs';
+    if (base && p.toLowerCase().startsWith(base.toLowerCase())) {
+      const rel = p.slice(base.length).replace(/^\/+/, '');
+      const first = rel.split('/')[0] || '';
+      if (first) return first;
+    }
+    return folder || 'Ready Docs';
+  };
+  const fetchTenderInfo = async () => {
+    const tid = infoForm.source_tender_id.trim();
+    if (!tid) return;
+    setFetchingTenderInfo(true);
+    try {
+      let match: Tender | null = null;
+      let fetchedFiles: Array<{ local_path: string; file_name: string; file_type: string }> = [];
+      let fetchNotice = '';
+
+      // Preferred flow: sync from Active Tenders for latest fields + copy missing files to project Tender Docs.
+      try {
+        const activeSync = await api.fetchProjectFromActive(projectId);
+        if (activeSync.found && activeSync.tender) {
+          if (activeSync.source === 'active_sync_no_download' || activeSync.source === 'active_sync_no_files') {
+            fetchNotice = String(activeSync.message || 'Tender synced, but files were not available yet.');
+          }
+          match = activeSync.tender;
+          fetchedFiles = (activeSync.files || []).map((f) => ({
+            local_path: String(f.local_path || ''),
+            file_name: String(f.file_name || ''),
+            file_type: String(f.file_type || 'document'),
+          }));
+        }
+      } catch {
+        // Endpoint may be unavailable on older backend; continue with fallback flow.
+      }
+
+      if (!match) try {
+        const result = await api.fetchTenderForProject(tid, true);
+        if (result.found && result.tender) {
+          match = result.tender;
+          fetchedFiles = (result.files || []).map((f) => ({
+            local_path: String(f.local_path || ''),
+            file_name: String(f.file_name || ''),
+            file_type: String(f.file_type || 'document'),
+          }));
+        }
+      } catch {
+        // Route may be unavailable on older backend process; fallback below.
+      }
+
+      if (!match) {
+        match = await findLocalTender(tid);
+      }
+
+      if (!match) {
+        const sites = await api.listWebsites();
+        for (const s of sites) {
+          const jobStart = await api.fetchTenders(s.id);
+          const ok = await waitForJob(jobStart.job_id);
+          if (!ok) continue;
+          match = await findLocalTender(tid);
+          if (match) break;
+        }
+      }
+
+      if (!match) {
+        alert('Tender not found in DB, and online scrape did not return this tender.');
+        return;
+      }
+
+      // Do not run fragile legacy download fallback from frontend.
+      // Backend fetch-from-active is the single authoritative download/sync flow.
+
+      setInfoForm((f) => ({
+        ...f,
+        source_tender_id: String(match.tender_id || f.source_tender_id || tid),
+        title: String(match.title || ''),
+        client_name: String(match.org_chain || ''),
+        project_value: normalizeValue2dp(String(match.tender_value || '')),
+        prebid: widenDateTimeGap(String(match.pre_bid_meeting_date || '')),
+        deadline: String(match.closing_date || ''),
+      }));
+
+      const existingByPath = new Set(
+        (checklist || [])
+          .map((x) => String(x.linked_file_path || '').trim().toLowerCase())
+          .filter(Boolean)
+      );
+      for (const file of fetchedFiles) {
+        const linked = String(file.local_path || '').trim();
+        if (!linked || existingByPath.has(linked.toLowerCase())) continue;
+        const reqName = String(file.file_name || fileNameOnly(linked) || '').trim();
+        const subfolder = linked.toLowerCase().includes('tender docs') ? 'Tender Docs' : inferSubfolderFromPath(linked, String(match.folder_path || ''));
+        await api.createChecklistItem(projectId, {
+          req_file_name: reqName,
+          description: file.file_type ? `${file.file_type} file` : '',
+          subfolder,
+          linked_file_path: linked,
+          status: 'Completed',
+        });
+        existingByPath.add(linked.toLowerCase());
+      }
+      qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+      qc.invalidateQueries({ queryKey: ['project', projectId] });
+      if (fetchNotice) {
+        alert(`${fetchNotice}\n\nTender details were updated. Files synced: ${fetchedFiles.length}.`);
+      } else if (fetchedFiles.length === 0) {
+        alert('Fetch completed but no files were found to sync into project Tender Docs.');
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      alert(`Fetch failed: ${msg}`);
+    } finally {
+      setFetchingTenderInfo(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!embedded) return;
+    const onEditToggle = () => setInfoEditable((v) => !v);
+    const onSave = () => {
+      if (!infoEditable || updateProjectInfo.isPending) return;
+      updateProjectInfo.mutate();
+    };
+    const onOpenFolder = () => {
+      void openProjectFolder();
+    };
+    window.addEventListener('bm-workspace-edit-toggle', onEditToggle as EventListener);
+    window.addEventListener('bm-workspace-save', onSave as EventListener);
+    window.addEventListener('bm-workspace-open-folder', onOpenFolder as EventListener);
+    return () => {
+      window.removeEventListener('bm-workspace-edit-toggle', onEditToggle as EventListener);
+      window.removeEventListener('bm-workspace-save', onSave as EventListener);
+      window.removeEventListener('bm-workspace-open-folder', onOpenFolder as EventListener);
+    };
+  }, [embedded, infoEditable, updateProjectInfo.isPending, projectFolderPath]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(WORKSPACE_VIEW_KEY(projectId));
+      if (!raw) return;
+      const saved = JSON.parse(raw) as {
+        selectedId?: number | null;
+        folder?: string;
+        previewWidth?: number;
+        previewCollapsed?: boolean;
+        infoEditable?: boolean;
+        managedFolders?: string[];
+      };
+      if (typeof saved.selectedId === 'number' || saved.selectedId === null) setSelectedId(saved.selectedId ?? null);
+      if (typeof saved.folder === 'string' && saved.folder.trim()) setFolder(saved.folder.trim());
+      if (typeof saved.previewWidth === 'number' && Number.isFinite(saved.previewWidth)) setPreviewWidth(Math.max(240, Math.min(680, saved.previewWidth)));
+      if (typeof saved.previewCollapsed === 'boolean') setPreviewCollapsed(saved.previewCollapsed);
+      if (typeof saved.infoEditable === 'boolean') setInfoEditable(saved.infoEditable);
+      if (Array.isArray(saved.managedFolders)) {
+        setManagedFolders(saved.managedFolders.map((x) => String(x || '').trim()).filter(Boolean));
+      }
+    } catch {
+      // ignore parse errors
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    const payload = {
+      selectedId,
+      folder,
+      previewWidth,
+      previewCollapsed,
+      infoEditable,
+      managedFolders,
+    };
+    localStorage.setItem(WORKSPACE_VIEW_KEY(projectId), JSON.stringify(payload));
+  }, [projectId, selectedId, folder, previewWidth, previewCollapsed, infoEditable, managedFolders]);
+
+  const timeRemainingLabel = useMemo(() => getTimeRemainingLabel(infoForm.deadline), [infoForm.deadline]);
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('bm-workspace-time-remaining', { detail: { label: timeRemainingLabel } }));
+    return () => {
+      window.dispatchEvent(new CustomEvent('bm-workspace-time-remaining', { detail: { label: '' } }));
+    };
+  }, [timeRemainingLabel]);
+
+  const attachFile = async () => {
+    if (!desktop?.pickPath || !desktop?.copyFileToFolder) {
+      alert('Desktop file integration is unavailable. Open this in Electron desktop mode.');
+      return;
+    }
+    const baseFolder = await resolveExistingProjectFolder();
+    if (!baseFolder) {
+      alert('Project folder is not available.');
+      return;
+    }
+    const pick = await desktop.pickPath({ file: true, title: 'Select attachment file' });
+    if (!pick?.ok || !pick.path) return;
+    const subfolder = selectedItem?.subfolder || folder || 'Ready Docs';
+    const cleanSubfolder = String(subfolder || 'Ready Docs').trim();
+    const targetDir = cleanSubfolder === 'Main'
+      ? baseFolder
+      : `${baseFolder}${baseFolder.endsWith('\\') || baseFolder.endsWith('/') ? '' : '\\'}${cleanSubfolder}`;
+    const pickedName = fileNameOnly(pick.path || '');
+    const pickedExtMatch = pickedName.match(/(\.[^./\\]+)$/);
+    const pickedExt = pickedExtMatch ? pickedExtMatch[1] : '';
+    const rawDesired = (selectedItem?.req_file_name || docName || pickedName).trim();
+    let desiredName = sanitizeFileName(rawDesired || pickedName);
+    if (desiredName && pickedExt && !desiredName.toLowerCase().endsWith(pickedExt.toLowerCase())) {
+      desiredName += pickedExt;
+    }
+    desiredName = sanitizeFileName(desiredName);
+    const copied = await desktop.copyFileToFolder({
+      sourcePath: pick.path,
+      targetDir,
+      targetName: desiredName || undefined,
+    });
+    if (!copied?.ok || !copied.path) {
+      alert(`Attach failed: ${copied?.message || 'Unknown error'}`);
+      return;
+    }
+    if (selectedItem) {
+      await api.updateChecklistItem(selectedItem.id, { linked_file_path: copied.path, status: 'Completed', subfolder: cleanSubfolder });
+    } else {
+      const created = await api.createChecklistItem(projectId, {
+        req_file_name: (docName || desiredName).trim(),
+        description: desc.trim(),
+        subfolder: cleanSubfolder,
+        linked_file_path: copied.path,
+        status: 'Completed',
+      });
+      setSelectedId(created.id);
+    }
+    qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+  };
+
+  const attachmentPath = String(selectedItem?.linked_file_path || '').trim();
+  const attachmentName = fileNameOnly(attachmentPath);
+  const isImage = /\.(png|jpg|jpeg|gif|bmp|webp|svg)$/i.test(attachmentName);
+  const isPdf = /\.pdf$/i.test(attachmentName);
+  const isTextLike = /\.(txt|log|csv|json|md|xml|html|css|js|ts|tsx|py)$/i.test(attachmentName);
+  const ext = (attachmentName.match(/\.([^.]+)$/)?.[1] || '').toLowerCase();
+  useEffect(() => {
+    let cancelled = false;
+    setTextPreview('');
+    setTextPreviewError('');
+    if (!attachmentPath || !isTextLike) return;
+    fetch(toFileUrl(attachmentPath))
+      .then((r) => r.text())
+      .then((txt) => {
+        if (cancelled) return;
+        setTextPreview(txt.slice(0, 4000));
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setTextPreviewError('Text preview is not available here. Use Open File.');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [attachmentPath, isTextLike]);
+  const startPreviewResize = (startX: number) => {
+    const startW = previewWidth;
+    const minW = 240;
+    const maxW = 680;
+    const onMove = (evt: MouseEvent) => {
+      const delta = evt.clientX - startX;
+      const next = Math.max(minW, Math.min(maxW, startW - delta));
+      setPreviewWidth(next);
+      if (previewCollapsed) setPreviewCollapsed(false);
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  const renameAttachedFile = async () => {
+    if (!selectedItem || !attachmentPath || !desktop?.renamePath) return;
+    const initialName = String(attachmentName || '').trim();
+    const asked = window.prompt('New file name', initialName);
+    const nextName = String(asked || '').trim();
+    if (!nextName) return;
+    const dir = attachmentPath.replace(/[\\/][^\\/]+$/, '');
+    const newPath = `${dir}${dir.endsWith('\\') || dir.endsWith('/') ? '' : '\\'}${nextName}`;
+    const result = await desktop.renamePath({ oldPath: attachmentPath, newPath });
+    if (!result?.ok || !result.path) {
+      alert(`Rename file failed: ${result?.message || 'Unknown error'}`);
+      return;
+    }
+    await api.updateChecklistItem(selectedItem.id, { linked_file_path: result.path });
+    qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+  };
+
+  const deleteAttachedFile = async () => {
+    if (!selectedItem || !attachmentPath || !desktop?.deleteFile) return;
+    const ok = window.confirm(`Delete attached file?\n${attachmentName}`);
+    if (!ok) return;
+    const result = await desktop.deleteFile(attachmentPath);
+    if (!result?.ok) {
+      alert(`Delete file failed: ${result?.message || 'Unknown error'}`);
+      return;
+    }
+    await api.updateChecklistItem(selectedItem.id, { linked_file_path: '', status: 'Pending' });
+    qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+  };
+  const deleteSelectedItem = async () => {
+    if (!selectedItem) return;
+    const label = String(selectedItem.req_file_name || selectedItem.description || `#${selectedItem.id}`);
+    const ok = window.confirm(`Delete item?\n${label}`);
+    if (!ok) return;
+    await deleteItem.mutateAsync(selectedItem.id);
+  };
+
+  const ensureFolder = (name: string) => {
+    const clean = String(name || '').trim();
+    if (!clean) return false;
+    if (folderOptions.some((x) => x.toLowerCase() === clean.toLowerCase())) return true;
+    setManagedFolders((prev) => [...prev, clean]);
+    return true;
+  };
+
+  const addFolder = () => {
+    if (!ensureFolder(newFolderName)) return;
+    setFolder(String(newFolderName || '').trim());
+    setNewFolderName('');
+  };
+
+  const renameFolder = async () => {
+    const from = String(renameFrom || '').trim();
+    const to = String(renameTo || '').trim();
+    if (!from || !to || from.toLowerCase() === to.toLowerCase()) return;
+    ensureFolder(to);
+    const hits = (checklist || []).filter((x) => String(x.subfolder || '').trim().toLowerCase() === from.toLowerCase());
+    await Promise.all(hits.map((x) => api.updateChecklistItem(x.id, { subfolder: to })));
+    setManagedFolders((prev) => prev.map((x) => (x.toLowerCase() === from.toLowerCase() ? to : x)).filter(Boolean));
+    if (folder.toLowerCase() === from.toLowerCase()) setFolder(to);
+    setRenameFrom('');
+    setRenameTo('');
+    qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+  };
+
+  const moveFolderItems = async () => {
+    const from = String(moveFrom || '').trim();
+    const to = String(moveTo || '').trim();
+    if (!from || !to || from.toLowerCase() === to.toLowerCase()) return;
+    ensureFolder(to);
+    const hits = (checklist || []).filter((x) => String(x.subfolder || '').trim().toLowerCase() === from.toLowerCase());
+    await Promise.all(hits.map((x) => api.updateChecklistItem(x.id, { subfolder: to })));
+    setMoveFrom('');
+    setMoveTo('');
+    qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+  };
+
+  const deleteFolder = async () => {
+    const name = String(deleteFolderName || '').trim();
+    if (!name) return;
+    if (FOLDER_ORDER.some((x) => x.toLowerCase() === name.toLowerCase())) {
+      alert('Default folder cannot be deleted.');
+      return;
+    }
+    const hits = (checklist || []).filter((x) => String(x.subfolder || '').trim().toLowerCase() === name.toLowerCase());
+    if (hits.length > 0) {
+      const moveTarget = folderOptions.find((x) => x.toLowerCase() !== name.toLowerCase()) || 'Ready Docs';
+      await Promise.all(hits.map((x) => api.updateChecklistItem(x.id, { subfolder: moveTarget })));
+    }
+    setManagedFolders((prev) => prev.filter((x) => x.toLowerCase() !== name.toLowerCase()));
+    if (folder.toLowerCase() === name.toLowerCase()) setFolder('Ready Docs');
+    setDeleteFolderName('');
+    qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+  };
+
+  if (projectLoading) {
+    return <div className="flex h-full items-center justify-center"><Spinner size={24} className="text-[var(--accent)]" /></div>;
+  }
+
+  return (
+    <div className={cn('flex flex-col bg-[var(--bg)] text-[var(--text)]', embedded ? 'h-full' : 'h-screen')}>
+      <div className="border-b border-[var(--border)] bg-[var(--surface-0)] px-4 py-2">
+        <div className="grid grid-cols-1 gap-2 text-sm lg:grid-cols-12">
+          <div className="lg:col-span-3">
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Tender ID</label>
+            <div className="flex gap-2">
+              <div className="relative flex-1">
+                <input value={infoForm.source_tender_id} readOnly={!infoEditable} onChange={(e) => uf('source_tender_id', e.target.value)} className="input-field h-8 w-full pr-10 text-xs" />
+                <button onClick={() => copyText(infoForm.source_tender_id)} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><Copy size={12} /></button>
+              </div>
+              <button onClick={fetchTenderInfo} disabled={fetchingTenderInfo} className="btn-secondary px-2 text-xs">{fetchingTenderInfo ? 'Fetching...' : 'Fetch'}</button>
+            </div>
+          </div>
+          <div className="lg:col-span-5">
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Client</label>
+            <div className="relative">
+              <input value={infoForm.client_name} readOnly={!infoEditable} onChange={(e) => uf('client_name', e.target.value)} className="input-field h-8 w-full pr-10 text-xs" />
+              <button onClick={() => copyText(infoForm.client_name)} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><Copy size={12} /></button>
+            </div>
+          </div>
+          <div className="lg:col-span-2">
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Value</label>
+            <div className="relative">
+              <input value={addIndianCommas(infoForm.project_value)} readOnly={!infoEditable} onChange={(e) => uf('project_value', e.target.value.replace(/,/g, ''))} className="input-field h-8 w-full max-w-[220px] pr-10 text-xs" />
+              <button onClick={() => copyText(infoForm.project_value)} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><Copy size={12} /></button>
+            </div>
+          </div>
+          <div className="lg:col-span-2">
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Prebid</label>
+            <div className="relative">
+              <input value={infoForm.prebid} readOnly={!infoEditable} onChange={(e) => uf('prebid', e.target.value)} className="input-field h-8 w-full max-w-[240px] pr-10 text-xs" />
+              <button onClick={() => copyText(infoForm.prebid)} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><Copy size={12} /></button>
+            </div>
+          </div>
+          <div className="lg:col-span-3">
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Deadline</label>
+            <div className="relative">
+              <input value={infoForm.deadline} readOnly={!infoEditable} onChange={(e) => uf('deadline', e.target.value)} className="input-field h-8 w-full pr-10 text-xs" />
+              <button onClick={() => copyText(infoForm.deadline)} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><Copy size={12} /></button>
+            </div>
+          </div>
+          <div className="lg:col-span-9">
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Name of Work</label>
+            <div className="relative">
+              <textarea
+                value={infoForm.title}
+                readOnly={!infoEditable}
+                onChange={(e) => uf('title', e.target.value)}
+                rows={3}
+                className="input-field min-h-[72px] w-full resize-y py-2 pr-12 text-xs leading-5"
+              />
+              <button onClick={() => copyText(infoForm.title)} className="absolute right-2 top-2 text-[var(--text-muted)] hover:text-[var(--text)]"><Copy size={12} /></button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="border-b border-[var(--border)] bg-[var(--surface-1)] px-4 py-2">
+        <div className="grid grid-cols-1 gap-2 lg:grid-cols-[1.6fr_1.5fr_1fr_auto_auto_auto_auto]">
+          <input value={docName} onChange={(e) => setDocName(e.target.value)} placeholder="Document Name" className="input-field h-9 text-sm" />
+          <input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="Description" className="input-field h-9 text-sm" />
+          <select value={folder} onChange={(e) => setFolder(e.target.value)} className="input-field h-9 text-sm">
+            {folderOptions.map((f) => <option key={f}>{f}</option>)}
+          </select>
+          <button disabled={!docName.trim() || createItem.isPending} onClick={() => createItem.mutate()} className="btn-primary gap-1 text-xs"><Plus size={12} />Add Item</button>
+          <button onClick={attachFile} className="btn-secondary gap-1 text-xs"><Paperclip size={12} />Attach File</button>
+          <button disabled={!selectedItem || updateItem.isPending} onClick={() => selectedItem && updateItem.mutate(selectedItem.id)} className="btn-secondary gap-1 text-xs">Update</button>
+          <button disabled={!selectedItem || deleteItem.isPending} onClick={deleteSelectedItem} className="btn-danger gap-1 text-xs"><Trash2 size={12} />Delete Item</button>
+        </div>
+        <div className="mt-2 flex items-center gap-2 overflow-x-auto whitespace-nowrap">
+          <button disabled={!attachmentPath} onClick={() => openPath(attachmentPath)} className="btn-ghost gap-1 text-xs"><Link2 size={12} />Open File</button>
+          <button disabled={!attachmentPath} onClick={renameAttachedFile} className="btn-ghost gap-1 text-xs"><Pencil size={12} />Rename File</button>
+          <button disabled={!attachmentPath} onClick={deleteAttachedFile} className="btn-danger gap-1 text-xs"><Trash2 size={12} />Delete File</button>
+          <button onClick={() => setManageFoldersOpen(true)} className="btn-ghost gap-1 text-xs"><FolderCog size={12} />Manage Folders</button>
+          <button onClick={() => qc.invalidateQueries({ queryKey: ['project-checklist', projectId] })} className="btn-ghost gap-1 text-xs"><RefreshCw size={12} />Refresh</button>
+          <button onClick={() => { setTemplateSearch(''); setApplyTemplateOpen(true); }} className="btn-ghost gap-1 text-xs"><BookOpen size={12} />Apply Template</button>
+          <button
+            onClick={handleCheckCorrigendum}
+            disabled={corrigendumStatus === 'running'}
+            className={cn('btn-ghost gap-1 text-xs', corrigendumStatus === 'done' && 'text-green-400', corrigendumStatus === 'error' && 'text-rose-400')}
+          >
+            <Download size={12} />{corrigendumStatus === 'running' ? 'Checking...' : 'Check for Corrigendum'}
+          </button>
+          <span className="h-4 w-px bg-[var(--border)] shrink-0" />
+          <button
+            onClick={() => {
+              setSaveTemplateForm(f => ({ ...f, template_name: String(project?.title || ''), organization: String(project?.client_name || '') }));
+              setSaveTemplateOpen(true);
+            }}
+            className="btn-ghost gap-1 text-xs"
+          ><Save size={12} />Save Template</button>
+          {corrigendumStatus !== 'idle' && (
+            <span className={cn('text-xs', corrigendumStatus === 'done' && 'text-green-400', corrigendumStatus === 'error' && 'text-rose-400', corrigendumStatus === 'running' && 'text-[var(--text-muted)]')}>
+              {corrigendumMsg}
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="flex min-h-0 flex-1">
+        <div className="min-w-0 flex-1 overflow-auto">
+          {checklistLoading ? (
+            <div className="flex justify-center py-10"><Spinner size={18} className="text-[var(--accent)]" /></div>
+          ) : (
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th className="w-14">Sr</th>
+                  <th>Document Name</th>
+                  <th>Description</th>
+                  <th className="w-36">Status</th>
+                  <th>Attachment</th>
+                </tr>
+              </thead>
+              <tbody>
+                {grouped.map((g, gidx) => (
+                  <Fragment key={`group-${g.name}-${gidx}`}>
+                    <tr>
+                      <td className="bg-[var(--surface-1)] font-semibold">{gidx + 1}</td>
+                      <td colSpan={4} className="bg-[var(--surface-1)] font-semibold">{g.name}</td>
+                    </tr>
+                    {g.rows.map((item, i) => (
+                      <tr key={item.id} onClick={() => setSelectedId(item.id)} className={cn('cursor-pointer', item.id === selectedId && 'row-selected')}>
+                        <td>{i + 1}.</td>
+                        <td>{item.req_file_name || '-'}</td>
+                        <td>{item.description || '-'}</td>
+                        <td><Badge variant={item.status === 'Completed' ? 'success' : 'muted'}>{item.status}</Badge></td>
+                        <td className="truncate">{fileNameOnly(item.linked_file_path || '') || '-'}</td>
+                      </tr>
+                    ))}
+                  </Fragment>
+                ))}
+                {(checklist || []).length === 0 && (
+                  <tr><td colSpan={5}><EmptyState icon={FolderOpen} title="No items" description="Add first document item above." /></td></tr>
+                )}
+              </tbody>
+            </table>
+          )}
+        </div>
+        <div className="relative shrink-0 border-l border-[var(--border)] bg-[var(--surface-0)]" style={{ width: previewCollapsed ? 16 : previewWidth }}>
+          <button
+            onClick={() => setPreviewCollapsed((v) => !v)}
+            className="absolute -left-3 top-1/2 z-10 flex h-12 w-3 -translate-y-1/2 items-center justify-center rounded-l border border-[var(--border)] bg-[var(--surface-1)] text-[var(--text-muted)] hover:text-[var(--text)]"
+            title={previewCollapsed ? 'Show preview' : 'Hide preview'}
+          >
+            {previewCollapsed ? <ChevronLeft size={12} /> : <ChevronRight size={12} />}
+          </button>
+          {!previewCollapsed && (
+            <div
+              className="absolute -left-1 top-0 h-full w-2 cursor-col-resize"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                startPreviewResize(e.clientX);
+              }}
+              title="Resize preview"
+            />
+          )}
+        <aside className={cn('h-full border-l border-[var(--border)] bg-[var(--surface-0)] p-3', previewCollapsed && 'hidden')}>
+          <h4 className="mb-2 text-sm font-semibold">Preview</h4>
+          {!selectedItem && <p className="text-xs text-[var(--text-muted)]">Select a row to preview details.</p>}
+          {selectedItem && (
+            <div className="space-y-2 text-xs">
+              <p><span className="text-[var(--text-muted)]">Document:</span> {selectedItem.req_file_name || '-'}</p>
+              <p><span className="text-[var(--text-muted)]">Description:</span> {selectedItem.description || '-'}</p>
+              <p><span className="text-[var(--text-muted)]">Folder:</span> {selectedItem.subfolder || '-'}</p>
+              <p><span className="text-[var(--text-muted)]">Attachment:</span> {attachmentName || '-'}</p>
+              {isImage && attachmentPath && (
+                <img src={toFileUrl(attachmentPath)} alt="Attachment preview" className="max-h-64 w-full rounded border border-[var(--border)] object-contain" />
+              )}
+              {isPdf && attachmentPath && (
+                <iframe src={toFileUrl(attachmentPath)} className="h-72 w-full rounded border border-[var(--border)] bg-white" title="PDF preview" />
+              )}
+              {isTextLike && (
+                <div className="rounded border border-[var(--border)] bg-[var(--surface-1)] p-2">
+                  {textPreview ? <pre className="max-h-72 overflow-auto whitespace-pre-wrap">{textPreview}</pre> : <p>{textPreviewError || 'Loading text preview...'}</p>}
+                </div>
+              )}
+              {!isImage && !isPdf && !isTextLike && attachmentPath && (
+                <div className="rounded border border-[var(--border)] bg-[var(--surface-1)] p-2 text-[var(--text-muted)]">
+                  Preview for `.{ext || 'file'}` is not supported here. Use `Open File`.
+                </div>
+              )}
+            </div>
+          )}
+        </aside>
+        </div>
+      </div>
+      {saveTemplateOpen && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 p-4">
+          <div className="w-full max-w-md rounded-xl border border-[var(--border)] bg-[var(--surface-0)] p-5 shadow-xl">
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Save Checklist as Template</h3>
+              <button onClick={() => setSaveTemplateOpen(false)} className="text-[var(--text-muted)]"><X size={16} /></button>
+            </div>
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="mb-1 block text-xs text-[var(--text-muted)]">No.</label>
+                  <input value={saveTemplateForm.template_no} onChange={e => setSaveTemplateForm(f => ({ ...f, template_no: e.target.value }))} placeholder="1" className="input-field h-8 w-full text-xs" />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-[var(--text-muted)]">Organization *</label>
+                  <input value={saveTemplateForm.organization} onChange={e => setSaveTemplateForm(f => ({ ...f, organization: e.target.value }))} className="input-field h-8 w-full text-xs" />
+                </div>
+              </div>
+              <div>
+                <label className="mb-1 block text-xs text-[var(--text-muted)]">Template Name *</label>
+                <input value={saveTemplateForm.template_name} onChange={e => setSaveTemplateForm(f => ({ ...f, template_name: e.target.value }))} className="input-field h-8 w-full text-xs" />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs text-[var(--text-muted)]">Description</label>
+                <input value={saveTemplateForm.description} onChange={e => setSaveTemplateForm(f => ({ ...f, description: e.target.value }))} className="input-field h-8 w-full text-xs" />
+              </div>
+            </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <button onClick={() => setSaveTemplateOpen(false)} className="btn-ghost text-xs">Cancel</button>
+              <button
+                onClick={handleSaveTemplate}
+                disabled={savingTemplate || !saveTemplateForm.template_name.trim() || !saveTemplateForm.organization.trim()}
+                className="btn-primary gap-1 text-xs"
+              ><Save size={12} />{savingTemplate ? 'Saving...' : 'Save Template'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {applyTemplateOpen && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 p-4">
+          <div className="w-full max-w-lg rounded-xl border border-[var(--border)] bg-[var(--surface-0)] p-5 shadow-xl">
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Apply Template to Project</h3>
+              <button onClick={() => setApplyTemplateOpen(false)} className="text-[var(--text-muted)]"><X size={16} /></button>
+            </div>
+            <div className="relative mb-3">
+              <Search size={12} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--text-muted)]" />
+              <input value={templateSearch} onChange={e => setTemplateSearch(e.target.value)} placeholder="Search templates..." className="input-field h-8 w-full pl-8 text-xs" />
+            </div>
+            <div className="max-h-72 overflow-auto space-y-1">
+              {(allTemplates || [])
+                .filter(t => !templateSearch || t.template_name.toLowerCase().includes(templateSearch.toLowerCase()) || t.organization.toLowerCase().includes(templateSearch.toLowerCase()))
+                .map(t => (
+                  <div key={t.id} className="flex items-center justify-between rounded border border-[var(--border)] px-3 py-2 hover:bg-[var(--surface-1)]">
+                    <div>
+                      <p className="text-sm font-medium text-[var(--text)]">{t.template_name}</p>
+                      <p className="text-xs text-[var(--text-muted)]">{t.organization}{t.template_no ? ` · #${t.template_no}` : ''}</p>
+                    </div>
+                    <button onClick={() => handleApplyTemplate(t.id)} className="btn-primary text-xs gap-1 shrink-0 ml-3"><Plus size={12} />Apply</button>
+                  </div>
+                ))}
+              {!(allTemplates || []).length && <p className="py-4 text-center text-xs text-[var(--text-muted)]">No templates found.</p>}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {manageFoldersOpen && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 p-4">
+          <div className="w-full max-w-2xl rounded-xl border border-[var(--border)] bg-[var(--surface-0)] p-4 shadow-xl">
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Manage Folders</h3>
+              <button onClick={() => setManageFoldersOpen(false)} className="btn-ghost text-xs">Close</button>
+            </div>
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+              <div className="rounded border border-[var(--border)] p-3">
+                <p className="mb-2 text-xs font-semibold text-[var(--text-muted)]">Add Folder</p>
+                <div className="flex gap-2">
+                  <input value={newFolderName} onChange={(e) => setNewFolderName(e.target.value)} placeholder="Folder name" className="input-field h-8 flex-1 text-xs" />
+                  <button onClick={addFolder} className="btn-primary text-xs">Add</button>
+                </div>
+              </div>
+              <div className="rounded border border-[var(--border)] p-3">
+                <p className="mb-2 text-xs font-semibold text-[var(--text-muted)]">Rename Folder</p>
+                <div className="grid grid-cols-2 gap-2">
+                  <select value={renameFrom} onChange={(e) => setRenameFrom(e.target.value)} className="input-field h-8 text-xs"><option value="">From</option>{folderOptions.map((f) => <option key={`rf-${f}`}>{f}</option>)}</select>
+                  <input value={renameTo} onChange={(e) => setRenameTo(e.target.value)} placeholder="To name" className="input-field h-8 text-xs" />
+                </div>
+                <button onClick={renameFolder} className="btn-secondary mt-2 text-xs">Rename</button>
+              </div>
+              <div className="rounded border border-[var(--border)] p-3">
+                <p className="mb-2 text-xs font-semibold text-[var(--text-muted)]">Move Items Between Folders</p>
+                <div className="grid grid-cols-2 gap-2">
+                  <select value={moveFrom} onChange={(e) => setMoveFrom(e.target.value)} className="input-field h-8 text-xs"><option value="">From</option>{folderOptions.map((f) => <option key={`mf-${f}`}>{f}</option>)}</select>
+                  <select value={moveTo} onChange={(e) => setMoveTo(e.target.value)} className="input-field h-8 text-xs"><option value="">To</option>{folderOptions.map((f) => <option key={`mt-${f}`}>{f}</option>)}</select>
+                </div>
+                <button onClick={moveFolderItems} className="btn-secondary mt-2 text-xs">Move</button>
+              </div>
+              <div className="rounded border border-[var(--border)] p-3">
+                <p className="mb-2 text-xs font-semibold text-[var(--text-muted)]">Delete Folder</p>
+                <div className="flex gap-2">
+                  <select value={deleteFolderName} onChange={(e) => setDeleteFolderName(e.target.value)} className="input-field h-8 flex-1 text-xs"><option value="">Select folder</option>{folderOptions.map((f) => <option key={`df-${f}`}>{f}</option>)}</select>
+                  <button onClick={deleteFolder} className="btn-danger text-xs">Delete</button>
+                </div>
+                <p className="mt-2 text-[11px] text-[var(--text-muted)]">If folder has items, they will be moved to another available folder.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,172 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Dark Theme (default) ── */
+:root, .dark {
+  --bg: #0c0e14;
+  --surface-0: #11141c;
+  --surface-1: #181c28;
+  --surface-2: #222838;
+  --surface-3: #2c3448;
+  --border: #252d40;
+  --text: #e4e8f1;
+  --text-muted: #6b7a96;
+  --accent: #5b8af5;
+  --accent-bg: rgba(91, 138, 245, 0.12);
+  --row-selected-bg: rgba(91, 138, 245, 0.08);
+  --accent-hover: #7aa3ff;
+  --danger: #ef5350;
+  --danger-bg: rgba(239, 83, 80, 0.12);
+}
+
+/* ── Light Theme ── */
+.light {
+  --bg: #f5f6fa;
+  --surface-0: #ffffff;
+  --surface-1: #f0f2f7;
+  --surface-2: #e6e9f0;
+  --surface-3: #d8dce6;
+  --border: #dfe2ea;
+  --text: #1a1f2e;
+  --text-muted: #6b7a96;
+  --accent: #3b6ce7;
+  --accent-bg: rgba(59, 108, 231, 0.08);
+  --row-selected-bg: rgba(59, 108, 231, 0.06);
+  --accent-hover: #2b5cd4;
+  --danger: #dc2626;
+  --danger-bg: rgba(220, 38, 38, 0.08);
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ── Card ── */
+.card {
+  background: var(--surface-0);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+/* ── Buttons ── */
+.btn-primary {
+  @apply inline-flex min-h-8 items-center gap-1 px-3.5 py-1.5 rounded-lg font-medium text-sm cursor-pointer transition-all;
+  background: var(--accent);
+  color: white;
+  border: none;
+}
+.btn-primary:hover { background: var(--accent-hover); }
+.btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.btn-secondary {
+  @apply inline-flex min-h-8 items-center gap-1 px-3.5 py-1.5 rounded-lg font-medium text-sm cursor-pointer transition-all;
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.btn-secondary:hover { background: var(--surface-3); }
+.btn-secondary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.btn-ghost {
+  @apply inline-flex min-h-8 items-center gap-1 px-3.5 py-1.5 rounded-lg font-medium text-sm cursor-pointer transition-all;
+  background: transparent;
+  color: var(--text-muted);
+  border: none;
+}
+.btn-ghost:hover { background: var(--surface-1); color: var(--text); }
+.btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.btn-danger {
+  @apply inline-flex items-center gap-1 px-3.5 py-1.5 rounded-lg font-medium text-sm cursor-pointer transition-all;
+  background: var(--danger-bg);
+  color: var(--danger);
+  border: 1px solid transparent;
+}
+.btn-danger:hover { border-color: var(--danger); }
+.btn-danger:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ── Input ── */
+.input-field {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 0 10px;
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.input-field:focus { border-color: var(--accent); }
+.input-field::placeholder { color: var(--text-muted); }
+
+select.input-field {
+  appearance: none;
+  padding-right: 28px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%236b7a96' viewBox='0 0 24 24'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+}
+
+textarea.input-field {
+  padding: 8px 10px;
+  resize: vertical;
+}
+
+/* ── Data Table ── */
+.data-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+.data-table thead {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--surface-0);
+}
+.data-table th {
+  padding: 8px 12px;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  user-select: none;
+}
+.data-table th svg {
+  display: inline;
+  vertical-align: -1px;
+  margin-left: 4px;
+}
+.data-table td {
+  padding: 10px 12px;
+  font-size: 13px;
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+.data-table tbody tr {
+  transition: background 0.1s;
+}
+.data-table tbody tr:hover {
+  background: var(--surface-1);
+}
+.data-table tbody tr.row-selected {
+  background: var(--row-selected-bg);
+}
+.data-table tbody tr.row-selected:hover {
+  background: var(--row-selected-bg);
+}

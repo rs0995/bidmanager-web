@@ -1,0 +1,53 @@
+{
+  "name": "bidmanager-desktop-shell",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Electron wrapper for BidManager",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "frontend:build": "npm --prefix frontend run build",
+    "backend:build": "pip install -r backend/requirements.txt && pyinstaller backend_server.spec --noconfirm --workpath build_backend --distpath dist",
+    "dev:electron": "npm run electron:dev",
+    "electron:dev": "concurrently -k \"cross-env VITE_API_PORT=8010 npm --prefix frontend run dev -- --host 127.0.0.1 --port 5173 --strictPort\" \"wait-on http-get://127.0.0.1:5173 && cross-env ELECTRON_DEV=1 ELECTRON_RENDERER_URL=http://127.0.0.1:5173 BIDMANAGER_PORT=8010 electron .\"",
+    "electron:dist": "npm run frontend:build && npm run backend:build && electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^33.2.1",
+    "electron-builder": "^26.0.12",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.bidmanager.desktop",
+    "productName": "BidManager",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "frontend/dist",
+        "to": "frontend/dist"
+      },
+      {
+        "from": "dist/backend",
+        "to": "backend"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "BidManager-Electron-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false
+    }
+  }
+}

@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/components/ui/shared.tsx","./src/lib/api.ts","./src/lib/store.ts","./src/lib/utils.ts","./src/pages/dashboardpage.tsx","./src/pages/projectworkspacepage.tsx","./src/pages/projectspage.tsx","./src/pages/serverpage.tsx","./src/pages/settingspage.tsx","./src/pages/templatespage.tsx","./src/pages/tenderspage.tsx"],"version":"5.9.3"}
