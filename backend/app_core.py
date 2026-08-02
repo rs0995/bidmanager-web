@@ -17,6 +17,7 @@ import hashlib
 import textwrap
 import tempfile
 import importlib
+import base64
 import urllib.request
 import urllib.error
 from urllib.parse import urlparse, urljoin, parse_qs, parse_qsl, urlencode, urlunparse
@@ -102,7 +103,7 @@ DB_FILE = "tender_manager.db"
 ROOT_FOLDER = "My_Tender_Projects"
 BASE_DOWNLOAD_DIRECTORY = "Tender_Downloads"
 TEMPLATE_LIBRARY_FOLDER = "Checklist_Templates"
-GOOGLE_API_KEY = "AIzaSyD78VcTNJCh3qlSYN9ZcLl4MdA3Q88TXQU"  # API Key from tender_scraper.py
+GOOGLE_API_KEY = str(os.getenv("GOOGLE_API_KEY", "") or "").strip()
 
 def _new_scraper_session():
     if requests is None:
@@ -889,8 +890,8 @@ def init_db(_recovery_attempted=False):
 # --- SCRAPER BACKEND ---
 class ScraperBackend:
     captcha_solved_in_session = False
-    gemini_model = None
-    gemini_model_name = None
+    captcha_ai_client = None
+    captcha_ai_signature = None
     session = None
 
     @staticmethod
@@ -1036,80 +1037,109 @@ class ScraperBackend:
             return None
 
     @staticmethod
-    def get_working_gemini_model():
-        if not ensure_scraper_dependencies():
-            return None
-        if ScraperBackend.gemini_model is not None:
-            return ScraperBackend.gemini_model
-        try:
-            genai.configure(api_key=GOOGLE_API_KEY)
-        except Exception as e:
-            log_to_gui(f"Gemini config error: {e}")
-            return None
+    def get_captcha_ai_config():
+        provider = str(os.getenv("CAPTCHA_AI_PROVIDER", "") or ScraperBackend.get_setting("captcha_ai_provider", "") or "").strip().lower()
+        api_key = str(os.getenv("CAPTCHA_AI_API_KEY", "") or ScraperBackend.get_setting("captcha_ai_api_key", "") or "").strip()
+        model = str(os.getenv("CAPTCHA_AI_MODEL", "") or ScraperBackend.get_setting("captcha_ai_model", "") or "").strip()
+        endpoint = str(os.getenv("CAPTCHA_AI_ENDPOINT", "") or ScraperBackend.get_setting("captcha_ai_endpoint", "") or "").strip().rstrip("/")
 
-        discovered = []
-        try:
-            for m in genai.list_models():
-                methods = getattr(m, "supported_generation_methods", []) or []
-                if "generateContent" in methods:
-                    mname = getattr(m, "name", None)
-                    if mname:
-                        discovered.append(mname)
-        except Exception as e:
-            log_to_gui(f"Gemini list_models warning: {e}")
+        legacy_google_key = GOOGLE_API_KEY or str(ScraperBackend.get_setting("google_api_key", "") or "").strip()
+        if not provider and legacy_google_key:
+            provider = "gemini"
+        if provider == "gemini" and not api_key:
+            api_key = legacy_google_key
 
-        def norm(name):
-            return name.split("/", 1)[1] if name.startswith("models/") else name
-
-        discovered_norm = [norm(x) for x in discovered]
-        discovered_norm.sort(key=lambda n: (0 if "flash" in n.lower() else 1, 0 if "pro" in n.lower() else 1, n))
-        fallback = [
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite",
-            "gemini-1.5-flash-latest",
-            "gemini-1.5-pro-latest",
-            "gemini-1.5-flash",
-            "gemini-pro",
-        ]
-        candidates = []
-        seen = set()
-        for name in discovered_norm + fallback:
-            if name and name not in seen:
-                seen.add(name)
-                candidates.append(name)
-
-        last_error = None
-        for name in candidates:
-            try:
-                model = genai.GenerativeModel(name)
-                # lightweight capability probe
-                _ = model.generate_content("ok", generation_config={"temperature": 0})
-                ScraperBackend.gemini_model = model
-                ScraperBackend.gemini_model_name = name
-                log_to_gui(f"Gemini model selected: {name}")
-                return model
-            except Exception as e:
-                last_error = e
-                continue
-
-        if last_error:
-            log_to_gui(f"Gemini model detection failed: {last_error}")
-        return None
+        aliases = {
+            "off": "manual",
+            "disabled": "manual",
+            "none": "manual",
+            "openai": "openai-compatible",
+            "openai_compatible": "openai-compatible",
+        }
+        provider = aliases.get(provider, provider or "manual")
+        return {
+            "provider": provider,
+            "api_key": api_key,
+            "model": model,
+            "endpoint": endpoint,
+        }
 
     @staticmethod
-    def solve_captcha_with_gemini(image_data):
+    def _extract_captcha_text(value):
+        text = re.sub(r"[^a-zA-Z0-9]", "", str(value or "").strip())
+        return text if len(text) == 6 else None
+
+    @staticmethod
+    def _solve_captcha_with_gemini(image_data, config):
+        if genai is None or Image is None:
+            return None
+        signature = ("gemini", config["api_key"], config["model"])
+        if ScraperBackend.captcha_ai_client is None or ScraperBackend.captcha_ai_signature != signature:
+            genai.configure(api_key=config["api_key"])
+            ScraperBackend.captcha_ai_client = genai.GenerativeModel(config["model"])
+            ScraperBackend.captcha_ai_signature = signature
+        image = Image.open(io.BytesIO(image_data))
+        response = ScraperBackend.captcha_ai_client.generate_content([
+            "Extract the 6 alphanumeric characters from this CAPTCHA image. Return only the characters.",
+            image,
+        ])
+        return ScraperBackend._extract_captcha_text(getattr(response, "text", ""))
+
+    @staticmethod
+    def _solve_captcha_with_openai_compatible(image_data, config):
+        endpoint = config["endpoint"]
+        if not endpoint:
+            raise ValueError("CAPTCHA AI endpoint is required for an OpenAI-compatible provider.")
+        image_base64 = base64.b64encode(image_data).decode("ascii")
+        response = requests.post(
+            endpoint,
+            headers={
+                "Authorization": f"Bearer {config['api_key']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": config["model"],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Extract the 6 alphanumeric characters from this CAPTCHA image. Return only the characters."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+                        ],
+                    }
+                ],
+                "temperature": 0,
+                "max_tokens": 20,
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+        if isinstance(content, list):
+            content = " ".join(str(item.get("text") or "") for item in content if isinstance(item, dict))
+        return ScraperBackend._extract_captcha_text(content)
+
+    @staticmethod
+    def solve_captcha_with_ai(image_data):
         if not ensure_scraper_dependencies():
             return None
+        config = ScraperBackend.get_captcha_ai_config()
+        provider = config["provider"]
+        if provider == "manual":
+            return None
+        if not config["api_key"] or not config["model"]:
+            log_to_gui("CAPTCHA AI requires both an API key and model. Manual input will be requested.")
+            return None
         try:
-            model = ScraperBackend.get_working_gemini_model()
-            if model is None:
-                return None
-            img = Image.open(io.BytesIO(image_data))
-            response = model.generate_content(["Extract the 6 alphanumeric characters from this CAPTCHA image. Return ONLY the text.", img])
-            text = re.sub(r'[^a-zA-Z0-9]', '', response.text.strip())
-            return text if len(text) == 6 else None
+            if provider == "gemini":
+                return ScraperBackend._solve_captcha_with_gemini(image_data, config)
+            if provider == "openai-compatible":
+                return ScraperBackend._solve_captcha_with_openai_compatible(image_data, config)
+            log_to_gui(f"Unsupported CAPTCHA AI provider '{provider}'. Manual input will be requested.")
+            return None
         except Exception as e:
-            log_to_gui(f"Gemini Error: {e}")
+            log_to_gui(f"CAPTCHA AI ({provider}) error: {e}")
             return None
 
     @staticmethod
@@ -1158,7 +1188,7 @@ class ScraperBackend:
                 img_data = captcha_img.screenshot_as_png
 
                 # Try Gemini first (auto attempts).
-                solution = ScraperBackend.solve_captcha_with_gemini(img_data)
+                solution = ScraperBackend.solve_captcha_with_ai(img_data)
                 if not solution:
                     log_to_gui(f"CAPTCHA auto-solve failed for {context}. Retrying ({attempt + 1}/{max_retries})...")
                     try:
@@ -2121,7 +2151,8 @@ class ScraperBackend:
         log_to_gui(f"Checking status for {len(tenders)} {mode_txt} tenders...")
         
         options = FirefoxOptions()
-        # options.add_argument("--headless") 
+        if str(os.getenv("BIDMANAGER_HEADLESS", "")).strip().lower() in {"1", "true", "yes"}:
+            options.add_argument("-headless")
         service = FirefoxService(GeckoDriverManager().install())
         driver = FirefoxWebDriver(service=service, options=options)
         # Solve once per Selenium session; retry only if portal asks again.
@@ -2183,6 +2214,8 @@ class ScraperBackend:
 
         log_to_gui(f"Starting result file checks for {len(targets)} tenders...")
         options = FirefoxOptions()
+        if str(os.getenv("BIDMANAGER_HEADLESS", "")).strip().lower() in {"1", "true", "yes"}:
+            options.add_argument("-headless")
         service = FirefoxService(GeckoDriverManager().install())
         driver = FirefoxWebDriver(service=service, options=options)
         ScraperBackend.captcha_solved_in_session = False
@@ -2285,6 +2318,8 @@ class ScraperBackend:
         log_to_gui(f"Starting download for {len(to_download)} tenders...")
         
         options = FirefoxOptions()
+        if str(os.getenv("BIDMANAGER_HEADLESS", "")).strip().lower() in {"1", "true", "yes"}:
+            options.add_argument("-headless")
         service = FirefoxService(GeckoDriverManager().install())
         driver = FirefoxWebDriver(service=service, options=options)
         wait = WebDriverWait(driver, 20)

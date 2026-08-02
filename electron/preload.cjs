@@ -11,4 +11,7 @@ contextBridge.exposeInMainWorld("bidmanagerDesktop", {
   copyFileToFolder: (payload) => ipcRenderer.invoke("desktop:copy-file-to-folder", payload),
   ensureProjectFolders: (targetPath) => ipcRenderer.invoke("desktop:ensure-project-folders", targetPath),
   writeJsonFile: (payload) => ipcRenderer.invoke("desktop:write-json-file", payload),
+  testBackendUrl: (backendUrl) => ipcRenderer.invoke("desktop:test-backend-url", backendUrl),
+  getBackendConfig: () => ipcRenderer.invoke("desktop:get-backend-config"),
+  setBackendConfig: (config) => ipcRenderer.invoke("desktop:set-backend-config", config),
 });

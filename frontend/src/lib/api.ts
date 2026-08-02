@@ -1,9 +1,10 @@
 /**
  * API client for the BidManager FastAPI backend.
- * All endpoints go through the Vite proxy (/v1 → localhost:8000).
+ * Local dev uses the Vite proxy. Hosted builds can set VITE_API_BASE_URL.
  */
 
-const BASE = '';  // Vite proxy handles /v1 → backend
+const runtimeBase = new URLSearchParams(window.location.search).get('apiBase') || '';
+const BASE = (runtimeBase || import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {

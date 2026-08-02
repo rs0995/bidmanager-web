@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.log
+Tender_Downloads/
+My_Tender_Projects/
+Checklist_Templates/
+app_paths.json
+user_settings.json

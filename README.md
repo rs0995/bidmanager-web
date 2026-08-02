@@ -301,31 +301,40 @@ All scraping, captcha handling, and file downloads happen server-side.
 - [ ] Set up HTTPS with a domain
 - [ ] (Optional) Containerize with Docker
 
-## Deploy Backend To Render
+## Deploy Backend To Google Cloud Run
 
-This repo includes `render.yaml` for a first Render backend deployment.
+The Cloud Run container lives in `backend/`, so Google Cloud builds and deploys
+only the FastAPI backend processing code. The frontend, Electron wrapper, and
+desktop build files are not part of the Cloud Run service.
 
-### Render settings
+### First deploy
 
-If creating the service manually, use:
-
-```bash
-Build Command: pip install -r backend/requirements.txt
-Start Command: cd backend && uvicorn api_server:app --host 0.0.0.0 --port $PORT
-Health Check Path: /health
-```
-
-Set this environment variable after the frontend is online:
+Install the Google Cloud CLI, sign in, then run from the repo root:
 
 ```bash
-BIDMANAGER_CORS_ORIGINS=https://your-frontend-domain.com,http://localhost:5173
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com
+gcloud run deploy bidmanager-backend --source backend --region asia-south1 --allow-unauthenticated --memory 2Gi --cpu 1 --timeout 900 --concurrency 10 --max-instances 1 --no-cpu-throttling --set-env-vars BIDMANAGER_CORS_ORIGINS=http://localhost:5173\,bidmanager://app,BIDMANAGER_HEADLESS=true
 ```
 
-### Current storage caveat
+After deployment, test `https://your-cloud-run-url/health`.
 
-The first Render deployment still uses local SQLite and local file paths. That is fine for proving the backend starts online, but Render instances can lose local runtime files during restarts/redeploys. For real online use, move app data to Postgres and tender/project files to Google Drive or object storage.
+### Connect the frontend to Cloud Run
 
----
+Set `VITE_API_BASE_URL=https://your-cloud-run-url` in `frontend/.env`, then run the frontend build or development server.
+
+When the frontend is deployed online, update CORS:
+
+```bash
+gcloud run services update bidmanager-backend --region asia-south1 --max-instances 1 --no-cpu-throttling --set-env-vars BIDMANAGER_CORS_ORIGINS=https://your-frontend-domain.com\,http://localhost:5173\,bidmanager://app,BIDMANAGER_HEADLESS=true
+```
+
+Cloud Run containers have disposable local filesystems. For permanent online storage, use a managed database and Cloud Storage.
+
+CAPTCHA images are produced by headless Firefox in Cloud Run. The CAPTCHA provider, model, endpoint, and key are configurable through Settings or the `CAPTCHA_AI_PROVIDER`, `CAPTCHA_AI_MODEL`, `CAPTCHA_AI_ENDPOINT`, and `CAPTCHA_AI_API_KEY` environment variables. Supported providers are `manual`, `gemini`, and `openai-compatible`. The desktop polls the cloud `/v1/captcha/pending` endpoint and submits manual answers to `/v1/captcha/respond` whenever AI is disabled or fails. Keep `max-instances=1` because jobs and CAPTCHA queues currently live in process memory, and keep CPU throttling disabled so background scraper threads continue after the start-job HTTP request returns.
+
+For Cloud Run AI solving, store the chosen provider key in Secret Manager and map it to `CAPTCHA_AI_API_KEY`. Set `CAPTCHA_AI_PROVIDER` and `CAPTCHA_AI_MODEL`; also set `CAPTCHA_AI_ENDPOINT` when using an OpenAI-compatible API. Do not store production cloud keys in the desktop settings database.
 
 ## Troubleshooting
 

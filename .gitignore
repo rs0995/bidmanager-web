@@ -1,11 +1,14 @@
 node_modules/
 frontend/node_modules/
 frontend/dist/
+frontend/tsconfig.tsbuildinfo
 dist/
 dist-electron/
 dist_new/
 build/
 build_backend/
+build_backend_debug/
+dist_debug/
 __pycache__/
 backend/__pycache__/
 **/__pycache__/
