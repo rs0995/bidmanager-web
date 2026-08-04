@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: bidmanager-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: cd backend && uvicorn api_server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.4
+      - key: BIDMANAGER_CORS_ORIGINS
+        sync: false
