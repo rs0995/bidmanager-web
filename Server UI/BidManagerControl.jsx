@@ -270,6 +270,11 @@ function createApi(base, adminKey) {
     async websites() {
       return apiFetch(base, '/v1/websites', { adminKey });
     },
+    async createWebsite(name, url, statusUrl) {
+      return apiFetch(base, '/v1/websites', {
+        method: 'POST', adminKey, body: { name, url, status_url: statusUrl || '' },
+      });
+    },
     async startScrape(websiteId, refreshOrganizations = true) {
       return apiFetch(base, '/admin/jobs/scrape', {
         method: 'POST', adminKey,
@@ -1249,6 +1254,11 @@ function ScraperPanel({ toast, base, adminKey }) {
   const [savedJobs, setSavedJobs] = useState([]);
   const [jobName, setJobName] = useState('');
   const [jobType, setJobType] = useState('scrape');
+  const [scrapeAllOrgs, setScrapeAllOrgs] = useState(false);
+  const [addingWebsite, setAddingWebsite] = useState(false);
+  const [newWebsiteName, setNewWebsiteName] = useState('');
+  const [newWebsiteUrl, setNewWebsiteUrl] = useState('');
+  const [newWebsiteStatusUrl, setNewWebsiteStatusUrl] = useState('');
   const [editingJobId, setEditingJobId] = useState(null);
   const [selectedSavedJobId, setSelectedSavedJobId] = useState(null);
   const [savedJobScheduleMode, setSavedJobScheduleMode] = useState('manual');
@@ -1300,6 +1310,25 @@ function ScraperPanel({ toast, base, adminKey }) {
 
   const changeWebsite = (nextWebsiteId) => {
     setWebsiteId(nextWebsiteId);
+  };
+
+  const addWebsite = async () => {
+    const name = newWebsiteName.trim();
+    const url = newWebsiteUrl.trim();
+    if (!name || !url) return toast('Enter both a name and a tenders-by-organisation URL');
+    setBusy('add-website');
+    try {
+      const created = await api.createWebsite(name, url, newWebsiteStatusUrl.trim());
+      const rows = await api.websites();
+      setWebsites(Array.isArray(rows) ? rows : []);
+      setWebsiteId(String(created.id));
+      setNewWebsiteName('');
+      setNewWebsiteUrl('');
+      setNewWebsiteStatusUrl('');
+      setAddingWebsite(false);
+      toast(`Website "${name}" added`);
+    } catch (err) { toast(err.message || 'Could not add website'); }
+    setBusy('');
   };
 
   const toggle = (setter, value) => setter((current) => {
@@ -1355,7 +1384,7 @@ function ScraperPanel({ toast, base, adminKey }) {
     const owner = ownerName.trim();
     const name = jobName.trim();
     if (!owner || !name) return toast('Enter both user/owner and job name');
-    if (jobType === 'scrape' && selectedOrgs.size === 0) return toast('Select at least one organization');
+    if (jobType === 'scrape' && !scrapeAllOrgs && selectedOrgs.size === 0) return toast('Select at least one organization, or check "Entire website"');
     if (jobType === 'download' && selectedTenders.size === 0) return toast('Select at least one tender');
     const scheduledForAt = savedJobScheduleMode === 'manual' ? 0 : new Date(savedJobScheduleAt).getTime() / 1000;
     if (savedJobScheduleMode !== 'manual' && (!Number.isFinite(scheduledForAt) || scheduledForAt <= Date.now() / 1000)) {
@@ -1368,6 +1397,7 @@ function ScraperPanel({ toast, base, adminKey }) {
       const saved = await api.saveCustomJob({
         owner_name: owner, name, website_id: Number(websiteId), job_type: jobType,
         org_ids: [...selectedOrgs], tender_ids: [...selectedTenders],
+        all_organizations: jobType === 'scrape' && scrapeAllOrgs,
         download_mode: 'auto', schedule_enabled: savedJobScheduleMode !== 'manual',
         schedule_mode: savedJobScheduleMode,
         interval_minutes: savedJobScheduleMode === 'interval' ? intervalMinutes : 0,
@@ -1390,6 +1420,7 @@ function ScraperPanel({ toast, base, adminKey }) {
     setSelectedOrgs(new Set(job.org_ids || []));
     setSelectedTenders(new Set(job.tender_ids || []));
     setJobType(job.job_type === 'both' ? 'download' : (job.job_type || 'scrape'));
+    setScrapeAllOrgs(Boolean(job.all_organizations));
     setSavedJobScheduleMode(job.schedule_mode || (job.schedule_enabled ? 'interval' : 'manual'));
     setSavedJobScheduleAt(toDateTimeLocal(job.next_run_at || job.scheduled_for_at || undefined));
     const minutes = Number(job.interval_minutes) || 180;
@@ -1434,7 +1465,7 @@ function ScraperPanel({ toast, base, adminKey }) {
     .some((value) => String(value || '').toLowerCase().includes(tenderNeedle)));
   const currentSelectedOrgCount = organizations.filter((org) => selectedOrgs.has(org.id)).length;
   const currentSelectedTenderCount = tenders.filter((tender) => selectedTenders.has(tender.id)).length;
-  const selectionReady = jobType === 'scrape' ? selectedOrgs.size > 0 : selectedTenders.size > 0;
+  const selectionReady = jobType === 'scrape' ? (scrapeAllOrgs || selectedOrgs.size > 0) : selectedTenders.size > 0;
   const repeatLabel = (minutes) => {
     const value = Number(minutes) || 0;
     if (value % 1440 === 0) return `${value / 1440} day${value === 1440 ? '' : 's'}`;
@@ -1466,8 +1497,18 @@ function ScraperPanel({ toast, base, adminKey }) {
           <div className="flex items-center gap-2">
             <Select value={websiteId} onChange={changeWebsite} w={210} options={websites.map((website) => ({ value: String(website.id), label: website.name }))} />
             <Btn variant="primary" icon={Play} busy={starting} disabled={!websiteId} onClick={runPortalScraper}>Run scraper</Btn>
+            <Btn size="sm" variant="ghost" icon={Plus} onClick={() => setAddingWebsite((v) => !v)}>Add website</Btn>
           </div>
         </div>
+        {addingWebsite && (
+          <div className="flex flex-wrap items-center gap-2 mt-3 pt-3" style={{ borderTop: `1px solid ${c.rule}` }}>
+            <TextIn value={newWebsiteName} onChange={setNewWebsiteName} w={160} placeholder="Website name" />
+            <TextIn value={newWebsiteUrl} onChange={setNewWebsiteUrl} w={320} placeholder="Tenders-by-organisation URL" />
+            <TextIn value={newWebsiteStatusUrl} onChange={setNewWebsiteStatusUrl} w={260} placeholder="Status-check URL (optional)" />
+            <Btn size="sm" variant="primary" busy={busy === 'add-website'} disabled={!newWebsiteName.trim() || !newWebsiteUrl.trim()} onClick={addWebsite}>Create</Btn>
+            <Btn size="sm" variant="ghost" onClick={() => setAddingWebsite(false)}>Cancel</Btn>
+          </div>
+        )}
       </Card>
       <Card pad={false} style={{ position: 'sticky', top: 52, zIndex: 5, marginBottom: 10, boxShadow: '0 6px 18px rgba(21,32,42,0.10)' }}>
         <div className="flex flex-wrap items-center justify-between gap-3 px-3 py-3" style={{ borderBottom: `1px solid ${c.rule}` }}>
@@ -1482,6 +1523,12 @@ function ScraperPanel({ toast, base, adminKey }) {
               { value: 'scrape', label: 'Scrape' },
               { value: 'download', label: 'Download' },
             ]} />
+            {jobType === 'scrape' && (
+              <label className="flex items-center gap-1.5" style={{ fontSize: 12, color: c.ink60, cursor: 'pointer' }}>
+                <Toggle checked={scrapeAllOrgs} onChange={setScrapeAllOrgs} />
+                Entire website
+              </label>
+            )}
             <Select value={savedJobScheduleMode} onChange={setSavedJobScheduleMode} w={118} options={[
               { value: 'manual', label: 'Manual' },
               { value: 'once', label: 'Run once at' },
@@ -1498,7 +1545,7 @@ function ScraperPanel({ toast, base, adminKey }) {
             </>}
             <Btn size="sm" busy={busy === 'save-custom'} disabled={!jobName.trim() || !selectionReady} onClick={saveNamedJob}>{editingJobId ? 'Update' : 'Save'}</Btn>
             <Btn size="sm" variant="primary" icon={Play} busy={selectedSavedJobId && busy === `run-${selectedSavedJobId}`} disabled={!selectedSavedJobId} onClick={() => runSavedJob({ id: selectedSavedJobId })}>Run</Btn>
-            {editingJobId && <Btn size="sm" variant="ghost" onClick={() => { setEditingJobId(null); setSelectedSavedJobId(null); setJobName(''); }}>Cancel edit</Btn>}
+            {editingJobId && <Btn size="sm" variant="ghost" onClick={() => { setEditingJobId(null); setSelectedSavedJobId(null); setJobName(''); setScrapeAllOrgs(false); }}>Cancel edit</Btn>}
           </div>
         </div>
         {editingJobId && <div className="flex items-center px-3 py-2" style={{ background: c.paper }}><Pill state="info">editing #{editingJobId}</Pill></div>}
@@ -1515,7 +1562,7 @@ function ScraperPanel({ toast, base, adminKey }) {
                 <td className="px-3 py-2"><div style={{ fontSize: 12.5, color: c.ink }}>{job.name}</div><Mono style={{ fontSize: 10.5, color: c.ink40 }}>#{job.id}</Mono></td>
                 <td className="px-3 py-2"><Pill state={job.job_type === 'scrape' ? 'info' : 'ok'}>{job.job_type}</Pill></td>
                 <td className="px-3 py-2" style={{ fontSize: 11.5, color: c.ink60 }}>{[
-                  job.job_type !== 'download' ? `${job.org_ids.length} organizations` : '',
+                  job.job_type !== 'download' ? (job.all_organizations ? 'All organizations' : `${job.org_ids.length} organizations`) : '',
                   job.job_type !== 'scrape' ? `${job.tender_ids.length} tenders` : '',
                 ].filter(Boolean).join(' Â· ')}</td>
                 <td className="px-3 py-2"><Pill state={job.schedule_enabled ? 'info' : 'neutral'}>{savedJobScheduleLabel(job)}</Pill></td>

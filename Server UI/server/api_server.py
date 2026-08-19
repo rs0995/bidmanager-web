@@ -5193,20 +5193,21 @@ def _validated_saved_custom_job(body: SavedCustomJobRequest) -> dict:
         raise HTTPException(400, "Choose a scheduled date and time in the future")
     org_ids = sorted({int(value) for value in (body.org_ids or []) if int(value) > 0})
     tender_ids = sorted({int(value) for value in (body.tender_ids or []) if int(value) > 0})
+    all_organizations = bool(body.all_organizations) and job_type == "scrape"
     with get_db() as conn:
         website = conn.execute("SELECT id FROM websites WHERE id=?", (int(body.website_id),)).fetchone()
         if not website:
             raise HTTPException(404, "Website not found")
         _selected_ids_by_website(conn, "organizations", org_ids, require_all=True)
         _selected_ids_by_website(conn, "tenders", tender_ids, require_all=True)
-    if job_type == "scrape" and not org_ids:
-        raise HTTPException(400, "Select at least one organization")
+    if job_type == "scrape" and not org_ids and not all_organizations:
+        raise HTTPException(400, "Select at least one organization, or choose to scrape the entire website")
     if job_type == "download" and not tender_ids:
         raise HTTPException(400, "Select at least one tender")
     return {
         "owner_name": owner, "name": name, "website_id": int(body.website_id),
-        "job_type": job_type, "org_ids": org_ids, "tender_ids": tender_ids,
-        "all_organizations": False, "all_tenders": False,
+        "job_type": job_type, "org_ids": [] if all_organizations else org_ids, "tender_ids": tender_ids,
+        "all_organizations": all_organizations, "all_tenders": False,
         "download_mode": mode, "schedule_enabled": schedule_enabled,
         "schedule_mode": schedule_mode, "interval_minutes": interval,
         "scheduled_for_at": scheduled_for_at,

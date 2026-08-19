@@ -2057,6 +2057,28 @@ class ScraperBackend:
         return True
 
     @staticmethod
+    def _wait_for_href(driver, by, locator, timeout=15, poll=0.5):
+        # Some NIC-GEP pages render a download anchor (e.g. DirectLink_0) before its
+        # href is actually populated — right after a captcha submit or a fresh page
+        # load. Waiting only for element presence can hand back that stale/empty
+        # href; poll until the href itself is populated instead.
+        deadline = time.time() + timeout
+        element = None
+        href = ""
+        placeholders = {"", "#", "javascript:void(0)", "javascript:void(0);", "javascript:;"}
+        while time.time() < deadline:
+            try:
+                element = driver.find_element(by, locator)
+                href = (element.get_attribute('href') or "").strip()
+                if href.lower() not in placeholders:
+                    return element, href
+            except Exception:
+                pass
+            href = ""
+            time.sleep(poll)
+        return element, href
+
+    @staticmethod
     def fetch_organisations_logic(website_id):
         if not ensure_scraper_dependencies():
             log_to_gui("Scraper dependencies are missing. Install requirements and rebuild.")
@@ -3452,15 +3474,11 @@ class ScraperBackend:
                                 downloaded_notice = False
                                 # If captcha already solved in this session, final link is often directly available.
                                 if ScraperBackend.captcha_solved_in_session:
-                                    try:
-                                        final_link = wait.until(EC.presence_of_element_located((By.ID, "DirectLink_0")))
-                                        href = final_link.get_attribute('href')
-                                        if href and ScraperBackend.download_file_with_requests(href, notice_path, driver.get_cookies(), t_id, file_type="notice"):
-                                            log_to_gui("  Downloaded Tender Notice.")
-                                            downloaded_notice = True
-                                            any_new_download = True
-                                    except Exception:
-                                        pass
+                                    _, href = ScraperBackend._wait_for_href(driver, By.ID, "DirectLink_0", timeout=8)
+                                    if href and ScraperBackend.download_file_with_requests(href, notice_path, driver.get_cookies(), t_id, file_type="notice"):
+                                        log_to_gui("  Downloaded Tender Notice.")
+                                        downloaded_notice = True
+                                        any_new_download = True
                                 if not downloaded_notice:
                                     trigger = None
                                     try:
@@ -3473,17 +3491,13 @@ class ScraperBackend:
                                     if trigger:
                                         driver.execute_script("arguments[0].click();", trigger)
                                         if ScraperBackend.handle_captcha_interaction(driver, "Tender Notice"):
-                                            try:
-                                                final_link = wait.until(EC.presence_of_element_located((By.ID, "DirectLink_0")))
-                                                href = final_link.get_attribute('href')
-                                                if href and ScraperBackend.download_file_with_requests(href, notice_path, driver.get_cookies(), t_id, file_type="notice"):
-                                                    log_to_gui("  Downloaded Tender Notice.")
-                                                    downloaded_notice = True
-                                                    any_new_download = True
-                                                else:
-                                                    log_to_gui("  Final Tender Notice link missing/invalid.")
-                                            except Exception:
-                                                log_to_gui("  Could not find final Notice link.")
+                                            _, href = ScraperBackend._wait_for_href(driver, By.ID, "DirectLink_0", timeout=15)
+                                            if href and ScraperBackend.download_file_with_requests(href, notice_path, driver.get_cookies(), t_id, file_type="notice"):
+                                                log_to_gui("  Downloaded Tender Notice.")
+                                                downloaded_notice = True
+                                                any_new_download = True
+                                            else:
+                                                log_to_gui("  Final Tender Notice link missing/invalid.")
                                 if not downloaded_notice:
                                     log_to_gui("  Tender Notice not downloaded.")
                         else:
@@ -3502,23 +3516,15 @@ class ScraperBackend:
                             log_to_gui("  Checking Zip File...")
                             if ScraperBackend.open_tender_page_with_recovery(driver, base_url, url):
                                 zip_href = None
-                                try:
-                                    zip_elem = wait.until(EC.presence_of_element_located((By.PARTIAL_LINK_TEXT, "Download as zip file")))
-                                    zip_href = zip_elem.get_attribute('href')
-                                except Exception:
-                                    try:
-                                        zip_elem = wait.until(EC.presence_of_element_located((By.PARTIAL_LINK_TEXT, "Download as zip")))
-                                        zip_href = zip_elem.get_attribute('href')
-                                    except Exception:
-                                        try:
-                                            zip_elem = wait.until(EC.presence_of_element_located((By.ID, "DirectLink_7")))
-                                            zip_href = zip_elem.get_attribute('href')
-                                        except Exception:
-                                            try:
-                                                zip_elem = wait.until(EC.presence_of_element_located((By.ID, "DirectLink_8")))
-                                                zip_href = zip_elem.get_attribute('href')
-                                            except Exception:
-                                                pass
+                                for by, locator in (
+                                    (By.PARTIAL_LINK_TEXT, "Download as zip file"),
+                                    (By.PARTIAL_LINK_TEXT, "Download as zip"),
+                                    (By.ID, "DirectLink_7"),
+                                    (By.ID, "DirectLink_8"),
+                                ):
+                                    _, zip_href = ScraperBackend._wait_for_href(driver, by, locator, timeout=5)
+                                    if zip_href:
+                                        break
                                 if zip_href and ScraperBackend.download_file_with_requests(zip_href, zip_path, driver.get_cookies(), t_id, file_type="zip"):
                                     log_to_gui("  Downloaded Zip File.")
                                     any_new_download = True
@@ -3534,22 +3540,19 @@ class ScraperBackend:
                     prebid_filename = f"PreBid_Meeting_{safe_id}.pdf"
                     prebid_path = os.path.join(save_dir, prebid_filename)
                     if ScraperBackend.open_tender_page_with_recovery(driver, base_url, url):
-                        try:
-                            pb_link = wait.until(EC.presence_of_element_located((By.ID, "DirectLink_2")))
-                            href = pb_link.get_attribute('href')
-                            if ScraperBackend.should_skip_file(
-                                t_id, prebid_filename, prebid_path,
-                                source_url=href, file_type="prebid",
-                            ):
-                                log_to_gui("  Skipping Pre-Bid file (already logged and file exists).")
-                            else:
-                                if href and ScraperBackend.download_file_with_requests(href, prebid_path, driver.get_cookies(), t_id, file_type="prebid"):
-                                    log_to_gui("  Downloaded Pre-Bid File.")
-                                    any_new_download = True
-                                else:
-                                    log_to_gui("  Pre-Bid file link not found.")
-                        except Exception:
+                        _, href = ScraperBackend._wait_for_href(driver, By.ID, "DirectLink_2", timeout=10)
+                        if not href:
                             log_to_gui("  No Pre-Bid file found.")
+                        elif ScraperBackend.should_skip_file(
+                            t_id, prebid_filename, prebid_path,
+                            source_url=href, file_type="prebid",
+                        ):
+                            log_to_gui("  Skipping Pre-Bid file (already logged and file exists).")
+                        elif ScraperBackend.download_file_with_requests(href, prebid_path, driver.get_cookies(), t_id, file_type="prebid"):
+                            log_to_gui("  Downloaded Pre-Bid File.")
+                            any_new_download = True
+                        else:
+                            log_to_gui("  Pre-Bid file link not found.")
                 except Exception as e:
                     log_to_gui(f"  Pre-bid error: {e}")
 

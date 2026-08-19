@@ -76,6 +76,31 @@ class CustomJobTests(unittest.TestCase):
             {"website_id": 2, "target_db_ids": [10, 12], "source": "custom"},
         )
 
+    def test_saved_scrape_job_allows_all_organizations_without_org_ids(self):
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = (5,)
+        with mock.patch.object(api_server, "get_db", return_value=_Context(conn)):
+            value = api_server._validated_saved_custom_job(
+                api_server.SavedCustomJobRequest(
+                    owner_name="Alice", name="Whole site", website_id=5,
+                    job_type="scrape", org_ids=[], all_organizations=True,
+                )
+            )
+        self.assertTrue(value["all_organizations"])
+        self.assertEqual(value["org_ids"], [])
+
+    def test_saved_scrape_job_without_orgs_or_all_organizations_rejected(self):
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = (5,)
+        with mock.patch.object(api_server, "get_db", return_value=_Context(conn)):
+            with self.assertRaises(api_server.HTTPException):
+                api_server._validated_saved_custom_job(
+                    api_server.SavedCustomJobRequest(
+                        owner_name="Alice", name="No scope", website_id=5,
+                        job_type="scrape", org_ids=[],
+                    )
+                )
+
     def test_auto_download_mode_uses_existing_main_files(self):
         with mock.patch.object(
             api_server.core.ScraperBackend,
