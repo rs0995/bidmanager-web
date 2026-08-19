@@ -3489,7 +3489,24 @@ class ScraperBackend:
                                         except Exception:
                                             pass
                                     if trigger:
+                                        # Some NIC-GEP skins open the captcha/download flow in a new
+                                        # popup window instead of the current tab (the corrigendum and
+                                        # result-summary flows already handle this same pattern). Detect
+                                        # and follow it if it happens, but don't assume it always does.
+                                        notice_main_window = driver.current_window_handle
+                                        existing_handles = set(driver.window_handles)
                                         driver.execute_script("arguments[0].click();", trigger)
+                                        popup_window = None
+                                        try:
+                                            WebDriverWait(driver, 5).until(
+                                                lambda d: len(d.window_handles) > len(existing_handles)
+                                            )
+                                            new_handles = [h for h in driver.window_handles if h not in existing_handles]
+                                            if new_handles:
+                                                popup_window = new_handles[0]
+                                                driver.switch_to.window(popup_window)
+                                        except Exception:
+                                            pass
                                         if ScraperBackend.handle_captcha_interaction(driver, "Tender Notice"):
                                             _, href = ScraperBackend._wait_for_href(driver, By.ID, "DirectLink_0", timeout=15)
                                             if href and ScraperBackend.download_file_with_requests(href, notice_path, driver.get_cookies(), t_id, file_type="notice"):
@@ -3498,6 +3515,12 @@ class ScraperBackend:
                                                 any_new_download = True
                                             else:
                                                 log_to_gui("  Final Tender Notice link missing/invalid.")
+                                        if popup_window:
+                                            try:
+                                                driver.close()
+                                            except Exception:
+                                                pass
+                                            driver.switch_to.window(notice_main_window)
                                 if not downloaded_notice:
                                     log_to_gui("  Tender Notice not downloaded.")
                         else:
