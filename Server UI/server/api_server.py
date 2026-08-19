@@ -1849,6 +1849,7 @@ _live_log_lock = threading.Lock()
 _live_log_seq = 0
 _live_log_buffer: list[tuple[int, str]] = []
 _LIVE_LOG_MAX = 20000
+_log_context = threading.local()
 _db_live_log_seen: set[tuple[str, int, str]] = set()
 _DB_LIVE_LOG_SEEN_MAX = 50000
 
@@ -1924,7 +1925,8 @@ def _install_live_log_bridge_once():
         return
 
     def _bridge_log_to_gui(message):
-        _append_live_log(str(message or ""))
+        tag = getattr(_log_context, "tag", "")
+        _append_live_log(f"{tag}{message or ''}" if tag else str(message or ""))
         return original(message)
 
     _bridge_log_to_gui._bidmanager_live_bridge = True  # type: ignore[attr-defined]
@@ -2156,6 +2158,10 @@ def _job_callable(action: str, payload: dict):
             forced_mode=payload.get("mode"),
             include_all=bool(payload.get("include_all")),
         )
+    if action == "refresh_tender_details":
+        return core.ScraperBackend.refresh_tender_details_logic(
+            website_id, target_db_ids=payload.get("target_db_ids")
+        )
     if action in {"refresh_selected_tenders", "refresh_and_download_tenders"}:
         target_db_ids = sorted({int(value) for value in (payload.get("target_db_ids") or [])})
         if not target_db_ids:
@@ -2261,6 +2267,7 @@ def _run_job(job_id: str):
             last_persisted[0] = now
 
     try:
+        _log_context.tag = f"[{action} #{job_id[:8]}] "
         _clear_captcha_state()
         core.configure_job_runtime(
             log_handler=_capture_log,
@@ -2376,6 +2383,7 @@ def _run_job(job_id: str):
         )
     finally:
         core.clear_job_runtime()
+        _log_context.tag = ""
         _expire_job_captchas(job_id)
         _release_execution_slot()
         if requeue_requested:
@@ -2821,8 +2829,8 @@ def _sync_admin_preset_saved_custom_jobs() -> None:
                 "download_mode='auto',schedule_enabled=excluded.schedule_enabled,"
                 "schedule_mode='interval',interval_minutes=excluded.interval_minutes,"
                 "scheduled_for_at=excluded.scheduled_for_at,next_run_at=excluded.next_run_at,"
-                "last_run_at=COALESCE(excluded.last_run_at,last_run_at),"
-                "last_job_id=COALESCE(excluded.last_job_id,last_job_id),updated_at=excluded.updated_at",
+                "last_run_at=COALESCE(excluded.last_run_at,saved_custom_jobs.last_run_at),"
+                "last_job_id=COALESCE(excluded.last_job_id,saved_custom_jobs.last_job_id),updated_at=excluded.updated_at",
                 (
                     preset_name,
                     int(website_id),
@@ -3108,7 +3116,7 @@ def refresh_tender_batch(website_id: int, body: BatchTenderDownloadRequest):
         ).fetchone()[0])
     if found != len(tender_ids):
         raise HTTPException(400, "One or more selected tenders do not belong to this website")
-    return _enqueue_job("refresh_selected_tenders", {
+    return _enqueue_job("refresh_tender_details", {
         "website_id": website_id,
         "target_db_ids": tender_ids,
         "source": "custom",
@@ -5348,6 +5356,7 @@ _JOB_KIND_BY_ACTION = {
     "fetch_tenders": "fetch",
     "fetch_tenders_selected": "fetch",
     "refresh_selected_tenders": "fetch",
+    "refresh_tender_details": "fetch",
     "check_status": "fetch",
     "check_status_archived": "fetch",
     "archive_completed_tenders": "fetch",

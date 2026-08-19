@@ -2680,6 +2680,21 @@ class ScraperBackend:
                                             d_soup,
                                             ["Work Description", "Description of Work", "Work Desc"]
                                         ) or "N/A"
+                                        # Prefer the tender's own detail page for critical dates over the
+                                        # listing table — it's the authoritative source and stays correct
+                                        # even if the listing columns shift.
+                                        detail_closing = ScraperBackend.get_detail_by_label(
+                                            d_soup,
+                                            ["Bid Submission End Date", "Bid Submission Closing Date", "Closing Date"]
+                                        )
+                                        if detail_closing:
+                                            closing_date = detail_closing
+                                        detail_opening = ScraperBackend.get_detail_by_label(
+                                            d_soup,
+                                            ["Bid Opening Date", "Technical Bid Opening Date"]
+                                        )
+                                        if detail_opening:
+                                            opening_date = detail_opening
                                 except: pass
                                 if not published or str(published).strip().upper() in {"N/A", "NA", "-"}:
                                     published = published_date or "N/A"
@@ -3252,6 +3267,88 @@ class ScraperBackend:
             if driver is not None:
                 driver.quit()
         log_to_gui("Result file check complete.")
+
+    @staticmethod
+    def refresh_tender_details_logic(website_id, target_db_ids):
+        if not ensure_scraper_dependencies():
+            log_to_gui("Scraper dependencies are missing. Install requirements and rebuild.")
+            return False
+        ids = []
+        if target_db_ids:
+            try:
+                ids = [int(x) for x in target_db_ids]
+            except Exception:
+                ids = []
+        if not ids:
+            log_to_gui("No tenders were selected to refresh.")
+            return False
+
+        conn = sqlite3.connect(DB_FILE)
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT id, tender_url FROM tenders WHERE website_id=? AND id IN ({placeholders})",
+            (website_id, *ids),
+        ).fetchall()
+        site_url_row = conn.execute("SELECT url FROM websites WHERE id=?", (website_id,)).fetchone()
+        conn.close()
+        base_url = site_url_row[0] if site_url_row else "https://mahatenders.gov.in/nicgep/app?page=FrontEndTendersByOrganisation&service=page"
+
+        targets = [(int(r[0]), str(r[1] or "").strip()) for r in rows if str(r[1] or "").strip()]
+        if not targets:
+            log_to_gui("Selected tender(s) have no stored URL to refresh from.")
+            return False
+
+        # (column, label variations, allow_contains) — mirrors fetch_tenders_logic's
+        # detail-page extraction so a tender-scoped refresh and the org-wide scrape
+        # source the same fields the same way.
+        detail_fields = (
+            ("emd", ["EMD Amount In â‚¹", "EMD Amount (in Rs.)", "EMD Amount In", "EMD Amount", "EMD"], True),
+            ("tender_value", ["Tender Value In â‚¹", "Tender Value In Rs.", "Tender Value In", "Tender Value"], True),
+            ("location", ["Location", "Work Location", "Place of Work"], True),
+            ("tender_category", ["Tender Category"], False),
+            ("pre_bid_meeting_date", ["Pre Bid Meeting Date", "Pre-Bid Meeting Date"], True),
+            ("published_date", ["Published Date", "e-Published Date"], True),
+            ("work_description", ["Work Description", "Description of Work", "Work Desc"], True),
+            ("closing_date", ["Bid Submission End Date", "Bid Submission Closing Date", "Closing Date"], True),
+            ("opening_date", ["Bid Opening Date", "Technical Bid Opening Date"], True),
+        )
+
+        log_to_gui(f"Refreshing details for {len(targets)} tender(s)...")
+        driver = None
+        try:
+            driver = create_browser_driver()
+            for db_id, tender_url in targets:
+                try:
+                    if not ScraperBackend.open_tender_page_with_recovery(driver, base_url, tender_url):
+                        log_to_gui(f"  Could not open tender page for id {db_id}. Skipping.")
+                        continue
+                    d_soup = BeautifulSoup(driver.page_source, 'html.parser')
+                    updates = {}
+                    for column, labels, allow_contains in detail_fields:
+                        value = ScraperBackend.get_detail_by_label(d_soup, labels, allow_contains=allow_contains)
+                        if value:
+                            updates[column] = value
+                    if not updates:
+                        log_to_gui(f"  No fields found on the tender page for id {db_id}; nothing updated.")
+                        continue
+                    set_clause = ",".join(f"{col}=?" for col in updates)
+                    conn = sqlite3.connect(DB_FILE)
+                    conn.execute(
+                        f"UPDATE tenders SET {set_clause},last_scraped_at=? WHERE id=?",
+                        (*updates.values(), time.time(), db_id),
+                    )
+                    conn.commit()
+                    conn.close()
+                    log_to_gui(f"  Refreshed {', '.join(updates.keys())} for id {db_id}.")
+                except (WebDriverException, TimeoutException) as e:
+                    log_to_gui(f"  Browser error refreshing id {db_id}: {e}")
+                except Exception as e:
+                    log_to_gui(f"  Error refreshing id {db_id}: {e}")
+        finally:
+            if driver is not None:
+                driver.quit()
+        log_to_gui("Tender detail refresh complete.")
+        return True
 
     @staticmethod
     def download_tenders_logic(website_id, target_db_ids=None, forced_mode=None, include_all=False):

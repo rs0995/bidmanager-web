@@ -1280,9 +1280,17 @@ function ScraperPanel({ toast, base, adminKey }) {
   useEffect(() => { loadData(); }, [loadData]);
 
   const loadSavedJobs = useCallback(async () => {
-    if (!ownerName.trim()) return setSavedJobs([]);
-    try { setSavedJobs(await api.savedCustomJobs(ownerName.trim())); }
-    catch (err) { toast(err.message || 'Could not load saved jobs'); }
+    const owner = ownerName.trim();
+    if (!owner) return setSavedJobs([]);
+    try {
+      const isAdmin = owner.toLowerCase() === 'admin';
+      const lists = await Promise.all(
+        isAdmin ? [api.savedCustomJobs(owner)] : [api.savedCustomJobs(owner), api.savedCustomJobs('admin')]
+      );
+      const merged = new Map();
+      lists.flat().forEach((job) => merged.set(job.id, job));
+      setSavedJobs(Array.from(merged.values()).sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0)));
+    } catch (err) { toast(err.message || 'Could not load saved jobs'); }
   }, [api, ownerName, toast]);
 
   useEffect(() => {
@@ -1469,7 +1477,6 @@ function ScraperPanel({ toast, base, adminKey }) {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <TextIn value={ownerName} onChange={setOwnerName} w={150} placeholder="User / owner" />
-            <Btn size="sm" variant="ghost" onClick={() => setOwnerName('admin')}>View automatic jobs</Btn>
             <TextIn value={jobName} onChange={setJobName} w={190} placeholder="Custom job name" />
             <Select value={jobType} onChange={setJobType} w={120} options={[
               { value: 'scrape', label: 'Scrape' },
@@ -1937,7 +1944,7 @@ function CaptchaPanel({ toast, captchas, setCaptchas, base, adminKey }) {
     if (!active || !answer.trim()) return;
     setBusy('send');
     try {
-      await api.answerCaptcha(active.id, answer.trim().toUpperCase()); // WIRE: POST /admin/captchas/{id}/answer
+      await api.answerCaptcha(active.id, answer.trim()); // WIRE: POST /admin/captchas/{id}/answer
       setCaptchas((q) => q.filter((x) => x.id !== active.id));
       setAnswer('');
       toast(`Answer sent — ${active.jobId} resumed`);
@@ -2036,14 +2043,14 @@ function CaptchaPanel({ toast, captchas, setCaptchas, base, adminKey }) {
               <div className="flex flex-wrap items-center justify-center gap-2 mb-4">
                 <input
                   ref={inputRef} value={answer} autoFocus
-                  onChange={(e) => setAnswer(e.target.value.toUpperCase())}
+                  onChange={(e) => setAnswer(e.target.value)}
                   onKeyDown={(e) => { if (e.key === 'Enter') send(); }}
                   placeholder="Type what you see"
                   aria-label="Captcha answer"
                   style={{
                     fontFamily: mono, fontSize: 20, letterSpacing: '0.22em', textAlign: 'center',
                     height: 51, padding: '0 12px', width: 240, border: `1px solid ${c.ink}`, background: c.card,
-                    color: c.ink, outline: 'none', textTransform: 'uppercase', boxSizing: 'border-box',
+                    color: c.ink, outline: 'none', boxSizing: 'border-box',
                   }}
                 />
                 <Btn variant="primary" icon={Send} busy={busy === 'send'} disabled={!answer.trim()} onClick={send} style={{ height: 51, padding: '0 14px' }}>Send answer</Btn>
