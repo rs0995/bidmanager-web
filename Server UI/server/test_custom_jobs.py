@@ -50,7 +50,7 @@ class CustomJobTests(unittest.TestCase):
             )
         self.assertEqual(result, queued)
         enqueue.assert_called_once_with(
-            "refresh_and_download_tenders",
+            "download_tenders",
             {
                 "website_id": 2,
                 "target_db_ids": [10, 12],

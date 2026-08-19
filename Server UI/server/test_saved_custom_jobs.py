@@ -123,7 +123,7 @@ class SavedCustomJobTests(unittest.TestCase):
                     cross_run = api.run_saved_custom_job(cross['id'], 'Alice', None)
                     assert cross_run['queued_count'] == 2
                     assert [item[0] for item in captured[cross_start:]] == [
-                        'refresh_and_download_tenders', 'refresh_and_download_tenders',
+                        'download_tenders', 'download_tenders',
                     ]
                     assert {item[1]['website_id'] for item in captured[cross_start:]} == {1, website_b}
                     assert all(item[1].get('include_all') is False for item in captured[cross_start:])

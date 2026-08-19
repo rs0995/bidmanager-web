@@ -2638,6 +2638,11 @@ def _scheduler_tick() -> int:
     if not _claim_scheduler_lease(now, interval_minutes * 60):
         return 0
 
+    try:
+        _sync_admin_preset_saved_custom_jobs()
+    except Exception as exc:
+        _append_live_log(f"Could not sync automatic-scrape presets: {exc}")
+
     enabled = {
         "mahatenders": core.setting_bool("portal_mahatenders", True),
         "etenders": core.setting_bool("portal_etenders", True),
@@ -2900,7 +2905,7 @@ def _enqueue_saved_custom_job(saved_job_id: int, scheduled_trigger: bool = False
             raise HTTPException(400, "This saved job has no selected tenders")
         for website_id, tender_ids in tender_groups.items():
             queued_jobs.append(_enqueue_job(
-                "refresh_and_download_tenders",
+                "download_tenders",
                 {
                     "website_id": website_id,
                     "target_db_ids": tender_ids,
@@ -3079,7 +3084,7 @@ def download_tender_batch(website_id: int, body: BatchTenderDownloadRequest):
         if found != len(tender_ids):
             raise HTTPException(400, "One or more selected tenders do not belong to this website")
     return _enqueue_job(
-        "download_tenders" if body.all_tenders else "refresh_and_download_tenders",
+        "download_tenders",
         {
             "website_id": website_id,
             "target_db_ids": [] if body.all_tenders else tender_ids,

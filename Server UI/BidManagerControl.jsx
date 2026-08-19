@@ -1469,6 +1469,7 @@ function ScraperPanel({ toast, base, adminKey }) {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <TextIn value={ownerName} onChange={setOwnerName} w={150} placeholder="User / owner" />
+            <Btn size="sm" variant="ghost" onClick={() => setOwnerName('admin')}>View automatic jobs</Btn>
             <TextIn value={jobName} onChange={setJobName} w={190} placeholder="Custom job name" />
             <Select value={jobType} onChange={setJobType} w={120} options={[
               { value: 'scrape', label: 'Scrape' },

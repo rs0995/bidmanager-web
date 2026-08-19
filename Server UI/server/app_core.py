@@ -2,6 +2,7 @@ import sqlite3
 import os
 import sys
 import shutil
+import socket
 import subprocess
 import platform
 import datetime
@@ -203,14 +204,49 @@ def new_chromium_options():
     return options
 
 
+# Keep in sync with the geckodriver version pre-warmed in Dockerfile so the
+# container never falls back to an unpinned "latest" lookup at runtime.
+GECKODRIVER_VERSION = "v0.37.1"
+
+
 def new_browser_driver():
     if configured_browser() == "chromium":
         options = new_chromium_options()
         service = ChromeService()
         return register_job_driver(ChromeWebDriver(service=service, options=options))
     options = new_firefox_options()
-    service = FirefoxService(GeckoDriverManager().install())
+    service = FirefoxService(GeckoDriverManager(version=GECKODRIVER_VERSION).install())
     return register_job_driver(FirefoxWebDriver(service=service, options=options))
+
+
+_socket_timeout_applied = False
+
+
+def _apply_browser_command_timeout():
+    # Selenium's remote connection has no read timeout by default (it falls back to
+    # socket.getdefaulttimeout(), which is None/blocking). Without this, a wedged
+    # marionette/geckodriver channel hangs the WebDriver call forever instead of
+    # raising, so nothing downstream (logging, cancellation, error handling) ever runs.
+    global _socket_timeout_applied
+    if _socket_timeout_applied:
+        return
+    timeout_s = setting_int("browser_command_timeout_s", 75, minimum=15, maximum=300)
+    socket.setdefaulttimeout(timeout_s)
+    _socket_timeout_applied = True
+
+
+def create_browser_driver(attempts=2):
+    _apply_browser_command_timeout()
+    last_error = None
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        try:
+            return new_browser_driver()
+        except Exception as e:
+            last_error = e
+            if attempt < attempts:
+                log_to_gui(f"Browser failed to start ({e}); retrying...")
+                time.sleep(3)
+    raise RuntimeError(f"Could not start the browser after {attempts} attempts: {last_error}")
 
 
 def _new_scraper_session():
@@ -3086,13 +3122,13 @@ class ScraperBackend:
 
         mode_txt = "selected archived" if archived_only else "selected"
         log_to_gui(f"Checking status for {len(tenders)} {mode_txt} tenders...")
-        
-        driver = new_browser_driver()
-        # Solve once per Selenium session; retry only if portal asks again.
-        ScraperBackend.captcha_solved_in_session = False
 
+        driver = None
         updated_count = 0
         try:
+            driver = create_browser_driver()
+            # Solve once per Selenium session; retry only if portal asks again.
+            ScraperBackend.captcha_solved_in_session = False
             for db_id, tid in tenders:
                 log_to_gui(f"Checking: {tid}")
                 driver.get(status_url)
@@ -3121,7 +3157,8 @@ class ScraperBackend:
                 except Exception as e:
                     log_to_gui(f"Error checking {tid}: {e}")
         finally:
-            driver.quit()
+            if driver is not None:
+                driver.quit()
         log_to_gui("Status check complete.")
         return updated_count
 
@@ -3147,10 +3184,11 @@ class ScraperBackend:
             return
 
         log_to_gui(f"Starting result file checks for {len(targets)} tenders...")
-        driver = new_browser_driver()
-        ScraperBackend.captcha_solved_in_session = False
         target_statuses = {"Financial Bid Opening", "Financial Evaluation", "AOC", "Concluded"}
+        driver = None
         try:
+            driver = create_browser_driver()
+            ScraperBackend.captcha_solved_in_session = False
             for db_id, tender_id, folder_path in targets:
                 tender_folder = ""
                 try:
@@ -3211,7 +3249,8 @@ class ScraperBackend:
                     if tender_folder:
                         storage_runtime.cleanup_scratch_folder(tender_folder)
         finally:
-            driver.quit()
+            if driver is not None:
+                driver.quit()
         log_to_gui("Result file check complete.")
 
     @staticmethod
@@ -3261,17 +3300,19 @@ class ScraperBackend:
         base_url = site_url_row[0] if site_url_row else "https://mahatenders.gov.in/nicgep/app?page=FrontEndTendersByOrganisation&service=page"
 
         log_to_gui(f"Starting download for {len(to_download)} tenders...")
-        
-        driver = new_browser_driver()
-        wait = WebDriverWait(driver, 20)
-        ScraperBackend.captcha_solved_in_session = False
+
+        driver = None
         # Establish Selenium session once (same pattern as tender_scraper.py).
         try:
+            driver = create_browser_driver()
+            wait = WebDriverWait(driver, 20)
+            ScraperBackend.captcha_solved_in_session = False
             driver.get(base_url)
             time.sleep(4)
         except Exception as e:
             log_to_gui(f"Failed to initialize Selenium session: {e}")
-            driver.quit()
+            if driver is not None:
+                driver.quit()
             return
         
         for db_id, t_id, title, url, last_dl, existing_folder in to_download:
@@ -3468,10 +3509,26 @@ class ScraperBackend:
                 )
                 conn.commit()
                 conn.close()
+                if isinstance(e, (WebDriverException, TimeoutException)):
+                    log_to_gui("Browser connection was lost; restarting the browser to continue with the remaining tenders...")
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    driver = None
+                    try:
+                        driver = create_browser_driver()
+                        wait = WebDriverWait(driver, 20)
+                        driver.get(base_url)
+                        time.sleep(4)
+                    except Exception as restart_error:
+                        log_to_gui(f"Could not restart the browser: {restart_error}. Stopping remaining downloads.")
+                        break
             finally:
                 storage_runtime.cleanup_scratch_folder(save_dir)
-        
-        driver.quit()
+
+        if driver is not None:
+            driver.quit()
         log_to_gui("Download process finished.")
 
     @staticmethod
