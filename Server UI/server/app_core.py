@@ -3478,7 +3478,13 @@ class ScraperBackend:
                         if unlock_trigger:
                             driver.execute_script("arguments[0].click();", unlock_trigger)
                             if ScraperBackend.handle_captcha_interaction(driver, "Tender documents"):
-                                ScraperBackend._wait_for_href(driver, By.ID, "DirectLink_0", timeout=30)
+                                for by, locator in (
+                                    (By.PARTIAL_LINK_TEXT, "Tendernotice"),
+                                    (By.ID, "DirectLink_0"),
+                                ):
+                                    _, unlocked_href = ScraperBackend._wait_for_href(driver, by, locator, timeout=15)
+                                    if unlocked_href:
+                                        break
                     except Exception as e:
                         log_to_gui(f"  Could not unlock tender documents: {e}")
 
@@ -3491,12 +3497,38 @@ class ScraperBackend:
                             t_id, notice_filename, notice_path, file_type="notice"
                         ):
                             log_to_gui("  Checking Tender Notice...")
-                            _, href = ScraperBackend._wait_for_href(driver, By.ID, "DirectLink_0", timeout=10)
-                            if href and ScraperBackend.download_file_with_requests(href, notice_path, driver.get_cookies(), t_id, file_type="notice"):
+                            # The document's numeric "DirectLink_N" id isn't stable across
+                            # tenders (it depends on how many other links precede it on the
+                            # page), so match the link by its visible filename text first,
+                            # the same way the Zip block already does, and fall back to the
+                            # id we usually see (DirectLink_0) if that text search fails.
+                            href = ""
+                            for by, locator in (
+                                (By.PARTIAL_LINK_TEXT, "Tendernotice"),
+                                (By.ID, "DirectLink_0"),
+                            ):
+                                _, href = ScraperBackend._wait_for_href(driver, by, locator, timeout=10)
+                                if href:
+                                    break
+                            if not href:
+                                log_to_gui("  Could not find the Tender Notice link on the page.")
+                                try:
+                                    diag = driver.find_elements(By.XPATH, "//a[contains(@id, 'DirectLink_')]")
+                                    if diag:
+                                        summary = ", ".join(
+                                            f"{el.get_attribute('id')}={'set' if (el.get_attribute('href') or '').strip() else 'empty'}"
+                                            for el in diag
+                                        )
+                                        log_to_gui(f"  Diagnostic - links on page: {summary}")
+                                    else:
+                                        log_to_gui("  Diagnostic - no DirectLink_* elements found on page at all.")
+                                except Exception:
+                                    pass
+                            elif ScraperBackend.download_file_with_requests(href, notice_path, driver.get_cookies(), t_id, file_type="notice"):
                                 log_to_gui("  Downloaded Tender Notice.")
                                 any_new_download = True
                             else:
-                                log_to_gui("  Tender Notice not downloaded.")
+                                log_to_gui("  Tender Notice link was found but the download failed.")
                         else:
                             log_to_gui("  Skipping Tender Notice (already logged and file exists).")
                     except Exception as e:
