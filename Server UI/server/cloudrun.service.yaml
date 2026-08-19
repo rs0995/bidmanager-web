@@ -1,0 +1,48 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: bidmanager-server
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "4"
+        run.googleapis.com/cpu-throttling: "false"
+    spec:
+      containerConcurrency: 10
+      timeoutSeconds: 900
+      containers:
+        - image: REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/bidmanager-server:latest
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          env:
+            - name: BIDMANAGER_ENV
+              value: production
+            - name: BIDMANAGER_HEADLESS
+              value: "true"
+            - name: GOOGLE_DRIVE_FOLDER_ID
+              value: REPLACE_WITH_DRIVE_FOLDER_ID
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: bidmanager-database-url
+                  key: latest
+            - name: ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: bidmanager-admin-api-key
+                  key: latest
+            - name: CLIENT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: bidmanager-client-api-key
+                  key: latest
+            - name: BIDMANAGER_DOWNLOAD_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: bidmanager-download-token-secret
+                  key: latest

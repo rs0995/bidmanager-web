@@ -1,0 +1,11 @@
+{
+  "name": "bidmanager-admin-ui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node ../frontend/node_modules/vite/bin/vite.js --port 5174 --strictPort",
+    "build": "node ../frontend/node_modules/vite/bin/vite.js build",
+    "preview": "node ../frontend/node_modules/vite/bin/vite.js preview --port 4174 --strictPort"
+  }
+}
