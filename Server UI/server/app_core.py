@@ -2952,6 +2952,7 @@ class ScraperBackend:
             log_to_gui(f"Download blocked by allowed_extensions: {os.path.basename(file_path)}")
             return False
         max_bytes = setting_int("max_file_size_mb", 80, minimum=1, maximum=2048) * 1024 * 1024
+        fetched_ok = False
         try:
             s = _new_scraper_session() or requests.Session()
             for c in cookies:
@@ -2978,6 +2979,7 @@ class ScraperBackend:
                     f.write(chunk)
                     digest.update(chunk)
 
+            fetched_ok = True
             digest_hex = digest.hexdigest()
             existing_reference = (
                 ScraperBackend.downloaded_content_reference(tender_id, digest_hex)
@@ -2995,15 +2997,28 @@ class ScraperBackend:
                     "no duplicate was added to durable storage."
                 )
             else:
-                stored = storage.persist(
-                    file_path,
-                    str(tender_id or ""),
-                    file_type,
-                    ScraperBackend.get_setting("storage_prefix", "tenders/"),
-                )
+                persist_attempts = 3
+                last_persist_error = None
+                stored = None
+                for attempt in range(1, persist_attempts + 1):
+                    try:
+                        stored = storage.persist(
+                            file_path,
+                            str(tender_id or ""),
+                            file_type,
+                            ScraperBackend.get_setting("storage_prefix", "tenders/"),
+                        )
+                        last_persist_error = None
+                        break
+                    except Exception as persist_error:
+                        last_persist_error = persist_error
+                        if attempt < persist_attempts:
+                            time.sleep(2)
+                if last_persist_error is not None:
+                    raise last_persist_error
                 stored_reference = stored.reference
                 remove_local_copy = stored.remove_local_copy
-            
+
             if tender_id:
                 ScraperBackend.log_downloaded_file(
                     tender_id,
@@ -3030,7 +3045,13 @@ class ScraperBackend:
                     os.remove(file_path)
             except Exception:
                 pass
-            log_to_gui(f"Download failed for {os.path.basename(file_path)}: {e}")
+            if fetched_ok:
+                log_to_gui(
+                    f"Fetched {os.path.basename(file_path)} but could not store it durably "
+                    f"after {persist_attempts if 'persist_attempts' in locals() else 1} attempt(s): {e}"
+                )
+            else:
+                log_to_gui(f"Download failed for {os.path.basename(file_path)}: {e}")
             return False
 
     @staticmethod
@@ -3549,14 +3570,28 @@ class ScraperBackend:
                                 (By.PARTIAL_LINK_TEXT, "Download as zip"),
                                 (By.ID, "DirectLink_7"),
                             ):
-                                _, zip_href = ScraperBackend._wait_for_href(driver, by, locator, timeout=5)
+                                _, zip_href = ScraperBackend._wait_for_href(driver, by, locator, timeout=10)
                                 if zip_href:
                                     break
-                            if zip_href and ScraperBackend.download_file_with_requests(zip_href, zip_path, driver.get_cookies(), t_id, file_type="zip"):
+                            if not zip_href:
+                                log_to_gui("  Could not find the Zip file link on the page.")
+                                try:
+                                    diag = driver.find_elements(By.XPATH, "//a[contains(@id, 'DirectLink_')]")
+                                    if diag:
+                                        summary = ", ".join(
+                                            f"{el.get_attribute('id')}={'set' if (el.get_attribute('href') or '').strip() else 'empty'}"
+                                            for el in diag
+                                        )
+                                        log_to_gui(f"  Diagnostic - links on page: {summary}")
+                                    else:
+                                        log_to_gui("  Diagnostic - no DirectLink_* elements found on page at all.")
+                                except Exception:
+                                    pass
+                            elif ScraperBackend.download_file_with_requests(zip_href, zip_path, driver.get_cookies(), t_id, file_type="zip"):
                                 log_to_gui("  Downloaded Zip File.")
                                 any_new_download = True
                             else:
-                                log_to_gui("  Zip link not found.")
+                                log_to_gui("  Zip link was found but the download failed.")
                         else:
                             log_to_gui("  Skipping Zip file (already logged and file exists).")
                     except Exception as e:
