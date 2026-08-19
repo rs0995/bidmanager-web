@@ -3459,6 +3459,29 @@ class ScraperBackend:
                     log_to_gui(f"Could not recover session for {t_id}. Skipping.")
                     continue
 
+                # --- 0. Unlock Tender Notice + Zip file (shared captcha gate) ---
+                # This portal shows the notice as "docDownload" and the zip file as
+                # "DirectLink_8" until a single captcha is solved; clicking either one
+                # opens the same captcha, and solving it reloads this same page with
+                # the notice now at "DirectLink_0" and the zip file at "DirectLink_7".
+                # Do this once per tender (or once per session, if already unlocked)
+                # instead of each document type trying its own separate reveal.
+                if download_mode == 'full' and not ScraperBackend.captcha_solved_in_session:
+                    try:
+                        unlock_trigger = None
+                        for locator_id in ("docDownload", "DirectLink_8"):
+                            try:
+                                unlock_trigger = wait.until(EC.element_to_be_clickable((By.ID, locator_id)))
+                                break
+                            except Exception:
+                                continue
+                        if unlock_trigger:
+                            driver.execute_script("arguments[0].click();", unlock_trigger)
+                            if ScraperBackend.handle_captcha_interaction(driver, "Tender documents"):
+                                ScraperBackend._wait_for_href(driver, By.ID, "DirectLink_0", timeout=30)
+                    except Exception as e:
+                        log_to_gui(f"  Could not unlock tender documents: {e}")
+
                 # --- 1. Tender Notice (Full Mode Only) ---
                 if download_mode == 'full':
                     try:
@@ -3468,61 +3491,12 @@ class ScraperBackend:
                             t_id, notice_filename, notice_path, file_type="notice"
                         ):
                             log_to_gui("  Checking Tender Notice...")
-                            if not ScraperBackend.open_tender_page_with_recovery(driver, base_url, url):
-                                log_to_gui("  Could not open tender page for Tender Notice.")
+                            _, href = ScraperBackend._wait_for_href(driver, By.ID, "DirectLink_0", timeout=10)
+                            if href and ScraperBackend.download_file_with_requests(href, notice_path, driver.get_cookies(), t_id, file_type="notice"):
+                                log_to_gui("  Downloaded Tender Notice.")
+                                any_new_download = True
                             else:
-                                downloaded_notice = False
-                                # If captcha already solved in this session, final link is often directly available.
-                                if ScraperBackend.captcha_solved_in_session:
-                                    _, href = ScraperBackend._wait_for_href(driver, By.ID, "DirectLink_0", timeout=8)
-                                    if href and ScraperBackend.download_file_with_requests(href, notice_path, driver.get_cookies(), t_id, file_type="notice"):
-                                        log_to_gui("  Downloaded Tender Notice.")
-                                        downloaded_notice = True
-                                        any_new_download = True
-                                if not downloaded_notice:
-                                    trigger = None
-                                    try:
-                                        trigger = wait.until(EC.element_to_be_clickable((By.ID, "docDownload")))
-                                    except Exception:
-                                        try:
-                                            trigger = wait.until(EC.element_to_be_clickable((By.ID, "DirectLink_8")))
-                                        except Exception:
-                                            pass
-                                    if trigger:
-                                        # Some NIC-GEP skins open the captcha/download flow in a new
-                                        # popup window instead of the current tab (the corrigendum and
-                                        # result-summary flows already handle this same pattern). Detect
-                                        # and follow it if it happens, but don't assume it always does.
-                                        notice_main_window = driver.current_window_handle
-                                        existing_handles = set(driver.window_handles)
-                                        driver.execute_script("arguments[0].click();", trigger)
-                                        popup_window = None
-                                        try:
-                                            WebDriverWait(driver, 5).until(
-                                                lambda d: len(d.window_handles) > len(existing_handles)
-                                            )
-                                            new_handles = [h for h in driver.window_handles if h not in existing_handles]
-                                            if new_handles:
-                                                popup_window = new_handles[0]
-                                                driver.switch_to.window(popup_window)
-                                        except Exception:
-                                            pass
-                                        if ScraperBackend.handle_captcha_interaction(driver, "Tender Notice"):
-                                            _, href = ScraperBackend._wait_for_href(driver, By.ID, "DirectLink_0", timeout=15)
-                                            if href and ScraperBackend.download_file_with_requests(href, notice_path, driver.get_cookies(), t_id, file_type="notice"):
-                                                log_to_gui("  Downloaded Tender Notice.")
-                                                downloaded_notice = True
-                                                any_new_download = True
-                                            else:
-                                                log_to_gui("  Final Tender Notice link missing/invalid.")
-                                        if popup_window:
-                                            try:
-                                                driver.close()
-                                            except Exception:
-                                                pass
-                                            driver.switch_to.window(notice_main_window)
-                                if not downloaded_notice:
-                                    log_to_gui("  Tender Notice not downloaded.")
+                                log_to_gui("  Tender Notice not downloaded.")
                         else:
                             log_to_gui("  Skipping Tender Notice (already logged and file exists).")
                     except Exception as e:
@@ -3537,22 +3511,20 @@ class ScraperBackend:
                             t_id, zip_filename, zip_path, file_type="zip"
                         ):
                             log_to_gui("  Checking Zip File...")
-                            if ScraperBackend.open_tender_page_with_recovery(driver, base_url, url):
-                                zip_href = None
-                                for by, locator in (
-                                    (By.PARTIAL_LINK_TEXT, "Download as zip file"),
-                                    (By.PARTIAL_LINK_TEXT, "Download as zip"),
-                                    (By.ID, "DirectLink_7"),
-                                    (By.ID, "DirectLink_8"),
-                                ):
-                                    _, zip_href = ScraperBackend._wait_for_href(driver, by, locator, timeout=5)
-                                    if zip_href:
-                                        break
-                                if zip_href and ScraperBackend.download_file_with_requests(zip_href, zip_path, driver.get_cookies(), t_id, file_type="zip"):
-                                    log_to_gui("  Downloaded Zip File.")
-                                    any_new_download = True
-                                else:
-                                    log_to_gui("  Zip link not found.")
+                            zip_href = None
+                            for by, locator in (
+                                (By.PARTIAL_LINK_TEXT, "Download as zip file"),
+                                (By.PARTIAL_LINK_TEXT, "Download as zip"),
+                                (By.ID, "DirectLink_7"),
+                            ):
+                                _, zip_href = ScraperBackend._wait_for_href(driver, by, locator, timeout=5)
+                                if zip_href:
+                                    break
+                            if zip_href and ScraperBackend.download_file_with_requests(zip_href, zip_path, driver.get_cookies(), t_id, file_type="zip"):
+                                log_to_gui("  Downloaded Zip File.")
+                                any_new_download = True
+                            else:
+                                log_to_gui("  Zip link not found.")
                         else:
                             log_to_gui("  Skipping Zip file (already logged and file exists).")
                     except Exception as e:
