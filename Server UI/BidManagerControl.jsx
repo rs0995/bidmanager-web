@@ -955,24 +955,6 @@ function ConfigPanel({ toast, env, base, adminKey, setBase, dbUrl, setDbUrl, sto
       </Card>
 
       <div className="xl:columns-2 2xl:columns-3" style={{ columnGap: 16 }}>
-          {group('Scraping schedule', <>
-            <Field label="Run on a schedule" hint="Off means fetches only start when you or a client asks" dirty={isDirty('schedule_enabled')}>
-              <Toggle checked={draft.schedule_enabled} onChange={(v) => set('schedule_enabled', v)} />
-            </Field>
-            <Field label="Interval between runs" dirty={isDirty('scrape_interval_minutes')}>
-              <NumIn value={draft.scrape_interval_minutes} onChange={(v) => set('scrape_interval_minutes', v)} suffix="min" min={5} />
-            </Field>
-            <Field label="MahaTenders" dirty={isDirty('portal_mahatenders')}>
-              <Toggle checked={draft.portal_mahatenders} onChange={(v) => set('portal_mahatenders', v)} />
-            </Field>
-            <Field label="ETenders" dirty={isDirty('portal_etenders')}>
-              <Toggle checked={draft.portal_etenders} onChange={(v) => set('portal_etenders', v)} />
-            </Field>
-            <Field label="Eprocure" dirty={isDirty('portal_eprocure')}>
-              <Toggle checked={draft.portal_eprocure} onChange={(v) => set('portal_eprocure', v)} />
-            </Field>
-          </>)}
-
           {group('Browser sessions', <>
             <Field label="Concurrent sessions" hint="Each session is one Chrome instance on the server" dirty={isDirty('max_concurrent_sessions')}>
               <NumIn value={draft.max_concurrent_sessions} onChange={(v) => set('max_concurrent_sessions', v)} min={1} />

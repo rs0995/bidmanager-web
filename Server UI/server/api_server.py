@@ -2633,59 +2633,6 @@ def _claim_scheduler_lease(now: float, interval_seconds: int, name: str = "defau
     return changed == 1
 
 
-def _scheduler_tick() -> int:
-    if not _scheduler_enabled():
-        return 0
-    try:
-        interval_minutes = max(
-            5, min(10080, int(core.ScraperBackend.get_setting("scrape_interval_minutes", "180")))
-        )
-    except Exception:
-        interval_minutes = 180
-    now = time.time()
-    if not _claim_scheduler_lease(now, interval_minutes * 60):
-        return 0
-
-    try:
-        _sync_admin_preset_saved_custom_jobs()
-    except Exception as exc:
-        _append_live_log(f"Could not sync automatic-scrape presets: {exc}")
-
-    enabled = {
-        "mahatenders": core.setting_bool("portal_mahatenders", True),
-        "etenders": core.setting_bool("portal_etenders", True),
-        "eprocure": core.setting_bool("portal_eprocure", False),
-    }
-    queued = 0
-    try:
-        with get_db() as conn:
-            websites = conn.execute("SELECT id,name FROM websites ORDER BY id").fetchall()
-        for website_id, name in websites:
-            normalized = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
-            portal_key = next((key for key in enabled if key in normalized), "")
-            if not portal_key or not enabled[portal_key]:
-                continue
-            try:
-                _enqueue_job(
-                    "fetch_tenders",
-                    {"website_id": int(website_id), "source": "scheduler"},
-                )
-                queued += 1
-            except HTTPException as exc:
-                _append_live_log(f"Scheduled scrape for {name} was not queued: {exc.detail}")
-    finally:
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE scheduler_leases SET lease_until=0,last_run_at=?,worker_id=? "
-                "WHERE name='default'",
-                (now, _JOB_WORKER_ID),
-            )
-            conn.commit()
-    if queued:
-        _append_live_log(f"Scheduler queued {queued} portal scrape job(s).")
-    return queued
-
-
 def _queue_due_tender_scrapes() -> int:
     if not _scheduler_enabled():
         return 0
@@ -2765,89 +2712,6 @@ _SAVED_CUSTOM_JOB_SELECT = (
     "all_organizations,all_tenders,download_mode,schedule_enabled,schedule_mode,interval_minutes,"
     "scheduled_for_at,next_run_at,last_run_at,last_job_id,created_at,updated_at FROM saved_custom_jobs "
 )
-
-
-def _portal_scheduler_enabled_for_name(name: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
-    if "mahatenders" in normalized:
-        return core.setting_bool("portal_mahatenders", True)
-    if "etenders" in normalized:
-        return core.setting_bool("portal_etenders", True)
-    if "eprocure" in normalized:
-        return core.setting_bool("portal_eprocure", False)
-    return False
-
-
-def _latest_scheduler_job_for_website(conn, website_id: int) -> tuple[Optional[str], Optional[float]]:
-    rows = conn.execute(
-        "SELECT id,payload_json,created_at FROM background_jobs "
-        "WHERE action='fetch_tenders' ORDER BY created_at DESC LIMIT 250"
-    ).fetchall()
-    for row in rows:
-        payload = _json_load(row[1], {})
-        if not isinstance(payload, dict):
-            continue
-        if int(payload.get("website_id") or 0) != int(website_id):
-            continue
-        if str(payload.get("source") or "") != "scheduler":
-            continue
-        return str(row[0]), float(row[2] or 0)
-    return None, None
-
-
-def _sync_admin_preset_saved_custom_jobs() -> None:
-    now = time.time()
-    schedule_globally_enabled = _scheduler_enabled()
-    try:
-        interval_minutes = max(
-            5, min(10080, int(core.ScraperBackend.get_setting("scrape_interval_minutes", "180")))
-        )
-    except Exception:
-        interval_minutes = 180
-
-    with get_db() as conn:
-        websites = conn.execute("SELECT id,name FROM websites ORDER BY id").fetchall()
-        for website_id, website_name in websites:
-            portal_enabled = _portal_scheduler_enabled_for_name(str(website_name or ""))
-            preset_enabled = bool(schedule_globally_enabled and portal_enabled)
-            last_job_id, last_run_at = _latest_scheduler_job_for_website(conn, int(website_id))
-            if preset_enabled:
-                base_run = float(last_run_at or now)
-                next_run_at = max(now + 60, base_run + interval_minutes * 60)
-            else:
-                next_run_at = 0
-            preset_name = f"Preset: {website_name} automatic scrape"
-            conn.execute(
-                "INSERT INTO saved_custom_jobs "
-                "(owner_name,name,website_id,job_type,org_ids_json,tender_ids_json,all_organizations,"
-                "all_tenders,download_mode,schedule_enabled,schedule_mode,interval_minutes,scheduled_for_at,"
-                "next_run_at,last_run_at,last_job_id,created_at,updated_at) "
-                "VALUES ('admin',?,?,?,?,?,1,0,'auto',?,'interval',?,?,?,?,?,?,?) "
-                "ON CONFLICT(owner_name,name) DO UPDATE SET "
-                "website_id=excluded.website_id,job_type=excluded.job_type,org_ids_json=excluded.org_ids_json,"
-                "tender_ids_json=excluded.tender_ids_json,all_organizations=1,all_tenders=0,"
-                "download_mode='auto',schedule_enabled=excluded.schedule_enabled,"
-                "schedule_mode='interval',interval_minutes=excluded.interval_minutes,"
-                "scheduled_for_at=excluded.scheduled_for_at,next_run_at=excluded.next_run_at,"
-                "last_run_at=COALESCE(excluded.last_run_at,saved_custom_jobs.last_run_at),"
-                "last_job_id=COALESCE(excluded.last_job_id,saved_custom_jobs.last_job_id),updated_at=excluded.updated_at",
-                (
-                    preset_name,
-                    int(website_id),
-                    "scrape",
-                    "[]",
-                    "[]",
-                    1 if preset_enabled else 0,
-                    interval_minutes,
-                    next_run_at,
-                    next_run_at,
-                    last_run_at,
-                    last_job_id,
-                    now,
-                    now,
-                ),
-            )
-        conn.commit()
 
 
 def _selected_ids_by_website(conn, table: str, selected_ids, require_all: bool = False) -> dict:
@@ -2996,7 +2860,6 @@ def _queue_due_saved_custom_jobs() -> int:
 def _scheduler_loop() -> None:
     while not _scheduler_stop.is_set():
         try:
-            _scheduler_tick()
             _queue_due_tender_scrapes()
             _queue_due_saved_custom_jobs()
         except Exception as exc:
@@ -5217,8 +5080,6 @@ def _validated_saved_custom_job(body: SavedCustomJobRequest) -> dict:
 @app.get("/admin/custom-jobs")
 def list_saved_custom_jobs(owner: str, _auth: None = Depends(require_admin_key)):
     owner_name = " ".join(str(owner or "").split())
-    if owner_name.lower() == "admin":
-        _sync_admin_preset_saved_custom_jobs()
     with get_db() as conn:
         rows = conn.execute(
             _SAVED_CUSTOM_JOB_SELECT + "WHERE owner_name=? ORDER BY updated_at DESC,id DESC",

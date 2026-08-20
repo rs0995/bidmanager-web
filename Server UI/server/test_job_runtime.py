@@ -299,22 +299,6 @@ class DurableJobRuntimeTests(unittest.TestCase):
                 with api.get_db() as conn:
                     assert conn.execute('SELECT id FROM background_jobs WHERE id=?',(old_id,)).fetchone() is None
 
-                captured = []
-                original_enqueue = api._enqueue_job
-                api._enqueue_job = lambda action, payload=None: captured.append((action, payload)) or {'job_id':'fake','status':'queued'}
-                api.core.ScraperBackend.set_setting('schedule_enabled', 'true')
-                api.core.ScraperBackend.set_setting('scheduler_paused', 'false')
-                api.core.ScraperBackend.set_setting('portal_mahatenders', 'true')
-                api.core.ScraperBackend.set_setting('portal_etenders', 'true')
-                api.core.ScraperBackend.set_setting('portal_eprocure', 'false')
-                with api.get_db() as conn:
-                    conn.execute("UPDATE scheduler_leases SET lease_until=0,last_run_at=NULL WHERE name='default'")
-                    conn.commit()
-                assert api._scheduler_tick() == 2
-                assert len(captured) == 2
-                assert api._scheduler_tick() == 0
-                api._enqueue_job = original_enqueue
-                api.core.ScraperBackend.set_setting('schedule_enabled', 'false')
                 api._scheduler_stop.set()
                 api._job_executor.shutdown(wait=True, cancel_futures=True)
                 """,
