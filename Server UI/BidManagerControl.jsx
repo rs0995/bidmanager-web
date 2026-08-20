@@ -337,7 +337,7 @@ function createApi(base, adminKey) {
       const qs = prefix ? `?prefix=${encodeURIComponent(prefix)}` : '';
       const raw = await apiFetch(base, `/admin/storage${qs}`, { adminKey });
       return {
-        folders: (raw.folders || []).map((f) => ({ name: f.name, items: f.items ?? 0, size: f.sizeBytes })),
+        folders: (raw.folders || []).map((f) => ({ name: f.name, items: f.items, size: f.sizeBytes })),
         files: (raw.files || []).map((f) => ({ name: f.name, size: f.sizeBytes, modified: f.modified })),
       };
     },
@@ -1801,7 +1801,7 @@ function StoragePanel({ toast, env, base, adminKey, storageUrl, localScope }) {
                   <Folder size={14} style={{ color: c.indigo, flexShrink: 0 }} />
                   <span className="truncate" style={{ fontFamily: mono, fontSize: 12.5, color: c.ink }}>{f.name}</span>
                 </button>
-                <Mono style={{ fontSize: 11.5, color: c.ink40 }}>{f.items} items</Mono>
+                <Mono style={{ fontSize: 11.5, color: c.ink40 }}>{f.items != null ? `${f.items} items` : '—'}</Mono>
                 <Mono style={{ fontSize: 11.5, color: c.ink60, width: 68, textAlign: 'right' }}>{fmtBytes(f.size)}</Mono>
               </div>
             ))}

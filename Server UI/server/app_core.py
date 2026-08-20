@@ -2913,18 +2913,19 @@ class ScraperBackend:
             tender_id, folder_path
         )
         now_epoch = time.time()
+        now_iso = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
         conn = sqlite3.connect(DB_FILE)
         conn.execute(
             "UPDATE tenders SET folder_path=?, download_status=?, "
             "is_downloaded=CASE WHEN ?=1 THEN 1 ELSE COALESCE(is_downloaded,0) END, "
             "initial_download_completed_at=CASE WHEN ?=1 THEN COALESCE(initial_download_completed_at,?) "
             "ELSE initial_download_completed_at END, last_update_checked_at=?, "
-            "last_downloaded_at=CASE WHEN ?=1 OR ?=1 THEN CURRENT_TIMESTAMP ELSE last_downloaded_at END, "
+            "last_downloaded_at=CASE WHEN ?=1 OR ?=1 THEN ? ELSE last_downloaded_at END, "
             "last_download_error='' WHERE id=?",
             (
                 durable_folder, "complete" if main_complete else "partial", 1 if main_complete else 0,
                 1 if main_complete else 0, now_epoch, now_epoch,
-                1 if main_complete else 0, 1 if any_new_download else 0, int(tender_db_id),
+                1 if main_complete else 0, 1 if any_new_download else 0, now_iso, int(tender_db_id),
             ),
         )
         conn.commit()
@@ -3297,8 +3298,9 @@ class ScraperBackend:
                     conn.close()
                     got = ScraperBackend._download_result_docs_from_popup(driver, tender_id, tender_folder)
                     if got:
+                        now_iso = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
                         conn = sqlite3.connect(DB_FILE)
-                        conn.execute("UPDATE tenders SET folder_path=?, last_downloaded_at=CURRENT_TIMESTAMP WHERE id=?", (durable_folder, db_id))
+                        conn.execute("UPDATE tenders SET folder_path=?, last_downloaded_at=? WHERE id=?", (durable_folder, now_iso, db_id))
                         conn.commit()
                         conn.close()
                 except Exception as e:
