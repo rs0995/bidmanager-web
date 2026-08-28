@@ -4868,6 +4868,7 @@ def update_settings(body: dict):
                 (str(key), str(value)),
             )
         conn.commit()
+    core.ScraperBackend.invalidate_settings_cache()
     # Keep filesystem path config in sync with app_paths.json used by scraper core.
     try:
         current = core.load_app_paths_config()
@@ -5686,6 +5687,7 @@ def admin_put_config(body: AdminConfigPatch, _auth: None = Depends(require_admin
                 updates,
             )
             conn.commit()
+        core.ScraperBackend.invalidate_settings_cache()
     return _admin_config_payload()
 
 
@@ -6025,6 +6027,12 @@ def health():
 
 
 if _job_execution_enabled():
+    # Import the scraper stack (selenium/PIL/bs4/…) once at boot so the first
+    # scraped tender doesn't pay the lazy-import cost mid-job.
+    try:
+        core.ensure_scraper_dependencies()
+    except Exception:
+        pass
     _load_and_recover_jobs(recover_running=True, submit_queued=True)
     _start_queue_poller()
     _start_scheduler()

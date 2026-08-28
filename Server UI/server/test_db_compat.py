@@ -145,6 +145,44 @@ class PostgresCompatibilityTests(unittest.TestCase):
         conn.execute("SELECT id FROM projects")
         self.assertEqual(conn.total_changes, 2)
 
+    def test_pooled_connection_is_returned_not_closed(self):
+        class _FakePool:
+            def __init__(self):
+                self.returned = []
+
+            def putconn(self, raw):
+                self.returned.append(raw)
+
+        pool = _FakePool()
+
+        # Explicit close(): rolled back and handed back to the pool, socket kept.
+        raw = _RawConnection()
+        conn = db_compat.PostgresConnection(raw, pool=pool)
+        conn.close()
+        self.assertEqual(pool.returned, [raw])
+        self.assertEqual(raw.rollbacks, 1)
+        self.assertFalse(raw.closed)
+
+        # Context-manager exit follows the same path (commit then return).
+        raw2 = _RawConnection()
+        with db_compat.PostgresConnection(raw2, pool=pool):
+            pass
+        self.assertEqual(raw2.commits, 1)
+        self.assertIn(raw2, pool.returned)
+        self.assertFalse(raw2.closed)
+
+        # Repeated open/close cycles must not accumulate live connections.
+        for _ in range(50):
+            db_compat.PostgresConnection(_RawConnection(), pool=pool).close()
+        self.assertEqual(len(pool.returned), 52)
+
+    def test_double_close_is_safe(self):
+        raw = _RawConnection()
+        conn = db_compat.PostgresConnection(raw)
+        conn.close()
+        conn.close()
+        self.assertTrue(raw.closed)
+
 
 if __name__ == "__main__":
     unittest.main()

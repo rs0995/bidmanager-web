@@ -1,6 +1,7 @@
 import os
 import re
 import sqlite3 as _sqlite3
+import threading
 from typing import Any, Iterable, Optional
 
 
@@ -259,8 +260,9 @@ class PostgresCursor:
 
 
 class PostgresConnection:
-    def __init__(self, raw):
+    def __init__(self, raw, pool=None):
         self._raw = raw
+        self._pool = pool
         self.row_factory = None
         self.total_changes = 0
 
@@ -287,7 +289,28 @@ class PostgresConnection:
         self._raw.rollback()
 
     def close(self):
-        self._raw.close()
+        raw, pool = self._raw, self._pool
+        self._raw = None
+        if raw is None:
+            return
+        if pool is None:
+            raw.close()
+            return
+        # Return the connection to the pool instead of tearing down the socket.
+        # Roll back first so a caller that forgot to commit (sqlite .close()
+        # semantics: uncommitted work is discarded) or a cursor error path that
+        # left the transaction aborted never leaks state to the next borrower.
+        try:
+            raw.rollback()
+        except Exception:
+            pass
+        try:
+            pool.putconn(raw)
+        except Exception:
+            try:
+                raw.close()
+            except Exception:
+                pass
 
     def __enter__(self):
         return self
@@ -301,6 +324,50 @@ class PostgresConnection:
         return False
 
 
+_pool = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool():
+    """Lazily create one process-wide psycopg connection pool.
+
+    Every ``sqlite3.connect(DB_FILE)`` in the codebase is monkey-patched to
+    ``connect()`` below, so in Postgres mode the hot path (``get_setting`` on
+    every scrape step, per-request ``get_db``) was paying a full TCP+TLS+SCRAM
+    handshake to a remote Neon instance per call. The pool turns that into a
+    near-zero checkout. Returns ``None`` if ``psycopg_pool`` is unavailable so
+    ``connect()`` can fall back to a direct connection.
+    """
+    global _pool
+    if _pool is not None:
+        return _pool
+    with _pool_lock:
+        if _pool is not None:
+            return _pool
+        try:
+            from psycopg_pool import ConnectionPool
+        except Exception:
+            return None
+        try:
+            max_size = int(os.getenv("BIDMANAGER_DB_POOL_MAX", "10") or "10")
+        except Exception:
+            max_size = 10
+        max_size = max(2, min(50, max_size))
+        pool = ConnectionPool(
+            _database_url(),
+            min_size=1,
+            max_size=max_size,
+            # Disable psycopg's implicit statement preparation: it is incompatible
+            # with a PgBouncer (Neon "-pooler") endpoint in transaction mode.
+            kwargs={"prepare_threshold": None},
+            name="bidmanager",
+            open=False,
+        )
+        pool.open(wait=True, timeout=10)
+        _pool = pool
+        return _pool
+
+
 def connect(_path: str = "", *args, **kwargs):
     if not using_postgres():
         return _ORIGINAL_CONNECT(_path, *args, **kwargs)
@@ -308,6 +375,9 @@ def connect(_path: str = "", *args, **kwargs):
         import psycopg
     except Exception as exc:
         raise RuntimeError("Postgres mode requires psycopg. Install backend requirements.") from exc
+    pool = _get_pool()
+    if pool is not None:
+        return PostgresConnection(pool.getconn(), pool=pool)
     return PostgresConnection(psycopg.connect(_database_url()))
 
 

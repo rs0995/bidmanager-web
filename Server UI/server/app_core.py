@@ -1444,6 +1444,14 @@ class ScraperBackend:
     captcha_ai_signature = None
     session = None
 
+    # In-process cache of the whole app_settings table. get_setting() is called
+    # many times per scraped tender (safe_request, _new_scraper_session,
+    # _job_cancel_requested via every log line); without this each call was a
+    # fresh remote Postgres connection + SELECT.
+    _settings_cache = None
+    _settings_cache_at = 0.0
+    _settings_lock = threading.Lock()
+
     @staticmethod
     def add_website_logic(name, url, status_url):
         conn = sqlite3.connect(DB_FILE)
@@ -1551,7 +1559,7 @@ class ScraperBackend:
             log_to_gui(scraper_dependency_message())
             return None
         attempts = setting_int("retry_attempts", 3, minimum=1, maximum=10)
-        backoff = setting_int("retry_backoff_s", 20, minimum=0, maximum=300)
+        backoff = setting_int("retry_backoff_s", 3, minimum=0, maximum=300)
         timeout = setting_int("page_load_timeout_s", 45, minimum=5, maximum=300)
         for attempt in range(attempts):
             check_job_cancelled()
@@ -1588,7 +1596,7 @@ class ScraperBackend:
                 if attempt + 1 >= attempts:
                     log_to_gui(f"Request failed after {attempts} attempt(s): {e}")
                     return None
-                delay = backoff * (attempt + 1)
+                delay = min(backoff * (attempt + 1), 15)
                 log_to_gui(f"Request failed ({attempt + 1}/{attempts}); retrying in {delay}s: {e}")
                 deadline = time.time() + delay
                 while time.time() < deadline:
@@ -2776,7 +2784,10 @@ class ScraperBackend:
                     
                     rows = table.find_all('tr')
                     tenders_to_save = []
-                    
+                    page_http = 0.0
+                    page_parse = 0.0
+                    page_db = 0.0
+
                     for tr in rows:
                         cols = tr.find_all('td')
                         if len(cols) > 4:
@@ -2785,6 +2796,7 @@ class ScraperBackend:
                             title_col = cols[4]
                             link_tag = title_col.find('a')
                             if link_tag:
+                                _tender_start = time.perf_counter()
                                 full_link = urljoin(current_url, link_tag['href'])
                                 listing_title_text = title_col.get_text(" ", strip=True)
                                 closing_date = cols[2].text.strip()
@@ -2803,7 +2815,10 @@ class ScraperBackend:
                                 d_soup = None
                                 
                                 try:
+                                    _ts = time.perf_counter()
                                     d_res = ScraperBackend.safe_request(full_link)
+                                    page_http += time.perf_counter() - _ts
+                                    _ts = time.perf_counter()
                                     if d_res:
                                         d_soup = BeautifulSoup(d_res.text, 'html.parser')
                                         # Keep mappings aligned with tender_scraper.py label strategy.
@@ -2852,14 +2867,16 @@ class ScraperBackend:
                                         )
                                         if detail_opening:
                                             opening_date = detail_opening
-                                except: pass
+                                    page_parse += time.perf_counter() - _ts
+                                except:
+                                    page_parse += time.perf_counter() - _ts
                                 if not published or str(published).strip().upper() in {"N/A", "NA", "-"}:
                                     published = published_date or "N/A"
                                 prebid_count, corrigendum_count = ScraperBackend.extract_prebid_corrigendum_counts(d_soup)
 
                                 title_text = ScraperBackend.derive_tender_title(listing_title_text, d_soup)
                                 t_id = ScraperBackend.derive_tender_id(listing_title_text, d_soup, full_link)
-                                log_to_gui(f"  > {t_id}")
+                                log_to_gui(f"  > {t_id}  [{time.perf_counter() - _tender_start:.1f}s]")
                                 t_id_norm = str(t_id or "").strip()
                                 if t_id_norm and t_id_norm.upper() != "N/A":
                                     org_seen_ids.add(t_id_norm)
@@ -2874,6 +2891,7 @@ class ScraperBackend:
                         inserted_count = 0
                         updated_count = 0
                         unchanged_count = 0
+                        _tdb = time.perf_counter()
                         for t in tenders_to_save:
                             try:
                                 result = ScraperBackend.upsert_tender_row(conn, t)
@@ -2887,9 +2905,12 @@ class ScraperBackend:
                                 log_to_gui(f"Upsert failed for tender '{t[2]}': {e}")
                         removed = ScraperBackend.dedupe_tenders_for_website(conn, website_id)
                         conn.commit()
+                        page_db += time.perf_counter() - _tdb
                         log_to_gui(
                             f"Saved page: inserted={inserted_count}, updated={updated_count}, "
-                            f"unchanged={unchanged_count}, deduped={removed}"
+                            f"unchanged={unchanged_count}, deduped={removed} "
+                            f"| http={page_http:.1f}s parse={page_parse:.1f}s db={page_db:.1f}s "
+                            f"n={len(tenders_to_save)}"
                         )
                     else:
                         log_to_gui("No tenders found in table rows.")
@@ -4139,11 +4160,62 @@ class ScraperBackend:
         log_to_gui("Tender archived.")
 
     @staticmethod
+    def invalidate_settings_cache():
+        """Drop the settings cache so the next get_setting() reloads from the DB.
+        Call after writing app_settings by any path other than set_setting()."""
+        with ScraperBackend._settings_lock:
+            ScraperBackend._settings_cache = None
+            ScraperBackend._settings_cache_at = 0.0
+
+    @staticmethod
+    def _settings_cache_ttl():
+        try:
+            return float(os.getenv("BIDMANAGER_SETTINGS_TTL_S", "30") or "30")
+        except Exception:
+            return 30.0
+
+    @staticmethod
+    def _refresh_settings_cache():
+        with ScraperBackend._settings_lock:
+            fresh = (
+                ScraperBackend._settings_cache is not None
+                and (time.time() - ScraperBackend._settings_cache_at)
+                <= ScraperBackend._settings_cache_ttl()
+            )
+            if fresh:
+                return ScraperBackend._settings_cache
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                try:
+                    rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+                finally:
+                    conn.close()
+            except Exception:
+                # Keep any stale copy on a transient DB error rather than wiping it.
+                return ScraperBackend._settings_cache
+            ScraperBackend._settings_cache = {str(k): v for k, v in rows}
+            ScraperBackend._settings_cache_at = time.time()
+            return ScraperBackend._settings_cache
+
+    @staticmethod
     def get_setting(key, default=None):
-        conn = sqlite3.connect(DB_FILE)
-        row = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
-        conn.close()
-        return row[0] if row else default
+        cache = ScraperBackend._settings_cache
+        if cache is None or (
+            time.time() - ScraperBackend._settings_cache_at
+        ) > ScraperBackend._settings_cache_ttl():
+            cache = ScraperBackend._refresh_settings_cache()
+        if cache is None:
+            # Cache could not be built (e.g. app_settings not created yet during
+            # init_db). Fall back to the original single-key read.
+            conn = sqlite3.connect(DB_FILE)
+            try:
+                row = conn.execute(
+                    "SELECT value FROM app_settings WHERE key=?", (key,)
+                ).fetchone()
+            finally:
+                conn.close()
+            return row[0] if row else default
+        return cache.get(key, default)
 
     @staticmethod
     def set_setting(key, value):
@@ -4154,6 +4226,12 @@ class ScraperBackend:
         )
         conn.commit()
         conn.close()
+        # Keep the in-process cache coherent for the writer. API and worker run in
+        # the same process, so admin config edits stay consistent; the TTL is the
+        # backstop for any path that writes app_settings without going through here.
+        with ScraperBackend._settings_lock:
+            if ScraperBackend._settings_cache is not None:
+                ScraperBackend._settings_cache[str(key)] = str(value)
 
     @staticmethod
     def log_auto_archive_run(status, archived_count=0, archived_status_updated=0, websites_count=0, notes=""):
