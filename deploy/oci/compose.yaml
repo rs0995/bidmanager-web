@@ -1,0 +1,64 @@
+# BidManager backend on one OCI Ampere A1 VM.
+#
+# Database:  external Neon Postgres (unchanged from the Cloud Run deployment) — set
+#            DATABASE_URL in .env. No Postgres container runs here.
+# Storage:   Google Drive (unchanged) — a service-account JSON key is mounted at
+#            /run/secrets/drive-sa.json because a VM has no Google ADC. Share the
+#            Drive root folder with that service account (already done for Cloud Run).
+services:
+  backend:
+    build:
+      context: ../../Server UI/server
+    restart: unless-stopped
+    shm_size: 1gb
+    environment:
+      PORT: "8080"
+      BIDMANAGER_ENV: production
+      BIDMANAGER_PROCESS_ROLE: all
+      BIDMANAGER_HEADLESS: "true"
+      BIDMANAGER_BROWSER: chromium
+      BIDMANAGER_WORKER_THREADS: "2"
+      BIDMANAGER_RUNTIME_DIR: /var/lib/bidmanager
+      BIDMANAGER_PUBLIC_URL: https://${BIDMANAGER_DOMAIN}
+      BIDMANAGER_CORS_ORIGINS: ${BIDMANAGER_CORS_ORIGINS:-bidmanager://app}
+      # External Neon Postgres — same value as the Cloud Run bidmanager-database-url secret.
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL (Neon connection string) in .env}
+      # Google Drive — same folder as Cloud Run; auth via the mounted SA key file.
+      GOOGLE_DRIVE_FOLDER_ID: ${GOOGLE_DRIVE_FOLDER_ID:?set GOOGLE_DRIVE_FOLDER_ID in .env}
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/drive-sa.json
+      # Carry these three over verbatim from GCP Secret Manager so already-issued
+      # admin keys and signed download URLs keep working.
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?set ADMIN_API_KEY in .env}
+      BIDMANAGER_CLIENT_API_KEY: ${BIDMANAGER_CLIENT_API_KEY:?set BIDMANAGER_CLIENT_API_KEY in .env}
+      BIDMANAGER_DOWNLOAD_TOKEN_SECRET: ${BIDMANAGER_DOWNLOAD_TOKEN_SECRET:?set BIDMANAGER_DOWNLOAD_TOKEN_SECRET in .env}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      BIDMANAGER_PROXY_URLS: ${BIDMANAGER_PROXY_URLS:-}
+      OCI_REGION: ${OCI_REGION:-}
+      OCI_INSTANCE_ID: ${OCI_INSTANCE_ID:-}
+    volumes:
+      - ./drive-sa.json:/run/secrets/drive-sa.json:ro
+      # Scratch only (downloads in flight); durable copies live in Google Drive.
+      - bidmanager-data:/var/lib/bidmanager
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      BIDMANAGER_DOMAIN: ${BIDMANAGER_DOMAIN:?set BIDMANAGER_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  bidmanager-data:
+  caddy-data:
+  caddy-config:

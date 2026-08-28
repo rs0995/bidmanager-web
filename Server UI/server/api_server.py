@@ -20,7 +20,8 @@ import time
 import collections
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Optional, List
+from zoneinfo import ZoneInfo
+from typing import Any, Optional, List
 from contextlib import contextmanager
 from urllib.parse import quote
 
@@ -38,6 +39,7 @@ import storage_runtime
 
 storage_runtime.require_durable_cloud_database()
 import admin_providers
+import db_compat
 import security
 import client_api
 
@@ -1986,7 +1988,16 @@ def _job_dedupe_key(action: str, payload: dict) -> str:
             f"mode:{str(payload.get('mode') or '')}:all"
         )
     source = str(payload.get("source") or "")
-    if source in {"tender-schedule", "custom", "custom-all"} and payload.get("org_ids"):
+    if source == "consolidated-schedule" and payload.get("website_id") is not None:
+        # The consolidated scheduler pass (_run_consolidated_scrape_pass)
+        # already merges every due tender-schedule/org-schedule/saved-custom
+        # target for a website into one job before calling _enqueue_job, so
+        # this key only needs to guard against back-to-back scheduler ticks
+        # re-enqueueing while the previous tick's job for the same website is
+        # still queued/running — at most one auto-scheduled job per website
+        # is ever in flight at a time.
+        return f"{action_name}:website:{int(payload.get('website_id'))}:auto-schedule"
+    if source in {"custom", "custom-all"} and payload.get("org_ids"):
         website_id = payload.get("website_id")
         org_ids = sorted({int(value) for value in (payload.get("org_ids") or [])})
         return f"{action_name}:website:{int(website_id)}:orgs:{','.join(map(str, org_ids))}"
@@ -2198,6 +2209,8 @@ def _job_callable(action: str, payload: dict):
         return core.ScraperBackend.check_tender_status_logic(website_id, archived_only=True)
     if action == "archive_completed_tenders":
         return core.ScraperBackend.archive_completed_tenders_logic(website_id)
+    if action == "push_to_cloud":
+        return core.ScraperBackend.push_local_data_to_cloud(website_id)
     if action == "download_single_tender":
         return core.ScraperBackend.download_single_tender_logic(payload.get("tender_db_id"), payload.get("mode", "full"))
     raise RuntimeError(f"Unsupported durable job action: {action}")
@@ -2456,7 +2469,7 @@ def _enqueue_job(action: str, payload: Optional[dict] = None) -> dict:
                     (dedupe_key,),
                 ).fetchone()
             if existing_row:
-                return {"job_id": str(existing_row[0]), "status": str(existing_row[1])}
+                return {"job_id": str(existing_row[0]), "status": str(existing_row[1]), "created": False}
             active = int(
                 conn.execute(
                     "SELECT COUNT(*) FROM background_jobs WHERE status IN ('queued','running')"
@@ -2501,11 +2514,11 @@ def _enqueue_job(action: str, payload: Optional[dict] = None) -> dict:
                     (dedupe_key,),
                 ).fetchone()
         if existing_row:
-            return {"job_id": str(existing_row[0]), "status": str(existing_row[1])}
+            return {"job_id": str(existing_row[0]), "status": str(existing_row[1]), "created": False}
         raise
     if _job_execution_enabled():
         _job_futures[job_id] = _job_executor.submit(_run_job, job_id)
-    return {"job_id": job_id, "status": "queued"}
+    return {"job_id": job_id, "status": "queued", "created": True}
 
 
 def _load_and_recover_jobs(*, recover_running: bool = True, submit_queued: bool = True) -> None:
@@ -2615,6 +2628,20 @@ def _saved_job_scheduler_enabled() -> bool:
     )
 
 
+_IST = ZoneInfo("Asia/Kolkata")
+_SCRAPE_WINDOW_START_HOUR = 9   # 9:00 AM IST, inclusive
+_SCRAPE_WINDOW_END_HOUR = 21    # 9:00 PM IST, exclusive
+
+
+def _within_scrape_window(now_epoch: Optional[float] = None) -> bool:
+    # The portal only changes between 9am-9pm IST, so automatic scraping is
+    # gated to that window. This only affects whether a *new* job gets
+    # enqueued below — it never touches a job that's already queued/running,
+    # so nothing in flight is ever interrupted mid-scrape.
+    moment = datetime.fromtimestamp(now_epoch if now_epoch is not None else time.time(), _IST)
+    return _SCRAPE_WINDOW_START_HOUR <= moment.hour < _SCRAPE_WINDOW_END_HOUR
+
+
 def _claim_scheduler_lease(now: float, interval_seconds: int, name: str = "default") -> bool:
     with get_db() as conn:
         conn.execute(
@@ -2631,52 +2658,6 @@ def _claim_scheduler_lease(now: float, interval_seconds: int, name: str = "defau
         changed = int(cur.rowcount or 0)
         conn.commit()
     return changed == 1
-
-
-def _queue_due_tender_scrapes() -> int:
-    if not _scheduler_enabled():
-        return 0
-    now = time.time()
-    lease_name = "tender-schedules"
-    if not _claim_scheduler_lease(now, 60, lease_name):
-        return 0
-    queued = 0
-    try:
-        with get_db() as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT t.website_id,o.id FROM tenders t "
-                "JOIN organizations o ON o.website_id=t.website_id AND o.name=t.org_chain "
-                "WHERE COALESCE(t.scrape_enabled,0)=1 AND COALESCE(t.scrape_interval_minutes,0)>0 "
-                "AND COALESCE(t.next_scrape_at,0)<=? ORDER BY t.website_id,o.id",
-                (now,),
-            ).fetchall()
-        grouped = {}
-        for website_id, org_id in rows:
-            grouped.setdefault(int(website_id), []).append(int(org_id))
-        for website_id, org_ids in grouped.items():
-            try:
-                _enqueue_job(
-                    "fetch_tenders_selected",
-                    {
-                        "website_id": website_id,
-                        "org_ids": sorted(set(org_ids)),
-                        "source": "tender-schedule",
-                        "download_after": False,
-                    },
-                )
-                queued += 1
-            except HTTPException as exc:
-                _append_live_log(f"Scheduled tender scrape was not queued: {exc.detail}")
-    finally:
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE scheduler_leases SET lease_until=0,last_run_at=?,worker_id=? WHERE name=?",
-                (now, _JOB_WORKER_ID, lease_name),
-            )
-            conn.commit()
-    if queued:
-        _append_live_log(f"Scheduler queued {queued} due tender-group scrape job(s).")
-    return queued
 
 
 def _saved_custom_job_from_row(row) -> dict:
@@ -2745,14 +2726,21 @@ def _enqueue_saved_custom_job(saved_job_id: int, scheduled_trigger: bool = False
         definition = _saved_custom_job_from_row(row)
         org_groups = _selected_ids_by_website(conn, "organizations", definition["org_ids"])
         tender_groups = _selected_ids_by_website(conn, "tenders", definition["tender_ids"])
+        all_org_ids = (
+            _all_organization_ids(conn, int(definition["website_id"]))
+            if definition.get("all_organizations") else []
+        )
 
     queued_jobs = []
     if definition["job_type"] == "scrape":
         if definition.get("all_organizations"):
+            if not all_org_ids:
+                raise HTTPException(400, "No organizations are available. Refresh organizations first.")
             queued_jobs.append(_enqueue_job(
-                "fetch_tenders",
+                "fetch_tenders_selected",
                 {
                     "website_id": int(definition["website_id"]),
+                    "org_ids": all_org_ids,
                     "source": "saved-custom",
                     "saved_custom_job_id": definition["id"],
                     "download_after": False,
@@ -2798,55 +2786,184 @@ def _enqueue_saved_custom_job(saved_job_id: int, scheduled_trigger: bool = False
     }
 
     now = time.time()
-    with get_db() as conn:
-        if scheduled_trigger and definition["schedule_mode"] == "once":
-            conn.execute(
-                "UPDATE saved_custom_jobs SET last_run_at=?,last_job_id=?,schedule_enabled=0,"
-                "next_run_at=0,updated_at=? WHERE id=?",
-                (now, ",".join(queued_ids), now, definition["id"]),
-            )
-        elif scheduled_trigger and definition["schedule_mode"] == "interval":
-            interval_seconds = definition["interval_minutes"] * 60
-            previous_next = float(definition.get("next_run_at") or now)
-            elapsed_intervals = max(1, int((now - previous_next) // interval_seconds) + 1)
-            next_run = previous_next + elapsed_intervals * interval_seconds
-            conn.execute(
-                "UPDATE saved_custom_jobs SET last_run_at=?,last_job_id=?,next_run_at=?,updated_at=? WHERE id=?",
-                (now, ",".join(queued_ids), next_run, now, definition["id"]),
-            )
-        else:
+    if scheduled_trigger and definition["schedule_mode"] in ("once", "interval"):
+        _advance_saved_custom_job_schedule(definition["id"], now, ",".join(queued_ids))
+    else:
+        with get_db() as conn:
             conn.execute(
                 "UPDATE saved_custom_jobs SET last_run_at=?,last_job_id=?,updated_at=? WHERE id=?",
                 (now, ",".join(queued_ids), now, definition["id"]),
             )
-        conn.commit()
+            conn.commit()
     return queued
 
 
-def _queue_due_saved_custom_jobs() -> int:
-    if not _saved_job_scheduler_enabled():
+def _advance_saved_custom_job_schedule(saved_job_id: int, now: float, job_id: str) -> None:
+    # Shared by the manual "scheduled_trigger=True" path in
+    # _enqueue_saved_custom_job and by _run_consolidated_scrape_pass, so a
+    # saved job's next_run_at only ever advances through this one place.
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT schedule_mode,interval_minutes,next_run_at FROM saved_custom_jobs WHERE id=?",
+            (int(saved_job_id),),
+        ).fetchone()
+        if not row:
+            return
+        schedule_mode, interval_minutes, next_run_at = row
+        if schedule_mode == "once":
+            conn.execute(
+                "UPDATE saved_custom_jobs SET last_run_at=?,last_job_id=?,schedule_enabled=0,"
+                "next_run_at=0,updated_at=? WHERE id=?",
+                (now, job_id, now, int(saved_job_id)),
+            )
+        elif schedule_mode == "interval" and int(interval_minutes or 0) > 0:
+            interval_seconds = int(interval_minutes) * 60
+            previous_next = float(next_run_at or now)
+            elapsed_intervals = max(1, int((now - previous_next) // interval_seconds) + 1)
+            next_run = previous_next + elapsed_intervals * interval_seconds
+            conn.execute(
+                "UPDATE saved_custom_jobs SET last_run_at=?,last_job_id=?,next_run_at=?,updated_at=? WHERE id=?",
+                (now, job_id, next_run, now, int(saved_job_id)),
+            )
+        else:
+            conn.execute(
+                "UPDATE saved_custom_jobs SET last_run_at=?,last_job_id=?,updated_at=? WHERE id=?",
+                (now, job_id, now, int(saved_job_id)),
+            )
+        conn.commit()
+
+
+def _run_consolidated_scrape_pass() -> int:
+    # Replaces the old _queue_due_tender_scrapes / _queue_due_org_scrapes /
+    # _queue_due_saved_custom_jobs trio. Multiple operators can independently
+    # bookmark the same tender/org or create saved custom jobs targeting the
+    # same organizations/tenders — this gathers everything due from every
+    # source in one pass, merges each website's targets into a union, and
+    # enqueues exactly one job per website per group (scrape vs. download),
+    # so overlapping schedules from different sources/users never race each
+    # other into duplicate concurrent scrapes of the same site.
+    #
+    # tenders.next_scrape_at / organizations.next_scrape_at are deliberately
+    # NOT touched here — they already self-correct inside upsert_tender_row /
+    # fetch_tenders_logic based on whichever orgs actually get processed by
+    # the job that runs, so they're always accurate regardless of how a job
+    # got triggered. saved_custom_jobs has no such self-correction (its
+    # next_run_at lives entirely in this scheduling layer), so it's only
+    # advanced below when this tick's job for its website was newly created
+    # — never when the enqueue attempt silently resolved to an already
+    # in-flight job from an earlier tick, which would not have included this
+    # job's targets.
+    include_bookmark = _scheduler_enabled()
+    include_saved = _saved_job_scheduler_enabled()
+    if not include_bookmark and not include_saved:
+        return 0
+    if not _within_scrape_window():
         return 0
     now = time.time()
-    lease_name = "saved-custom-jobs"
+    lease_name = "consolidated-schedule"
     if not _claim_scheduler_lease(now, 60, lease_name):
         return 0
     queued = 0
     try:
+        website_scrape_orgs: dict[int, set] = {}
+        website_all_orgs: set = set()
+        website_download_tenders: dict[int, set] = {}
+        saved_scrape_ids_by_website: dict[int, list] = {}
+        saved_download_ids_by_website: dict[int, list] = {}
+
         with get_db() as conn:
-            due_ids = [
-                int(row[0]) for row in conn.execute(
-                    "SELECT id FROM saved_custom_jobs WHERE schedule_enabled=1 "
+            if include_bookmark:
+                for website_id, org_id in conn.execute(
+                    "SELECT DISTINCT t.website_id,o.id FROM tenders t "
+                    "JOIN organizations o ON o.website_id=t.website_id AND o.name=t.org_chain "
+                    "WHERE COALESCE(t.scrape_enabled,0)=1 AND COALESCE(t.scrape_interval_minutes,0)>0 "
+                    "AND COALESCE(t.next_scrape_at,0)<=?",
+                    (now,),
+                ).fetchall():
+                    website_scrape_orgs.setdefault(int(website_id), set()).add(int(org_id))
+                for website_id, org_id in conn.execute(
+                    "SELECT website_id,id FROM organizations WHERE COALESCE(scrape_enabled,0)=1 "
+                    "AND COALESCE(scrape_interval_minutes,0)>0 AND COALESCE(next_scrape_at,0)<=?",
+                    (now,),
+                ).fetchall():
+                    website_scrape_orgs.setdefault(int(website_id), set()).add(int(org_id))
+            if include_saved:
+                saved_rows = conn.execute(
+                    "SELECT id,website_id,job_type,org_ids_json,tender_ids_json,all_organizations "
+                    "FROM saved_custom_jobs WHERE schedule_enabled=1 "
                     "AND schedule_mode IN ('once','interval') AND COALESCE(next_run_at,0)>0 "
                     "AND COALESCE(next_run_at,0)<=? ORDER BY next_run_at,id",
                     (now,),
                 ).fetchall()
-            ]
-        for saved_job_id in due_ids:
+                for saved_id, website_id, job_type, org_ids_json, tender_ids_json, all_orgs in saved_rows:
+                    website_id = int(website_id)
+                    if job_type == "scrape":
+                        saved_scrape_ids_by_website.setdefault(website_id, []).append(int(saved_id))
+                        if all_orgs:
+                            website_all_orgs.add(website_id)
+                        else:
+                            try:
+                                org_ids = json.loads(org_ids_json or "[]")
+                            except (TypeError, ValueError):
+                                org_ids = []
+                            website_scrape_orgs.setdefault(website_id, set()).update(int(x) for x in org_ids)
+                    elif job_type == "download":
+                        try:
+                            tender_ids = json.loads(tender_ids_json or "[]")
+                        except (TypeError, ValueError):
+                            tender_ids = []
+                        website_download_tenders.setdefault(website_id, set()).update(int(x) for x in tender_ids)
+                        saved_download_ids_by_website.setdefault(website_id, []).append(int(saved_id))
+
+            # An "all organizations" saved job means literally every org row
+            # for that website — resolve the wildcard now, while the
+            # connection is open, so it's always a superset of any
+            # explicitly-due org rather than being scoped to whatever
+            # happens to have organizations.is_selected=1 (an unrelated,
+            # client-facing watchlist flag).
+            website_all_org_ids: dict[int, set] = {}
+            for website_id in website_all_orgs:
+                website_all_org_ids[website_id] = set(_all_organization_ids(conn, website_id))
+
+        for website_id in set(website_scrape_orgs) | website_all_orgs:
+            is_wildcard = website_id in website_all_orgs
+            # website_all_org_ids is every org for the site, so it already
+            # covers any explicitly-due org too — no need to union them.
+            explicit_orgs = (
+                website_all_org_ids.get(website_id, set()) if is_wildcard
+                else set(website_scrape_orgs.get(website_id, set()))
+            )
+            if not explicit_orgs:
+                _append_live_log(f"Consolidated scrape skipped for website {website_id}: no organizations exist yet.")
+                continue
+            action, payload = "fetch_tenders_selected", {
+                "website_id": website_id, "org_ids": sorted(explicit_orgs),
+                "source": "consolidated-schedule", "download_after": False,
+            }
             try:
-                _enqueue_saved_custom_job(saved_job_id, scheduled_trigger=True)
+                result = _enqueue_job(action, payload)
+            except HTTPException as exc:
+                _append_live_log(f"Consolidated scrape was not queued for website {website_id}: {exc.detail}")
+                continue
+            if result.get("created"):
                 queued += 1
-            except Exception as exc:
-                _append_live_log(f"Saved custom job {saved_job_id} was not queued: {exc}")
+                for saved_id in saved_scrape_ids_by_website.get(website_id, []):
+                    _advance_saved_custom_job_schedule(saved_id, now, result["job_id"])
+
+        for website_id, tender_ids in website_download_tenders.items():
+            try:
+                result = _enqueue_job("download_tenders", {
+                    "website_id": website_id, "target_db_ids": sorted(tender_ids),
+                    "include_all": False, "mode": "auto",
+                    "source": "consolidated-schedule", "download_after": False,
+                })
+            except HTTPException as exc:
+                _append_live_log(f"Consolidated download was not queued for website {website_id}: {exc.detail}")
+                continue
+            if result.get("created"):
+                queued += 1
+                for saved_id in saved_download_ids_by_website.get(website_id, []):
+                    _advance_saved_custom_job_schedule(saved_id, now, result["job_id"])
     finally:
         with get_db() as conn:
             conn.execute(
@@ -2854,14 +2971,37 @@ def _queue_due_saved_custom_jobs() -> int:
                 (now, _JOB_WORKER_ID, lease_name),
             )
             conn.commit()
+    if queued:
+        _append_live_log(f"Scheduler queued {queued} consolidated scrape/download job(s).")
     return queued
+
+
+def _run_expired_tender_sweep() -> int:
+    lease_name = "expired-tender-sweep"
+    if not _claim_scheduler_lease(time.time(), 1800, lease_name):
+        return 0
+    archived = 0
+    try:
+        with get_db() as conn:
+            website_ids = [int(row[0]) for row in conn.execute("SELECT id FROM websites ORDER BY id").fetchall()]
+        for website_id in website_ids:
+            archived += core.ScraperBackend.archive_completed_tenders_logic(website_id)
+    finally:
+        now = time.time()
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE scheduler_leases SET lease_until=0,last_run_at=?,worker_id=? WHERE name=?",
+                (now, _JOB_WORKER_ID, lease_name),
+            )
+            conn.commit()
+    return archived
 
 
 def _scheduler_loop() -> None:
     while not _scheduler_stop.is_set():
         try:
-            _queue_due_tender_scrapes()
-            _queue_due_saved_custom_jobs()
+            _run_consolidated_scrape_pass()
+            _run_expired_tender_sweep()
         except Exception as exc:
             _append_live_log(f"Scheduler error: {exc}")
         _scheduler_stop.wait(15)
@@ -2908,15 +3048,23 @@ def fetch_selected_tenders(website_id: int, body: FetchSelectedTendersRequest):
     )
 
 
+def _all_organization_ids(conn, website_id: int) -> list:
+    # The one place "every organization for this website" is resolved — used
+    # anywhere a caller means literally all orgs, as opposed to
+    # organizations.is_selected=1 (an unrelated, client-facing watchlist
+    # flag; see PATCH /v1/organizations/{id}) or an explicit org_ids list.
+    return [
+        int(row[0]) for row in conn.execute(
+            "SELECT id FROM organizations WHERE website_id=? ORDER BY id",
+            (website_id,),
+        ).fetchall()
+    ]
+
+
 @app.post("/v1/websites/{website_id}/tenders/fetch-all", response_model=JobStartResponse)
 def fetch_all_tenders(website_id: int):
     with get_db() as conn:
-        org_ids = [
-            int(row[0]) for row in conn.execute(
-                "SELECT id FROM organizations WHERE website_id=? ORDER BY id",
-                (website_id,),
-            ).fetchall()
-        ]
+        org_ids = _all_organization_ids(conn, website_id)
     if not org_ids:
         raise HTTPException(400, "No organizations are available. Refresh organizations first.")
     return _enqueue_job(
@@ -3028,6 +3176,11 @@ def check_status_archived(website_id: int):
 @app.post("/v1/websites/{website_id}/tenders/archive-completed", response_model=JobStartResponse)
 def archive_completed_tenders(website_id: int):
     return _enqueue_job("archive_completed_tenders", {"website_id": website_id})
+
+
+@app.post("/v1/websites/{website_id}/tenders/push-to-cloud", response_model=JobStartResponse)
+def push_to_cloud(website_id: int):
+    return _enqueue_job("push_to_cloud", {"website_id": website_id})
 
 
 @app.get("/v1/jobs/{job_id}")
@@ -5168,6 +5321,35 @@ def delete_saved_custom_job(saved_job_id: int, owner: str, _auth: None = Depends
     return {"ok": True}
 
 
+@app.post("/admin/custom-jobs/renumber")
+def renumber_saved_custom_jobs(_auth: None = Depends(require_admin_key)):
+    """Reassign saved_custom_jobs.id to a sequential 1..N range (in current id
+    order) and reset the id sequence, so newly created jobs keep getting low
+    ids instead of drifting upward after rows are deleted."""
+    with get_db() as conn:
+        old_ids = [int(row[0]) for row in conn.execute("SELECT id FROM saved_custom_jobs ORDER BY id").fetchall()]
+        if old_ids == list(range(1, len(old_ids) + 1)):
+            return {"ok": True, "renumbered": 0}
+        # Shift to a temp range first so intermediate ids can never collide with
+        # either an old id still awaiting its turn or an already-assigned new id.
+        offset = max(old_ids, default=0) + len(old_ids) + 1000
+        for old_id in old_ids:
+            conn.execute("UPDATE saved_custom_jobs SET id=? WHERE id=?", (old_id + offset, old_id))
+        for new_id, old_id in enumerate(old_ids, start=1):
+            conn.execute("UPDATE saved_custom_jobs SET id=? WHERE id=?", (new_id, old_id + offset))
+        if db_compat.using_postgres():
+            conn.execute(
+                "SELECT setval(pg_get_serial_sequence('saved_custom_jobs', 'id'), ?, true)",
+                (len(old_ids),),
+            )
+        elif conn.execute(
+            "UPDATE sqlite_sequence SET seq=? WHERE name='saved_custom_jobs'", (len(old_ids),)
+        ).rowcount == 0:
+            conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('saved_custom_jobs', ?)", (len(old_ids),))
+        conn.commit()
+    return {"ok": True, "renumbered": len(old_ids)}
+
+
 def _admin_provider_payload() -> dict:
     return admin_providers.active_providers()
 
@@ -5222,6 +5404,7 @@ _JOB_KIND_BY_ACTION = {
     "check_status": "fetch",
     "check_status_archived": "fetch",
     "archive_completed_tenders": "fetch",
+    "push_to_cloud": "download",
     "download_tenders": "download",
     "refresh_and_download_tenders": "download",
     "download_tender_results": "download",
@@ -5366,6 +5549,84 @@ def admin_providers_endpoint(_auth: None = Depends(require_admin_key)):
     return _admin_provider_payload()
 
 
+@app.post("/admin/push-to-cloud", response_model=JobStartResponse)
+def admin_push_to_cloud(_auth: None = Depends(require_admin_key)):
+    return _enqueue_job("push_to_cloud", {})
+
+
+def _public_client_user(row: Any, activity_count: int = 0) -> dict[str, Any]:
+    data = dict(row)
+    return {
+        "id": int(data["id"]),
+        "email": str(data.get("email") or ""),
+        "display_name": str(data.get("display_name") or ""),
+        "status": str(data.get("status") or "active"),
+        "created_at": data.get("created_at"),
+        "last_login_at": data.get("last_login_at"),
+        "last_seen_at": data.get("last_seen_at"),
+        "activity_count": activity_count,
+    }
+
+
+@app.get("/admin/users")
+def admin_list_users(_auth: None = Depends(require_admin_key)):
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT u.id,u.email,u.display_name,u.status,u.created_at,u.last_login_at,u.last_seen_at,"
+            "(SELECT COUNT(*) FROM client_activity_log a WHERE a.user_id=u.id) AS activity_count "
+            "FROM client_users u ORDER BY u.created_at DESC"
+        ).fetchall()
+    return {"items": [_public_client_user(row, int(dict(row).get("activity_count") or 0)) for row in rows]}
+
+
+@app.get("/admin/users/{user_id}")
+def admin_get_user(user_id: int, _auth: None = Depends(require_admin_key)):
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id,email,display_name,status,created_at,last_login_at,last_seen_at "
+            "FROM client_users WHERE id=?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "User not found.")
+        activity_rows = conn.execute(
+            "SELECT route,tender_id,created_at FROM client_activity_log "
+            "WHERE user_id=? ORDER BY created_at DESC LIMIT 100",
+            (user_id,),
+        ).fetchall()
+    user = _public_client_user(row, len(activity_rows))
+    user["recent_activity"] = [dict(item) for item in activity_rows]
+    return user
+
+
+@app.post("/admin/users/{user_id}/suspend")
+def admin_suspend_user(user_id: int, _auth: None = Depends(require_admin_key)):
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM client_users WHERE id=?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "User not found.")
+        conn.execute("UPDATE client_users SET status='suspended' WHERE id=?", (user_id,))
+        # Revoke every active token immediately so suspension takes effect on
+        # the client's very next request rather than at its next login.
+        conn.execute(
+            "UPDATE client_tokens SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+            (time.time(), user_id),
+        )
+        conn.commit()
+    return {"ok": True, "status": "suspended"}
+
+
+@app.post("/admin/users/{user_id}/reactivate")
+def admin_reactivate_user(user_id: int, _auth: None = Depends(require_admin_key)):
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM client_users WHERE id=?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "User not found.")
+        conn.execute("UPDATE client_users SET status='active' WHERE id=?", (user_id,))
+        conn.commit()
+    return {"ok": True, "status": "active"}
+
+
 _PROCESS_START_TIME = time.time()
 
 
@@ -5375,6 +5636,7 @@ def admin_health(_auth: None = Depends(require_admin_key)):
         **admin_providers.active_compute_provider().health(),
         "uptimeSeconds": int(time.time() - _PROCESS_START_TIME),
         "providers": _admin_provider_payload(),
+        "cloudPushConfigured": bool(os.getenv("CLOUD_PUSH_DATABASE_URL", "").strip()),
     }
 
 
@@ -5740,7 +6002,7 @@ def admin_server_action(action: str, _auth: None = Depends(require_admin_key)):
 def health():
     durable_storage = not storage_runtime.is_cloud_runtime() or bool(
         admin_providers.drive_storage and admin_providers.drive_storage.using_drive_storage()
-    )
+    ) or storage_runtime.using_persistent_local_storage()
     payload = {
         "status": "ok" if durable_storage else "degraded",
         "version": core.APP_VERSION,
@@ -5755,6 +6017,9 @@ def health():
     if not security.is_cloud_environment():
         payload["db"] = core.DB_FILE
         payload["instance_token"] = os.getenv("BIDMANAGER_INSTANCE_TOKEN", "")
+        payload["scraperReady"] = bool(core.SCRAPER_AVAILABLE)
+        if not core.SCRAPER_AVAILABLE:
+            payload["scraperError"] = core.SCRAPER_IMPORT_ERROR
     return payload
 
 

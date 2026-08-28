@@ -9,7 +9,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "desktop:dev": "concurrently -k \"vite --host 127.0.0.1 --port 5180 --strictPort\" \"wait-on http-get://127.0.0.1:5180 && cross-env ELECTRON_DEV=1 ELECTRON_RENDERER_URL=http://127.0.0.1:5180 electron .\"",
+    "desktop:dev": "concurrently -k \"vite --host localhost --port 3000 --strictPort\" \"wait-on http-get://localhost:3000 && cross-env ELECTRON_DEV=1 ELECTRON_RENDERER_URL=http://localhost:3000 electron .\"",
     "desktop:dist": "npm run build && electron-builder --win nsis"
   },
   "dependencies": {

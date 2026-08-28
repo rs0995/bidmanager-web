@@ -10,6 +10,7 @@ Output:
 """
 
 import os
+from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
 base_dir = os.path.dirname(os.path.abspath(SPEC))
@@ -115,14 +116,21 @@ a = Analysis(
         # --- multipart ---
         'multipart',
         'python_multipart',
-    ],
+        # --- scraper / tender downloads ---
+        'requests',
+        'bs4',
+        'PIL',
+        'PIL.Image',
+        'google.generativeai',
+        'webdriver_manager',
+        'webdriver_manager.firefox',
+    ] + collect_submodules('selenium'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Exclude heavy optional deps that app_core lazy-loads
-        'selenium', 'bs4', 'PIL', 'google.generativeai',
-        'webdriver_manager', 'fitz',
+        # Exclude optional PDF support (not needed for tender downloads)
+        'fitz',
         # Exclude test frameworks
         'pytest', 'unittest',
     ],

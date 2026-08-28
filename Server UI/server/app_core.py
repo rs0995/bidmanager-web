@@ -52,6 +52,7 @@ NoSuchElementException = None
 GeckoDriverManager = None
 SCRAPER_AVAILABLE = False
 SCRAPER_IMPORT_ERROR = ""
+SCRAPER_IMPORT_TRACEBACK = ""
 _SCRAPER_IMPORT_ATTEMPTED = False
 
 # --- CONFIGURATION ---
@@ -273,7 +274,7 @@ def ensure_scraper_dependencies():
     global webdriver, FirefoxService, FirefoxOptions, FirefoxWebDriver, By, WebDriverWait, Select, EC
     global ChromeService, ChromeOptions, ChromeWebDriver
     global TimeoutException, WebDriverException, StaleElementReferenceException, NoSuchElementException
-    global GeckoDriverManager, SCRAPER_AVAILABLE, SCRAPER_IMPORT_ERROR, _SCRAPER_IMPORT_ATTEMPTED
+    global GeckoDriverManager, SCRAPER_AVAILABLE, SCRAPER_IMPORT_ERROR, SCRAPER_IMPORT_TRACEBACK, _SCRAPER_IMPORT_ATTEMPTED
     if SCRAPER_AVAILABLE:
         return True
     if _SCRAPER_IMPORT_ATTEMPTED and not SCRAPER_AVAILABLE:
@@ -303,9 +304,12 @@ def ensure_scraper_dependencies():
         _NoSuchElementException = getattr(_exc_mod, "NoSuchElementException")
         _GeckoDriverManager = getattr(importlib.import_module("webdriver_manager.firefox"), "GeckoDriverManager")
     except Exception as e:
-        SCRAPER_IMPORT_ERROR = str(e)
+        import traceback as _traceback
+        SCRAPER_IMPORT_ERROR = f"{e.__class__.__name__}: {e}"
+        SCRAPER_IMPORT_TRACEBACK = _traceback.format_exc()
         SCRAPER_AVAILABLE = False
-        print(f"Scraper dependencies missing: {e}")
+        print(f"Scraper dependencies missing: {SCRAPER_IMPORT_ERROR}")
+        print(SCRAPER_IMPORT_TRACEBACK)
         return False
     requests = _requests
     BeautifulSoup = _BeautifulSoup
@@ -329,7 +333,14 @@ def ensure_scraper_dependencies():
     GeckoDriverManager = _GeckoDriverManager
     SCRAPER_AVAILABLE = True
     SCRAPER_IMPORT_ERROR = ""
+    SCRAPER_IMPORT_TRACEBACK = ""
     return True
+
+
+def scraper_dependency_message():
+    """User-facing reason a scraper job cannot run, including the real import error."""
+    detail = SCRAPER_IMPORT_ERROR or "unknown import error"
+    return f"Scraper dependencies unavailable: {detail}"
 
 def _normalize_db_file(raw):
     txt = str(raw or "").strip()
@@ -1044,6 +1055,9 @@ def _init_db_schema(conn):
         ("last_update_checked_at", "REAL"),
         ("last_download_error", "TEXT"),
         ("scrape_count", "INTEGER DEFAULT 0"),
+        ("prebid_count", "INTEGER DEFAULT 0"),
+        ("corrigendum_count", "INTEGER DEFAULT 0"),
+        ("pushed_to_cloud_at", "REAL"),
     ]
     for col, ddl in tender_tracking_migrations:
         try:
@@ -1095,6 +1109,18 @@ def _init_db_schema(conn):
         "WHERE normalized_tender_id IS NOT NULL AND TRIM(normalized_tender_id)!=''"
     )
     c.execute("CREATE INDEX IF NOT EXISTS idx_tenders_next_scrape ON tenders(scrape_enabled, next_scrape_at)")
+    org_migrations = [
+        ("scrape_enabled", "INTEGER DEFAULT 0"),
+        ("scrape_interval_minutes", "INTEGER DEFAULT 0"),
+        ("next_scrape_at", "REAL DEFAULT 0"),
+        ("last_scraped_at", "REAL"),
+    ]
+    for col, ddl in org_migrations:
+        try:
+            c.execute(f"ALTER TABLE organizations ADD COLUMN {col} {ddl}")
+        except sqlite3.OperationalError:
+            pass
+    c.execute("CREATE INDEX IF NOT EXISTS idx_organizations_next_scrape ON organizations(scrape_enabled, next_scrape_at)")
     c.execute('''CREATE TABLE IF NOT EXISTS tender_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tender_db_id INTEGER NOT NULL,
@@ -1133,6 +1159,7 @@ def _init_db_schema(conn):
         ("last_error", "TEXT"),
         ("file_size_bytes", "INTEGER"),
         ("seen_count", "INTEGER DEFAULT 0"),
+        ("pushed_to_cloud_at", "REAL"),
     ]
     for col, ddl in download_migrations:
         try:
@@ -1346,6 +1373,43 @@ def _init_db_schema(conn):
     )''')
     c.execute("CREATE INDEX IF NOT EXISTS idx_auto_archive_runs_ts ON auto_archive_runs(run_at_utc)")
 
+    c.execute('''CREATE TABLE IF NOT EXISTS client_users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        display_name TEXT DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at REAL NOT NULL,
+        last_login_at REAL,
+        last_seen_at REAL
+    )''')
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_client_users_email ON client_users(LOWER(email))")
+    c.execute('''CREATE TABLE IF NOT EXISTS client_tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        token_hash TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        revoked_at REAL,
+        FOREIGN KEY(user_id) REFERENCES client_users(id)
+    )''')
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_client_tokens_hash ON client_tokens(token_hash)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_client_tokens_user ON client_tokens(user_id)")
+    c.execute('''CREATE TABLE IF NOT EXISTS client_activity_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        route TEXT NOT NULL,
+        tender_id INTEGER,
+        created_at REAL NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES client_users(id)
+    )''')
+    c.execute("CREATE INDEX IF NOT EXISTS idx_client_activity_user_created ON client_activity_log(user_id, created_at)")
+    c.execute('''CREATE TABLE IF NOT EXISTS client_user_sync (
+        user_id INTEGER PRIMARY KEY,
+        data_json TEXT NOT NULL DEFAULT '{}',
+        updated_at REAL NOT NULL DEFAULT 0,
+        FOREIGN KEY(user_id) REFERENCES client_users(id)
+    )''')
+
     conn.commit()
 
 
@@ -1484,7 +1548,7 @@ class ScraperBackend:
     def safe_request(url):
         """Performs a request with automatic session refreshing if stale."""
         if not ensure_scraper_dependencies():
-            log_to_gui("Scraper dependencies are missing. Install requirements and rebuild.")
+            log_to_gui(scraper_dependency_message())
             return None
         attempts = setting_int("retry_attempts", 3, minimum=1, maximum=10)
         backoff = setting_int("retry_backoff_s", 20, minimum=0, maximum=300)
@@ -1833,6 +1897,7 @@ class ScraperBackend:
             ("last_error", "TEXT"),
             ("file_size_bytes", "INTEGER"),
             ("seen_count", "INTEGER DEFAULT 0"),
+            ("pushed_to_cloud_at", "REAL"),
         ]
         for col, ddl in download_migrations:
             try:
@@ -1897,8 +1962,11 @@ class ScraperBackend:
     def log_downloaded_file(
         tender_id, file_name, file_type="document", source_url=None, local_path=None,
         content_sha256=None, download_status="complete", last_error=None, file_size_bytes=None,
+        conn=None,
     ):
-        conn = sqlite3.connect(DB_FILE)
+        owns_conn = conn is None
+        if owns_conn:
+            conn = sqlite3.connect(DB_FILE)
         canonical_id = ScraperBackend.canonical_tender_id(tender_id)
         tender_row = conn.execute(
             "SELECT id FROM tenders WHERE normalized_tender_id=? ORDER BY id DESC LIMIT 1",
@@ -1958,7 +2026,8 @@ class ScraperBackend:
             )
             ledger_id = int(cur.lastrowid)
         conn.commit()
-        conn.close()
+        if owns_conn:
+            conn.close()
         return ledger_id
 
     @staticmethod
@@ -2081,7 +2150,7 @@ class ScraperBackend:
     @staticmethod
     def fetch_organisations_logic(website_id):
         if not ensure_scraper_dependencies():
-            log_to_gui("Scraper dependencies are missing. Install requirements and rebuild.")
+            log_to_gui(scraper_dependency_message())
             return False
         websites = ScraperBackend.get_websites()
         if website_id not in websites: return
@@ -2185,6 +2254,29 @@ class ScraperBackend:
                         if val:
                             return val
         return None
+
+    @staticmethod
+    def _count_document_table_rows(soup, table_id):
+        table = soup.find('table', id=table_id)
+        if not table:
+            return 0
+        count = 0
+        for tr in table.find_all('tr'):
+            cell = tr.find('td')
+            if cell and cell.get_text(strip=True).isdigit():
+                count += 1
+        return count
+
+    @staticmethod
+    def extract_prebid_corrigendum_counts(soup):
+        # None means "couldn't check this cycle" (detail page fetch failed) —
+        # distinct from a confirmed 0 (page loaded, table just isn't there).
+        if soup is None:
+            return None, None
+        return (
+            ScraperBackend._count_document_table_rows(soup, 'preBidTable'),
+            ScraperBackend._count_document_table_rows(soup, 'corrigendumDocumenttable'),
+        )
 
     @staticmethod
     def normalize_tender_id(raw_text):
@@ -2338,7 +2430,8 @@ class ScraperBackend:
     def tender_snapshot(tender_row):
         (
             website_id, org_chain, tender_id, title, tender_value, emd, closing_date, opening_date,
-            tender_url, location, tender_category, pre_bid_meeting_date, published_date, work_description
+            tender_url, location, tender_category, pre_bid_meeting_date, published_date, work_description,
+            *_rest
         ) = tender_row
         return {
             "website_id": int(website_id),
@@ -2402,6 +2495,29 @@ class ScraperBackend:
         return True
 
     @staticmethod
+    def set_org_scrape_schedule(org_id, interval_minutes, enabled=True):
+        interval = max(0, int(interval_minutes or 0))
+        active = bool(enabled and interval > 0)
+        now_epoch = time.time()
+        conn = sqlite3.connect(DB_FILE)
+        row = conn.execute(
+            "SELECT last_scraped_at FROM organizations WHERE id=?",
+            (int(org_id),),
+        ).fetchone()
+        if not row:
+            conn.close()
+            return False
+        last_scraped_at = float(row[0] or 0)
+        next_scrape_at = max(now_epoch, last_scraped_at + interval * 60) if active else 0
+        conn.execute(
+            "UPDATE organizations SET scrape_interval_minutes=?, scrape_enabled=?, next_scrape_at=? WHERE id=?",
+            (interval, 1 if active else 0, next_scrape_at, int(org_id)),
+        )
+        conn.commit()
+        conn.close()
+        return True
+
+    @staticmethod
     def tender_scrape_due(tender_db_id, now_epoch=None, force=False):
         conn = sqlite3.connect(DB_FILE)
         row = conn.execute(
@@ -2424,8 +2540,11 @@ class ScraperBackend:
     def upsert_tender_row(conn, tender_row):
         (
             website_id, org_chain, tender_id, title, tender_value, emd, closing_date, opening_date,
-            tender_url, location, tender_category, pre_bid_meeting_date, published_date, work_description
+            tender_url, location, tender_category, pre_bid_meeting_date, published_date, work_description,
+            *_rest
         ) = tender_row
+        prebid_count = _rest[0] if len(_rest) > 0 else None
+        corrigendum_count = _rest[1] if len(_rest) > 1 else None
         now_epoch = time.time()
         norm_url = ScraperBackend.normalize_tender_url(tender_url)
         normalized_tender_id = ScraperBackend.canonical_tender_id(tender_id)
@@ -2497,6 +2616,14 @@ class ScraperBackend:
                     1 if changed else 0, now_epoch, next_scrape_at, row_id
                 )
             )
+            # Counts aren't part of the change-hash snapshot above, so persist them
+            # separately; COALESCE keeps the existing value when this cycle didn't
+            # produce a fresh read (e.g. the detail-page fetch failed).
+            c.execute(
+                "UPDATE tenders SET prebid_count=COALESCE(?,prebid_count), "
+                "corrigendum_count=COALESCE(?,corrigendum_count) WHERE id=?",
+                (prebid_count, corrigendum_count, row_id),
+            )
             if changed:
                 ScraperBackend._record_tender_history(
                     conn, row_id, tender_key, now_epoch, content_hash,
@@ -2511,13 +2638,16 @@ class ScraperBackend:
                    (website_id, org_chain, tender_id, title, tender_value, emd, closing_date, opening_date,
                     tender_url, location, tender_category, pre_bid_meeting_date, published_date, work_description,
                     status, is_archived, normalized_tender_url, normalized_tender_id, tender_key, content_hash,
-                    first_seen_at, last_seen_at, last_scraped_at, last_changed_at, scrape_count)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+                    first_seen_at, last_seen_at, last_scraped_at, last_changed_at, scrape_count,
+                    prebid_count, corrigendum_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
                 (
                     website_id, org_chain, tender_id, title, tender_value, emd, closing_date, opening_date,
                     tender_url, location, tender_category, pre_bid_meeting_date, published_date, work_description,
                     norm_url, normalized_tender_id, tender_key, content_hash,
                     now_epoch, now_epoch, now_epoch, now_epoch,
+                    prebid_count if prebid_count is not None else 0,
+                    corrigendum_count if corrigendum_count is not None else 0,
                 )
             )
             row_id = int(c.lastrowid)
@@ -2583,7 +2713,7 @@ class ScraperBackend:
     @staticmethod
     def fetch_tenders_logic(website_id, org_ids=None):
         if not ensure_scraper_dependencies():
-            log_to_gui("Scraper dependencies are missing. Install requirements and rebuild.")
+            log_to_gui(scraper_dependency_message())
             return
         ids = []
         if org_ids:
@@ -2596,27 +2726,32 @@ class ScraperBackend:
         if ids:
             placeholders = ",".join("?" for _ in ids)
             c.execute(
-                f"SELECT name, tenders_url FROM organizations WHERE website_id=? AND id IN ({placeholders})",
+                f"SELECT id, name, tenders_url FROM organizations WHERE website_id=? AND id IN ({placeholders})",
                 (website_id, *ids),
             )
         else:
-            c.execute("SELECT name, tenders_url FROM organizations WHERE website_id=? AND is_selected=1", (website_id,))
+            c.execute("SELECT id, name, tenders_url FROM organizations WHERE website_id=? AND is_selected=1", (website_id,))
         selected_orgs = c.fetchall()
-        conn.close()
 
         if not selected_orgs:
             log_to_gui("No organizations selected. Please select organizations first.")
+            conn.close()
             return
 
         scraped_org_seen_ids = {}
         failed_orgs = set()
 
-        for org_name, url in selected_orgs:
+        # One connection is reused for the whole job (page saves, org schedule
+        # updates, final dedupe/archive) instead of reconnecting per page/org —
+        # each reconnect is a fresh network round trip when DATABASE_URL points at
+        # Postgres, which otherwise dominates scrape wall-clock time.
+        try:
+          for org_id, org_name, url in selected_orgs:
             log_to_gui(f"Scraping tenders for: {org_name}")
             current_url = url
             org_seen_ids = set()
             org_scrape_ok = False
-            
+
             while current_url:
                 try:
                     res = ScraperBackend.safe_request(current_url)
@@ -2720,6 +2855,7 @@ class ScraperBackend:
                                 except: pass
                                 if not published or str(published).strip().upper() in {"N/A", "NA", "-"}:
                                     published = published_date or "N/A"
+                                prebid_count, corrigendum_count = ScraperBackend.extract_prebid_corrigendum_counts(d_soup)
 
                                 title_text = ScraperBackend.derive_tender_title(listing_title_text, d_soup)
                                 t_id = ScraperBackend.derive_tender_id(listing_title_text, d_soup, full_link)
@@ -2730,12 +2866,11 @@ class ScraperBackend:
                                 
                                 tenders_to_save.append((
                                     website_id, org_name, t_id, title_text, val, emd, closing_date, opening_date,
-                                    full_link, loc, cat, prebid, published, work_desc
+                                    full_link, loc, cat, prebid, published, work_desc, prebid_count, corrigendum_count
                                 ))
 
                     # Save batch
                     if tenders_to_save:
-                        conn = sqlite3.connect(DB_FILE)
                         inserted_count = 0
                         updated_count = 0
                         unchanged_count = 0
@@ -2752,7 +2887,6 @@ class ScraperBackend:
                                 log_to_gui(f"Upsert failed for tender '{t[2]}': {e}")
                         removed = ScraperBackend.dedupe_tenders_for_website(conn, website_id)
                         conn.commit()
-                        conn.close()
                         log_to_gui(
                             f"Saved page: inserted={inserted_count}, updated={updated_count}, "
                             f"unchanged={unchanged_count}, deduped={removed}"
@@ -2770,10 +2904,24 @@ class ScraperBackend:
                     break
             if org_scrape_ok:
                 scraped_org_seen_ids[org_name] = org_seen_ids
+                try:
+                    org_row = conn.execute(
+                        "SELECT COALESCE(scrape_enabled,0),COALESCE(scrape_interval_minutes,0) "
+                        "FROM organizations WHERE id=?",
+                        (org_id,),
+                    ).fetchone()
+                    if org_row and int(org_row[0]) == 1 and int(org_row[1]) > 0:
+                        now_epoch = time.time()
+                        conn.execute(
+                            "UPDATE organizations SET next_scrape_at=?, last_scraped_at=? WHERE id=?",
+                            (now_epoch + int(org_row[1]) * 60, now_epoch, org_id),
+                        )
+                        conn.commit()
+                except Exception as e:
+                    log_to_gui(f"  Could not advance scrape schedule for org {org_name}: {e}")
             else:
                 failed_orgs.add(org_name)
-        try:
-            conn = sqlite3.connect(DB_FILE)
+          try:
             removed = ScraperBackend.dedupe_tenders_for_website(conn, website_id)
             archived_missing = 0
             for org_name, seen_ids in scraped_org_seen_ids.items():
@@ -2785,7 +2933,6 @@ class ScraperBackend:
                     (time.time(), website_id, org_name),
                 )
             conn.commit()
-            conn.close()
             if removed:
                 log_to_gui(f"Post-scrape dedupe removed {removed} duplicate rows.")
             if archived_missing:
@@ -2796,10 +2943,12 @@ class ScraperBackend:
             )
             if failed_orgs:
                 log_to_gui(f"Skipped stale-archive for failed org scrape(s): {', '.join(sorted(failed_orgs))}")
-        except Exception as e:
+          except Exception as e:
             log_to_gui(f"Post-scrape dedupe error: {e}")
-        log_to_gui("Tender fetching complete.")
-        return True
+          log_to_gui("Tender fetching complete.")
+          return True
+        finally:
+            conn.close()
 
     @staticmethod
     def archive_missing_tenders_for_org(conn, website_id, org_name, seen_tender_ids):
@@ -3133,7 +3282,7 @@ class ScraperBackend:
     @staticmethod
     def check_tender_status_logic(website_id, archived_only=False):
         if not ensure_scraper_dependencies():
-            log_to_gui("Scraper dependencies are missing. Install requirements and rebuild.")
+            log_to_gui(scraper_dependency_message())
             return 0
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -3224,7 +3373,7 @@ class ScraperBackend:
     @staticmethod
     def download_tender_results_logic(website_id):
         if not ensure_scraper_dependencies():
-            log_to_gui("Scraper dependencies are missing. Install requirements and rebuild.")
+            log_to_gui(scraper_dependency_message())
             return
         storage_runtime.require_durable_cloud_storage()
         conn = sqlite3.connect(DB_FILE)
@@ -3316,7 +3465,7 @@ class ScraperBackend:
     @staticmethod
     def refresh_tender_details_logic(website_id, target_db_ids):
         if not ensure_scraper_dependencies():
-            log_to_gui("Scraper dependencies are missing. Install requirements and rebuild.")
+            log_to_gui(scraper_dependency_message())
             return False
         ids = []
         if target_db_ids:
@@ -3373,6 +3522,11 @@ class ScraperBackend:
                         value = ScraperBackend.get_detail_by_label(d_soup, labels, allow_contains=allow_contains)
                         if value:
                             updates[column] = value
+                    prebid_count, corrigendum_count = ScraperBackend.extract_prebid_corrigendum_counts(d_soup)
+                    if prebid_count is not None:
+                        updates["prebid_count"] = prebid_count
+                    if corrigendum_count is not None:
+                        updates["corrigendum_count"] = corrigendum_count
                     if not updates:
                         log_to_gui(f"  No fields found on the tender page for id {db_id}; nothing updated.")
                         continue
@@ -3398,7 +3552,7 @@ class ScraperBackend:
     @staticmethod
     def download_tenders_logic(website_id, target_db_ids=None, forced_mode=None, include_all=False):
         if not ensure_scraper_dependencies():
-            log_to_gui("Scraper dependencies are missing. Install requirements and rebuild.")
+            log_to_gui(scraper_dependency_message())
             return
         storage_runtime.require_durable_cloud_storage()
         ScraperBackend.ensure_download_tables()
@@ -3698,7 +3852,7 @@ class ScraperBackend:
     @staticmethod
     def download_docs_for_tender_to_folder(source_tender_id, destination_folder):
         if not ensure_scraper_dependencies():
-            log_to_gui("Scraper dependencies are missing. Install requirements and rebuild.")
+            log_to_gui(scraper_dependency_message())
             return False
         tender_id = str(source_tender_id or "").strip()
         dest = str(destination_folder or "").strip()
@@ -3756,7 +3910,7 @@ class ScraperBackend:
     @staticmethod
     def download_updates_for_tender_to_folder(source_tender_id, destination_folder):
         if not ensure_scraper_dependencies():
-            log_to_gui("Scraper dependencies are missing. Install requirements and rebuild.")
+            log_to_gui(scraper_dependency_message())
             return False
         tender_id = str(source_tender_id or "").strip()
         dest = str(destination_folder or "").strip()
@@ -3840,16 +3994,9 @@ class ScraperBackend:
 
     @staticmethod
     def archive_completed_tenders_logic(website_id):
-        completed = ("AOC", "Concluded", "Cancelled", "Withdrawn", "Terminated")
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        placeholders = ",".join("?" for _ in completed)
-        c.execute(
-            f"UPDATE tenders SET is_archived=1 WHERE website_id=? AND status IN ({placeholders})",
-            (website_id, *completed)
-        )
-        changed_by_status = int(c.rowcount or 0)
-        now_dt = datetime.datetime.now()
+        grace_cutoff = datetime.datetime.now() - datetime.timedelta(hours=24)
         overdue_ids = []
         rows = c.execute(
             "SELECT id, closing_date FROM tenders WHERE website_id=? AND COALESCE(is_archived,0)=0",
@@ -3857,19 +4004,107 @@ class ScraperBackend:
         ).fetchall()
         for tid, closing_raw in rows:
             closing_dt = ScraperBackend.parse_closing_datetime(closing_raw)
-            if closing_dt and closing_dt < now_dt:
+            if closing_dt and closing_dt < grace_cutoff:
                 overdue_ids.append(tid)
-        changed_by_due = 0
+        changed = 0
         if overdue_ids:
             c.executemany("UPDATE tenders SET is_archived=1 WHERE id=?", [(tid,) for tid in overdue_ids])
-            changed_by_due = int(c.rowcount or 0)
-        changed = changed_by_status + changed_by_due
+            changed = int(c.rowcount or 0)
         conn.commit()
         conn.close()
-        log_to_gui(
-            f"Archived {changed} tenders (status-based={changed_by_status}, overdue={changed_by_due})."
-        )
+        log_to_gui(f"Archived {changed} tenders (24h+ past closing_date).")
         return changed
+
+    @staticmethod
+    def push_local_data_to_cloud(website_id=None):
+        if db_compat.using_postgres():
+            raise RuntimeError("This server is already writing directly to Postgres; there is no local data to push.")
+        cloud_db_url = os.getenv("CLOUD_PUSH_DATABASE_URL", "").strip()
+        if not cloud_db_url:
+            raise RuntimeError("CLOUD_PUSH_DATABASE_URL is not configured.")
+        try:
+            import psycopg
+        except Exception as exc:
+            raise RuntimeError("Cloud push requires psycopg. Install backend requirements.") from exc
+
+        cloud_conn = db_compat.PostgresConnection(psycopg.connect(cloud_db_url))
+        local_conn = sqlite3.connect(DB_FILE)
+        now_epoch = time.time()
+        tenders_pushed = 0
+        files_pushed = 0
+        errors = 0
+        try:
+            where_sql = "WHERE (pushed_to_cloud_at IS NULL OR last_changed_at > pushed_to_cloud_at)"
+            params = []
+            if website_id:
+                where_sql += " AND website_id=?"
+                params.append(int(website_id))
+            tender_rows = local_conn.execute(
+                "SELECT id, website_id, org_chain, tender_id, title, tender_value, emd, closing_date, "
+                "opening_date, tender_url, location, tender_category, pre_bid_meeting_date, published_date, "
+                "work_description, prebid_count, corrigendum_count, normalized_tender_id "
+                f"FROM tenders {where_sql}",
+                tuple(params),
+            ).fetchall()
+            for row in tender_rows:
+                local_id = int(row[0])
+                tender_row = tuple(row[1:17])
+                try:
+                    ScraperBackend.upsert_tender_row(cloud_conn, tender_row)
+                    local_conn.execute("UPDATE tenders SET pushed_to_cloud_at=? WHERE id=?", (now_epoch, local_id))
+                    local_conn.commit()
+                    tenders_pushed += 1
+                except Exception as exc:
+                    errors += 1
+                    log_to_gui(f"Cloud push: failed to push tender {row[17]}: {exc}")
+
+            drive_folder_id = os.getenv("CLOUD_PUSH_DRIVE_FOLDER_ID", "").strip()
+            file_where_sql = (
+                "WHERE df.pushed_to_cloud_at IS NULL AND COALESCE(df.local_path,'')!='' "
+                "AND df.local_path NOT LIKE 'gdrive://%'"
+            )
+            file_params = []
+            if website_id:
+                file_where_sql += " AND t.website_id=?"
+                file_params.append(int(website_id))
+            file_rows = local_conn.execute(
+                "SELECT df.id, df.tender_id, df.file_name, df.file_type, df.local_path, df.source_url, "
+                "df.content_sha256, df.download_status, df.file_size_bytes "
+                "FROM downloaded_files df JOIN tenders t ON t.id=df.tender_db_id "
+                f"{file_where_sql}",
+                tuple(file_params),
+            ).fetchall()
+            for (
+                file_db_id, tender_id, file_name, file_type, local_path, source_url,
+                content_sha256, download_status, file_size_bytes,
+            ) in file_rows:
+                if not os.path.isfile(local_path or ""):
+                    continue
+                try:
+                    if drive_folder_id:
+                        reference = storage_runtime.drive_storage.upload_file(
+                            local_path, tender_id, file_type or "document", folder_id=drive_folder_id
+                        )
+                    else:
+                        reference = local_path
+                    ScraperBackend.log_downloaded_file(
+                        tender_id, file_name, file_type=file_type or "document", source_url=source_url,
+                        local_path=reference, content_sha256=content_sha256,
+                        download_status=download_status or "complete", file_size_bytes=file_size_bytes,
+                        conn=cloud_conn,
+                    )
+                    local_conn.execute("UPDATE downloaded_files SET pushed_to_cloud_at=? WHERE id=?", (now_epoch, file_db_id))
+                    local_conn.commit()
+                    files_pushed += 1
+                except Exception as exc:
+                    errors += 1
+                    log_to_gui(f"Cloud push: failed to push file {file_name}: {exc}")
+        finally:
+            local_conn.close()
+            cloud_conn.close()
+
+        log_to_gui(f"Cloud push complete: {tenders_pushed} tenders, {files_pushed} files, {errors} errors.")
+        return {"tenders_pushed": tenders_pushed, "files_pushed": files_pushed, "errors": errors}
 
     @staticmethod
     def get_download_log_rows(website_id=None, limit=500):

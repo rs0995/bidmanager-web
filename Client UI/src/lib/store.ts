@@ -22,11 +22,6 @@ interface AppState {
     columnOrder: string[];
     columnWidths: Record<string, number>;
   };
-  serverStorageTable: {
-    hiddenColumns: string[];
-    columnOrder: string[];
-    columnWidths: Record<string, number>;
-  };
   tendersView: {
     tab: 'orgs' | 'active' | 'archived' | 'logs';
     selectedWebsiteId: number | 'ALL';
@@ -51,9 +46,6 @@ interface AppState {
   setProjectsHiddenColumns: (hiddenColumns: string[]) => void;
   setProjectsColumnOrder: (columnOrder: string[]) => void;
   setProjectsColumnWidth: (columnKey: string, width: number) => void;
-  setServerStorageHiddenColumns: (hiddenColumns: string[]) => void;
-  setServerStorageColumnOrder: (columnOrder: string[]) => void;
-  setServerStorageColumnWidth: (columnKey: string, width: number) => void;
   setTendersViewTab: (tab: AppState['tendersView']['tab']) => void;
   setTendersViewWebsite: (selectedWebsiteId: number | 'ALL') => void;
   setHighlightedOrgIdsForWebsite: (websiteId: number, orgIds: number[]) => void;
@@ -73,11 +65,6 @@ export const useAppStore = create<AppState>()(
         columnOrder: [],
       },
       projectsTable: {
-        hiddenColumns: [],
-        columnOrder: [],
-        columnWidths: {},
-      },
-      serverStorageTable: {
         hiddenColumns: [],
         columnOrder: [],
         columnWidths: {},
@@ -124,20 +111,6 @@ export const useAppStore = create<AppState>()(
             ...s.projectsTable,
             columnWidths: {
               ...s.projectsTable.columnWidths,
-              [String(columnKey)]: Number(width),
-            },
-          },
-        })),
-      setServerStorageHiddenColumns: (hiddenColumns) =>
-        set((s) => ({ serverStorageTable: { ...s.serverStorageTable, hiddenColumns } })),
-      setServerStorageColumnOrder: (columnOrder) =>
-        set((s) => ({ serverStorageTable: { ...s.serverStorageTable, columnOrder } })),
-      setServerStorageColumnWidth: (columnKey, width) =>
-        set((s) => ({
-          serverStorageTable: {
-            ...s.serverStorageTable,
-            columnWidths: {
-              ...s.serverStorageTable.columnWidths,
               [String(columnKey)]: Number(width),
             },
           },
@@ -189,9 +162,9 @@ export const useAppStore = create<AppState>()(
       partialize: (state) => ({
         theme: state.theme,
         sidebarCollapsed: state.sidebarCollapsed,
+        notifications: state.notifications,
         tendersTable: state.tendersTable,
         projectsTable: state.projectsTable,
-        serverStorageTable: state.serverStorageTable,
         tendersView: state.tendersView,
       }),
     }

@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import os
 import hashlib
+import json
+import re
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,21 +66,248 @@ def _get_db():
         conn.close()
 
 
-def _configured_client_key() -> str:
-    # CLIENT_API_KEY is the public contract.  The older name is accepted during
-    # rollout so an existing Cloud Run revision does not become unreachable.
-    return (
-        os.getenv("CLIENT_API_KEY", "").strip()
-        or os.getenv("BIDMANAGER_CLIENT_API_KEY", "").strip()
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _normalize_email(email: str) -> str:
+    value = str(email or "").strip().lower()
+    if not _EMAIL_RE.match(value):
+        raise HTTPException(400, "Enter a valid email address.")
+    return value
+
+
+def _extract_tender_id(request: Request) -> Optional[int]:
+    raw = request.path_params.get("tender_db_id")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def require_client_user(request: Request, x_client_key: Optional[str] = Header(default=None)) -> int:
+    token = str(x_client_key or "").strip()
+    if not token:
+        raise HTTPException(401, "Missing client token. Sign in again.")
+    token_hash = security.hash_client_token(token)
+    now = time.time()
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT u.id AS id, u.status AS status FROM client_tokens t "
+            "JOIN client_users u ON u.id=t.user_id "
+            "WHERE t.token_hash=? AND t.revoked_at IS NULL",
+            (token_hash,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(401, "Invalid or expired client token. Sign in again.")
+        data = dict(row)
+        if str(data.get("status") or "") != "active":
+            raise HTTPException(
+                403, detail={"reason": "suspended", "message": "This account has been suspended."}
+            )
+        user_id = int(data["id"])
+        conn.execute("UPDATE client_users SET last_seen_at=? WHERE id=?", (now, user_id))
+        conn.execute(
+            "INSERT INTO client_activity_log (user_id, route, tender_id, created_at) VALUES (?,?,?,?)",
+            (user_id, request.url.path, _extract_tender_id(request), now),
+        )
+        conn.commit()
+    return user_id
+
+
+def _issue_token(conn: Any, user_id: int) -> str:
+    token = security.new_client_token()
+    conn.execute(
+        "INSERT INTO client_tokens (user_id, token_hash, created_at) VALUES (?,?,?)",
+        (user_id, security.hash_client_token(token), time.time()),
     )
+    return token
 
 
-def require_client_key(x_client_key: Optional[str] = Header(default=None)) -> None:
-    expected = _configured_client_key()
-    if not expected:
-        raise HTTPException(503, "CLIENT_API_KEY is not configured on the backend.")
-    if not security.secure_equals(x_client_key, expected):
-        raise HTTPException(401, "Invalid or missing client key.")
+class RegisterRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=200)
+    display_name: str = Field("", max_length=200)
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class AuthResponse(BaseModel):
+    user_id: int
+    email: str
+    display_name: str
+    token: str
+
+
+@router.post("/auth/register", response_model=AuthResponse)
+def client_register(body: RegisterRequest) -> dict[str, Any]:
+    email = _normalize_email(body.email)
+    display_name = body.display_name.strip()
+    now = time.time()
+    with _get_db() as conn:
+        existing = conn.execute("SELECT id FROM client_users WHERE LOWER(email)=?", (email,)).fetchone()
+        if existing:
+            raise HTTPException(409, "An account with this email already exists.")
+        password_hash = security.hash_password(body.password)
+        cur = conn.execute(
+            "INSERT INTO client_users "
+            "(email, password_hash, display_name, status, created_at, last_login_at, last_seen_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (email, password_hash, display_name, "active", now, now, now),
+        )
+        user_id = int(cur.lastrowid)
+        token = _issue_token(conn, user_id)
+        conn.commit()
+    return {"user_id": user_id, "email": email, "display_name": display_name, "token": token}
+
+
+@router.post("/auth/login", response_model=AuthResponse)
+def client_login(body: LoginRequest) -> dict[str, Any]:
+    email = _normalize_email(body.email)
+    now = time.time()
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT id,password_hash,display_name,status FROM client_users WHERE LOWER(email)=?",
+            (email,),
+        ).fetchone()
+        data = dict(row) if row else {}
+        if not row or not security.verify_password(body.password, str(data.get("password_hash") or "")):
+            raise HTTPException(401, "Incorrect email or password.")
+        if str(data.get("status") or "") != "active":
+            raise HTTPException(
+                403, detail={"reason": "suspended", "message": "This account has been suspended."}
+            )
+        user_id = int(data["id"])
+        token = _issue_token(conn, user_id)
+        conn.execute(
+            "UPDATE client_users SET last_login_at=?, last_seen_at=? WHERE id=?", (now, now, user_id)
+        )
+        conn.commit()
+    return {
+        "user_id": user_id,
+        "email": email,
+        "display_name": str(data.get("display_name") or ""),
+        "token": token,
+    }
+
+
+@router.post("/auth/logout")
+def client_logout(x_client_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    token = str(x_client_key or "").strip()
+    if token:
+        with _get_db() as conn:
+            conn.execute(
+                "UPDATE client_tokens SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
+                (time.time(), security.hash_client_token(token)),
+            )
+            conn.commit()
+    return {"ok": True}
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(min_length=8, max_length=200)
+
+
+@router.post("/auth/change-password")
+def client_change_password(
+    body: ChangePasswordRequest, user_id: int = Depends(require_client_user)
+) -> dict[str, Any]:
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT password_hash FROM client_users WHERE id=?", (user_id,)
+        ).fetchone()
+        data = dict(row) if row else {}
+        if not row or not security.verify_password(body.current_password, str(data.get("password_hash") or "")):
+            raise HTTPException(401, "Current password is incorrect.")
+        new_hash = security.hash_password(body.new_password)
+        conn.execute("UPDATE client_users SET password_hash=? WHERE id=?", (new_hash, user_id))
+        conn.commit()
+    return {"ok": True}
+
+
+MAX_SYNC_PAYLOAD_BYTES = 2 * 1024 * 1024
+
+
+class SyncPushRequest(BaseModel):
+    data: dict[str, Any]
+
+
+def _coerce_id_set(values: Any) -> set[int]:
+    result = set()
+    for value in values or []:
+        try:
+            result.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _apply_bookmark_schedules(data: dict[str, Any]) -> None:
+    # Side effect of a sync push: the first time any user bookmarks a tender
+    # or organization, auto-enable a recurring 3-hour scrape for it — but
+    # never override a schedule that's already on (admin- or previously
+    # bookmark-configured), and never disable one on unbookmark.
+    tender_ids = _coerce_id_set(data.get("bookmarks"))
+    org_ids = _coerce_id_set(data.get("bookmarkedOrgIds"))
+    if not tender_ids and not org_ids:
+        return
+    with _get_db() as conn:
+        pending_tenders = set()
+        if tender_ids:
+            placeholders = ",".join("?" for _ in tender_ids)
+            rows = conn.execute(
+                f"SELECT id FROM tenders WHERE id IN ({placeholders}) AND COALESCE(scrape_enabled,0)=0",
+                tuple(tender_ids),
+            ).fetchall()
+            pending_tenders = {int(row[0]) for row in rows}
+        pending_orgs = set()
+        if org_ids:
+            placeholders = ",".join("?" for _ in org_ids)
+            rows = conn.execute(
+                f"SELECT id FROM organizations WHERE id IN ({placeholders}) AND COALESCE(scrape_enabled,0)=0",
+                tuple(org_ids),
+            ).fetchall()
+            pending_orgs = {int(row[0]) for row in rows}
+    for tender_id in pending_tenders:
+        core.ScraperBackend.set_tender_scrape_schedule(tender_id, 180, True)
+    for org_id in pending_orgs:
+        core.ScraperBackend.set_org_scrape_schedule(org_id, 180, True)
+
+
+@router.get("/sync", dependencies=[Depends(require_client_user)])
+def client_pull_sync(user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT data_json, updated_at FROM client_user_sync WHERE user_id=?", (user_id,)
+        ).fetchone()
+    if not row:
+        return {"data": {}, "updated_at": 0}
+    data = dict(row)
+    try:
+        parsed = json.loads(data.get("data_json") or "{}")
+    except (TypeError, ValueError):
+        parsed = {}
+    return {"data": parsed, "updated_at": float(data.get("updated_at") or 0)}
+
+
+@router.put("/sync", dependencies=[Depends(require_client_user)])
+def client_push_sync(body: SyncPushRequest, user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    payload = json.dumps(body.data, ensure_ascii=False)
+    if len(payload.encode("utf-8")) > MAX_SYNC_PAYLOAD_BYTES:
+        raise HTTPException(413, "Sync payload is too large.")
+    now = time.time()
+    with _get_db() as conn:
+        conn.execute(
+            "INSERT INTO client_user_sync (user_id, data_json, updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET data_json=excluded.data_json, updated_at=excluded.updated_at",
+            (user_id, payload, now),
+        )
+        conn.commit()
+    _apply_bookmark_schedules(body.data)
+    return {"ok": True, "updated_at": now}
 
 
 def _page_meta(page: int, page_size: int, total: int) -> dict[str, int]:
@@ -95,6 +325,7 @@ def _public_tender(row: Any) -> dict[str, Any]:
         "id": int(data["id"]),
         "website_id": int(data["website_id"]),
         "website_name": str(data.get("website_name") or ""),
+        "website_url": str(data.get("website_url") or ""),
         "organization": str(data.get("org_chain") or ""),
         "tender_id": str(data.get("tender_id") or ""),
         "title": str(data.get("title") or ""),
@@ -111,6 +342,8 @@ def _public_tender(row: Any) -> dict[str, Any]:
         "is_archived": bool(data.get("is_archived")),
         "has_documents": int(data.get("document_count") or 0) > 0,
         "document_count": int(data.get("document_count") or 0),
+        "prebid_count": int(data.get("prebid_count") or 0),
+        "corrigendum_count": int(data.get("corrigendum_count") or 0),
         "tender_url": str(data.get("tender_url") or ""),
     }
 
@@ -118,6 +351,7 @@ def _public_tender(row: Any) -> dict[str, Any]:
 def _tender_select() -> str:
     return (
         "SELECT t.id,t.website_id,COALESCE(w.name,'') AS website_name,"
+        "COALESCE(w.url,'') AS website_url,"
         "COALESCE(t.org_chain,'') AS org_chain,COALESCE(t.tender_id,'') AS tender_id,"
         "COALESCE(t.title,'') AS title,COALESCE(t.work_description,'') AS work_description,"
         "COALESCE(t.tender_value,'') AS tender_value,COALESCE(t.emd,'') AS emd,"
@@ -127,6 +361,8 @@ def _tender_select() -> str:
         "COALESCE(t.location,'') AS location,COALESCE(t.tender_category,'') AS tender_category,"
         "COALESCE(t.status,'') AS status,COALESCE(t.is_archived,0) AS is_archived,"
         "COALESCE(t.tender_url,'') AS tender_url,"
+        "COALESCE(t.prebid_count,0) AS prebid_count,"
+        "COALESCE(t.corrigendum_count,0) AS corrigendum_count,"
         "(SELECT COUNT(*) FROM downloaded_files d WHERE "
         "d.tender_db_id=t.id OR (d.tender_db_id IS NULL AND "
         "UPPER(TRIM(COALESCE(d.tender_id,'')))=UPPER(TRIM(COALESCE(t.tender_id,''))))) "
@@ -209,7 +445,7 @@ class DownloadRequest(BaseModel):
     document_id: int = Field(gt=0)
 
 
-@router.get("/health", dependencies=[Depends(require_client_key)])
+@router.get("/health", dependencies=[Depends(require_client_user)])
 def client_health() -> dict[str, Any]:
     try:
         with _get_db() as conn:
@@ -219,7 +455,7 @@ def client_health() -> dict[str, Any]:
     return {"status": "ok", "version": core.APP_VERSION, "read_only": True}
 
 
-@router.get("/tenders", dependencies=[Depends(require_client_key)])
+@router.get("/tenders", dependencies=[Depends(require_client_user)])
 def client_tenders(
     q: str = Query("", max_length=200),
     website_id: Optional[int] = Query(None, gt=0),
@@ -242,7 +478,7 @@ def client_tenders(
     )
 
 
-@router.get("/search", dependencies=[Depends(require_client_key)])
+@router.get("/search", dependencies=[Depends(require_client_user)])
 def client_search(
     q: str = Query(..., min_length=1, max_length=200),
     website_id: Optional[int] = Query(None, gt=0),
@@ -258,6 +494,51 @@ def client_search(
     )
 
 
+def _public_organization(row: Any) -> dict[str, Any]:
+    data = dict(row)
+    return {
+        "id": int(data["id"]),
+        "website_id": int(data["website_id"]),
+        "website_name": str(data.get("website_name") or ""),
+        "name": str(data.get("name") or ""),
+        "tenders_url": str(data.get("tenders_url") or ""),
+        "tender_count": int(data.get("tender_count") or 0),
+        "scrape_enabled": bool(data.get("scrape_enabled")),
+    }
+
+
+@router.get("/organizations", dependencies=[Depends(require_client_user)])
+def client_organizations(
+    q: str = Query("", max_length=200),
+    website_id: Optional[int] = Query(None, gt=0),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+) -> dict[str, Any]:
+    conditions: list[str] = []
+    params: list[Any] = []
+    if q:
+        conditions.append("LOWER(COALESCE(o.name,'')) LIKE ?")
+        params.append(f"%{q.strip().lower()}%")
+    if website_id is not None:
+        conditions.append("o.website_id=?")
+        params.append(website_id)
+    where_sql = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+    select_sql = (
+        "SELECT o.id,o.website_id,COALESCE(w.name,'') AS website_name,"
+        "COALESCE(o.name,'') AS name,COALESCE(o.tenders_url,'') AS tenders_url,"
+        "COALESCE(o.tender_count,0) AS tender_count,COALESCE(o.scrape_enabled,0) AS scrape_enabled "
+        "FROM organizations o LEFT JOIN websites w ON w.id=o.website_id"
+    )
+    offset = (page - 1) * page_size
+    with _get_db() as conn:
+        total = int(conn.execute(f"SELECT COUNT(*) FROM organizations o{where_sql}", params).fetchone()[0])
+        rows = conn.execute(
+            f"{select_sql}{where_sql} ORDER BY o.name ASC,o.id ASC LIMIT ? OFFSET ?",
+            [*params, page_size, offset],
+        ).fetchall()
+    return {"items": [_public_organization(row) for row in rows], **_page_meta(page, page_size, total)}
+
+
 def _find_tender(conn: Any, tender_db_id: int) -> Any:
     row = conn.execute(f"{_tender_select()} WHERE t.id=?", (tender_db_id,)).fetchone()
     if not row:
@@ -265,7 +546,7 @@ def _find_tender(conn: Any, tender_db_id: int) -> Any:
     return row
 
 
-@router.get("/tenders/{tender_db_id}", dependencies=[Depends(require_client_key)])
+@router.get("/tenders/{tender_db_id}", dependencies=[Depends(require_client_user)])
 def client_tender_detail(tender_db_id: int) -> dict[str, Any]:
     with _get_db() as conn:
         return _public_tender(_find_tender(conn, tender_db_id))
@@ -296,7 +577,7 @@ def _public_document(row: Any) -> dict[str, Any]:
     }
 
 
-@router.get("/tenders/{tender_db_id}/documents", dependencies=[Depends(require_client_key)])
+@router.get("/tenders/{tender_db_id}/documents", dependencies=[Depends(require_client_user)])
 def client_tender_documents(
     tender_db_id: int,
     file_type: str = Query("", max_length=100),
@@ -366,7 +647,7 @@ def _document_token_subject(document_id: int, kind: str, reference: str) -> str:
     return f"client-document:{document_id}:{kind}:{digest}"
 
 
-@router.post("/tenders/{tender_db_id}/download-request", dependencies=[Depends(require_client_key)])
+@router.post("/tenders/{tender_db_id}/download-request", dependencies=[Depends(require_client_user)])
 def client_download_request(tender_db_id: int, body: DownloadRequest, request: Request) -> dict[str, Any]:
     with _get_db() as conn:
         data = dict(_document_row(conn, tender_db_id, body.document_id))
@@ -379,6 +660,57 @@ def client_download_request(tender_db_id: int, body: DownloadRequest, request: R
         "document_id": body.document_id,
         "url": f"{base_url}/client/documents/{body.document_id}/download?token={quote(token)}",
         "expires_at": datetime.fromtimestamp(expires, timezone.utc).isoformat(),
+    }
+
+
+class RequestDownloadResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+@router.post(
+    "/tenders/{tender_db_id}/request-download",
+    dependencies=[Depends(require_client_user)],
+    response_model=RequestDownloadResponse,
+)
+def client_request_tender_download(tender_db_id: int) -> dict[str, Any]:
+    # A tender may not have any downloaded_files rows yet, so there is nothing
+    # for /download-request to sign. This kicks off the same scrape+download
+    # job the admin console uses for a single tender (api_server._enqueue_job,
+    # action "download_single_tender") and the client polls its status below.
+    with _get_db() as conn:
+        _find_tender(conn, tender_db_id)
+    import api_server  # deferred: api_server imports this module at load time
+
+    result = api_server._enqueue_job(
+        "download_single_tender",
+        {"tender_db_id": tender_db_id, "mode": "full", "source": "client"},
+    )
+    return {"job_id": str(result["job_id"]), "status": str(result["status"])}
+
+
+@router.get("/tenders/{tender_db_id}/download-status", dependencies=[Depends(require_client_user)])
+def client_tender_download_status(
+    tender_db_id: int, job_id: str = Query(..., min_length=1)
+) -> dict[str, Any]:
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT status,error,payload_json FROM background_jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Download job not found.")
+    data = dict(row)
+    try:
+        payload = json.loads(data.get("payload_json") or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    if int(payload.get("tender_db_id") or 0) != tender_db_id:
+        raise HTTPException(404, "Download job not found.")
+    status = str(data.get("status") or "")
+    return {
+        "job_id": job_id,
+        "status": status,
+        "error": str(data.get("error") or "") if status == "failed" else "",
     }
 
 
@@ -415,7 +747,7 @@ def client_document_download(document_id: int, token: str = Query(..., min_lengt
     )
 
 
-@router.get("/stats", dependencies=[Depends(require_client_key)])
+@router.get("/stats", dependencies=[Depends(require_client_user)])
 def client_stats() -> dict[str, Any]:
     with _get_db() as conn:
         row = conn.execute(

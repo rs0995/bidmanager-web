@@ -26,6 +26,12 @@ def is_cloud_runtime() -> bool:
     }
 
 
+def using_persistent_local_storage() -> bool:
+    """Return true when cloud documents live on a mounted durable volume."""
+    provider = str(os.getenv("BIDMANAGER_STORAGE_PROVIDER", "") or "").strip().lower()
+    return provider in {"local-volume", "oci-block-volume"}
+
+
 def runtime_root() -> str:
     configured = str(os.getenv("BIDMANAGER_RUNTIME_DIR", "") or "").strip()
     root = Path(configured) if configured else Path(tempfile.gettempdir()) / "bidmanager"
@@ -88,10 +94,14 @@ def active_document_storage():
 
 
 def require_durable_cloud_storage() -> None:
-    if is_cloud_runtime() and not drive_storage.using_drive_storage():
+    if (
+        is_cloud_runtime()
+        and not drive_storage.using_drive_storage()
+        and not using_persistent_local_storage()
+    ):
         raise RuntimeError(
-            "Cloud mode requires GOOGLE_DRIVE_FOLDER_ID so downloaded files are not lost "
-            "when the Cloud Run instance stops."
+            "Cloud mode requires Google Drive or BIDMANAGER_STORAGE_PROVIDER="
+            "oci-block-volume/local-volume with BIDMANAGER_RUNTIME_DIR mounted persistently."
         )
 
 
@@ -110,7 +120,7 @@ def require_durable_cloud_database() -> None:
 
 
 def cleanup_scratch_folder(path: str) -> None:
-    if not is_cloud_runtime():
+    if not is_cloud_runtime() or using_persistent_local_storage():
         return
     target = Path(str(path or "")).resolve()
     root = Path(runtime_root()).resolve()

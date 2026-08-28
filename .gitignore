@@ -4,9 +4,13 @@ frontend/dist/
 frontend/tsconfig.tsbuildinfo
 dist/
 dist-electron/
+dist-electron-admin/
+Server UI/build/
+Server UI/installer/
 dist_new/
 build/
 build_backend/
+build_backend_admin/
 build_backend_debug/
 dist_debug/
 __pycache__/

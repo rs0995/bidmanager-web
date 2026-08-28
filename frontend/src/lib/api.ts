@@ -285,7 +285,7 @@ export const api = {
     request(`/v1/tenders/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   archiveTender: (id: number) =>
     request(`/v1/tenders/${id}/archive`, { method: 'POST' }),
-  downloadSingleTender: async (id: number, mode: 'full' | 'update' = 'full') => {
+  downloadSingleTender: async (id: number, mode: 'auto' | 'full' | 'update' = 'auto') => {
     const errors: string[] = [];
     const attempts: Array<() => Promise<JobResponse>> = [
       () =>

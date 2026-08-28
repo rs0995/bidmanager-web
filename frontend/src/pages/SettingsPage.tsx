@@ -74,14 +74,24 @@ export default function SettingsPage(){
       const test=await desktop.testBackendUrl(d.backend_url||'');
       if(!test?.ok)throw new Error(test?.message||'Cloud backend connection failed');
     }
-    await api.updateSettings(d);
+    let desktopConfigSaved=false;
     if(desktop?.setBackendConfig){
       const result=await desktop.setBackendConfig({mode:d.backend_mode||'local',url:d.backend_url||''});
       if(!result?.ok)throw new Error(result?.message||'Failed to save desktop backend mode');
+      desktopConfigSaved=true;
     }
-  },onSuccess:()=>{qc.invalidateQueries({queryKey:['settings']});window.dispatchEvent(new Event('bm-settings-updated'));setPathStatus('Saved. Restart BidManager to apply backend mode.');setSaved(true);setTimeout(()=>setSaved(false),2000)},onError:(error)=>setPathStatus(`Save failed: ${error instanceof Error?error.message:String(error)}`)});
+    try{
+      await api.updateSettings(d);
+      return {desktopOnly:false};
+    }catch(error){
+      if(desktopConfigSaved){
+        return {desktopOnly:true,message:error instanceof Error?error.message:String(error)};
+      }
+      throw error;
+    }
+  },onSuccess:(result)=>{qc.invalidateQueries({queryKey:['settings']});window.dispatchEvent(new Event('bm-settings-updated'));setPathStatus(result?.desktopOnly?'Backend mode saved. Restart BidManager to apply it. Other settings could not sync because the current API is offline.':'Saved. Restart BidManager to apply backend mode.');setSaved(true);setTimeout(()=>setSaved(false),2000)},onError:(error)=>setPathStatus(`Save failed: ${error instanceof Error?error.message:String(error)}`)});
   const handleSave=()=>saveMut.mutate(form);
-  const uf=(k:string,v:string)=>setForm(f=>({...f,[k]:v}));
+  const uf=(k:string,v:string)=>setForm(f=>({...f,[k]:v,...(k==='backend_mode'&&v==='local'?{backend_url:''}:{})}));
 
   const browseForPath = async (key: string, label: string, file = false) => {
     try {
@@ -115,6 +125,8 @@ export default function SettingsPage(){
         setPathStatus(`Connected. Version: ${h.version||'unknown'}`);
         return;
       }
+      const runtimeBase=new URLSearchParams(window.location.search).get('apiBase')||'';
+      if(runtimeBase){setPathStatus('Save Local mode and restart BidManager to start the local backend.');return}
       const h=await api.health();setPathStatus(`Connected. Version: ${h.version}`)
     }
     catch(e:any){setPathStatus(`Failed: ${e.message}`)}

@@ -42,6 +42,16 @@ def main() -> None:
     from api_server import app
     import uvicorn
 
+    try:
+        import app_core
+        if app_core.ensure_scraper_dependencies():
+            _log_startup("Scraper dependencies OK")
+        else:
+            _log_startup(f"Scraper dependencies FAILED: {app_core.SCRAPER_IMPORT_ERROR}")
+            _log_startup(getattr(app_core, "SCRAPER_IMPORT_TRACEBACK", "") or "")
+    except Exception:
+        _log_startup("Scraper dependency probe raised:\n" + traceback.format_exc())
+
     port = int(os.environ.get("BIDMANAGER_PORT", "8090"))
     _log_startup(f"Backend imports complete; listening on port {port}")
     uvicorn.run(

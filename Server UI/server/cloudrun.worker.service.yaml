@@ -34,6 +34,15 @@ spec:
               value: "2"
             - name: GOOGLE_DRIVE_FOLDER_ID
               value: REPLACE_WITH_DRIVE_FOLDER_ID
+            # The runtime service account (default compute SA unless serviceAccountName
+            # is set below) MUST have roles/secretmanager.secretAccessor on this secret:
+            #   gcloud secrets add-iam-policy-binding bidmanager-database-url \
+            #     --member=serviceAccount:<runtime-service-account> \
+            #     --role=roles/secretmanager.secretAccessor
+            # Without that grant, `gcloud run deploy` fails at "Creating Revision" with
+            # a permission-denied error. Do NOT work around that by hardcoding DATABASE_URL
+            # as a literal env var instead — that silently defeats future secret rotations
+            # (this happened once already and cost a full migration's worth of debugging).
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

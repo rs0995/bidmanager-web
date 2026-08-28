@@ -705,7 +705,7 @@ export default function TendersPage() {
     setTendersViewTab('logs');
     for (const tender of targets) {
       try {
-        const { job_id } = await api.downloadSingleTender(tender.id, 'full');
+        const { job_id } = await api.downloadSingleTender(tender.id, 'auto');
         let done = false;
         let seen = 0;
         while (!done) {
@@ -1403,9 +1403,9 @@ export default function TendersPage() {
                               <div className="flex gap-1">
                                 {tab === 'active' && (
                                   <>
-                                    <Tooltip text="Download Full">
+                                    <Tooltip text="Download">
                                       <button
-                                        onClick={(e) => { e.stopPropagation(); runSingleJob(() => api.downloadSingleTender(t.id, 'full')); }}
+                                        onClick={(e) => { e.stopPropagation(); runSingleJob(() => api.downloadSingleTender(t.id, 'auto')); }}
                                         disabled={jobRunning}
                                         className="rounded p-1 text-[var(--text-muted)] hover:text-[var(--text)] disabled:opacity-50"
                                       >

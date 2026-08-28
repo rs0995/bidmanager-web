@@ -2,6 +2,8 @@
 
 import os
 
+from PyInstaller.utils.hooks import collect_all, copy_metadata
+
 block_cipher = None
 base_dir = os.path.dirname(os.path.abspath(SPEC))          # Server UI/server
 console_ui_dist = os.path.join(os.path.dirname(base_dir), "dist")  # Server UI/dist
@@ -22,12 +24,53 @@ for f in optional_files:
     if os.path.isfile(f):
         datas.append((f, "."))
 
+# Scraper dependencies ship data files, native extensions, or are namespace
+# packages. collect_all() pulls their submodules/binaries; copy_metadata() keeps
+# their .dist-info so runtime importlib.metadata / entry_points lookups succeed
+# inside the frozen build (bare hiddenimports alone left these out and the
+# lazy scraper import failed at runtime).
+_extra_datas, _extra_binaries, _extra_hidden = [], [], []
+for _pkg in (
+    "selenium",
+    "webdriver_manager",
+    "bs4",
+    "soupsieve",
+    "google.generativeai",
+    "google.ai.generativelanguage",
+    "google.api_core",
+    "grpc",
+    "proto",
+):
+    try:
+        _d, _b, _h = collect_all(_pkg)
+    except Exception:
+        continue
+    _extra_datas += _d
+    _extra_binaries += _b
+    _extra_hidden += _h
+
+for _dist in (
+    "selenium",
+    "webdriver-manager",
+    "beautifulsoup4",
+    "google-generativeai",
+    "google-api-core",
+    "requests",
+):
+    try:
+        _extra_datas += copy_metadata(_dist)
+    except Exception:
+        pass
+
+datas += _extra_datas
+
 a = Analysis(
     ["admin_backend_server.py"],
     pathex=[base_dir],
-    binaries=[],
+    binaries=_extra_binaries,
     datas=datas,
     hiddenimports=[
+        *_extra_hidden,
         "requests",
         "bs4",
         "PIL",

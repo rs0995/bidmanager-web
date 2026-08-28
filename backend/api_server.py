@@ -21,16 +21,17 @@ from datetime import datetime
 from typing import Optional, List
 from contextlib import contextmanager
 
-from fastapi import FastAPI, HTTPException, Query, Depends
+from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from starlette.routing import Route
 from pydantic import BaseModel
 
 # Import your existing backend logic
 # Make sure app_core.py is in the same directory or on PYTHONPATH
 import app_core as core
+import admin_providers
 
 # -- Initialise --
 
@@ -50,14 +51,22 @@ def _cors_origins() -> list[str]:
         "http://localhost:5173",
         "http://localhost:3000",
         "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:4174",
+        "http://127.0.0.1:4174",
         "bidmanager://app",
     ]
 
 
-# Allow configured frontends to call this API.
+# Allow configured frontends to call this API. The regex additionally covers the
+# packaged admin-console desktop app, which loads its local backend from a port
+# randomized per install/launch (28000 + pid % 10000) and so can't be pinned to a
+# static entry in allow_origins.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins(),
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -3453,6 +3462,282 @@ def delete_older_storage_files(body: StorageDeleteOlderRequest):
                 continue
 
     return {"deleted_files": deleted_files, "deleted_dirs": deleted_dirs}
+
+
+# -- Admin API --
+
+ADMIN_CONFIG_KEYS = {
+    "schedule_enabled": "false",
+    "scrape_interval_minutes": "60",
+    "max_concurrent_sessions": "1",
+    "page_load_timeout_s": "45",
+    "retry_attempts": "3",
+    "captcha_manual_fallback": "true",
+    "captcha_manual_wait_s": "180",
+    "auto_download_documents": "true",
+    "max_file_size_mb": "80",
+    "read_only_mode": "false",
+    "scheduler_paused": "false",
+    "drain_mode": "false",
+}
+
+
+class AdminConfigPatch(BaseModel):
+    settings: dict
+
+
+class AdminCaptchaAnswer(BaseModel):
+    answer: str = ""
+
+
+class AdminCaptchaSkip(BaseModel):
+    action: str = "requeue"
+
+
+def require_admin_key(
+    request: Request,
+    x_admin_key: Optional[str] = Header(default=None),
+) -> None:
+    expected = os.getenv("ADMIN_API_KEY", "").strip()
+    if not expected:
+        raise HTTPException(503, "ADMIN_API_KEY is not configured on the backend.")
+    query_key = request.query_params.get("admin_key") if request.url.path == "/admin/logs/stream" else ""
+    provided = (x_admin_key or query_key or "").strip()
+    if provided != expected:
+        raise HTTPException(401, "Invalid or missing admin key.")
+
+
+def _admin_provider_payload() -> dict:
+    return admin_providers.active_providers()
+
+
+def _coerce_setting(value: str):
+    text = str(value or "")
+    lower = text.strip().lower()
+    if lower in {"true", "false"}:
+        return lower == "true"
+    if re.fullmatch(r"-?\d+", text.strip()):
+        try:
+            return int(text)
+        except Exception:
+            pass
+    return text
+
+
+def _admin_config_payload() -> dict:
+    settings = {}
+    for key, default in ADMIN_CONFIG_KEYS.items():
+        settings[key] = _coerce_setting(core.ScraperBackend.get_setting(key, default))
+    return {"provider": "custom-api", "settings": settings, "providers": _admin_provider_payload()}
+
+
+def _admin_job_payload(job_id: str, job: dict) -> dict:
+    raw_status = str(job.get("status") or "unknown")
+    status = "done" if raw_status == "completed" else raw_status
+    return {
+        "id": job_id,
+        "status": status,
+        "action": job.get("action", ""),
+        "progress": 100 if status == "done" else 0,
+        "error": job.get("error", ""),
+        "logs": job.get("logs", []),
+        "provider": admin_providers.active_compute_provider().metadata()["provider"],
+    }
+
+
+def _pending_admin_captcha() -> Optional[dict]:
+    pending = get_pending_captcha()
+    if not pending:
+        return None
+    created = float(pending.get("created_at") or time.time())
+    expires = created + _CAPTCHA_TTL_SECONDS
+    image_base64 = pending.get("image_base64", "")
+    return {
+        "id": pending.get("request_id"),
+        "request_id": pending.get("request_id"),
+        "jobId": "",
+        "tenderId": "",
+        "portal": pending.get("context") or "captcha",
+        "image": f"data:image/png;base64,{image_base64}" if image_base64 else "",
+        "image_base64": image_base64,
+        "receivedAt": int(created * 1000),
+        "expiresAt": int(expires * 1000),
+        "reason": "Manual captcha required",
+        "provider": admin_providers.active_compute_provider().metadata()["provider"],
+    }
+
+
+@app.get("/admin/providers")
+def admin_providers_endpoint(_auth: None = Depends(require_admin_key)):
+    return _admin_provider_payload()
+
+
+@app.get("/admin/health")
+def admin_health(_auth: None = Depends(require_admin_key)):
+    return {
+        **admin_providers.active_compute_provider().health(),
+        "providers": _admin_provider_payload(),
+    }
+
+
+@app.get("/admin/metrics")
+def admin_metrics(_auth: None = Depends(require_admin_key)):
+    with _job_lock:
+        jobs = list(_jobs.values())
+    total = len(jobs)
+    failed = len([j for j in jobs if j.get("status") == "failed"])
+    running = len([j for j in jobs if j.get("status") == "running"])
+    queued = len([j for j in jobs if j.get("status") == "queued"])
+    return {
+        "provider": admin_providers.active_compute_provider().metadata()["provider"],
+        "jobsTotal": total,
+        "jobsRunning": running,
+        "jobsQueued": queued,
+        "jobsFailed": failed,
+        "errorRate": round((failed / total) * 100, 2) if total else 0,
+        "checkedAt": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+@app.get("/admin/config")
+def admin_get_config(_auth: None = Depends(require_admin_key)):
+    return _admin_config_payload()
+
+
+@app.put("/admin/config")
+def admin_put_config(body: AdminConfigPatch, _auth: None = Depends(require_admin_key)):
+    for key, value in dict(body.settings or {}).items():
+        if key in ADMIN_CONFIG_KEYS:
+            core.ScraperBackend.set_setting(key, value)
+    return _admin_config_payload()
+
+
+@app.get("/admin/jobs")
+def admin_jobs(
+    status: str = Query("", max_length=40),
+    _auth: None = Depends(require_admin_key),
+):
+    with _job_lock:
+        rows = [_admin_job_payload(job_id, job) for job_id, job in _jobs.items()]
+    wanted = str(status or "").strip().lower()
+    if wanted and wanted != "all":
+        rows = [row for row in rows if str(row.get("status", "")).lower() == wanted]
+    return {"provider": admin_providers.active_compute_provider().metadata()["provider"], "jobs": rows}
+
+
+@app.post("/admin/jobs/{job_id}/cancel")
+def admin_cancel_job(job_id: str, _auth: None = Depends(require_admin_key)):
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.get("status") in {"queued", "running"}:
+        job["status"] = "cancelled"
+        job["error"] = "Cancel requested from admin UI. Running scraper threads may finish current work."
+    return {"ok": True, "job": _admin_job_payload(job_id, job)}
+
+
+@app.post("/admin/jobs/{job_id}/retry")
+def admin_retry_job(job_id: str, _auth: None = Depends(require_admin_key)):
+    if job_id not in _jobs:
+        raise HTTPException(404, "Job not found")
+    raise HTTPException(501, "Retry is not supported for this provider/action yet.")
+
+
+@app.post("/admin/jobs/purge")
+def admin_purge_jobs(_auth: None = Depends(require_admin_key)):
+    removed = 0
+    with _job_lock:
+        for job_id in list(_jobs.keys()):
+            if _jobs[job_id].get("status") in {"completed", "failed", "cancelled"}:
+                del _jobs[job_id]
+                removed += 1
+    return {"ok": True, "removed": removed}
+
+
+@app.get("/admin/logs/live")
+def admin_live_logs(
+    limit: int = Query(400, ge=1, le=5000),
+    since_seq: int = Query(0, ge=0),
+    _auth: None = Depends(require_admin_key),
+):
+    payload = get_live_logs(limit=limit, since_seq=since_seq)
+    return {
+        "provider": admin_providers.active_compute_provider().metadata()["provider"],
+        **payload,
+    }
+
+
+@app.get("/admin/logs/stream")
+def admin_log_stream(_auth: None = Depends(require_admin_key)):
+    def events():
+        next_seq = 0
+        while True:
+            payload = get_live_logs(limit=100, since_seq=next_seq)
+            next_seq = int(payload.get("next_seq") or next_seq)
+            for line in payload.get("lines") or []:
+                yield f"data: {json.dumps({'line': line, 'seq': next_seq})}\n\n"
+            time.sleep(2)
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+
+@app.get("/admin/captchas/pending")
+def admin_pending_captchas(_auth: None = Depends(require_admin_key)):
+    pending = _pending_admin_captcha()
+    return {"provider": admin_providers.active_compute_provider().metadata()["provider"], "captchas": [pending] if pending else []}
+
+
+@app.post("/admin/captchas/{captcha_id}/answer")
+def admin_answer_captcha(captcha_id: str, body: AdminCaptchaAnswer, _auth: None = Depends(require_admin_key)):
+    return submit_captcha(CaptchaSubmitRequest(request_id=captcha_id, text=body.answer))
+
+
+@app.post("/admin/captchas/{captcha_id}/skip")
+def admin_skip_captcha(captcha_id: str, body: AdminCaptchaSkip, _auth: None = Depends(require_admin_key)):
+    action = str(body.action or "requeue").strip().lower()
+    answer = "" if action == "abandon" else "__SKIP__"
+    return submit_captcha(CaptchaSubmitRequest(request_id=captcha_id, text=answer))
+
+
+@app.get("/admin/captchas/stats")
+def admin_captcha_stats(_auth: None = Depends(require_admin_key)):
+    return {
+        "provider": admin_providers.active_compute_provider().metadata()["provider"],
+        "pending": 1 if _pending_admin_captcha() else 0,
+        "manualFallback": _coerce_setting(core.ScraperBackend.get_setting("captcha_manual_fallback", "true")),
+    }
+
+
+@app.get("/admin/db/stats")
+def admin_db_stats(_auth: None = Depends(require_admin_key)):
+    return admin_providers.active_database_provider().stats()
+
+
+@app.get("/admin/storage")
+def admin_storage(prefix: str = Query("", max_length=500), _auth: None = Depends(require_admin_key)):
+    try:
+        return admin_providers.active_storage_provider().list_items(prefix)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/admin/storage/usage")
+def admin_storage_usage(_auth: None = Depends(require_admin_key)):
+    return admin_providers.active_storage_provider().usage()
+
+
+@app.post("/admin/server/{action}")
+def admin_server_action(action: str, _auth: None = Depends(require_admin_key)):
+    normalized = str(action or "").strip().lower()
+    compute = admin_providers.active_compute_provider().metadata()
+    if normalized == "drain":
+        core.ScraperBackend.set_setting("drain_mode", "true")
+        return {"ok": True, "action": normalized, "provider": compute["provider"]}
+    if normalized == "pause-scheduler":
+        current = _coerce_setting(core.ScraperBackend.get_setting("scheduler_paused", "false"))
+        core.ScraperBackend.set_setting("scheduler_paused", "false" if current else "true")
+        return {"ok": True, "action": normalized, "paused": not bool(current), "provider": compute["provider"]}
+    raise HTTPException(501, f"{action} is not supported for provider {compute['provider']} yet.")
 
 
 # -- Health Check --

@@ -269,8 +269,9 @@ def upload_file(
     tender_id: str = "",
     file_type: str = "document",
     prefix: str = "",
+    folder_id: str = "",
 ) -> str:
-    root_folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+    root_folder_id = str(folder_id or "").strip() or os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
     if not root_folder_id:
         raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is not configured.")
 

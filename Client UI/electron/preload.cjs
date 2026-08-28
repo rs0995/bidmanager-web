@@ -10,6 +10,9 @@ contextBridge.exposeInMainWorld("bidmanagerDesktop", {
   deleteFile: (targetPath) => ipcRenderer.invoke("desktop:delete-file", targetPath),
   copyFileToFolder: (payload) => ipcRenderer.invoke("desktop:copy-file-to-folder", payload),
   ensureProjectFolders: (targetPath) => ipcRenderer.invoke("desktop:ensure-project-folders", targetPath),
+  ensureDirectory: (targetPath) => ipcRenderer.invoke("desktop:ensure-directory", targetPath),
   writeJsonFile: (payload) => ipcRenderer.invoke("desktop:write-json-file", payload),
   clientApiRequest: (payload) => ipcRenderer.invoke("desktop:client-api-request", payload),
+  openTender: (payload) => ipcRenderer.invoke("desktop:open-tender", payload),
+  downloadFile: (payload) => ipcRenderer.invoke("desktop:download-file", payload),
 });

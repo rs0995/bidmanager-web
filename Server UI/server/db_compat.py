@@ -10,6 +10,7 @@ ID_TABLES = {
     "checklist_template_item_files",
     "checklist_template_items",
     "checklist_templates",
+    "client_users",
     "downloaded_files",
     "organizations",
     "projects",

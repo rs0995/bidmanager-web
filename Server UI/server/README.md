@@ -6,21 +6,35 @@
 
 ## Client-safe API
 
-All data routes require `x-client-key: <CLIENT_API_KEY>` and return no database paths,
-Drive IDs, storage credentials, scraper controls, configuration, job controls, or mutation
-operations.
+Each Client UI install signs in as its own account (`POST /client/auth/register` /
+`POST /client/auth/login`), gets a per-device token, and sends it as `x-client-key` on
+every subsequent call. All data routes require a valid, non-suspended account and return
+no database paths, Drive IDs, storage credentials, scraper controls, configuration, job
+controls, or mutation operations beyond what's listed below.
 
+- `POST /client/auth/register`, `POST /client/auth/login`, `POST /client/auth/logout`
 - `GET /client/health`
 - `GET /client/tenders`
 - `GET /client/tenders/{id}`
 - `GET /client/tenders/{id}/documents`
 - `GET /client/search`
 - `GET /client/stats`
-- `POST /client/tenders/{id}/download-request`
+- `POST /client/tenders/{id}/download-request` — signs an existing file for download
+- `POST /client/tenders/{id}/request-download` — enqueues the same scrape/download job
+  the admin console uses for a single tender, for tenders with no documents yet
+- `GET /client/tenders/{id}/download-status` — polls the job started above
 
 Listing and search provide server-side pagination, filtering, and whitelisted sorting.
-The download-request route does not run a scraper or write to the database; it creates a
+`download-request` does not run a scraper or write to the database; it creates a
 short-lived signed URL for an existing file and streams it without exposing Drive access.
+`request-download`/`download-status` are the only client routes that trigger real work —
+they reuse the existing durable job queue (`background_jobs`, action
+`download_single_tender`), including its captcha handling.
+
+A suspended account (see Server UI's Users tab) is rejected on its very next call with a
+403 and `{"reason": "suspended"}`, not just at its next sign-in — every active token for
+that account is revoked immediately on suspension. Every authenticated call is logged to
+`client_activity_log` (user, route, tender) for that Users tab to read.
 
 It powers `Server UI/BidManagerControl.jsx` and all other server consumers from one
 maintained implementation.
@@ -127,9 +141,12 @@ unless `GOOGLE_DRIVE_FOLDER_ID` is configured. Public health reports
 `durableStorage: false` and a degraded state when Drive is missing.
 
 The included `Dockerfile` installs Firefox and pre-caches geckodriver during the image
-build. `cloudrun.service.yaml` is a deployment template; replace its image and Drive
-folder placeholders, create the referenced Secret Manager secrets, and deploy it with a
-Cloud Run service account that has access to the Drive root folder.
+build. `cloudrun.api.service.yaml` (request-serving, autoscaled) and
+`cloudrun.worker.service.yaml` (the always-on scheduler/job worker, single instance) are
+the deployment templates; replace their image and Drive folder placeholders, create the
+referenced Secret Manager secrets, and deploy both with a Cloud Run service account that
+has access to the Drive root folder. There is no Render deployment target — Render's
+build never installs a browser, so it cannot run the scraper.
 
 ## SQLite to Neon migration
 
@@ -149,6 +166,37 @@ The migration includes scraper data, projects, templates, settings, durable jobs
 CAPTCHA requests, and scheduler leases. Existing rows are retained on conflict and
 PostgreSQL sequences are advanced after copying. Take a backup of the source SQLite file
 and test against staging before migrating production.
+
+## Running locally: storage modes
+
+This same server can run on a local machine (e.g. via `backend_server.py`) instead of
+Cloud Run. Two modes are available, both driven by the env vars already described above:
+
+- **Direct to cloud** — set `DATABASE_URL`/`POSTGRES_URL` and `GOOGLE_DRIVE_FOLDER_ID`
+  (plus `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON` or `GOOGLE_APPLICATION_CREDENTIALS`) before
+  starting the local process. Scraping and downloading run on this machine, but every
+  write lands directly in the shared Postgres DB and Drive folder, same as Cloud Run.
+- **Fully local** (default) — leave those env vars unset. Scraping/downloading writes to
+  local SQLite and local disk, exactly like today. `GET /admin/health` reports
+  `providers.database.engine` / `providers.storage.provider` so you can see which mode is
+  active.
+
+When running fully local, use **Push to Cloud** (a button in the operator console's
+Connection settings, or `POST /admin/push-to-cloud` / `POST
+/v1/websites/{id}/tenders/push-to-cloud`) to sync locally-scraped tenders and downloaded
+files up to the cloud on demand. This requires a *separate* pair of env vars — kept apart
+from the ones above so a fully-local instance doesn't start writing to the cloud during
+normal scraping, only when you explicitly push:
+
+- `CLOUD_PUSH_DATABASE_URL` — Postgres connection string for the cloud DB.
+- `CLOUD_PUSH_DRIVE_FOLDER_ID` — the cloud Drive folder to upload files into (reuses
+  `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON`/`GOOGLE_APPLICATION_CREDENTIALS` for credentials).
+
+Pushing is incremental: each tender and downloaded file is stamped with
+`pushed_to_cloud_at` once pushed, and a tender is re-pushed only if it changed
+(`last_changed_at`) since its last push. Tenders are matched into the cloud DB by the
+same natural key the scraper itself uses (website + tender ID/URL), not by row ID, so
+pushing never collides with tenders the cloud side scraped independently.
 
 ## Running it
 
@@ -173,10 +221,14 @@ Set these through Cloud Run environment variables and Secret Manager:
 ```text
 BIDMANAGER_ENV=staging|production
 ADMIN_API_KEY=<admin console secret>
-CLIENT_API_KEY=<read-only client API secret>
+BIDMANAGER_CLIENT_API_KEY=<write key for /v1 mutations from a non-loopback caller>
 BIDMANAGER_DOWNLOAD_TOKEN_SECRET=<independent signed-download secret>
 ```
 
-The isolated `/client/*` routes require `x-client-key`. Every state-changing `/v1`
-request, including legacy action-style `GET` routes, requires its existing write key.
-Admin routes require `x-admin-key`; client authentication never accepts `ADMIN_API_KEY`.
+`BIDMANAGER_CLIENT_API_KEY` is unrelated to end-user accounts — it only satisfies
+`_protect_client_mutations`, the guard on state-changing `/v1/*` requests from a
+non-loopback caller (alongside `ADMIN_API_KEY`, which also works there). The isolated
+`/client/*` routes are authenticated per-account instead: `x-client-key` carries the
+per-device token issued by `/client/auth/register` or `/client/auth/login`, not a shared
+secret. Admin routes (including the Users tab's moderation endpoints) require
+`x-admin-key`; client account tokens never satisfy it.

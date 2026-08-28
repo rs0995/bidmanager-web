@@ -1,3 +1,5 @@
+import { DEFAULT_SERVER_URL } from './cloud-config.js';
+
 const DB_NAME = 'bidmanager-client';
 const DB_VERSION = 1;
 const STORE = 'state';
@@ -11,12 +13,21 @@ const initialState = () => ({
   checklist: [],
   templates: [],
   templateItems: [],
+  documents: [],
+  bookmarkedOrgs: [],
+  // {id, website_id, name} rows, refreshed on every syncFromServer() — used
+  // only to resolve a bookmarked org_chain string to the server's numeric
+  // organizations.id when pushing cloud sync data; never rendered directly.
+  organizations: [],
   settings: {
     parent_dir: '',
     project_details_show_tender_info: 'true',
     projects_entry_mode: 'inline',
-    server_url: 'https://bidmanager-backend-426342323597.asia-south1.run.app',
-    client_api_key: '',
+    server_url: DEFAULT_SERVER_URL,
+    auth_token: '',
+    user_email: '',
+    user_id: null,
+    display_name: '',
     last_sync_at: '',
   },
 });

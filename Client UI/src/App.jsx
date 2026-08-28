@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback, Fragment } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  LayoutDashboard, Globe, FolderOpen, FileText, Server, Settings,
+  LayoutDashboard, Globe, FolderOpen, FileText, Settings,
   Bell, Sun, Moon, PanelLeftClose, PanelLeft, X, AlertTriangle,
   Activity, Calendar, Edit3, Save,
   Search, Plus, Eye, EyeOff, Copy, ExternalLink, Trash2,
@@ -10,7 +10,8 @@ import {
   Bookmark, Columns3, FileDown, Star, RefreshCw,
   ChevronDown, Folder, ArrowUp, Wifi, WifiOff, CheckCircle2,
   Paperclip, FolderCog, Link2, BookOpen, Pencil,
-  Palette, RotateCcw, Home, Download, Upload, Rows3, Type, Info,
+  Palette, RotateCcw, Home, Download, Upload, Rows3, Type, Info, Filter,
+  LogOut, LogIn, UserPlus, KeyRound,
 } from 'lucide-react';
 import { api } from './lib/api';
 import { cn, formatINR, formatCrores } from './lib/utils';
@@ -47,7 +48,7 @@ import {
    calls the same `api` used by the operator app.
    ════════════════════════════════════════════════════════════════════════════ */
 
-// Page keys: 'dashboard' | 'tenders' | 'projects' | 'templates' | 'archived_projects' | 'files' | 'settings'
+// Page keys: 'dashboard' | 'tenders' | 'projects' | 'templates' | 'archived_projects' | 'settings'
 
 /* ═══════════════════════════════════════════════════════════════════════════
    CLIENT-SIDE PREFERENCES
@@ -73,7 +74,6 @@ const STARTUP_PAGE_OPTIONS = [
   { value: 'tenders', label: 'Online Tenders' },
   { value: 'projects', label: 'Projects' },
   { value: 'templates', label: 'Templates' },
-  { value: 'files', label: 'Files' },
 ];
 const DEFAULT_CLIENT_PREFS = {
   accent: '',              // '' = follow theme default
@@ -239,7 +239,6 @@ function Sidebar({ active, onNavigate, collapsed, onToggle }) {
   ];
   const bottomItems = [
     { key: 'archived_projects', label: 'Archived Projects', icon: FolderOpen },
-    { key: 'files', label: 'Files', icon: Server },
     { key: 'settings', label: 'Settings', icon: Settings },
   ];
 
@@ -502,22 +501,26 @@ function DashboardPage() {
    no job queue, no CAPTCHA, no live log console)
    ═══════════════════════════════════════════════════════════════════════════ */
 const TENDER_COLUMNS = [
-  { key: 'tender_id', label: 'Tender ID', width: 190 },
+  { key: '_sr', label: 'Sr. No.', width: 60 },
+  { key: 'is_bookmarked', label: 'Bookmark', width: 90 },
+  { key: 'tender_id', label: 'Tender ID / Work Desc', width: 320 },
   { key: 'title', label: 'Title', width: 300 },
-  { key: 'work_description', label: 'Work Desc', width: 300 },
   { key: 'tender_value', label: 'Value', width: 130 },
   { key: 'emd', label: 'EMD', width: 120 },
   { key: 'org_chain', label: 'Org Chain', width: 200 },
   { key: 'published_date', label: 'Published', width: 150 },
   { key: 'closing_date', label: 'Closing Date', width: 170 },
   { key: 'pre_bid_meeting_date', label: 'Pre-Bid', width: 150 },
+  { key: '_prebid_corrigendum', label: 'Prebid/Corrigendum', width: 150 },
   { key: 'location', label: 'Location', width: 180 },
   { key: 'tender_category', label: 'Category', width: 130 },
   { key: 'status', label: 'Status', width: 140 },
-  { key: 'is_bookmarked', label: 'Bookmark', width: 90 },
+  { key: '_download', label: 'Download', width: 170 },
   { key: '_time', label: 'Time Left', width: 110 },
-  { key: '_actions', label: 'Actions', width: 120 },
+  { key: '_actions', label: 'Actions', width: 100 },
 ];
+
+const TENDER_NON_SORTABLE = new Set(['_sr', 'is_bookmarked', '_prebid_corrigendum', '_download', '_time', '_actions']);
 
 const TENDER_TABLE_WIDTH = TENDER_COLUMNS.reduce((total, column) => total + column.width, 0);
 
@@ -552,6 +555,38 @@ function exportCSV(headers, rows, keys, filename) {
   URL.revokeObjectURL(url);
 }
 
+async function openTender(initUrl, tenderUrl) {
+  if (!tenderUrl) return;
+  if (window.bidmanagerDesktop?.openTender) {
+    const result = await window.bidmanagerDesktop.openTender({ initUrl, tenderUrl });
+    if (!result?.ok) alert(result?.message || 'Could not open tender.');
+    return;
+  }
+  // Non-Electron fallback: revisit the portal's home page first (same trick the
+  // scraper uses to recover from a stale session) before navigating to the tender.
+  const win = window.open(initUrl || tenderUrl, '_blank', 'noopener');
+  if (win && initUrl) {
+    setTimeout(() => { try { win.location.href = tenderUrl; } catch (_) { /* cross-origin set is fine */ } }, 1500);
+  }
+}
+
+const TENDERS_FILTER_STATE_KEY = 'bm-client:tenders:filters:v1';
+
+function loadTenderFilterState() {
+  try {
+    const raw = localStorage.getItem(TENDERS_FILTER_STATE_KEY);
+    if (!raw) return { org: '', location: '', category: '' };
+    const parsed = JSON.parse(raw);
+    return {
+      org: String(parsed?.org || ''),
+      location: String(parsed?.location || ''),
+      category: String(parsed?.category || ''),
+    };
+  } catch {
+    return { org: '', location: '', category: '' };
+  }
+}
+
 function TendersPage() {
   const qc = useQueryClient();
   const [tab, setTab] = useState('active'); // 'active' | 'archived'
@@ -560,18 +595,123 @@ function TendersPage() {
   const [sortCol, setSortCol] = useState('closing_date');
   const [sortDir, setSortDir] = useState('asc');
   const [selectedId, setSelectedId] = useState(null);
+  const [showFilters, setShowFilters] = useState(false);
+  const [pendingRequestIds, setPendingRequestIds] = useState(() => new Set());
+  const [filters, setFilters] = useState(loadTenderFilterState);
+
+  // Filter selections are saved locally and re-applied automatically to any
+  // freshly-synced tender data (the filter runs client-side over whatever
+  // `tenders` currently holds), so a sync never clears the user's choices.
+  useEffect(() => {
+    try { localStorage.setItem(TENDERS_FILTER_STATE_KEY, JSON.stringify(filters)); } catch { /* ignore storage failures */ }
+  }, [filters]);
 
   // WIRE: list of tenders visible to the client. Assumes the same
   // api.listTenders(websiteId, opts) shape as the operator app, called
   // across all configured sources rather than filtered by a single website.
   const { data: tenders, isLoading } = useQuery({
     queryKey: ['client-tenders', tab],
-    queryFn: () => api.listTenders(null, { archived: tab === 'archived', limit: 5000 }),
+    // The Bookmarked tab needs both active and archived tenders in one list,
+    // so `archived` is left out of the params entirely for it — listTenders
+    // only applies that filter when the key is present.
+    queryFn: () => api.listTenders(null, tab === 'bookmarked' ? { limit: 5000 } : { archived: tab === 'archived', limit: 5000 }),
   });
 
   const toggleBookmark = useMutation({
-    mutationFn: (t) => api.patchTender(t.id, { is_bookmarked: !t.is_bookmarked }),
+    mutationFn: async (t) => {
+      if (!t.is_bookmarked) {
+        const count = await api.countBookmarkedTenders();
+        if (count >= 10) throw new Error('You can bookmark at most 10 tenders. Remove one before adding another.');
+      }
+      return api.patchTender(t.id, { is_bookmarked: !t.is_bookmarked });
+    },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['client-tenders', tab] }),
+    onError: (err) => alert(err instanceof Error ? err.message : String(err)),
+  });
+
+  const { data: bookmarkedOrgs } = useQuery({ queryKey: ['bookmarked-orgs'], queryFn: api.listBookmarkedOrgs });
+  const bookmarkedOrgsSet = useMemo(() => new Set(bookmarkedOrgs || []), [bookmarkedOrgs]);
+  const toggleOrgBookmark = useMutation({
+    mutationFn: (org) => api.toggleOrgBookmark(org),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['bookmarked-orgs'] }),
+  });
+  const [orgToAdd, setOrgToAdd] = useState('');
+
+  // Fetches every document available for a tender and downloads them all in
+  // one click — same signed-URL request per file as a single-document
+  // download, just looped over the whole set instead of one file at a time.
+  const downloadTenderDocuments = useMutation({
+    mutationFn: async (t) => {
+      const docsPage = await api.listTenderDocuments(t.id, { page_size: 200 });
+      const items = docsPage?.items || [];
+      if (!items.length) return { tenderId: t.id, count: 0 };
+      for (const doc of items) {
+        const link = await api.requestDocumentDownload(t.id, doc.id);
+        if (link?.url) {
+          const a = document.createElement('a');
+          a.href = link.url;
+          a.download = doc.name || '';
+          a.rel = 'noopener noreferrer';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+        }
+      }
+      await api.patchTender(t.id, { client_downloaded: true, has_documents: true, document_count: items.length });
+      return { tenderId: t.id, count: items.length };
+    },
+    onSuccess: (result) => {
+      qc.invalidateQueries({ queryKey: ['client-tenders', tab] });
+      if (!result.count) alert('No documents are available yet for this tender.');
+    },
+    onError: (err) => alert(`Download failed: ${err?.message || String(err)}`),
+  });
+
+  // Polls a queued "request-download" job until it completes or fails, then
+  // clears the tender's pending state. On completion the tenders list is
+  // re-fetched — has_documents/document_count are computed live from
+  // downloaded_files server-side, so the row flips to "Download" on its own.
+  const pollTenderRequestStatus = (tender, jobId, attempt = 0) => {
+    const MAX_ATTEMPTS = 40;
+    const clearPending = () => setPendingRequestIds((prev) => {
+      const next = new Set(prev);
+      next.delete(tender.id);
+      return next;
+    });
+    api.getTenderDownloadStatus(tender.id, jobId).then(({ status, error }) => {
+      if (status === 'completed') {
+        clearPending();
+        qc.invalidateQueries({ queryKey: ['client-tenders', tab] });
+        return;
+      }
+      if (status === 'failed') {
+        clearPending();
+        alert(`Request failed: ${error || 'Download failed.'}`);
+        return;
+      }
+      if (attempt >= MAX_ATTEMPTS) {
+        clearPending();
+        alert('Request timed out waiting for the server.');
+        return;
+      }
+      setTimeout(() => pollTenderRequestStatus(tender, jobId, attempt + 1), 15000);
+    }).catch((err) => {
+      clearPending();
+      alert(`Request failed: ${err?.message || String(err)}`);
+    });
+  };
+
+  // "Request" — queues the real server-side scrape/download job for a tender
+  // that has no documents yet (see Server UI/server/client_api.py
+  // request-download, which enqueues the same download_single_tender job the
+  // admin console uses).
+  const requestTenderJob = useMutation({
+    mutationFn: (t) => api.requestTenderDownloadJob(t.id),
+    onSuccess: ({ job_id }, t) => {
+      setPendingRequestIds((prev) => new Set(prev).add(t.id));
+      pollTenderRequestStatus(t, job_id);
+    },
+    onError: (err) => alert(`Request failed: ${err?.message || String(err)}`),
   });
 
   // Converts a tender into a project — a normal client action, not scraping.
@@ -590,9 +730,25 @@ function TendersPage() {
     onError: (err) => alert(`Could not create project: ${err?.message || String(err)}`),
   });
 
+  const uniqueOrgs = useMemo(
+    () => [...new Set((tenders || []).map((t) => t.org_chain).filter(Boolean))].sort(),
+    [tenders]
+  );
+  const uniqueLocations = useMemo(
+    () => [...new Set((tenders || []).map((t) => t.location).filter(Boolean))].sort(),
+    [tenders]
+  );
+  const uniqueCategories = useMemo(
+    () => [...new Set((tenders || []).map((t) => t.tender_category).filter(Boolean))].sort(),
+    [tenders]
+  );
+
   const filtered = useMemo(() => {
     let list = tenders || [];
     if (showBookmarkedOnly) list = list.filter((t) => t.is_bookmarked);
+    if (filters.org) list = list.filter((t) => t.org_chain === filters.org);
+    if (filters.location) list = list.filter((t) => t.location === filters.location);
+    if (filters.category) list = list.filter((t) => t.tender_category === filters.category);
     if (search.trim()) {
       const q = search.toLowerCase();
       list = list.filter((t) => Object.values(t).some((v) => String(v ?? '').toLowerCase().includes(q)));
@@ -601,7 +757,40 @@ function TendersPage() {
       const c = smartCmp(a[sortCol] ?? '', b[sortCol] ?? '');
       return sortDir === 'asc' ? c : -c;
     });
-  }, [tenders, showBookmarkedOnly, search, sortCol, sortDir]);
+  }, [tenders, showBookmarkedOnly, filters, search, sortCol, sortDir]);
+
+  // Bookmarked tab: `tenders` already holds both active+archived when this
+  // tab is selected (see the query above), so this is just the starred subset.
+  const bookmarkedTenderRows = useMemo(() => {
+    const list = (tenders || []).filter((t) => t.is_bookmarked);
+    return [...list].sort((a, b) => {
+      const c = smartCmp(a[sortCol] ?? '', b[sortCol] ?? '');
+      return sortDir === 'asc' ? c : -c;
+    });
+  }, [tenders, sortCol, sortDir]);
+  const orgsAvailableToAdd = useMemo(
+    () => uniqueOrgs.filter((org) => !bookmarkedOrgsSet.has(org)),
+    [uniqueOrgs, bookmarkedOrgsSet]
+  );
+  const tenderCountByOrg = useMemo(() => {
+    const map = new Map();
+    for (const t of tenders || []) {
+      if (!t.org_chain) continue;
+      map.set(t.org_chain, (map.get(t.org_chain) || 0) + 1);
+    }
+    return map;
+  }, [tenders]);
+
+  // Active tenders are active by definition, so the Status column only earns
+  // its place once tenders can carry other statuses — i.e. once archived.
+  const visibleTenderColumns = useMemo(
+    () => TENDER_COLUMNS.filter((column) => tab === 'active' ? column.key !== 'status' : true),
+    [tab]
+  );
+  const tenderTableWidth = useMemo(
+    () => visibleTenderColumns.reduce((total, column) => total + column.width, 0),
+    [visibleTenderColumns]
+  );
 
   const toggleSort = (key) => {
     if (sortCol === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
@@ -609,7 +798,7 @@ function TendersPage() {
   };
 
   const exportCurrent = () => {
-    const exportColumns = TENDER_COLUMNS.filter((column) => !column.key.startsWith('_') && column.key !== 'is_bookmarked');
+    const exportColumns = visibleTenderColumns.filter((column) => !TENDER_NON_SORTABLE.has(column.key));
     exportCSV(
       exportColumns.map((column) => column.label),
       filtered,
@@ -618,8 +807,34 @@ function TendersPage() {
     );
   };
 
-  const renderTenderCell = (tender, column) => {
+  const renderTenderCell = (tender, column, index) => {
+    if (column.key === '_sr') return <span className="text-xs text-[var(--text-muted)]">{index + 1}</span>;
     if (column.key === '_time') return <TimeBadge dateStr={tender.closing_date} />;
+    if (column.key === '_download') {
+      const hasDocs = tender.has_documents || Number(tender.document_count) > 0;
+      const isDownloaded = hasDocs && tender.client_downloaded;
+      if (isDownloaded) return <Badge variant="success">Downloaded</Badge>;
+      const busy = downloadTenderDocuments.isPending && downloadTenderDocuments.variables?.id === tender.id;
+      const requesting = pendingRequestIds.has(tender.id)
+        || (requestTenderJob.isPending && requestTenderJob.variables?.id === tender.id);
+      const pillStyles = hasDocs
+        ? 'bg-sky-500/15 text-sky-400 hover:bg-sky-500/25'
+        : 'bg-[var(--surface-2)] text-[var(--text-muted)] hover:bg-[var(--surface-3)]';
+      return (
+        <button
+          onClick={(event) => {
+            event.stopPropagation();
+            if (hasDocs) downloadTenderDocuments.mutate(tender);
+            else requestTenderJob.mutate(tender);
+          }}
+          disabled={busy || requesting}
+          className={cn('inline-flex items-center gap-1 whitespace-nowrap rounded-full border-0 px-2.5 py-0.5 text-xs font-medium transition-colors disabled:opacity-50', pillStyles)}
+        >
+          <Download size={11} />
+          {busy ? 'Working…' : requesting ? 'Requested…' : hasDocs ? 'Download' : 'Request'}
+        </button>
+      );
+    }
     if (column.key === 'is_bookmarked') {
       return (
         <button
@@ -638,21 +853,29 @@ function TendersPage() {
             <FolderOpen size={14} />
           </button>
           {tender.tender_url && (
-            <a href={tender.tender_url} target="_blank" rel="noopener noreferrer" className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]" title="Open Tender">
+            <button onClick={() => openTender(tender.website_url, tender.tender_url)} className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]" title="Open Tender">
               <ExternalLink size={14} />
-            </a>
+            </button>
           )}
         </div>
       );
     }
     if (column.key === 'status') return <StatusBadge status={tender.status} />;
     if (column.key === 'tender_value' || column.key === 'emd') return <span className="whitespace-nowrap font-mono text-xs">{formatINR(tender[column.key])}</span>;
-    if (column.key === 'tender_id') return <span className="font-mono text-xs text-[var(--accent)]">{tender.tender_id || '—'}</span>;
+    if (column.key === 'tender_id') {
+      return (
+        <div>
+          <p className="font-mono text-xs text-[var(--accent)]">{tender.tender_id || '—'}</p>
+          <p className="mt-0.5 overflow-hidden text-xs text-[var(--text-muted)]" style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>{tender.work_description || '—'}</p>
+        </div>
+      );
+    }
     if (column.key === 'title') {
       return <p className="overflow-hidden text-sm text-[var(--text)]" style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>{tender.title || '—'}</p>;
     }
-    if (column.key === 'work_description') {
-      return <p className="overflow-hidden text-xs text-[var(--text-muted)]" style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>{tender.work_description || '—'}</p>;
+    if (column.key === '_prebid_corrigendum') {
+      const total = (Number(tender.prebid_count) || 0) + (Number(tender.corrigendum_count) || 0);
+      return <span className="text-xs">{total || '—'}</span>;
     }
     return <span className="text-xs">{String(tender[column.key] ?? '') || '—'}</span>;
   };
@@ -663,24 +886,60 @@ function TendersPage() {
       <div className="space-y-2 border-b border-[var(--border)] bg-[var(--surface-0)] px-6 py-3">
         <div className="flex items-center justify-between">
           <h1 className="text-lg font-bold text-[var(--text)]">Online Tenders</h1>
-          <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-xs font-medium text-[var(--text-muted)]">{filtered.length}</span>
+          <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-xs font-medium text-[var(--text-muted)]">{tab === 'bookmarked' ? bookmarkedTenderRows.length : filtered.length}</span>
         </div>
-        <div className="flex flex-wrap items-center gap-3">
-          <div className="relative min-w-[180px] max-w-sm flex-1">
-            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search..." className="input-field h-8 w-full text-sm" />
-            {search && <button onClick={() => setSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><X size={14} /></button>}
-          </div>
-          <button
-            onClick={() => setShowBookmarkedOnly((v) => !v)}
-            className={cn('btn-ghost gap-1.5 text-xs', showBookmarkedOnly && 'bg-[var(--accent-bg)] text-[var(--accent)]')}
-          >
-            <Star size={13} />Bookmarked
-          </button>
-          <div className="flex-1" />
-          <button onClick={exportCurrent} className="btn-ghost gap-1.5 text-xs"><FileDown size={13} />Export CSV</button>
-        </div>
+        {tab !== 'bookmarked' && (
+          <>
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="relative min-w-[180px] max-w-sm flex-1">
+                <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search..." className="input-field h-8 w-full text-sm" />
+                {search && <button onClick={() => setSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><X size={14} /></button>}
+              </div>
+              <button
+                onClick={() => setShowBookmarkedOnly((v) => !v)}
+                className={cn('btn-ghost gap-1.5 text-xs', showBookmarkedOnly && 'bg-[var(--accent-bg)] text-[var(--accent)]')}
+              >
+                <Star size={13} />Bookmarked
+              </button>
+              <button
+                onClick={() => setShowFilters((v) => !v)}
+                className={cn('btn-ghost gap-1.5 text-xs', (showFilters || filters.org || filters.location || filters.category) && 'bg-[var(--accent-bg)] text-[var(--accent)]')}
+              >
+                <Filter size={13} />Filters
+              </button>
+              <div className="flex-1" />
+              <button onClick={exportCurrent} className="btn-ghost gap-1.5 text-xs"><FileDown size={13} />Export CSV</button>
+            </div>
+            {showFilters && (
+              <div className="grid grid-cols-2 gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3 lg:grid-cols-4">
+                <div>
+                  <label className="mb-1 block text-xs text-[var(--text-muted)]">Organization</label>
+                  <select value={filters.org} onChange={(e) => setFilters((f) => ({ ...f, org: e.target.value }))} className="input-field h-8 w-full text-xs">
+                    <option value="">All</option>
+                    {uniqueOrgs.map((o) => <option key={o} value={o}>{o}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-[var(--text-muted)]">Location</label>
+                  <select value={filters.location} onChange={(e) => setFilters((f) => ({ ...f, location: e.target.value }))} className="input-field h-8 w-full text-xs">
+                    <option value="">All</option>
+                    {uniqueLocations.map((l) => <option key={l} value={l}>{l}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-[var(--text-muted)]">Category</label>
+                  <select value={filters.category} onChange={(e) => setFilters((f) => ({ ...f, category: e.target.value }))} className="input-field h-8 w-full text-xs">
+                    <option value="">All</option>
+                    {uniqueCategories.map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+                <div className="flex items-end"><button onClick={() => setFilters({ org: '', location: '', category: '' })} className="btn-ghost text-xs">Clear</button></div>
+              </div>
+            )}
+          </>
+        )}
         <div className="-mx-6 -mb-3 mt-1 flex border-t border-[var(--border)] px-6">
-          {[{ key: 'active', label: 'Active Tenders' }, { key: 'archived', label: 'Archived' }].map((t) => (
+          {[{ key: 'active', label: 'Active Tenders' }, { key: 'archived', label: 'Archived' }, { key: 'bookmarked', label: 'Bookmarked' }].map((t) => (
             <button
               key={t.key}
               onClick={() => setTab(t.key)}
@@ -693,36 +952,125 @@ function TendersPage() {
       </div>
 
       {/* Table */}
-      <div className="flex-1 overflow-auto">
-        {isLoading ? (
-          <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>
-        ) : filtered.length === 0 ? (
-          <EmptyState icon={Globe} title="No tenders" description={search ? `No tenders match "${search}"` : 'No tenders to show yet.'} />
-        ) : (
-          <table className="data-table" style={{ tableLayout: 'fixed', width: TENDER_TABLE_WIDTH, minWidth: TENDER_TABLE_WIDTH }}>
-            <thead>
-              <tr>
-                {TENDER_COLUMNS.map((c) => (
-                  <th key={c.key} style={{ width: c.width }} className={!c.key.startsWith('_') && c.key !== 'is_bookmarked' ? 'cursor-pointer' : ''} onClick={() => !c.key.startsWith('_') && c.key !== 'is_bookmarked' && toggleSort(c.key)}>
-                    {c.label}{sortCol === c.key && <span className="ml-1">{sortDir === 'asc' ? '▲' : '▼'}</span>}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {filtered.map((t, i) => (
-                <tr key={t.id} onClick={() => setSelectedId(t.id === selectedId ? null : t.id)} className={cn('cursor-pointer', selectedId === t.id && 'row-selected')}>
-                  {TENDER_COLUMNS.map((column) => (
-                    <td key={column.key} className={column.key === 'is_bookmarked' ? 'text-center' : ''}>
-                      {renderTenderCell(t, column)}
-                    </td>
+      {tab === 'bookmarked' ? (
+        <div className="flex-1 overflow-auto p-4 space-y-6">
+          <div>
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-[var(--text)]">Bookmarked Organizations</h3>
+              <div className="flex items-center gap-2">
+                <select value={orgToAdd} onChange={(e) => setOrgToAdd(e.target.value)} className="input-field h-8 w-56 text-xs">
+                  <option value="">Select an organization…</option>
+                  {orgsAvailableToAdd.map((org) => <option key={org} value={org}>{org}</option>)}
+                </select>
+                <button
+                  disabled={!orgToAdd || toggleOrgBookmark.isPending}
+                  onClick={() => { toggleOrgBookmark.mutate(orgToAdd); setOrgToAdd(''); }}
+                  className="btn-primary gap-1.5 text-xs"
+                >
+                  <Plus size={13} />Add
+                </button>
+              </div>
+            </div>
+            {isLoading ? (
+              <div className="flex justify-center py-8"><Spinner size={20} className="text-[var(--accent)]" /></div>
+            ) : (bookmarkedOrgs || []).length === 0 ? (
+              <EmptyState icon={Bookmark} title="No bookmarked organizations" description="Add one above to get notified about its new tenders." />
+            ) : (
+              <table className="data-table">
+                <thead><tr><th>Organization</th><th style={{ width: 140 }}>Tenders</th><th style={{ width: 100 }}>Remove</th></tr></thead>
+                <tbody>
+                  {[...bookmarkedOrgs].sort().map((org) => (
+                    <tr key={org}>
+                      <td className="text-sm">{org}</td>
+                      <td className="text-xs">{tenderCountByOrg.get(org) || 0}</td>
+                      <td>
+                        <button onClick={() => toggleOrgBookmark.mutate(org)} className="btn-ghost gap-1 text-xs text-rose-400 hover:text-rose-300">
+                          <X size={12} />Remove
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          <div>
+            <h3 className="mb-2 text-sm font-semibold text-[var(--text)]">Bookmarked Tenders</h3>
+            {isLoading ? (
+              <div className="flex justify-center py-8"><Spinner size={20} className="text-[var(--accent)]" /></div>
+            ) : bookmarkedTenderRows.length === 0 ? (
+              <EmptyState icon={Star} title="No bookmarked tenders" description="Star a tender in Active or Archived to see it here." />
+            ) : (
+              <div className="overflow-auto">
+                <table className="data-table" style={{ tableLayout: 'fixed', width: tenderTableWidth, minWidth: tenderTableWidth }}>
+                  <thead>
+                    <tr>
+                      {visibleTenderColumns.map((c) => (
+                        <th
+                          key={c.key}
+                          style={{ width: c.width, textAlign: (c.key === 'is_bookmarked' || c.key === '_sr' || c.key === '_download') ? 'center' : 'left' }}
+                          className={!TENDER_NON_SORTABLE.has(c.key) ? 'cursor-pointer' : ''}
+                          onClick={() => !TENDER_NON_SORTABLE.has(c.key) && toggleSort(c.key)}
+                        >
+                          {c.label}{sortCol === c.key && <span className="ml-1">{sortDir === 'asc' ? '▲' : '▼'}</span>}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {bookmarkedTenderRows.map((t, i) => (
+                      <tr key={t.id} onClick={() => setSelectedId(t.id === selectedId ? null : t.id)} className={cn('cursor-pointer', selectedId === t.id && 'row-selected')}>
+                        {visibleTenderColumns.map((column) => (
+                          <td key={column.key} className={column.key === 'is_bookmarked' || column.key === '_sr' || column.key === '_download' ? 'text-center' : ''}>
+                            {renderTenderCell(t, column, i)}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="flex-1 overflow-auto">
+          {isLoading ? (
+            <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>
+          ) : filtered.length === 0 ? (
+            <EmptyState icon={Globe} title="No tenders" description={search ? `No tenders match "${search}"` : 'No tenders to show yet.'} />
+          ) : (
+            <table className="data-table" style={{ tableLayout: 'fixed', width: tenderTableWidth, minWidth: tenderTableWidth }}>
+              <thead>
+                <tr>
+                  {visibleTenderColumns.map((c) => (
+                    <th
+                      key={c.key}
+                      style={{ width: c.width, textAlign: (c.key === 'is_bookmarked' || c.key === '_sr' || c.key === '_download') ? 'center' : 'left' }}
+                      className={!TENDER_NON_SORTABLE.has(c.key) ? 'cursor-pointer' : ''}
+                      onClick={() => !TENDER_NON_SORTABLE.has(c.key) && toggleSort(c.key)}
+                    >
+                      {c.label}{sortCol === c.key && <span className="ml-1">{sortDir === 'asc' ? '▲' : '▼'}</span>}
+                    </th>
                   ))}
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
+              </thead>
+              <tbody>
+                {filtered.map((t, i) => (
+                  <tr key={t.id} onClick={() => setSelectedId(t.id === selectedId ? null : t.id)} className={cn('cursor-pointer', selectedId === t.id && 'row-selected')}>
+                    {visibleTenderColumns.map((column) => (
+                      <td key={column.key} className={column.key === 'is_bookmarked' || column.key === '_sr' || column.key === '_download' ? 'text-center' : ''}>
+                        {renderTenderCell(t, column, i)}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -855,6 +1203,10 @@ function ProjectsPage({ onOpenProjectWorkspace, archived = false }) {
   const { data: projects, isLoading } = useQuery({ queryKey: ['projects', projectStatus, search], queryFn: () => api.listProjects(search, projectStatus) });
   const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
   const projectsEntryMode = String(settings?.projects_entry_mode || 'inline').toLowerCase() === 'popup' ? 'popup' : 'inline';
+  const setEntryMode = useMutation({
+    mutationFn: (mode) => api.updateSettings({ projects_entry_mode: mode }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['settings'] }),
+  });
   const selectedProject = useMemo(() => (projects || []).find((p) => p.id === selId) || null, [projects, selId]);
   const { data: checklist, isLoading: checklistLoading } = useQuery({ queryKey: ['project-checklist', selId], queryFn: () => api.listChecklist(selId), enabled: !!selId && showDetails });
 
@@ -1127,6 +1479,20 @@ function ProjectsPage({ onOpenProjectWorkspace, archived = false }) {
                   </div>
                 </>
               )}
+            </div>
+          )}
+          {!archived && (
+            <div className="flex items-center rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-0.5 gap-0.5" title="How the New/Edit Project form opens">
+              {['inline', 'popup'].map(mode => (
+                <button
+                  key={mode}
+                  onClick={() => setEntryMode.mutate(mode)}
+                  disabled={setEntryMode.isPending}
+                  className={cn('flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs transition-all', projectsEntryMode === mode ? 'bg-[var(--surface-0)] text-[var(--text)] shadow-sm' : 'text-[var(--text-muted)] hover:text-[var(--text)]')}
+                >
+                  {mode === 'inline' ? 'Inline Form' : 'Popup Form'}
+                </button>
+              ))}
             </div>
           )}
           <div className="flex-1" />
@@ -2277,260 +2643,30 @@ function TemplateItemsList({ templateId, onDelete }) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   FILES  (renamed from "Server Control" — a plain file browser over the
-   shared project storage)
-   — dropped: "Delete files older than N days" bulk-maintenance action. That
-     is an operator/server-hygiene tool, not something a client user should
-     be able to trigger. Browsing + single-folder delete is kept.
-   ═══════════════════════════════════════════════════════════════════════════ */
-const STORAGE_COLUMNS = [
-  { key: 'name', label: 'Name', width: 360 },
-  { key: 'type', label: 'Type', width: 130 },
-  { key: 'size', label: 'Size', width: 140 },
-  { key: 'modified', label: 'Modified', width: 220 },
-];
-
-function formatBytes(bytes) {
-  const b = Number(bytes || 0);
-  if (b < 1024) return `${b} B`;
-  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
-  if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(b / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
-
-function FilesPage() {
-  const qc = useQueryClient();
-  const {
-    serverStorageTable,
-    setServerStorageHiddenColumns,
-    setServerStorageColumnOrder,
-    setServerStorageColumnWidth,
-  } = useAppStore();
-
-  const [relPath, setRelPath] = useState('');
-  const [selectedRelPath, setSelectedRelPath] = useState('');
-  const [showColsMenu, setShowColsMenu] = useState(false);
-  const [dragIdx, setDragIdx] = useState(null);
-
-  const { data, isLoading, isFetching } = useQuery({
-    queryKey: ['client-files', relPath],
-    queryFn: () => api.listServerStorage(relPath),
-  });
-
-  const selectedItem = useMemo(() => {
-    const items = data?.items || [];
-    return items.find((x) => x.rel_path === selectedRelPath) || null;
-  }, [data?.items, selectedRelPath]);
-
-  const storageColOrder = useMemo(
-    () => (serverStorageTable.columnOrder?.length ? serverStorageTable.columnOrder : STORAGE_COLUMNS.map((c) => c.key)),
-    [serverStorageTable.columnOrder]
-  );
-  const storageHidden = useMemo(() => new Set(serverStorageTable.hiddenColumns || []), [serverStorageTable.hiddenColumns]);
-  const orderedStorageCols = useMemo(() => {
-    const byKey = new Map(STORAGE_COLUMNS.map((c) => [c.key, c]));
-    return storageColOrder.map((k) => byKey.get(k)).filter(Boolean);
-  }, [storageColOrder]);
-  const visibleStorageCols = orderedStorageCols.filter((c) => c.fixed || !storageHidden.has(c.key));
-  const getStorageColWidth = (c) => {
-    const v = serverStorageTable.columnWidths?.[c.key];
-    return Number.isFinite(v) && v > 0 ? v : c.width;
-  };
-  const toggleStorageCol = (key) => {
-    const next = new Set(storageHidden);
-    if (next.has(key)) next.delete(key);
-    else next.add(key);
-    setServerStorageHiddenColumns(Array.from(next));
-  };
-  const moveStorageCol = (from, to) => {
-    if (from === to) return;
-    const next = [...storageColOrder];
-    const [item] = next.splice(from, 1);
-    next.splice(to, 0, item);
-    setServerStorageColumnOrder(next);
-  };
-  const startStorageColResize = (col, startX) => {
-    const startW = getStorageColWidth(col);
-    const onMove = (evt) => {
-      const next = Math.max(90, startW + (evt.clientX - startX));
-      setServerStorageColumnWidth(col.key, next);
-    };
-    const onUp = () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-  };
-
-  const deleteFolder = useMutation({
-    mutationFn: (path) => api.deleteServerFolder(path),
-    onSuccess: () => {
-      setSelectedRelPath('');
-      qc.invalidateQueries({ queryKey: ['client-files', relPath] });
-    },
-  });
-
-  const goParent = () => {
-    const parent = data?.parent_rel_path || '';
-    setRelPath(parent);
-    setSelectedRelPath('');
-  };
-
-  return (
-    <div className="flex h-full flex-col">
-      <div className="border-b border-[var(--border)] bg-[var(--surface-0)] px-6 py-4">
-        <h1 className="text-lg font-bold text-[var(--text)]">Files</h1>
-        <p className="mt-0.5 text-sm text-[var(--text-muted)]">Browse project storage</p>
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <button onClick={goParent} className="btn-ghost gap-1 text-xs" disabled={!data?.parent_rel_path}>
-            <ArrowUp size={12} />
-            Parent
-          </button>
-          <button onClick={() => qc.invalidateQueries({ queryKey: ['client-files', relPath] })} className="btn-ghost gap-1 text-xs">
-            <RefreshCw size={12} className={cn(isFetching && 'animate-spin')} />
-            Refresh
-          </button>
-          <button onClick={() => selectedItem?.is_dir && deleteFolder.mutate(selectedItem.rel_path)} className="btn-danger gap-1 text-xs" disabled={!selectedItem?.is_dir || deleteFolder.isPending}>
-            <Trash2 size={12} />
-            Delete Folder
-          </button>
-          <div className="relative ml-2">
-            <button onClick={() => setShowColsMenu((v) => !v)} className="btn-ghost gap-1 text-xs">
-              <Columns3 size={12} />
-              Columns
-            </button>
-            {showColsMenu && (
-              <>
-                <div className="fixed inset-0 z-40" onClick={() => setShowColsMenu(false)} />
-                <div className="card absolute right-0 top-8 z-50 max-h-72 w-60 overflow-auto border border-[var(--border)] p-2 shadow-xl">
-                  <p className="mb-1 border-b border-[var(--border)] px-2 pb-1 text-xs text-[var(--text-muted)]">Drag to reorder, toggle columns</p>
-                  {orderedStorageCols.map((c, i) => (
-                    <div key={c.key} draggable onDragStart={() => setDragIdx(i)} onDragOver={(e) => e.preventDefault()} onDrop={() => {
-                      if (dragIdx !== null) {
-                        const fromKey = orderedStorageCols[dragIdx]?.key;
-                        const toKey = orderedStorageCols[i]?.key;
-                        if (fromKey && toKey) {
-                          const fi = storageColOrder.indexOf(fromKey);
-                          const ti = storageColOrder.indexOf(toKey);
-                          if (fi >= 0 && ti >= 0) moveStorageCol(fi, ti);
-                        }
-                      }
-                      setDragIdx(null);
-                    }} className={cn('flex cursor-grab items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-[var(--surface-1)]', dragIdx === i && 'opacity-50')}>
-                      <span className="select-none cursor-grab text-[var(--text-muted)]">::</span>
-                      <input type="checkbox" checked={!storageHidden.has(c.key)} onChange={() => toggleStorageCol(c.key)} className="accent-[var(--accent)]" />
-                      <span className="flex-1">{c.label}</span>
-                    </div>
-                  ))}
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-        <div className="mt-2 text-xs text-[var(--text-muted)]">
-          Root: <span className="font-mono">{data?.root_folder || '-'}</span>
-          <br />
-          Current: <span className="font-mono">{data?.current_rel_path || '/'}</span>
-        </div>
-      </div>
-
-      <div className="flex-1 overflow-auto p-6">
-        {isLoading ? (
-          <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>
-        ) : (
-          <>
-            {!data?.items || data.items.length === 0 ? (
-              <EmptyState icon={Server} title="No items" description="This folder is empty" />
-            ) : (
-              <table className="data-table" style={{ tableLayout: 'fixed', width: '100%' }}>
-                <thead>
-                  <tr>
-                    {visibleStorageCols.map((c) => (
-                      <th key={c.key} style={{ width: getStorageColWidth(c) }} className="relative">
-                        <div className="flex items-center">{c.label}</div>
-                        <div className="absolute right-0 top-0 h-full w-2 cursor-col-resize" onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); startStorageColResize(c, e.clientX); }} />
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.items.map((item) => (
-                    <tr key={item.rel_path || item.name} onClick={() => setSelectedRelPath(item.rel_path)} onDoubleClick={() => {
-                      if (item.is_dir) {
-                        setRelPath(item.rel_path);
-                        setSelectedRelPath('');
-                      }
-                    }} className={cn('cursor-pointer', selectedRelPath === item.rel_path && 'row-selected')}>
-                      {visibleStorageCols.map((c) => {
-                        if (c.key === 'name') return <td key={c.key} className="text-sm"><span className="inline-flex items-center gap-2">{item.is_dir ? <Folder size={14} /> : <FolderOpen size={14} />}{item.name}</span></td>;
-                        if (c.key === 'type') return <td key={c.key} className="text-xs">{item.is_dir ? 'Folder' : 'File'}</td>;
-                        if (c.key === 'size') return <td key={c.key} className="text-xs">{item.is_dir ? '-' : formatBytes(item.size_bytes)}</td>;
-                        if (c.key === 'modified') return <td key={c.key} className="text-xs">{new Date(item.modified_at).toLocaleString()}</td>;
-                        return <td key={c.key} className="text-xs" />;
-                      })}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
    SETTINGS  (client-relevant only)
    — dropped: CAPTCHA AI provider config, Backend/Cloud Run connection
-     config (mode / URL / API & admin keys), and Update Manifest URL — all
-     operator-only concerns. Kept & expanded: appearance/theming, workspace
-     behavior, projects entry mode, the "show tender info" toggle, directory
-     paths, server connection/sync, and local data & cache controls.
-
-   Two separate stores of settings live on this page:
-     1. Server-relevant `form` fields (unchanged plumbing) — saved via
-        api.updateSettings() and shown under Workspace / Directories / Connection.
-     2. Local-only `prefs` (accent, density, UI scale, startup page) — saved to
-        localStorage via useClientPrefs(), applied instantly, never sent to
-        the backend. See DEFAULT_CLIENT_PREFS above.
+     config (mode / URL / API & admin keys), Auto-Archive scheduling, and
+     Update Manifest URL — all operator-only concerns. Kept: appearance,
+     projects entry mode, the "show tender info" toggle, directory paths,
+     and a simple read-only connection status.
    ═══════════════════════════════════════════════════════════════════════════ */
-const SETTINGS_TABS = [
-  { key: 'appearance', label: 'Appearance', icon: Palette },
-  { key: 'workspace', label: 'Workspace', icon: LayoutGrid },
-  { key: 'directories', label: 'Directories', icon: FolderOpen },
-  { key: 'connection', label: 'Connection & Sync', icon: Server },
-  { key: 'data', label: 'Data & Cache', icon: RotateCcw },
-];
-
 function SettingsPage() {
   const { theme, toggleTheme } = useAppStore();
   const qc = useQueryClient();
-  const [prefs, updatePrefs, resetPrefs] = useClientPrefs();
-  const [tab, setTab] = useState('appearance');
   const { data: settings, isLoading } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
-  const { data: health, isFetching: healthLoading } = useQuery({
-    queryKey: ['client-health', settings?.server_url, Boolean(settings?.client_api_key)],
-    queryFn: () => api.health(),
-    enabled: Boolean(settings?.client_api_key),
-    retry: false,
-  });
+  const { data: health } = useQuery({ queryKey: ['health'], queryFn: () => api.health(), retry: false });
 
   const [form, setForm] = useState({
     parent_dir: '',
     project_details_show_tender_info: 'true',
-    projects_entry_mode: 'inline',
     server_url: api.defaultServerUrl,
-    client_api_key: '',
   });
   const [saved, setSaved] = useState(false);
   const [pathStatus, setPathStatus] = useState('');
-  const [dataStatus, setDataStatus] = useState('');
-  const [showClientKey, setShowClientKey] = useState(false);
-  const [customAccent, setCustomAccent] = useState('');
+  const [showChangePw, setShowChangePw] = useState(false);
+  const [pwForm, setPwForm] = useState({ current_password: '', new_password: '', confirm_password: '' });
+  const [pwStatus, setPwStatus] = useState('');
   const desktop = window.bidmanagerDesktop;
-  const importFileRef = React.useRef(null);
 
   const deriveParent = (s) => {
     if (s.parent_dir) return String(s.parent_dir);
@@ -2548,37 +2684,63 @@ function SettingsPage() {
       ...f,
       parent_dir: deriveParent(settings) || f.parent_dir,
       project_details_show_tender_info: settings.project_details_show_tender_info || f.project_details_show_tender_info,
-      projects_entry_mode: settings.projects_entry_mode || f.projects_entry_mode,
       server_url: settings.server_url || api.defaultServerUrl,
-      client_api_key: settings.client_api_key || '',
     }));
   }, [settings]);
 
   const saveMut = useMutation({
-    mutationFn: (d) => api.updateSettings(d),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['settings'] }); window.dispatchEvent(new Event('bm-settings-updated')); setPathStatus('Saved.'); setSaved(true); setTimeout(() => setSaved(false), 2000); },
+    mutationFn: async (d) => {
+      await api.updateSettings(d);
+      return api.ensureParentFolders(d.parent_dir);
+    },
+    onSuccess: (foldersResult) => {
+      qc.invalidateQueries({ queryKey: ['settings'] });
+      window.dispatchEvent(new Event('bm-settings-updated'));
+      setPathStatus(foldersResult?.ok === false ? `Saved settings, but could not create folders: ${foldersResult.message}` : 'Saved.');
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    },
     onError: (error) => setPathStatus(`Save failed: ${error instanceof Error ? error.message : String(error)}`),
   });
   const handleSave = () => saveMut.mutate(form);
   const uf = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+  const subPath = (name) => (form.parent_dir
+    ? `${form.parent_dir}${form.parent_dir.endsWith('\\') || form.parent_dir.endsWith('/') ? '' : '\\'}${name}`
+    : '-');
 
-  const refreshAll = () => {
-    qc.invalidateQueries();
-    window.dispatchEvent(new Event('bm-settings-updated'));
-  };
-  const syncMut = useMutation({
-    mutationFn: () => api.syncFromServer(form),
-    onSuccess: (result) => {
-      refreshAll();
-      setPathStatus(`Imported ${result.tenders} tenders from ${result.websites} server sources. Local changes remain on this device.`);
-    },
-    onError: (error) => setPathStatus(`Sync failed: ${error instanceof Error ? error.message : String(error)}`),
-  });
   const connectionMut = useMutation({
     mutationFn: () => api.testConnection(form),
     onSuccess: (result) => setPathStatus(`Connected successfully. Server version: ${result.version || 'unknown'}. Read-only access confirmed.`),
     onError: (error) => setPathStatus(`Connection failed: ${error instanceof Error ? error.message : String(error)}`),
   });
+  const syncMut = useMutation({
+    mutationFn: () => api.syncFromServer(form),
+    onSuccess: (result) => {
+      qc.invalidateQueries();
+      window.dispatchEvent(new Event('bm-settings-updated'));
+      setPathStatus(`Imported ${result.tenders} tenders from ${result.websites} server sources. Local changes remain on this device.`);
+    },
+    onError: (error) => setPathStatus(`Sync failed: ${error instanceof Error ? error.message : String(error)}`),
+  });
+  const signOutMut = useMutation({
+    mutationFn: () => api.signOut(),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['settings'] }); qc.clear(); },
+  });
+  const changePasswordMut = useMutation({
+    mutationFn: () => api.changePassword(pwForm),
+    onSuccess: () => {
+      setPwStatus('Password changed.');
+      setPwForm({ current_password: '', new_password: '', confirm_password: '' });
+      setTimeout(() => { setShowChangePw(false); setPwStatus(''); }, 1500);
+    },
+    onError: (error) => setPwStatus(error instanceof Error ? error.message : String(error)),
+  });
+  const submitChangePassword = () => {
+    if (pwForm.new_password.length < 8) { setPwStatus('New password must be at least 8 characters.'); return; }
+    if (pwForm.new_password !== pwForm.confirm_password) { setPwStatus('New passwords do not match.'); return; }
+    changePasswordMut.mutate();
+  };
+
   const browseForPath = async (key, label) => {
     try {
       if (!desktop?.pickPath) { setPathStatus('Browse is available in the desktop app.'); return; }
@@ -2590,299 +2752,129 @@ function SettingsPage() {
     }
   };
 
-  // ── Data & Cache tab actions ──────────────────────────────────────────────
-  const exportSettings = () => {
-    const payload = {
-      exportedAt: new Date().toISOString(),
-      workspace: {
-        project_details_show_tender_info: form.project_details_show_tender_info,
-        projects_entry_mode: form.projects_entry_mode,
-        server_url: form.server_url,
-        // client_api_key intentionally excluded from export for safety
-      },
-      preferences: prefs,
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `bidmanager-settings-${new Date().toISOString().slice(0, 10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    setDataStatus('Settings exported.');
-  };
-  const importSettings = async (file) => {
-    try {
-      const text = await file.text();
-      const parsed = JSON.parse(text);
-      if (parsed.preferences) updatePrefs(parsed.preferences);
-      if (parsed.workspace) {
-        setForm((f) => ({
-          ...f,
-          project_details_show_tender_info: parsed.workspace.project_details_show_tender_info || f.project_details_show_tender_info,
-          projects_entry_mode: parsed.workspace.projects_entry_mode || f.projects_entry_mode,
-          server_url: parsed.workspace.server_url || f.server_url,
-        }));
-      }
-      setDataStatus('Settings imported. Review and click "Save Settings" to persist workspace changes.');
-    } catch (e) {
-      setDataStatus(`Import failed: ${e?.message || String(e)}`);
-    }
-  };
-  const clearLocalCache = () => {
-    Object.keys(localStorage)
-      .filter((k) => k.startsWith('bm-workspace-view-'))
-      .forEach((k) => localStorage.removeItem(k));
-    qc.clear();
-    refreshAll();
-    setDataStatus('Local view cache cleared and data refreshed from source.');
-  };
-
-  const activeAccent = prefs.accent || '';
-
   return (
     <div className="flex flex-col h-full overflow-auto">
       <div className="px-6 py-4 border-b border-[var(--border)] bg-[var(--surface-0)]">
         <div className="flex items-center justify-between">
           <h1 className="text-lg font-bold text-[var(--text)]">Settings</h1>
           <div className="flex items-center gap-2">
-            {healthLoading ? <Badge variant="muted"><Spinner size={10} />Checking</Badge>
-              : health ? <Badge variant="success"><Wifi size={10} />Client API connected</Badge>
-                : <Badge variant="danger"><WifiOff size={10} />Client API not connected</Badge>}
+            {health ? <Badge variant="success"><Wifi size={10} />Connected v{health.version}</Badge> : <Badge variant="danger"><WifiOff size={10} />Offline</Badge>}
           </div>
         </div>
       </div>
       {isLoading ? (
         <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>
       ) : (
-        <div className="flex flex-1 min-h-0">
-          {/* ── Sub-nav ── */}
-          <nav className="w-48 shrink-0 border-r border-[var(--border)] bg-[var(--surface-0)] p-3 space-y-0.5">
-            {SETTINGS_TABS.map((t) => (
-              <button
-                key={t.key}
-                onClick={() => setTab(t.key)}
-                className={cn('settings-tab w-full', tab === t.key && 'settings-tab-active')}
-              >
-                <t.icon size={14} />{t.label}
-              </button>
-            ))}
-          </nav>
+        <div className="p-6">
+          <div className="grid grid-cols-1 gap-6 xl:grid-cols-12">
+            <div className="space-y-6 xl:col-span-7">
+              <div className="card p-5 space-y-4">
+                <h3 className="text-sm font-semibold text-[var(--text)]">Appearance</h3>
+                <div className="flex items-center justify-between">
+                  <div><p className="text-sm text-[var(--text)]">Theme</p><p className="text-xs text-[var(--text-muted)]">Light / Dark mode</p></div>
+                  <button onClick={toggleTheme} className="btn-secondary text-sm gap-2">{theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}{theme === 'dark' ? 'Light' : 'Dark'}</button>
+                </div>
+                <div className="flex items-center justify-between">
+                  <div><p className="text-sm text-[var(--text)]">Show Tender Info panel</p><p className="text-xs text-[var(--text-muted)]">In project details view</p></div>
+                  <input type="checkbox" checked={form.project_details_show_tender_info === 'true'} onChange={(e) => uf('project_details_show_tender_info', e.target.checked ? 'true' : 'false')} className="accent-[var(--accent)] w-5 h-5" />
+                </div>
+                <p className="flex items-start gap-2 text-[11px] text-[var(--text-muted)]"><Info size={12} className="mt-0.5 shrink-0" />The New/Edit Project form's Inline vs Popup mode moved to the Projects page toolbar.</p>
+              </div>
 
-          <div className="flex-1 overflow-auto p-6">
-            <div className="mx-auto max-w-2xl space-y-6 pb-24">
-
-              {tab === 'appearance' && (
-                <>
-                  <div className="card p-5 space-y-4">
-                    <h3 className="text-sm font-semibold text-[var(--text)]">Theme</h3>
-                    <SettingRow title="Color mode" hint="Light or dark interface">
-                      <SegmentedControl
-                        value={theme}
-                        onChange={(v) => { if (v !== theme) toggleTheme(); }}
-                        options={[{ value: 'light', label: 'Light', icon: Sun }, { value: 'dark', label: 'Dark', icon: Moon }]}
-                      />
-                    </SettingRow>
-                  </div>
-
-                  <div className="card p-5 space-y-4">
-                    <h3 className="text-sm font-semibold text-[var(--text)]">Accent color</h3>
-                    <p className="text-xs text-[var(--text-muted)]">Pick a preset or enter a custom hex color. Applies instantly across buttons, links, and selection highlights.</p>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        title="Default"
-                        onClick={() => updatePrefs({ accent: '' })}
-                        className={cn('color-swatch flex items-center justify-center bg-[var(--surface-2)]', !activeAccent && 'color-swatch-active')}
-                      >
-                        <RotateCcw size={11} className="text-[var(--text-muted)]" />
-                      </button>
-                      {ACCENT_PRESETS.map((p) => (
-                        <button
-                          key={p.hex}
-                          title={p.name}
-                          onClick={() => updatePrefs({ accent: p.hex })}
-                          style={{ background: p.hex }}
-                          className={cn('color-swatch', activeAccent.toLowerCase() === p.hex.toLowerCase() && 'color-swatch-active')}
-                        />
-                      ))}
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <input
-                        value={customAccent}
-                        onChange={(e) => setCustomAccent(e.target.value)}
-                        placeholder="#5b8af5"
-                        maxLength={7}
-                        className="input-field h-8 w-28 text-xs font-mono"
-                        spellCheck={false}
-                      />
-                      <button
-                        disabled={!hexToRgb(customAccent)}
-                        onClick={() => { updatePrefs({ accent: customAccent }); }}
-                        className="btn-secondary text-xs px-3"
-                      >
-                        Apply custom
-                      </button>
-                      {activeAccent && <span className="inline-flex items-center gap-1.5 text-xs text-[var(--text-muted)]"><span className="color-swatch" style={{ width: 12, height: 12, background: activeAccent }} />{activeAccent}</span>}
-                    </div>
-                  </div>
-
-                  <div className="card p-5 space-y-4">
-                    <h3 className="text-sm font-semibold text-[var(--text)]">Layout density</h3>
-                    <SettingRow title="Table & card density" hint="Compact reduces row height and padding for denser lists">
-                      <SegmentedControl
-                        value={prefs.density}
-                        onChange={(v) => updatePrefs({ density: v })}
-                        options={[{ value: 'comfortable', label: 'Comfortable', icon: LayoutGrid }, { value: 'compact', label: 'Compact', icon: Rows3 }]}
-                      />
-                    </SettingRow>
-                    <SettingRow title="Interface size" hint="Scales text and spacing across the app">
-                      <SegmentedControl
-                        value={prefs.uiScale}
-                        onChange={(v) => updatePrefs({ uiScale: v })}
-                        options={[{ value: 'sm', label: 'Small' }, { value: 'md', label: 'Default' }, { value: 'lg', label: 'Large' }]}
-                      />
-                    </SettingRow>
-                  </div>
-                </>
-              )}
-
-              {tab === 'workspace' && (
-                <>
-                  <div className="card p-5 space-y-4">
-                    <h3 className="text-sm font-semibold text-[var(--text)]">Behavior</h3>
-                    <SettingRow title="Startup page" hint="What loads when the app opens">
-                      <div className="relative w-44">
-                        <select value={prefs.startupPage} onChange={(e) => updatePrefs({ startupPage: e.target.value })} className="input-field h-9 w-full appearance-none pr-8 text-sm">
-                          {STARTUP_PAGE_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-                        </select>
-                        <ChevronDown size={14} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)]" />
-                      </div>
-                    </SettingRow>
-                    <SettingRow title="Projects entry mode" hint="Inline form or popup dialog">
-                      <div className="relative w-36">
-                        <select value={form.projects_entry_mode} onChange={(e) => uf('projects_entry_mode', e.target.value)} className="input-field h-9 w-full appearance-none pr-8 text-sm">
-                          <option value="inline">Inline</option>
-                          <option value="popup">Popup</option>
-                        </select>
-                        <ChevronDown size={14} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)]" />
-                      </div>
-                    </SettingRow>
-                    <SettingRow title="Show Tender Info panel" hint="In project details view">
-                      <Toggle checked={form.project_details_show_tender_info === 'true'} onChange={(v) => uf('project_details_show_tender_info', v ? 'true' : 'false')} />
-                    </SettingRow>
-                  </div>
-                  <p className="flex items-start gap-2 text-xs text-[var(--text-muted)]"><Info size={13} className="mt-0.5 shrink-0" />Changes on this tab are saved with the "Save Settings" button below.</p>
-                </>
-              )}
-
-              {tab === 'directories' && (
-                <div className="card p-5 space-y-4">
-                  <h3 className="text-sm font-semibold text-[var(--text)]">Directory Paths</h3>
-                  <p className="text-xs text-[var(--text-muted)]">Choose one parent folder. App auto-creates and uses standard internal paths.</p>
-                  <div>
-                    <label className="text-xs text-[var(--text-muted)] mb-1 block">Parent Folder</label>
-                    <div className="flex gap-2">
-                      <input value={form.parent_dir} onChange={(e) => uf('parent_dir', e.target.value)} className="input-field h-9 text-sm flex-1" placeholder="Path to parent folder" />
-                      <button onClick={() => browseForPath('parent_dir', 'Parent Folder')} className="btn-secondary text-xs px-3 gap-1 shrink-0"><FolderOpen size={13} />Browse</button>
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-1 gap-2 text-xs text-[var(--text-muted)]">
-                    <div>Projects: <span className="text-[var(--text)]">{form.parent_dir ? `${form.parent_dir}${form.parent_dir.endsWith('\\') || form.parent_dir.endsWith('/') ? '' : '\\'}My_Tender_Projects` : '-'}</span></div>
-                    <div>Templates: <span className="text-[var(--text)]">{form.parent_dir ? `${form.parent_dir}${form.parent_dir.endsWith('\\') || form.parent_dir.endsWith('/') ? '' : '\\'}Checklist_Templates` : '-'}</span></div>
+              <div className="card p-5 space-y-4">
+                <h3 className="text-sm font-semibold text-[var(--text)]">Directory Paths</h3>
+                <p className="text-xs text-[var(--text-muted)]">Choose one parent folder — the four folders below are created automatically under it when you save.</p>
+                <div>
+                  <label className="text-xs text-[var(--text-muted)] mb-1 block">Parent Folder</label>
+                  <div className="flex gap-2">
+                    <input value={form.parent_dir} onChange={(e) => uf('parent_dir', e.target.value)} className="input-field h-9 text-sm flex-1" placeholder="Path to parent folder" />
+                    <button onClick={() => browseForPath('parent_dir', 'Parent Folder')} className="btn-secondary text-xs px-3 gap-1 shrink-0"><FolderOpen size={13} />Browse</button>
                   </div>
                 </div>
-              )}
+                <div className="grid grid-cols-1 gap-2 text-xs text-[var(--text-muted)]">
+                  <div>Tender Downloads: <span className="text-[var(--text)]">{subPath('Tender_Downloads')}</span></div>
+                  <div>Projects: <span className="text-[var(--text)]">{subPath('My_Tender_Projects')}</span></div>
+                  <div>Archived: <span className="text-[var(--text)]">{subPath('Archived Projects')}</span></div>
+                  <div>Templates: <span className="text-[var(--text)]">{subPath('Checklist_Templates')}</span></div>
+                </div>
+              </div>
+            </div>
 
-              {tab === 'connection' && (
-                <div className="card p-5 space-y-4">
-                  <div>
-                    <h3 className="text-sm font-semibold text-[var(--text)]">Server Connection</h3>
-                    <p className="mt-1 text-xs text-[var(--text-muted)]">The production URL is prefilled and remains editable. Only authenticated /client/* routes are used.</p>
-                  </div>
-                  <div>
-                    <label className="text-xs text-[var(--text-muted)] mb-1 block">Backend URL</label>
-                    <input
-                      value={form.server_url}
-                      onChange={(event) => uf('server_url', event.target.value)}
-                      className="input-field h-9 w-full font-mono text-xs"
-                      placeholder={api.defaultServerUrl}
-                      spellCheck={false}
-                    />
-                  </div>
-                  <div>
-                    <label className="text-xs text-[var(--text-muted)] mb-1 block">Client API key</label>
-                    <div className="relative">
-                      <input
-                        type={showClientKey ? 'text' : 'password'}
-                        value={form.client_api_key}
-                        onChange={(event) => uf('client_api_key', event.target.value)}
-                        className="input-field h-9 w-full pr-10 font-mono text-xs"
-                        placeholder="Enter CLIENT_API_KEY"
-                        autoComplete="off"
-                        spellCheck={false}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setShowClientKey((value) => !value)}
-                        className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-[var(--text-muted)] hover:text-[var(--text)]"
-                        title={showClientKey ? 'Hide key' : 'Show key'}
-                      >
-                        {showClientKey ? <EyeOff size={14} /> : <Eye size={14} />}
+            <div className="space-y-6 xl:col-span-5">
+              <div className="card p-5 space-y-4">
+                <h3 className="text-sm font-semibold text-[var(--text)]">Account</h3>
+                {settings?.auth_token ? (
+                  <>
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <p className="text-sm text-[var(--text)]">{settings.display_name || settings.user_email}</p>
+                        <p className="text-[11px] text-[var(--text-muted)]">{settings.user_email}</p>
+                      </div>
+                      <button onClick={() => signOutMut.mutate()} disabled={signOutMut.isPending} className="btn-secondary text-xs gap-1.5">
+                        {signOutMut.isPending ? <Spinner size={13} /> : <LogOut size={13} />}Sign Out
                       </button>
                     </div>
-                    <p className="mt-1 text-[11px] text-[var(--text-muted)]">Stored only in this client's local IndexedDB. It is sent as x-client-key and never placed in a URL.</p>
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    <button onClick={() => connectionMut.mutate()} disabled={connectionMut.isPending || !form.client_api_key.trim()} className="btn-secondary text-xs gap-1.5">
-                      {connectionMut.isPending ? <Spinner size={13} /> : <Wifi size={13} />}Test Connection
-                    </button>
-                    <button onClick={() => syncMut.mutate()} disabled={syncMut.isPending || !form.client_api_key.trim()} className="btn-primary text-xs gap-1.5">
-                      {syncMut.isPending ? <Spinner size={13} /> : <RefreshCw size={13} />}Sync Tenders
-                    </button>
-                  </div>
-                  <p className="text-[11px] text-[var(--text-muted)]">Sync reads paginated tender data from Postgres through the backend and updates the offline cache. Projects, bookmarks, templates, settings, and local files are never uploaded.</p>
-                  {settings?.last_sync_at && <p className="text-[11px] text-[var(--text-muted)]">Last sync: {new Date(settings.last_sync_at).toLocaleString()}</p>}
-                </div>
-              )}
-
-              {tab === 'data' && (
-                <>
-                  <div className="card p-5 space-y-4">
-                    <h3 className="text-sm font-semibold text-[var(--text)]">Backup & restore</h3>
-                    <p className="text-xs text-[var(--text-muted)]">Export appearance preferences and workspace settings (excluding the API key) to a JSON file, or restore from a previous export.</p>
-                    <div className="flex flex-wrap gap-2">
-                      <button onClick={exportSettings} className="btn-secondary text-xs gap-1.5"><Download size={13} />Export settings</button>
-                      <button onClick={() => importFileRef.current?.click()} className="btn-secondary text-xs gap-1.5"><Upload size={13} />Import settings</button>
-                      <input ref={importFileRef} type="file" accept="application/json" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) importSettings(f); e.target.value = ''; }} />
+                    <div className="border-t border-[var(--border)] pt-3">
+                      <button onClick={() => { setShowChangePw((v) => !v); setPwStatus(''); }} className="btn-ghost text-xs gap-1.5">
+                        <KeyRound size={13} />{showChangePw ? 'Cancel' : 'Change Password'}
+                      </button>
+                      {showChangePw && (
+                        <div className="mt-3 space-y-2">
+                          <input type="password" value={pwForm.current_password} onChange={(e) => setPwForm((f) => ({ ...f, current_password: e.target.value }))} placeholder="Current password" className="input-field h-9 w-full text-sm" autoComplete="current-password" />
+                          <input type="password" value={pwForm.new_password} onChange={(e) => setPwForm((f) => ({ ...f, new_password: e.target.value }))} placeholder="New password (min 8 characters)" className="input-field h-9 w-full text-sm" autoComplete="new-password" />
+                          <input type="password" value={pwForm.confirm_password} onChange={(e) => setPwForm((f) => ({ ...f, confirm_password: e.target.value }))} placeholder="Confirm new password" className="input-field h-9 w-full text-sm" autoComplete="new-password" />
+                          {pwStatus && <p className="text-xs text-rose-400">{pwStatus}</p>}
+                          <button
+                            onClick={submitChangePassword}
+                            disabled={changePasswordMut.isPending || !pwForm.current_password || !pwForm.new_password || !pwForm.confirm_password}
+                            className="btn-primary text-xs gap-1.5"
+                          >
+                            {changePasswordMut.isPending ? <Spinner size={13} /> : <KeyRound size={13} />}Update Password
+                          </button>
+                        </div>
+                      )}
                     </div>
-                  </div>
-                  <div className="card p-5 space-y-4">
-                    <h3 className="text-sm font-semibold text-[var(--text)]">Local cache</h3>
-                    <p className="text-xs text-[var(--text-muted)]">Clears cached tender/project data held in this browser session and per-project workspace layout memory, then refetches from source. Nothing is deleted on the server.</p>
-                    <button onClick={clearLocalCache} className="btn-secondary text-xs gap-1.5"><RotateCcw size={13} />Clear local cache</button>
-                  </div>
-                  <div className="card p-5 space-y-4">
-                    <h3 className="text-sm font-semibold text-[var(--text)]">Reset</h3>
-                    <SettingRow title="Reset appearance to defaults" hint="Accent color, density, and interface size">
-                      <button onClick={resetPrefs} className="btn-ghost text-xs gap-1.5"><RotateCcw size={13} />Reset</button>
-                    </SettingRow>
-                  </div>
-                  {dataStatus && <p className="text-xs text-[var(--text-muted)]">{dataStatus}</p>}
-                </>
-              )}
+                  </>
+                ) : (
+                  <p className="text-xs text-[var(--text-muted)]">Not signed in.</p>
+                )}
+              </div>
 
-              {pathStatus && (tab === 'workspace' || tab === 'directories' || tab === 'connection') && <p className="text-xs text-rose-400">{pathStatus}</p>}
+              <div className="card p-5 space-y-4">
+                <div>
+                  <h3 className="text-sm font-semibold text-[var(--text)]">Server & Sync</h3>
+                  <p className="mt-1 text-xs text-[var(--text-muted)]">The production URL is prefilled and remains editable. Only authenticated /client/* routes are used.</p>
+                </div>
+                <div>
+                  <label className="text-xs text-[var(--text-muted)] mb-1 block">Backend URL</label>
+                  <input
+                    value={form.server_url}
+                    onChange={(event) => uf('server_url', event.target.value)}
+                    className="input-field h-9 w-full font-mono text-xs"
+                    placeholder={api.defaultServerUrl}
+                    spellCheck={false}
+                  />
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button onClick={() => connectionMut.mutate()} disabled={connectionMut.isPending || !settings?.auth_token} className="btn-secondary text-xs gap-1.5">
+                    {connectionMut.isPending ? <Spinner size={13} /> : <Wifi size={13} />}Test Connection
+                  </button>
+                  <button onClick={() => syncMut.mutate()} disabled={syncMut.isPending || !settings?.auth_token} className="btn-primary text-xs gap-1.5">
+                    {syncMut.isPending ? <Spinner size={13} /> : <RefreshCw size={13} />}Sync Tenders
+                  </button>
+                </div>
+                <p className="text-[11px] text-[var(--text-muted)]">Sync reads paginated tender data from Postgres through the backend and updates the offline cache. Projects, bookmarks, templates, settings, and local files are never uploaded.</p>
+                {settings?.last_sync_at && <p className="text-[11px] text-[var(--text-muted)]">Last sync: {new Date(settings.last_sync_at).toLocaleString()}</p>}
+                {pathStatus && <p className="text-xs text-rose-400">{pathStatus}</p>}
+              </div>
+
+              <div className="flex items-center gap-3 pb-6 xl:pb-0">
+                <button onClick={handleSave} disabled={saveMut.isPending} className="btn-primary text-sm gap-1.5">
+                  {saveMut.isPending ? <Spinner size={14} /> : saved ? <CheckCircle2 size={14} /> : <Save size={14} />}{saved ? 'Saved!' : 'Save Settings'}
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
-
-      {!isLoading && (tab === 'workspace' || tab === 'directories' || tab === 'connection') && (
-        <div className="sticky bottom-0 flex items-center gap-3 border-t border-[var(--border)] bg-[var(--surface-0)] px-6 py-3">
-          <button onClick={handleSave} disabled={saveMut.isPending} className="btn-primary text-sm gap-1.5">
-            {saveMut.isPending ? <Spinner size={14} /> : saved ? <CheckCircle2 size={14} /> : <Save size={14} />}{saved ? 'Saved!' : 'Save Settings'}
-          </button>
-          <span className="text-xs text-[var(--text-muted)]">Appearance settings under the Appearance tab save automatically.</span>
         </div>
       )}
     </div>
@@ -2897,10 +2889,82 @@ function SettingsPage() {
      on a timer. That whole cycle was the scraper re-checking source portals
      for completed tenders — an operator-only background job.
    ═══════════════════════════════════════════════════════════════════════════ */
+function SignInScreen() {
+  const qc = useQueryClient();
+  const [mode, setMode] = useState('login');
+  const [form, setForm] = useState({ email: '', password: '', display_name: '' });
+  const [remember, setRemember] = useState(true);
+  const [error, setError] = useState('');
+  const uf = (key, value) => setForm((f) => ({ ...f, [key]: value }));
+
+  const mut = useMutation({
+    mutationFn: () => api.signIn(form, mode, remember),
+    onSuccess: () => { setError(''); qc.invalidateQueries({ queryKey: ['settings'] }); },
+    onError: (err) => setError(err instanceof Error ? err.message : String(err)),
+  });
+
+  const submit = (event) => {
+    event.preventDefault();
+    if (!form.email.trim() || !form.password.trim()) { setError('Enter your email and password.'); return; }
+    mut.mutate();
+  };
+
+  return (
+    <div className="h-screen flex items-center justify-center bg-[var(--bg)] text-[var(--text)]">
+      <form onSubmit={submit} className="card w-full max-w-sm p-6 space-y-4">
+        <div>
+          <h1 className="text-lg font-bold">{mode === 'register' ? 'Create Account' : 'Sign In'}</h1>
+          <p className="mt-1 text-xs text-[var(--text-muted)]">BidManager Client</p>
+        </div>
+        {mode === 'register' && (
+          <div>
+            <label className="text-xs text-[var(--text-muted)] mb-1 block">Name</label>
+            <input value={form.display_name} onChange={(event) => uf('display_name', event.target.value)}
+              className="input-field h-9 w-full text-sm" placeholder="Your name" autoComplete="name" />
+          </div>
+        )}
+        <div>
+          <label className="text-xs text-[var(--text-muted)] mb-1 block">Email</label>
+          <input type="email" value={form.email} onChange={(event) => uf('email', event.target.value)}
+            className="input-field h-9 w-full text-sm" placeholder="you@example.com" autoComplete="email" required />
+        </div>
+        <div>
+          <label className="text-xs text-[var(--text-muted)] mb-1 block">Password</label>
+          <input type="password" value={form.password} onChange={(event) => uf('password', event.target.value)}
+            className="input-field h-9 w-full text-sm" placeholder={mode === 'register' ? 'At least 8 characters' : 'Password'}
+            autoComplete={mode === 'register' ? 'new-password' : 'current-password'} required />
+        </div>
+        <label className="flex items-center gap-2 text-xs text-[var(--text-muted)]">
+          <input type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)}
+            className="h-3.5 w-3.5 rounded border-[var(--border)]" />
+          Keep me signed in on this device
+        </label>
+        {error && <p className="text-xs text-[var(--danger)]">{error}</p>}
+        <button type="submit" disabled={mut.isPending} className="btn-primary w-full text-sm justify-center gap-1.5">
+          {mut.isPending ? <Spinner size={13} /> : mode === 'register' ? <UserPlus size={14} /> : <LogIn size={14} />}
+          {mode === 'register' ? 'Create Account' : 'Sign In'}
+        </button>
+        <button type="button" onClick={() => { setMode(mode === 'register' ? 'login' : 'register'); setError(''); }}
+          className="w-full text-xs text-[var(--text-muted)] hover:text-[var(--text)]">
+          {mode === 'register' ? 'Already have an account? Sign in' : 'New here? Create an account'}
+        </button>
+      </form>
+    </div>
+  );
+}
+
 export default function App() {
+  const qc = useQueryClient();
   const { theme, toggleTheme, sidebarCollapsed, toggleSidebar, notifications } = useAppStore();
+  const { data: authSettings, isLoading: authLoading } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
+  const { data: connected } = useQuery({
+    queryKey: ['client-health', authSettings?.server_url, Boolean(authSettings?.auth_token)],
+    queryFn: () => api.health(),
+    enabled: Boolean(authSettings?.auth_token),
+    retry: false,
+  });
   const [page, setPage] = useState(() => {
-    const allowed = ['dashboard', 'tenders', 'projects', 'templates', 'archived_projects', 'files', 'settings'];
+    const allowed = ['dashboard', 'tenders', 'projects', 'templates', 'archived_projects', 'settings'];
     const startupPage = readClientPrefs().startupPage;
     if (startupPage && startupPage !== 'resume' && allowed.includes(startupPage)) return startupPage;
     const saved = localStorage.getItem('bm-client-last-page');
@@ -2928,13 +2992,23 @@ export default function App() {
     return () => window.removeEventListener('bm-workspace-time-remaining', onTime);
   }, []);
 
+  // Keeps the offline cache current without relying on the user remembering
+  // to press "Sync Tenders" in Settings — same pull-only sync, just scheduled.
+  useEffect(() => {
+    if (!authSettings?.auth_token) return undefined;
+    const run = () => { api.syncFromServer().then(() => qc.invalidateQueries()).catch(() => {}); };
+    const timer = setInterval(run, 15 * 60 * 1000);
+    return () => clearInterval(timer);
+  }, [authSettings?.auth_token, qc]);
+
+  if (!authLoading && !authSettings?.auth_token) return <SignInScreen />;
+
   const pages = {
     dashboard: <DashboardPage />,
     tenders: <TendersPage />,
     projects: <ProjectsPage key="projects-active" onOpenProjectWorkspace={(projectId) => setWorkspaceProjectId(projectId)} />,
     archived_projects: <ProjectsPage key="projects-archived" archived onOpenProjectWorkspace={(projectId) => setWorkspaceProjectId(projectId)} />,
     templates: <TemplatesPage />,
-    files: <FilesPage />,
     settings: <SettingsPage />,
   };
 
@@ -2943,6 +3017,13 @@ export default function App() {
       <header className="h-11 flex items-center px-4 border-b border-[var(--border)] bg-[var(--surface-0)] shrink-0 relative z-30">
         <span className="text-xs text-[var(--text-muted)] font-medium">Tender & Bid Manager</span>
         <div className="flex-1" />
+        <div className="flex items-center gap-2">
+          {connected ? (
+            <span title="Connected to the server"><Badge variant="success"><Wifi size={10} /></Badge></span>
+          ) : (
+            <span title="Not connected — check Settings › Connection & Sync"><Badge variant="danger"><WifiOff size={10} /></Badge></span>
+          )}
+        </div>
         <div className="flex items-center gap-1">
           <button onClick={() => setShowNotifications(!showNotifications)} className="relative p-1.5 rounded-md hover:bg-[var(--surface-1)] text-[var(--text-muted)]">
             <Bell size={16} />

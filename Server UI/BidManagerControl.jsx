@@ -4,7 +4,7 @@ import {
   Globe, Key, Search, X, Check, AlertTriangle, RefreshCw, Play, Pause, Trash2,
   Download, Upload, Plus, RotateCcw, Loader2, ChevronRight, ChevronDown, ArrowLeft,
   Copy, ExternalLink, Filter, ShieldCheck, Zap, FileText,
-  Eye, Bell, SkipForward, Timer, Send
+  Eye, Bell, SkipForward, Timer, Send, Users, Ban
 } from 'lucide-react';
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -33,12 +33,17 @@ const cond = "'IBM Plex Sans Condensed', 'IBM Plex Sans', sans-serif";
    so no component needs to change during wiring.
    ═════════════════════════════════════════════════════════════════════════ */
 
-const PRODUCTION_API_BASE = 'https://bidmanager-backend-426342323597.asia-south1.run.app';
+// OCI Ampere VM (migrated off Google Cloud Run 2026-08-28). Matches BIDMANAGER_DOMAIN
+// in deploy/oci/.env. IP-pinned sslip.io hostname until a real domain is put in front.
+const PRODUCTION_API_BASE = 'https://161.118.170.233.sslip.io';
 const LEGACY_PRODUCTION_API_BASE = 'https://bidmanager-api-3xk2.a.run.app';
 const LEGACY_PRODUCTION_API_BASES = [
   LEGACY_PRODUCTION_API_BASE,
   'https://bidmanager-server-426342323597.asia-south1.run.app',
   'https://bidmanager-backend-zz2boi3jzq-el.a.run.app',
+  // Retired Google Cloud Run production URLs — kept here so saved operator profiles
+  // auto-repoint to PRODUCTION_API_BASE (see the migration at ~line 2433).
+  'https://bidmanager-backend-426342323597.asia-south1.run.app',
 ];
 const PRODUCTION_STORAGE_ROOT = 'gdrive://1h3dDknN6sVsv-T-6e3kFqnEc2Sooa9sS';
 const DESKTOP_LOCAL_API_BASE = typeof window !== 'undefined'
@@ -222,7 +227,14 @@ function createApi(base, adminKey) {
         uptimeSeconds: raw.uptimeSeconds ?? 0,
         lastDeploy: raw.lastDeploy || new Date().toISOString(),
         checks: raw.checks || [],
+        providers: raw.providers || null,
+        cloudPushConfigured: !!raw.cloudPushConfigured,
       };
+    },
+    // WIRE: POST /admin/push-to-cloud — pushes all locally-scraped tenders + files
+    // (not yet pushed) into the shared Postgres DB and Drive folder.
+    async pushToCloud() {
+      return apiFetch(base, '/admin/push-to-cloud', { method: 'POST', adminKey });
     },
     // WIRE: GET /admin/metrics
     async metrics() {
@@ -330,6 +342,27 @@ function createApi(base, adminKey) {
       return apiFetch(base, `/admin/custom-jobs/${Number(id)}?owner=${encodeURIComponent(owner)}`, {
         method: 'DELETE', adminKey,
       });
+    },
+    async renumberSavedCustomJobs() {
+      return apiFetch(base, '/admin/custom-jobs/renumber', { method: 'POST', adminKey });
+    },
+
+    // WIRE: GET /admin/users — every account that has ever signed in from the client app
+    async clientUsers() {
+      const raw = await apiFetch(base, '/admin/users', { adminKey });
+      return raw.items || [];
+    },
+    // WIRE: GET /admin/users/{id} — includes recent client_activity_log rows
+    async clientUserDetail(id) {
+      return apiFetch(base, `/admin/users/${Number(id)}`, { adminKey });
+    },
+    // WIRE: POST /admin/users/{id}/suspend — revokes all of that user's tokens immediately
+    async suspendClientUser(id) {
+      return apiFetch(base, `/admin/users/${Number(id)}/suspend`, { method: 'POST', adminKey });
+    },
+    // WIRE: POST /admin/users/{id}/reactivate
+    async reactivateClientUser(id) {
+      return apiFetch(base, `/admin/users/${Number(id)}/reactivate`, { method: 'POST', adminKey });
     },
 
     // WIRE: GET /admin/storage?prefix=
@@ -771,6 +804,7 @@ function ConfigPanel({ toast, env, base, adminKey, setBase, dbUrl, setDbUrl, sto
   const [dbDraft, setDbDraft] = useState(dbUrl || '');
   const [storageDraft, setStorageDraft] = useState(storageUrl || '');
   const [testing, setTesting] = useState(false);
+  const [pushingToCloud, setPushingToCloud] = useState(false);
 
   useEffect(() => {
     setUrlDraft(base || ''); setDbDraft(dbUrl || ''); setStorageDraft(storageUrl || '');
@@ -827,6 +861,15 @@ function ConfigPanel({ toast, env, base, adminKey, setBase, dbUrl, setDbUrl, sto
       setDbDraft('postgresql://bm_app@10.42.0.5:5432/bidmanager');
       setStorageDraft(PRODUCTION_STORAGE_ROOT);
     }
+  };
+
+  const pushToCloud = async () => {
+    setPushingToCloud(true);
+    try {
+      const job = await api.pushToCloud();
+      toast(`Cloud push ${job.job_id || job.id || ''} queued`);
+    } catch (err) { toast(err.message || 'Could not queue cloud push'); }
+    setPushingToCloud(false);
   };
 
   const testConnection = async () => {
@@ -923,8 +966,11 @@ function ConfigPanel({ toast, env, base, adminKey, setBase, dbUrl, setDbUrl, sto
               <div className="flex items-start gap-2 p-2.5" style={{ background: c.amberSoft, border: '1px solid #E4CFA4' }}>
                 <AlertTriangle size={13} style={{ color: c.amber, marginTop: 2, flexShrink: 0 }} />
                 <span style={{ fontSize: 12, color: c.amber, lineHeight: 1.5 }}>
-                  Pointed at a database and folder on this machine. Tenders scraped here won't reach the shared database, and nothing else can see this local storage.
+                  Pointed at a database and folder on this machine. Tenders scraped here won't reach the shared database, and nothing else can see this local storage — use Push to Cloud below to sync what's been scraped so far.
                 </span>
+              </div>
+              <div className="pt-2">
+                <Btn size="sm" variant="primary" icon={Upload} busy={pushingToCloud} onClick={pushToCloud}>Push to Cloud</Btn>
               </div>
             </div>
           )
@@ -1242,6 +1288,7 @@ function ScraperPanel({ toast, base, adminKey }) {
   const [newWebsiteUrl, setNewWebsiteUrl] = useState('');
   const [newWebsiteStatusUrl, setNewWebsiteStatusUrl] = useState('');
   const [editingJobId, setEditingJobId] = useState(null);
+  const [editingJobOwner, setEditingJobOwner] = useState(null);
   const [selectedSavedJobId, setSelectedSavedJobId] = useState(null);
   const [savedJobScheduleMode, setSavedJobScheduleMode] = useState('manual');
   const [savedJobScheduleAt, setSavedJobScheduleAt] = useState(() => toDateTimeLocal());
@@ -1377,7 +1424,7 @@ function ScraperPanel({ toast, base, adminKey }) {
     setBusy('save-custom');
     try {
       const saved = await api.saveCustomJob({
-        owner_name: owner, name, website_id: Number(websiteId), job_type: jobType,
+        owner_name: editingJobId ? (editingJobOwner || owner) : owner, name, website_id: Number(websiteId), job_type: jobType,
         org_ids: [...selectedOrgs], tender_ids: [...selectedTenders],
         all_organizations: jobType === 'scrape' && scrapeAllOrgs,
         download_mode: 'auto', schedule_enabled: savedJobScheduleMode !== 'manual',
@@ -1396,6 +1443,7 @@ function ScraperPanel({ toast, base, adminKey }) {
 
   const editSavedJob = (job) => {
     setEditingJobId(job.id);
+    setEditingJobOwner(job.owner_name);
     setSelectedSavedJobId(job.id);
     setJobName(job.name);
     setWebsiteId(String(job.website_id));
@@ -1421,7 +1469,7 @@ function ScraperPanel({ toast, base, adminKey }) {
   const runSavedJob = async (job) => {
     setBusy(`run-${job.id}`);
     try {
-      const queued = await api.runSavedCustomJob(job.id, ownerName.trim());
+      const queued = await api.runSavedCustomJob(job.id, job.owner_name || ownerName.trim());
       toast(`Job ${queued.job_id || ''} queued`);
       await loadSavedJobs();
     } catch (err) { toast(err.message || 'Could not run saved job'); }
@@ -1431,12 +1479,22 @@ function ScraperPanel({ toast, base, adminKey }) {
   const deleteSavedJob = async (job) => {
     setBusy(`delete-${job.id}`);
     try {
-      await api.deleteSavedCustomJob(job.id, ownerName.trim());
-      if (editingJobId === job.id) { setEditingJobId(null); setJobName(''); }
+      await api.deleteSavedCustomJob(job.id, job.owner_name || ownerName.trim());
+      if (editingJobId === job.id) { setEditingJobId(null); setEditingJobOwner(null); setJobName(''); }
       if (selectedSavedJobId === job.id) setSelectedSavedJobId(null);
       toast('Saved job deleted');
       await loadSavedJobs();
     } catch (err) { toast(err.message || 'Could not delete saved job'); }
+    setBusy('');
+  };
+
+  const renumberSavedJobs = async () => {
+    setBusy('renumber-custom');
+    try {
+      const result = await api.renumberSavedCustomJobs();
+      toast(result.renumbered ? `Renumbered ${result.renumbered} saved job${result.renumbered === 1 ? '' : 's'}` : 'Saved job ids are already sequential');
+      await loadSavedJobs();
+    } catch (err) { toast(err.message || 'Could not renumber saved jobs'); }
     setBusy('');
   };
 
@@ -1499,6 +1557,7 @@ function ScraperPanel({ toast, base, adminKey }) {
             <div style={{ fontSize: 12, color: c.ink60 }}>Save the current selection, run it manually, or schedule it for a specific time.</div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <Btn size="sm" variant="ghost" icon={RotateCcw} busy={busy === 'renumber-custom'} disabled={savedJobs.length === 0} onClick={renumberSavedJobs}>Renumber IDs</Btn>
             <TextIn value={ownerName} onChange={setOwnerName} w={150} placeholder="User / owner" />
             <TextIn value={jobName} onChange={setJobName} w={190} placeholder="Custom job name" />
             <Select value={jobType} onChange={setJobType} w={120} options={[
@@ -1527,7 +1586,7 @@ function ScraperPanel({ toast, base, adminKey }) {
             </>}
             <Btn size="sm" busy={busy === 'save-custom'} disabled={!jobName.trim() || !selectionReady} onClick={saveNamedJob}>{editingJobId ? 'Update' : 'Save'}</Btn>
             <Btn size="sm" variant="primary" icon={Play} busy={selectedSavedJobId && busy === `run-${selectedSavedJobId}`} disabled={!selectedSavedJobId} onClick={() => runSavedJob({ id: selectedSavedJobId })}>Run</Btn>
-            {editingJobId && <Btn size="sm" variant="ghost" onClick={() => { setEditingJobId(null); setSelectedSavedJobId(null); setJobName(''); setScrapeAllOrgs(false); }}>Cancel edit</Btn>}
+            {editingJobId && <Btn size="sm" variant="ghost" onClick={() => { setEditingJobId(null); setEditingJobOwner(null); setSelectedSavedJobId(null); setJobName(''); setScrapeAllOrgs(false); }}>Cancel edit</Btn>}
           </div>
         </div>
         {editingJobId && <div className="flex items-center px-3 py-2" style={{ background: c.paper }}><Pill state="info">editing #{editingJobId}</Pill></div>}
@@ -2144,6 +2203,122 @@ function CaptchaPanel({ toast, captchas, setCaptchas, base, adminKey }) {
   );
 }
 
+function UsersPanel({ toast, base, adminKey }) {
+  const api = useMemo(() => createApi(base, adminKey), [base, adminKey]);
+  const [users, setUsers] = useState(null);
+  const [loadError, setLoadError] = useState('');
+  const loadingRef = useRef(false);
+  const [busyId, setBusyId] = useState(null);
+  const [filter, setFilter] = useState('all');
+
+  const load = useCallback(async () => {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
+    try {
+      setLoadError('');
+      setUsers(await api.clientUsers()); // WIRE: GET /admin/users
+    } catch (err) {
+      const message = err.message || 'Could not load users';
+      setLoadError(message);
+      setUsers([]);
+      toast(message);
+    } finally {
+      loadingRef.current = false;
+    }
+  }, [api, toast]);
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => { const t = setInterval(load, 15000); return () => clearInterval(t); }, [load]);
+
+  const act = async (id, kind) => {
+    setBusyId(id);
+    try {
+      if (kind === 'suspend') await api.suspendClientUser(id); // WIRE: POST /admin/users/{id}/suspend
+      else await api.reactivateClientUser(id); // WIRE: POST /admin/users/{id}/reactivate
+      toast(kind === 'suspend' ? 'Account suspended' : 'Account reactivated');
+      load();
+    } catch (err) {
+      toast(err.message || 'Action failed');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  if (!users) return <Panel code="USR" title="Users"><Card><Empty icon={Loader2} title="Loading accounts…" /></Card></Panel>;
+
+  const counts = users.reduce((a, u) => ({ ...a, [u.status]: (a[u.status] || 0) + 1 }), {});
+  const shown = filter === 'all' ? users : users.filter((u) => u.status === filter);
+  const fmt = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : '—');
+
+  return (
+    <Panel
+      code="USR" title="Users" note="Every account signed in from the client app"
+      right={<Btn size="sm" icon={RefreshCw} onClick={load}>Refresh</Btn>}
+    >
+      {loadError && (
+        <Card style={{ marginBottom: 10 }}>
+          <div className="flex items-center gap-2 p-3" style={{ background: c.amberSoft, border: `1px solid #E4CFA4` }}>
+            <AlertTriangle size={14} style={{ color: c.amber }} />
+            <span style={{ fontSize: 12.5, color: c.amber }}>{loadError}</span>
+          </div>
+        </Card>
+      )}
+      <StatStrip items={[
+        ['Active', String(counts.active || 0).padStart(2, '0'), c.seal],
+        ['Suspended', String(counts.suspended || 0).padStart(2, '0'), c.stamp],
+        ['Total', String(users.length).padStart(2, '0'), c.ink60],
+      ]} />
+
+      <div className="flex flex-wrap gap-1.5 mb-3">
+        {['all', 'active', 'suspended'].map((f) => (
+          <button key={f} onClick={() => setFilter(f)}
+            style={{
+              fontFamily: mono, fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', padding: '4px 10px',
+              background: filter === f ? c.ink : c.card, color: filter === f ? '#fff' : c.ink60,
+              border: `1px solid ${filter === f ? c.ink : c.rule}`, cursor: 'pointer',
+            }}>{f}</button>
+        ))}
+      </div>
+
+      <Card pad={false}>
+        {shown.length === 0 ? (
+          <Empty icon={Users} title="No accounts in this state." />
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full" style={{ borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ background: c.paper }}>
+                  {['Email', 'Name', 'Status', 'Created', 'Last seen', 'Activity', ''].map((th) => (
+                    <th key={th} className="text-left px-3 py-2" style={{ fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60, borderBottom: `1px solid ${c.rule}`, fontWeight: 500 }}>{th}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map((u) => (
+                  <tr key={u.id} style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
+                    <td className="px-3 py-2" style={{ fontSize: 12.5, color: c.ink }}>{u.email}</td>
+                    <td className="px-3 py-2" style={{ fontSize: 12.5, color: c.ink60 }}>{u.display_name || '—'}</td>
+                    <td className="px-3 py-2"><Pill state={u.status === 'active' ? 'ok' : 'error'}>{u.status}</Pill></td>
+                    <td className="px-3 py-2"><Mono style={{ fontSize: 11, color: c.ink60 }}>{fmt(u.created_at)}</Mono></td>
+                    <td className="px-3 py-2"><Mono style={{ fontSize: 11, color: c.ink60 }}>{fmt(u.last_seen_at)}</Mono></td>
+                    <td className="px-3 py-2"><Mono style={{ fontSize: 11.5, color: c.ink60 }}>{u.activity_count}</Mono></td>
+                    <td className="px-3 py-2 text-right whitespace-nowrap">
+                      {u.status === 'active' ? (
+                        <Btn size="sm" variant="danger" icon={Ban} busy={busyId === u.id} onClick={() => act(u.id, 'suspend')}>Suspend</Btn>
+                      ) : (
+                        <Btn size="sm" icon={Check} busy={busyId === u.id} onClick={() => act(u.id, 'reactivate')}>Reactivate</Btn>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+    </Panel>
+  );
+}
+
 function DbPanel({ toast, env, base, adminKey, dbUrl, localScope }) {
   const api = useMemo(() => createApi(base, adminKey), [base, adminKey]);
   const [d, setD] = useState(null);
@@ -2248,6 +2423,7 @@ const NAV = [
   { code: 'SCR', key: 'scraper', label: 'Scraper',  icon: Globe },
   { code: 'JOB', key: 'jobs',    label: 'Jobs',     icon: Layers },
   { code: 'CAP', key: 'captcha', label: 'Captchas', icon: Eye, badge: true },
+  { code: 'USR', key: 'users',   label: 'Users',    icon: Users },
   { code: 'FS',  key: 'storage', label: 'Files',    icon: Folder },
   { code: 'LOG', key: 'logs',    label: 'Logs',     icon: Terminal },
   { code: 'DB',  key: 'db',      label: 'Database', icon: Database },
@@ -2356,7 +2532,7 @@ export default function BidManagerControl() {
   }, [bases, env, keyVal]);
   const toast = useCallback((m) => { setToastMsg(m); setTimeout(() => setToastMsg(null), 2600); }, []);
 
-  const Body = { server: ServerPanel, config: ConfigPanel, scraper: ScraperPanel, jobs: JobsPanel, captcha: CaptchaPanel, storage: StoragePanel, logs: LogsPanel, db: DbPanel }[tab];
+  const Body = { server: ServerPanel, config: ConfigPanel, scraper: ScraperPanel, jobs: JobsPanel, captcha: CaptchaPanel, users: UsersPanel, storage: StoragePanel, logs: LogsPanel, db: DbPanel }[tab];
 
   return (
     <div style={{ background: c.paper, minHeight: '100vh', fontFamily: sans, color: c.ink }}>

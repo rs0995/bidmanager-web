@@ -76,9 +76,14 @@ class FastApiComputeProvider(ComputeProvider):
     def metadata(self) -> dict[str, Any]:
         service = _env("K_SERVICE")
         revision = _env("K_REVISION")
-        region = _env("GOOGLE_CLOUD_REGION") or _env("GCP_REGION") or _env("CLOUD_RUN_REGION")
-        provider_id = "google-cloud-run" if service or revision else "custom-api"
-        label = "Google Cloud Run" if provider_id == "google-cloud-run" else "Custom API / FastAPI"
+        oci_region = _env("OCI_REGION")
+        region = oci_region or _env("GOOGLE_CLOUD_REGION") or _env("GCP_REGION") or _env("CLOUD_RUN_REGION")
+        if oci_region or _env("OCI_INSTANCE_ID"):
+            provider_id, label = "oracle-cloud", "Oracle Cloud Infrastructure"
+        elif service or revision:
+            provider_id, label = "google-cloud-run", "Google Cloud Run"
+        else:
+            provider_id, label = "custom-api", "Custom API / FastAPI"
         service_url = _env("BIDMANAGER_PUBLIC_URL") or _env("CLOUD_RUN_SERVICE_URL")
         project_id = _env("GOOGLE_CLOUD_PROJECT") or _env("GCP_PROJECT")
         return {
@@ -102,7 +107,11 @@ class FastApiComputeProvider(ComputeProvider):
     def health(self) -> dict[str, Any]:
         metadata = self.metadata()
         storage = active_storage_provider().metadata()
-        storage_ok = not storage_runtime.is_cloud_runtime() or storage["provider"] == "google-drive"
+        storage_ok = (
+            not storage_runtime.is_cloud_runtime()
+            or storage["provider"] == "google-drive"
+            or storage_runtime.using_persistent_local_storage()
+        )
         return {
             "status": "serving",
             "provider": metadata["provider"],
@@ -118,7 +127,7 @@ class FastApiComputeProvider(ComputeProvider):
                 {
                     "name": "Storage",
                     "state": "ok" if storage_ok else "error",
-                    "detail": storage["label"] if storage_ok else "Google Drive is required in cloud mode",
+                    "detail": storage["label"] if storage_ok else "Durable cloud storage is required",
                 },
             ],
         }
@@ -276,7 +285,7 @@ class HybridStorageProvider(StorageProvider):
             "provider": provider_id,
             "label": _provider_label(provider_id, "Google Drive" if using_drive else "Local / Volume"),
             "root": root,
-            "configured": using_drive,
+            "configured": using_drive or storage_runtime.using_persistent_local_storage(),
         }
 
     def list_items(self, prefix: str = "") -> dict[str, Any]:

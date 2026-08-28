@@ -22,9 +22,9 @@ if errorlevel 1 (
 )
 
 REM -- Step 2: Check app_core.py --------------------------------------
-if not exist "backend\app_core.py" (
-    echo [ERROR] backend\app_core.py not found!
-    echo         Copy your existing app_core.py into the backend\ folder.
+if not exist "Server UI\server\app_core.py" (
+    echo [ERROR] Server UI\server\app_core.py not found!
+    echo         Server UI\server is the backend source of truth.
     exit /b 1
 )
 

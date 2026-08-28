@@ -1,0 +1,7 @@
+
+Client UI
+For now, regarding the scraping part, just keep the flow that all the scraped data and downloaded files are viewable in the app. For tenders whose files are present for download will show a download button that will download the files locally. FOr those whose download files are not present will show a "Request Tender Files" button.
+
+Scraper UI 
+
+1. In saved custom jobs, if entire website is selected, there should be no option to select individual tenders also. Even if individual orgs or tenders are bookmarked, the should be irrelevant for the logic of scraping. 2. If a tendder fails to download, it should still show NOT_DOWNLOADED in status in tender table. 3. If a captcha job is abandoned, it should stop the entire job. 

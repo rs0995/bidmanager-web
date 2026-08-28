@@ -22,6 +22,11 @@ import urllib.request
 import urllib.error
 from urllib.parse import urlparse, urljoin, parse_qs, parse_qsl, urlencode, urlunparse
 
+import db_compat
+import drive_storage
+
+db_compat.patch_sqlite3(sqlite3)
+
 # --- External Libraries for Scraper (lazy-loaded for faster app startup) ---
 requests = None
 BeautifulSoup = None
@@ -138,7 +143,10 @@ def ensure_scraper_dependencies():
         _webdriver = importlib.import_module("selenium.webdriver")
         _FirefoxService = getattr(importlib.import_module("selenium.webdriver.firefox.service"), "Service")
         _FirefoxOptions = getattr(importlib.import_module("selenium.webdriver.firefox.options"), "Options")
-        from selenium.webdriver.firefox.webdriver import WebDriver as _FirefoxWebDriver
+        # Use Selenium's public constructor. Importing the internal
+        # selenium.webdriver.firefox.webdriver module directly is brittle and
+        # can also be missed by frozen desktop builds.
+        _FirefoxWebDriver = getattr(_webdriver, "Firefox")
         _By = getattr(importlib.import_module("selenium.webdriver.common.by"), "By")
         _ui_mod = importlib.import_module("selenium.webdriver.support.ui")
         _WebDriverWait = getattr(_ui_mod, "WebDriverWait")
@@ -2009,6 +2017,14 @@ class ScraperBackend:
             with open(file_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
+
+            stored_path = file_path
+            if drive_storage.using_drive_storage():
+                stored_path = drive_storage.upload_file(
+                    file_path,
+                    tender_id=str(tender_id or ""),
+                    file_type=file_type,
+                )
             
             if tender_id:
                 ScraperBackend.log_downloaded_file(
@@ -2016,7 +2032,7 @@ class ScraperBackend:
                     os.path.basename(file_path),
                     file_type=file_type,
                     source_url=url,
-                    local_path=file_path
+                    local_path=stored_path
                 )
             return True
         except Exception as e:

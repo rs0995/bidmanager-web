@@ -29,6 +29,25 @@ class StorageRuntimeTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 storage_runtime.require_durable_cloud_storage()
 
+    def test_oci_volume_is_accepted_and_never_cleaned_as_scratch(self):
+        with tempfile.TemporaryDirectory(prefix="bidmanager-oci-volume-") as tmp, mock.patch.dict(
+            os.environ,
+            {
+                "BIDMANAGER_ENV": "production",
+                "BIDMANAGER_STORAGE_PROVIDER": "oci-block-volume",
+                "BIDMANAGER_RUNTIME_DIR": tmp,
+                "GOOGLE_DRIVE_FOLDER_ID": "",
+            },
+            clear=False,
+        ):
+            storage_runtime.require_durable_cloud_storage()
+            child = Path(tmp) / "downloads" / "42"
+            child.mkdir(parents=True)
+            document = child / "tender.pdf"
+            document.write_bytes(b"durable")
+            storage_runtime.cleanup_scratch_folder(str(child))
+            self.assertTrue(document.exists())
+
     def test_cloud_mode_refuses_ephemeral_sqlite_database(self):
         clean_env = {
             "K_SERVICE": "bidmanager",

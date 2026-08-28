@@ -2,7 +2,10 @@ import os
 import base64
 import json
 import sqlite3
+import sys
 import tempfile
+import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -25,25 +28,85 @@ class ClientApiTests(unittest.TestCase):
         conn = sqlite3.connect(self.db_path)
         conn.executescript(
             """
-            CREATE TABLE websites (id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE websites (id INTEGER PRIMARY KEY, name TEXT, url TEXT);
             CREATE TABLE tenders (
                 id INTEGER PRIMARY KEY, website_id INTEGER, org_chain TEXT, tender_id TEXT,
                 title TEXT, work_description TEXT, tender_value TEXT, emd TEXT,
                 closing_date TEXT, opening_date TEXT, published_date TEXT,
                 pre_bid_meeting_date TEXT, location TEXT, tender_category TEXT,
-                status TEXT, is_archived INTEGER, tender_url TEXT
+                status TEXT, is_archived INTEGER, tender_url TEXT,
+                prebid_count INTEGER DEFAULT 0, corrigendum_count INTEGER DEFAULT 0,
+                scrape_enabled INTEGER DEFAULT 0, scrape_interval_minutes INTEGER DEFAULT 0,
+                next_scrape_at REAL DEFAULT 0, last_scraped_at REAL
+            );
+            CREATE TABLE organizations (
+                id INTEGER PRIMARY KEY, website_id INTEGER, name TEXT, tenders_url TEXT,
+                tender_count INTEGER, is_selected INTEGER DEFAULT 0,
+                scrape_enabled INTEGER DEFAULT 0, scrape_interval_minutes INTEGER DEFAULT 0,
+                next_scrape_at REAL DEFAULT 0, last_scraped_at REAL
             );
             CREATE TABLE downloaded_files (
                 id INTEGER PRIMARY KEY, tender_id TEXT, tender_db_id INTEGER,
                 file_name TEXT, file_type TEXT, file_size_bytes INTEGER,
                 downloaded_at TEXT, download_status TEXT, local_path TEXT, drive_file_id TEXT
             );
-            INSERT INTO websites VALUES (1, 'MahaTenders');
+            CREATE TABLE client_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                display_name TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at REAL NOT NULL,
+                last_login_at REAL,
+                last_seen_at REAL
+            );
+            CREATE UNIQUE INDEX idx_client_users_email ON client_users(LOWER(email));
+            CREATE TABLE client_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                revoked_at REAL
+            );
+            CREATE TABLE client_activity_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                route TEXT NOT NULL,
+                tender_id INTEGER,
+                created_at REAL NOT NULL
+            );
+            CREATE TABLE client_user_sync (
+                user_id INTEGER PRIMARY KEY,
+                data_json TEXT NOT NULL DEFAULT '{}',
+                updated_at REAL NOT NULL DEFAULT 0
+            );
+            CREATE TABLE background_jobs (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                action TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT,
+                error TEXT,
+                logs_json TEXT NOT NULL DEFAULT '[]',
+                progress INTEGER DEFAULT 0,
+                created_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL,
+                heartbeat_at REAL,
+                cancel_requested INTEGER DEFAULT 0,
+                attempt_count INTEGER DEFAULT 0,
+                worker_id TEXT,
+                dedupe_key TEXT
+            );
+            INSERT INTO websites VALUES (1, 'MahaTenders', 'https://example.test');
             INSERT INTO tenders VALUES
                 (1,1,'Road Authority','T-100','Road bridge','Build a bridge','1000','10',
-                 '2026-09-10','2026-09-11','2026-08-01','2026-08-20','Pune','Works','Open',0,'https://example.test/t/100'),
+                 '2026-09-10','2026-09-11','2026-08-01','2026-08-20','Pune','Works','Open',0,'https://example.test/t/100',1,2,0,0,0,NULL),
                 (2,1,'Water Authority','T-200','Water works','Pipeline','2000','20',
-                 '2026-10-10','2026-10-11','2026-08-02','','Mumbai','Services','Closed',1,'https://example.test/t/200');
+                 '2026-10-10','2026-10-11','2026-08-02','','Mumbai','Services','Closed',1,'https://example.test/t/200',0,0,0,0,0,NULL);
+            INSERT INTO organizations VALUES
+                (1,1,'Road Authority','https://example.test/org/1',1,1,0,0,0,NULL),
+                (2,1,'Water Authority','https://example.test/org/2',1,1,0,0,0,NULL);
             """
         )
         conn.execute(
@@ -61,13 +124,21 @@ class ClientApiTests(unittest.TestCase):
             mock.patch.object(client_api.core, "DB_FILE", str(self.db_path)),
             mock.patch.object(client_api.core, "BASE_DOWNLOAD_DIRECTORY", str(self.root)),
             mock.patch.dict(os.environ, {
-                "CLIENT_API_KEY": "client-secret",
                 "ADMIN_API_KEY": "admin-secret",
                 "BIDMANAGER_DOWNLOAD_TOKEN_SECRET": "download-secret",
             }, clear=False),
         ]
         for patch in self.patches:
             patch.start()
+
+        register = self.client.post(
+            "/client/auth/register",
+            json={"email": "tester@example.com", "password": "correct horse battery"},
+        )
+        self.assertEqual(register.status_code, 200, register.text)
+        self.token = register.json()["token"]
+        self.user_id = register.json()["user_id"]
+        register.close()
 
     def tearDown(self):
         self.client.close()
@@ -77,17 +148,76 @@ class ClientApiTests(unittest.TestCase):
 
     @property
     def headers(self):
-        return {"x-client-key": "client-secret"}
+        return {"x-client-key": self.token}
 
-    def test_all_data_routes_fail_closed_without_client_key(self):
+    def _row(self, sql, params=()):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            return conn.execute(sql, params).fetchone()
+        finally:
+            conn.close()
+
+    # ── auth ────────────────────────────────────────────────────────────
+
+    def test_all_data_routes_fail_closed_without_a_valid_token(self):
         for path in ("/client/health", "/client/tenders", "/client/search?q=road", "/client/stats"):
             with self.subTest(path=path):
                 self.assertEqual(self.client.get(path).status_code, 401)
+                self.assertEqual(
+                    self.client.get(path, headers={"x-client-key": "not-a-real-token"}).status_code, 401
+                )
 
-        admin_response = self.client.get(
-            "/client/health", headers={"x-client-key": "admin-secret"},
+    def test_register_rejects_duplicate_email(self):
+        response = self.client.post(
+            "/client/auth/register",
+            json={"email": "tester@example.com", "password": "another password"},
         )
-        self.assertEqual(admin_response.status_code, 401)
+        self.assertEqual(response.status_code, 409)
+
+    def test_login_succeeds_with_correct_password_and_fails_otherwise(self):
+        ok = self.client.post(
+            "/client/auth/login",
+            json={"email": "tester@example.com", "password": "correct horse battery"},
+        )
+        self.assertEqual(ok.status_code, 200)
+        self.assertTrue(ok.json()["token"])
+        self.assertNotEqual(ok.json()["token"], self.token)  # a fresh token per login
+
+        bad = self.client.post(
+            "/client/auth/login",
+            json={"email": "tester@example.com", "password": "wrong password"},
+        )
+        self.assertEqual(bad.status_code, 401)
+
+    def test_logout_revokes_the_token(self):
+        logout = self.client.post("/client/auth/logout", headers=self.headers)
+        self.assertEqual(logout.status_code, 200)
+        after = self.client.get("/client/health", headers=self.headers)
+        self.assertEqual(after.status_code, 401)
+
+    def test_suspended_account_is_rejected_with_reason(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE client_users SET status='suspended' WHERE id=?", (self.user_id,))
+        conn.commit()
+        conn.close()
+        response = self.client.get("/client/health", headers=self.headers)
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["detail"]["reason"], "suspended")
+
+    def test_authenticated_requests_are_logged_per_user(self):
+        self.client.get("/client/health", headers=self.headers).close()
+        self.client.get("/client/tenders/1", headers=self.headers).close()
+        row = self._row(
+            "SELECT COUNT(*) AS n FROM client_activity_log WHERE user_id=?", (self.user_id,)
+        )
+        self.assertEqual(dict(row)["n"], 2)
+        tender_row = self._row(
+            "SELECT tender_id FROM client_activity_log WHERE route LIKE '%/tenders/1'"
+        )
+        self.assertEqual(dict(tender_row)["tender_id"], 1)
+
+    # ── tenders / documents (unchanged contract, now behind per-user auth) ──
 
     def test_tender_list_filters_sorts_and_paginates_without_internal_paths(self):
         response = self.client.get(
@@ -136,6 +266,121 @@ class ClientApiTests(unittest.TestCase):
             "/client/tenders/2/download-request", headers=self.headers, json={"document_id": 1},
         )
         self.assertEqual(response.status_code, 404)
+
+    # ── async tender download job ──────────────────────────────────────
+
+    def test_request_download_enqueues_a_job_and_status_can_be_polled(self):
+        fake_api_server = types.ModuleType("api_server")
+        fake_api_server._enqueue_job = mock.Mock(return_value={"job_id": "job-1", "status": "queued"})
+        with mock.patch.dict(sys.modules, {"api_server": fake_api_server}):
+            response = self.client.post("/client/tenders/1/request-download", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"job_id": "job-1", "status": "queued"})
+        fake_api_server._enqueue_job.assert_called_once_with(
+            "download_single_tender", {"tender_db_id": 1, "mode": "full", "source": "client"}
+        )
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO background_jobs (id,status,action,payload_json,created_at) VALUES (?,?,?,?,?)",
+            ("job-1", "completed", "download_single_tender", json.dumps({"tender_db_id": 1}), time.time()),
+        )
+        conn.commit()
+        conn.close()
+
+        status = self.client.get("/client/tenders/1/download-status?job_id=job-1", headers=self.headers)
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["status"], "completed")
+
+        mismatched = self.client.get("/client/tenders/2/download-status?job_id=job-1", headers=self.headers)
+        self.assertEqual(mismatched.status_code, 404)
+
+    def test_request_download_for_missing_tender_404s(self):
+        response = self.client.post("/client/tenders/999/request-download", headers=self.headers)
+        self.assertEqual(response.status_code, 404)
+
+    def test_download_status_for_unknown_job_404s(self):
+        response = self.client.get("/client/tenders/1/download-status?job_id=nope", headers=self.headers)
+        self.assertEqual(response.status_code, 404)
+
+    # ── organizations ──────────────────────────────────────────────────
+
+    def test_organizations_list_requires_auth_and_returns_expected_shape(self):
+        self.assertEqual(self.client.get("/client/organizations").status_code, 401)
+        response = self.client.get("/client/organizations", headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["total"], 2)
+        names = {item["name"] for item in payload["items"]}
+        self.assertEqual(names, {"Road Authority", "Water Authority"})
+        first = payload["items"][0]
+        self.assertIn("scrape_enabled", first)
+        self.assertIn("website_name", first)
+
+    def test_organizations_list_filters_by_query(self):
+        response = self.client.get("/client/organizations?q=road", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["total"], 1)
+
+    # ── cloud sync ──────────────────────────────────────────────────────
+
+    def test_sync_pull_is_empty_before_any_push(self):
+        response = self.client.get("/client/sync", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"data": {}, "updated_at": 0})
+
+    def test_sync_push_then_pull_round_trips(self):
+        blob = {"templates": [{"id": 1, "template_name": "Standard"}], "bookmarks": []}
+        pushed = self.client.put("/client/sync", json={"data": blob}, headers=self.headers)
+        self.assertEqual(pushed.status_code, 200, pushed.text)
+        pulled = self.client.get("/client/sync", headers=self.headers)
+        self.assertEqual(pulled.status_code, 200)
+        self.assertEqual(pulled.json()["data"], blob)
+        self.assertGreater(pulled.json()["updated_at"], 0)
+
+    def test_sync_push_requires_auth(self):
+        response = self.client.put("/client/sync", json={"data": {}})
+        self.assertEqual(response.status_code, 401)
+
+    def test_sync_push_rejects_oversized_payload(self):
+        blob = {"notes": "x" * (client_api.MAX_SYNC_PAYLOAD_BYTES + 1)}
+        response = self.client.put("/client/sync", json={"data": blob}, headers=self.headers)
+        self.assertEqual(response.status_code, 413)
+
+    def test_sync_push_enables_scrape_schedule_for_newly_bookmarked_tender_and_org(self):
+        response = self.client.put(
+            "/client/sync",
+            json={"data": {"bookmarks": [1], "bookmarkedOrgIds": [2]}},
+            headers=self.headers,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        tender_row = self._row(
+            "SELECT scrape_enabled, scrape_interval_minutes FROM tenders WHERE id=1"
+        )
+        self.assertEqual((tender_row["scrape_enabled"], tender_row["scrape_interval_minutes"]), (1, 180))
+        org_row = self._row(
+            "SELECT scrape_enabled, scrape_interval_minutes FROM organizations WHERE id=2"
+        )
+        self.assertEqual((org_row["scrape_enabled"], org_row["scrape_interval_minutes"]), (1, 180))
+        # Tender 2 / org 1 were not bookmarked, so their schedules stay off.
+        untouched_tender = self._row("SELECT scrape_enabled FROM tenders WHERE id=2")
+        self.assertEqual(untouched_tender["scrape_enabled"], 0)
+        untouched_org = self._row("SELECT scrape_enabled FROM organizations WHERE id=1")
+        self.assertEqual(untouched_org["scrape_enabled"], 0)
+
+    def test_sync_push_never_overrides_an_already_configured_schedule(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "UPDATE tenders SET scrape_enabled=1, scrape_interval_minutes=30 WHERE id=1"
+        )
+        conn.commit()
+        conn.close()
+        response = self.client.put(
+            "/client/sync", json={"data": {"bookmarks": [1]}}, headers=self.headers
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        row = self._row("SELECT scrape_interval_minutes FROM tenders WHERE id=1")
+        self.assertEqual(row["scrape_interval_minutes"], 30)  # unchanged, not reset to 180
 
 
 if __name__ == "__main__":

@@ -115,6 +115,13 @@ ipcMain.handle('desktop:ensure-project-folders', (_event, targetPath) => safeRes
   return { ok: true, path: root };
 }));
 
+ipcMain.handle('desktop:ensure-directory', (_event, targetPath) => safeResult(() => {
+  const root = path.resolve(String(targetPath || ''));
+  if (!String(targetPath || '').trim()) throw new Error('Folder path is empty.');
+  fs.mkdirSync(root, { recursive: true });
+  return { ok: true, path: root };
+}));
+
 ipcMain.handle('desktop:write-json-file', (_event, payload = {}) => safeResult(() => {
   const destination = path.resolve(String(payload.filePath || ''));
   if (!String(payload.filePath || '').trim()) throw new Error('File path is empty.');
@@ -134,8 +141,11 @@ ipcMain.handle('desktop:client-api-request', async (_event, payload = {}) => {
     const method = String(payload.method || 'GET').toUpperCase();
     if (!['GET', 'POST'].includes(method)) throw new Error('Unsupported client API method.');
     const clientKey = String(payload.clientKey || '').trim();
-    if (!clientKey) throw new Error('Client API key is required.');
-    const headers = { Accept: 'application/json', 'x-client-key': clientKey };
+    // Auth routes (/client/auth/register, /client/auth/login) are called
+    // before a token exists, so an empty key is valid — the server decides
+    // whether the route requires one.
+    const headers = { Accept: 'application/json' };
+    if (clientKey) headers['x-client-key'] = clientKey;
     const options = { method, headers };
     if (method === 'POST') {
       headers['Content-Type'] = 'application/json';
@@ -145,8 +155,51 @@ ipcMain.handle('desktop:client-api-request', async (_event, payload = {}) => {
     const text = await response.text();
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch (_) { data = null; }
-    if (!response.ok) throw new Error(data?.detail || `Client API returned HTTP ${response.status}.`);
+    if (!response.ok) {
+      const detail = data?.detail;
+      const message = (detail && typeof detail === 'object' ? detail.message : detail)
+        || `Client API returned HTTP ${response.status}.`;
+      const reason = detail && typeof detail === 'object' ? detail.reason : null;
+      return { ok: false, status: response.status, reason, message };
+    }
     return { ok: true, data, status: response.status };
+  } catch (error) {
+    return { ok: false, message: String(error?.message || error) };
+  }
+});
+
+ipcMain.handle('desktop:open-tender', async (_event, payload = {}) => {
+  try {
+    const initUrl = String(payload.initUrl || '').trim();
+    const tenderUrl = String(payload.tenderUrl || '').trim();
+    if (!tenderUrl) return { ok: false, message: 'Tender URL is empty.' };
+    const win = new BrowserWindow({ show: true, autoHideMenuBar: true, width: 1280, height: 900 });
+    if (initUrl) await win.loadURL(initUrl);
+    await win.loadURL(tenderUrl);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, message: String(error?.message || error) };
+  }
+});
+
+ipcMain.handle('desktop:download-file', async (_event, payload = {}) => {
+  try {
+    const url = String(payload.url || '').trim();
+    if (!url) throw new Error('Download URL is empty.');
+    let parsed;
+    try { parsed = new URL(url); } catch (_) { throw new Error('Invalid download URL.'); }
+    if (!['https:', 'http:'].includes(parsed.protocol)) throw new Error('Download URL must be HTTP or HTTPS.');
+    const destinationPath = String(payload.destinationPath || '').trim();
+    if (!destinationPath) throw new Error('Destination path is empty.');
+    const destination = path.resolve(destinationPath);
+    const response = await net.fetch(url);
+    if (!response.ok) throw new Error(`Download failed with HTTP ${response.status}.`);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    const temp = `${destination}.part`;
+    fs.writeFileSync(temp, buffer);
+    fs.renameSync(temp, destination);
+    return { ok: true, path: destination, bytes: buffer.length };
   } catch (error) {
     return { ok: false, message: String(error?.message || error) };
   }

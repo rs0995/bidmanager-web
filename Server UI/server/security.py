@@ -18,6 +18,8 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
+import bcrypt
+
 
 _LOCAL_ENVIRONMENTS = {"local", "dev", "development", "test"}
 _CLOUD_ENVIRONMENTS = {"staging", "stage", "production", "prod"}
@@ -78,6 +80,27 @@ def secure_equals(provided: str | None, expected: str | None) -> bool:
     left = str(provided or "").encode("utf-8")
     right = str(expected or "").encode("utf-8")
     return bool(right) and hmac.compare_digest(left, right)
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(str(password or "").encode("utf-8"), bcrypt.gensalt()).decode("ascii")
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(
+            str(password or "").encode("utf-8"), str(password_hash or "").encode("utf-8")
+        )
+    except ValueError:
+        return False
+
+
+def new_client_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def hash_client_token(token: str) -> str:
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
 
 
 def _download_token_secret(environ: Mapping[str, str] | None = None) -> bytes:
