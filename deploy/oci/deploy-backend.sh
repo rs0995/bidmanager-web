@@ -13,13 +13,15 @@
 #   deploy/oci/deploy-backend.sh [--with-compose] [--no-build] [HEALTH_URL]
 #
 # Overridable env:
-#   BIDMANAGER_OCI_SSH   ssh target        (default: bidmanager-oci  — see ~/.ssh/config)
-#   BIDMANAGER_OCI_DIR   repo dir on VM    (default: ~/bidmanager)
+#   BIDMANAGER_OCI_SSH   ssh target                (default: bidmanager-oci — see ~/.ssh/config)
+#   BIDMANAGER_OCI_DIR   repo dir on VM, relative to the login home or absolute;
+#                        do NOT use a leading ~ (it is passed inside quotes)
+#                        (default: bidmanager)
 
 set -euo pipefail
 
 REMOTE="${BIDMANAGER_OCI_SSH:-bidmanager-oci}"
-REMOTE_DIR="${BIDMANAGER_OCI_DIR:-~/bidmanager}"
+REMOTE_DIR="${BIDMANAGER_OCI_DIR:-bidmanager}"
 
 with_compose=0
 do_build=1
