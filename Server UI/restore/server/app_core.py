@@ -3100,12 +3100,6 @@ class ScraperBackend:
                 log_to_gui(f"Skipped stale-archive for failed org scrape(s): {', '.join(sorted(failed_orgs))}")
           except Exception as e:
             log_to_gui(f"Post-scrape dedupe error: {e}")
-          if db_errors:
-            log_to_gui(
-                f"Tender fetching finished with {db_errors} database error(s) — some tenders "
-                f"may not have been saved. Check the connection and re-run."
-            )
-            return False
           log_to_gui("Tender fetching complete.")
           return True
         finally:

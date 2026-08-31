@@ -1536,7 +1536,7 @@ function ScraperPanel({ toast, base, adminKey }) {
       await api.deleteSavedCustomJob(job.id, job.owner_name || ownerName.trim());
       // Remaining jobs are auto-renumbered on the server, so any cached id
       // (edit target / selection) can now point at a different row — reset.
-      setEditingJobId(null); setEditingJobOwner(null); setJobName(''); setSelectedSavedJobId(null); setAllOrgsMode(false);
+      setEditingJobId(null); setEditingJobOwner(null); setJobName(''); setSelectedSavedJobId(null);
       toast('Saved job deleted');
       await loadSavedJobs();
     } catch (err) { toast(err.message || 'Could not delete saved job'); }

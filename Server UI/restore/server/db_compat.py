@@ -360,16 +360,6 @@ def _get_pool():
             # Disable psycopg's implicit statement preparation: it is incompatible
             # with a PgBouncer (Neon "-pooler") endpoint in transaction mode.
             kwargs={"prepare_threshold": None},
-            # Neon's pooler / compute autosuspend recycle server-side connections
-            # aggressively, so a long-lived idle connection in the pool goes dead
-            # without us knowing. check= runs a cheap liveness probe on every
-            # checkout and transparently replaces a dead connection; the lifetime
-            # / idle caps make the pool drop stale sockets before a query hits
-            # them. Without this a mid-scrape drop poisoned the rest of the job
-            # with "the connection is closed".
-            check=ConnectionPool.check_connection,
-            max_lifetime=180,
-            max_idle=60,
             name="bidmanager",
             open=False,
         )

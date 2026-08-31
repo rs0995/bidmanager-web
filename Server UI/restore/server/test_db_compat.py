@@ -203,11 +203,9 @@ class PostgresCompatibilityTests(unittest.TestCase):
         saved_mod = sys.modules.get("psycopg_pool")
         db_compat._pool = None
         sys.modules["psycopg_pool"] = fake_module
-        env = {"DATABASE_URL": "postgresql://u:p@localhost/db", "POSTGRES_URL": "", "POSTGRES_CONNECTION_STRING": ""}
         try:
-            with mock.patch.dict(os.environ, env, clear=False):
-                self.assertTrue(db_compat.using_postgres())
-                pool = db_compat._get_pool()
+            self.assertTrue(db_compat.using_postgres())  # test env points DATABASE_URL at PG
+            pool = db_compat._get_pool()
         finally:
             db_compat._pool = saved_pool
             if saved_mod is not None:

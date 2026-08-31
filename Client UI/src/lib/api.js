@@ -1,8 +1,9 @@
 import { getState, nextId, updateState } from './db.js';
 import { useAppStore } from './store';
-import { DEFAULT_SERVER_URL } from './cloud-config.js';
+import { timeRemaining } from './utils';
 
 const desktop = () => window.bidmanagerDesktop;
+const DEFAULT_SERVER_URL = 'https://161.118.170.233.sslip.io';
 const leaf = (value) => String(value || 'Project').replace(/[<>:"/\\|?*]+/g, ' ').replace(/\s+/g, ' ').trim() || 'Project';
 const joinPath = (...parts) => parts.filter(Boolean).join('\\').replace(/[\\/]+/g, '\\');
 const valueNumber = (value) => Number(String(value || '').replace(/[^0-9.]/g, '')) || 0;
@@ -21,24 +22,28 @@ function normalizeServerUrl(value) {
   return raw;
 }
 
-// Set by signIn() when "Remember me" is unchecked: holds the session's auth
-// profile in memory only, so it never reaches IndexedDB and disappears the
-// next time the app launches. Takes priority over persisted settings.
+// "Remember me" off at sign-in keeps the token here only (session-only, never
+// written to IndexedDB) instead of in settings.auth_token — getState()/
+// getSettings() overlay it so the rest of the app never needs to care which
+// case it is. Cleared on sign-out and on a "remember me" sign-in (which
+// persists to settings instead).
 let sessionAuth = null;
 
 async function connection(overrides = {}) {
   const settings = await getState().then((state) => state.settings);
   return {
     server_url: normalizeServerUrl(overrides.server_url ?? settings.server_url),
+    // Login issues a personal session token (Server UI/server/client_api.py
+    // require_client_user) that travels in the x-client-key header — a
+    // per-user token, not a shared app secret.
     auth_token: String(overrides.auth_token ?? sessionAuth?.auth_token ?? settings.auth_token ?? '').trim(),
   };
 }
 
-// Thrown when the server rejects the request as unauthenticated (401, no/expired
-// token) or forbidden (403, suspended account) — the UI catches this by name to
-// clear local auth state and return to the sign-in screen, distinct from an
-// ordinary network/validation error.
-export class AuthError extends Error {
+// A rejected/expired/revoked token surfaces as a 401/403 from any /client/*
+// call. main.jsx's QueryCache/MutationCache onError hook catches this by name
+// and signs the device out, so App re-renders into SignInScreen.
+class AuthError extends Error {
   constructor(message, reason) {
     super(message);
     this.name = 'AuthError';
@@ -60,9 +65,7 @@ async function requestClient(route, options = {}, overrides = {}, { requireAuth 
       body: options.body,
     });
     if (!result?.ok) {
-      if (result?.status === 401 || result?.status === 403) {
-        throw new AuthError(result?.message || 'Sign in again.', result?.reason || 'unauthorized');
-      }
+      if (result?.status === 401 || result?.status === 403) throw new AuthError(result?.message || 'Sign in again.', result?.reason);
       throw new Error(result?.message || 'Could not reach the client API.');
     }
     return result.data;
@@ -78,28 +81,14 @@ async function requestClient(route, options = {}, overrides = {}, { requireAuth 
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     const detail = payload?.detail;
-    const message = (detail && typeof detail === 'object' ? detail.message : detail)
-      || `Client API returned HTTP ${response.status}.`;
-    if (response.status === 401 || response.status === 403) {
-      throw new AuthError(message, (detail && typeof detail === 'object' ? detail.reason : null) || 'unauthorized');
-    }
+    const message = Array.isArray(detail)
+      ? detail.map((d) => d.msg || d.type).join('; ')
+      : (detail && typeof detail === 'object' ? detail.message : detail)
+        || `Client API returned HTTP ${response.status}.`;
+    if (response.status === 401 || response.status === 403) throw new AuthError(message, detail?.reason);
     throw new Error(message);
   }
   return payload;
-}
-
-// Wraps updateState() for mutations that touch cloud-synced data (bookmarks,
-// templates, projects, checklist) — after the local write lands, it schedules
-// a debounced push to /client/sync so other devices pick it up. Rapid edits
-// collapse into one push instead of one per keystroke/toggle; failures are
-// swallowed (offline-tolerant, matches the app's existing sync posture) and
-// never block the caller, since the local write already succeeded.
-let _syncPushTimer = null;
-function updateSyncedState(mutator) {
-  const result = updateState(mutator);
-  clearTimeout(_syncPushTimer);
-  _syncPushTimer = setTimeout(() => { api.pushUserData().catch(() => {}); }, 2000);
-  return result;
 }
 
 function normalizeTender(row) {
@@ -119,7 +108,14 @@ async function downloadServerOrganizations(overrides = {}) {
       `/client/organizations?page=${page}&page_size=100`, {}, overrides,
     );
     if (!payload || !Array.isArray(payload.items)) break;
-    organizations.push(...payload.items.map((row) => ({ id: row.id, website_id: row.website_id, name: row.name })));
+    organizations.push(...payload.items.map((row) => ({
+      id: row.id,
+      website_id: row.website_id,
+      name: row.name,
+      website_name: row.website_name || '',
+      tender_count: Number(row.tender_count) || 0,
+      scrape_enabled: Boolean(row.scrape_enabled),
+    })));
     pages = Math.max(0, Number(payload.pages) || 0);
     page += 1;
     if (page > 1000) break;
@@ -161,8 +157,64 @@ async function downloadServerSnapshot(overrides = {}) {
   return { websites, tenders, organizations, server_stats: serverStats };
 }
 
+// Wraps updateState() for mutations that touch cloud-synced data (bookmarks,
+// templates, projects, checklist) — after the local write lands, it schedules
+// a debounced push to /client/sync so other devices pick it up. Rapid edits
+// collapse into one push instead of one per keystroke/toggle; failures are
+// swallowed (offline-tolerant, matches the app's existing sync posture) and
+// never block the caller, since the local write already succeeded.
+let _syncPushTimer = null;
+function updateSyncedState(mutator) {
+  const result = updateState(mutator);
+  clearTimeout(_syncPushTimer);
+  _syncPushTimer = setTimeout(() => { api.pushUserData().catch(() => {}); }, 2000);
+  return result;
+}
+
 export const api = {
   defaultServerUrl: DEFAULT_SERVER_URL,
+
+  // ── Auth ───────────────────────────────────────────────────────────
+  registerAccount: (input, overrides = {}) => requestClient(
+    '/client/auth/register',
+    { method: 'POST', body: { email: input.email, password: input.password, display_name: input.display_name || '' } },
+    overrides,
+    { requireAuth: false },
+  ),
+  loginAccount: (input, overrides = {}) => requestClient(
+    '/client/auth/login',
+    { method: 'POST', body: { email: input.email, password: input.password } },
+    overrides,
+    { requireAuth: false },
+  ),
+  logoutAccount: (overrides = {}) => requestClient('/client/auth/logout', { method: 'POST' }, overrides),
+  // mode: 'login' | 'register'. remember=false keeps the token in memory only
+  // (sessionAuth) instead of persisting it to settings, so the account isn't
+  // still signed in after the app restarts.
+  signIn: async (input, mode = 'login', remember = true) => {
+    const response = mode === 'register' ? await api.registerAccount(input) : await api.loginAccount(input);
+    const auth = {
+      auth_token: response.token,
+      user_email: response.email,
+      user_id: response.user_id,
+      display_name: response.display_name || '',
+    };
+    if (remember) { sessionAuth = null; await api.updateSettings(auth); }
+    else sessionAuth = auth;
+    await api.pullUserData().catch(() => {});
+    return response;
+  },
+  signOut: async () => {
+    try { await api.logoutAccount(); } catch { /* best-effort */ }
+    sessionAuth = null;
+    await api.updateSettings({ auth_token: '', user_email: '', user_id: null, display_name: '' });
+  },
+  changePassword: (input, overrides = {}) => requestClient(
+    '/client/auth/change-password',
+    { method: 'POST', body: { current_password: input.current_password, new_password: input.new_password } },
+    overrides,
+  ),
+
   health: (overrides = {}) => requestClient('/client/health', {}, overrides),
   testConnection: (overrides = {}) => requestClient('/client/health', {}, overrides),
   getTenderDetail: (id, overrides = {}) => requestClient(`/client/tenders/${Number(id)}`, {}, overrides),
@@ -176,11 +228,15 @@ export const api = {
     if (params.file_type) query.set('file_type', params.file_type);
     return requestClient(`/client/tenders/${Number(id)}/documents?${query}`, {}, overrides);
   },
-  requestDocumentDownload: (tenderId, documentId, overrides = {}) => requestClient(
-    `/client/tenders/${Number(tenderId)}/download-request`,
-    { method: 'POST', body: { document_id: Number(documentId) } },
-    overrides,
-  ),
+  requestDocumentDownload: (tenderId, documentId, overrides = {}) => {
+    const docId = Number(documentId);
+    if (!Number.isInteger(docId) || docId <= 0) throw new Error('Invalid document id');
+    return requestClient(
+      `/client/tenders/${Number(tenderId)}/download-request`,
+      { method: 'POST', body: { document_id: docId } },
+      overrides,
+    );
+  },
   // Kicks off the server-side scrape/download job for a tender that has no
   // documents yet (see Server UI/server/client_api.py request-download).
   requestTenderDownloadJob: (tenderId, overrides = {}) => requestClient(
@@ -278,6 +334,7 @@ export const api = {
       file_name: '', file_type: '', size_bytes: 0, downloadable: false,
       client_status: 'requested',
       local_path: null,
+      job_id: jobId,
       requested_at: new Date().toISOString(),
       downloaded_at: null,
       error: null,
@@ -308,6 +365,22 @@ export const api = {
       setTimeout(() => api.pollTenderDownloadJob(tender, jobId, overrides, attempt + 1), 15000);
     } catch (error) {
       await api.upsertDocument({ id: -Number(tender.id), client_status: 'failed', error: error?.message || String(error) });
+    }
+  },
+  // Call once at app startup: the setTimeout chain in pollTenderDownloadJob only
+  // lives as long as the page/app stays open, so a restart while a request is
+  // still 'requested' needs to re-attach polling to whatever job_id was saved
+  // on the placeholder row — otherwise the pill would stay "Requested…" forever.
+  resumePendingDownloadJobs: async (overrides = {}) => {
+    const pending = await api.listPendingDocuments();
+    for (const placeholder of pending) {
+      if (!placeholder.job_id) continue;
+      const tender = {
+        id: placeholder.tender_db_id,
+        tender_id: placeholder.tender_id,
+        title: placeholder.tender_title,
+      };
+      api.pollTenderDownloadJob(tender, placeholder.job_id, overrides, 0);
     }
   },
   // "Download" — mint a signed URL for an already-available document, then
@@ -349,6 +422,20 @@ export const api = {
   },
 
   listWebsites: async () => (await getState()).websites,
+  listOrganizations: async () => (await getState()).organizations || [],
+  listBookmarkedOrgs: async () => (await getState()).bookmarkedOrgs || [],
+  toggleOrgBookmark: async (orgChain) => {
+    let result;
+    await updateSyncedState((state) => {
+      const set = new Set(state.bookmarkedOrgs || []);
+      if (set.has(orgChain)) set.delete(orgChain); else set.add(orgChain);
+      state.bookmarkedOrgs = [...set];
+      result = state.bookmarkedOrgs;
+      return state;
+    });
+    return result;
+  },
+  countBookmarkedTenders: async () => (await getState()).tenders.filter((row) => row.is_bookmarked).length,
   listTenders: async (websiteId, params = {}) => {
     let rows = (await getState()).tenders;
     if (websiteId != null) rows = rows.filter((row) => Number(row.website_id) === Number(websiteId));
@@ -361,21 +448,6 @@ export const api = {
     let result;
     await updateSyncedState((state) => {
       state.tenders = state.tenders.map((row) => row.id === id ? (result = { ...row, ...patch }) : row);
-      return state;
-    });
-    return result;
-  },
-  countBookmarkedTenders: async () => (await getState()).tenders.filter((row) => row.is_bookmarked).length,
-
-  listBookmarkedOrgs: async () => (await getState()).bookmarkedOrgs || [],
-  toggleOrgBookmark: async (orgChain) => {
-    const org = String(orgChain || '').trim();
-    let result;
-    await updateSyncedState((state) => {
-      const set = new Set(state.bookmarkedOrgs || []);
-      if (set.has(org)) set.delete(org); else set.add(org);
-      state.bookmarkedOrgs = [...set];
-      result = state.bookmarkedOrgs;
       return state;
     });
     return result;
@@ -493,44 +565,40 @@ export const api = {
     state.templateItems = state.templateItems.filter((row) => row.id !== Number(id));
     return state;
   }),
-  // Only req_file_name/description/subfolder travel between a project's
-  // checklist and a template — id, project_id/template_id, linked_file_path,
-  // and status are per-project state and must never leak across projects.
   saveProjectAsTemplate: async (projectId, data) => {
     const template = await api.createTemplate(data);
     const items = await api.listChecklist(projectId);
-    for (const item of items) {
-      await api.createTemplateItem(template.id, {
-        req_file_name: item.req_file_name,
-        description: item.description,
-        subfolder: item.subfolder,
-      });
-    }
+    for (const item of items) await api.createTemplateItem(template.id, item);
     return template;
   },
   applyTemplateToProject: async (projectId, templateId) => {
     const items = await api.listTemplateItems(templateId);
-    for (const item of items) {
-      await api.createChecklistItem(projectId, {
-        req_file_name: item.req_file_name,
-        description: item.description,
-        subfolder: item.subfolder,
-      });
-    }
+    for (const item of items) await api.createChecklistItem(projectId, item);
     return { ok: true, added: items.length };
   },
 
   dashboardStats: async () => {
     const state = await getState();
     const active = state.tenders.filter((row) => !row.is_archived);
-    const upcoming = active.filter((row) => row.closing_date).slice().sort((a, b) => String(a.closing_date).localeCompare(String(b.closing_date))).slice(0, 8);
     const activeProjects = state.projects.filter((row) => String(row.status || 'Active').toLowerCase() === 'active');
+    // Only surface deadlines for tenders the user has actually acted on
+    // (bookmarked, or already turned into a project) — not every closing
+    // tender, which is what the "Closing < 7 Days" stat card is for instead.
+    const activeProjectTenderIds = new Set(activeProjects.map((row) => row.source_tender_id).filter(Boolean));
+    const upcoming = active
+      .filter((row) => row.closing_date && (row.is_bookmarked || activeProjectTenderIds.has(row.tender_id)))
+      .slice().sort((a, b) => String(a.closing_date).localeCompare(String(b.closing_date))).slice(0, 12);
     const bookmarkedItems = state.tenders.filter((row) => row.is_bookmarked).slice().sort((a, b) => String(a.closing_date || '').localeCompare(String(b.closing_date || ''))).slice(0, 6);
+    const closingSoon = active.filter((row) => {
+      const r = timeRemaining(row.closing_date);
+      return !r.expired && r.totalDays >= 0 && r.totalDays <= 7;
+    }).length;
     return {
       active_tenders: active.length,
       archived_tenders: state.tenders.length - active.length,
       active_projects: activeProjects.length,
       bookmarked_tenders: state.tenders.filter((row) => row.is_bookmarked).length,
+      closing_soon: closingSoon,
       total_pipeline_value: state.projects.reduce((sum, row) => sum + valueNumber(row.project_value), 0),
       websites: state.websites.map((site) => {
         const siteTenders = active.filter((row) => Number(row.website_id) === Number(site.id));
@@ -553,135 +621,46 @@ export const api = {
     const settings = (await getState()).settings;
     return sessionAuth ? { ...settings, ...sessionAuth } : settings;
   },
-  updateSettings: async (patch) => updateState((state) => { state.settings = { ...state.settings, ...patch }; return state; }),
-
-  // Creates the four standard subfolders under the chosen parent folder up
-  // front (Tender_Downloads, My_Tender_Projects, Archived Projects,
-  // Checklist_Templates) instead of waiting for each to be needed lazily.
   ensureParentFolders: async (parentDir) => {
-    const parent = String(parentDir || '').trim();
-    if (!parent) return { ok: false, message: 'Choose a parent folder first.' };
+    const dir = String(parentDir || '').trim();
+    if (!dir) return { ok: false, message: 'Choose a parent folder first.' };
     const bridge = desktop();
     if (!bridge?.ensureDirectory) return { ok: false, message: 'Folder creation is available in the desktop app.' };
     const names = ['Tender_Downloads', 'My_Tender_Projects', 'Archived Projects', 'Checklist_Templates'];
     for (const name of names) {
-      const made = await bridge.ensureDirectory(joinPath(parent, name));
-      if (!made?.ok) return { ok: false, message: made?.message || `Could not create ${name}.` };
+      const result = await bridge.ensureDirectory(joinPath(dir, name));
+      if (!result?.ok) return { ok: false, message: result?.message || `Could not create ${name}.` };
     }
     return { ok: true };
   },
+  updateSettings: async (patch) => updateState((state) => { state.settings = { ...state.settings, ...patch }; return state; }),
+  listServerStorage: async (relPath = '') => {
+    const state = await getState();
+    const linked = state.checklist.filter((row) => row.linked_file_path).map((row) => ({
+      name: String(row.linked_file_path).split(/[\\/]/).pop(), rel_path: row.linked_file_path, is_dir: false, size_bytes: 0, modified_at: '',
+    }));
+    return { root_folder: state.settings.parent_dir || '', current_rel_path: relPath, parent_rel_path: '', items: linked };
+  },
+  deleteServerFolder: async () => { throw new Error('Folder deletion is available through the operating system.'); },
 
-  // ── Account (self-service signup; a suspended account is moderated from
-  // the Server UI admin console, not by the client). Registering or logging
-  // in issues a fresh per-device token, stored in settings.auth_token.
-  registerAccount: (input, overrides = {}) => requestClient(
-    '/client/auth/register',
-    { method: 'POST', body: { email: input.email, password: input.password, display_name: input.display_name || '' } },
-    overrides, { requireAuth: false },
-  ),
-  loginAccount: (input, overrides = {}) => requestClient(
-    '/client/auth/login',
-    { method: 'POST', body: { email: input.email, password: input.password } },
-    overrides, { requireAuth: false },
-  ),
-  logoutAccount: (overrides = {}) => requestClient('/client/auth/logout', { method: 'POST' }, overrides),
-  changePassword: (input, overrides = {}) => requestClient(
-    '/client/auth/change-password',
-    { method: 'POST', body: { current_password: input.current_password, new_password: input.new_password } },
-    overrides,
-  ),
-  // remember=false keeps the token in the in-memory sessionAuth var only, so
-  // it never reaches IndexedDB and the sign-in screen returns on next launch.
-  signIn: async (input, mode = 'login', remember = true) => {
-    const result = mode === 'register' ? await api.registerAccount(input) : await api.loginAccount(input);
-    const profile = {
-      auth_token: result.token,
-      user_email: result.email,
-      user_id: result.user_id,
-      display_name: result.display_name || '',
-    };
-    if (remember) {
-      sessionAuth = null;
-      await api.updateSettings(profile);
-    } else {
-      sessionAuth = profile;
-    }
-    // Pull this account's cloud data (bookmarks/templates/projects/checklist)
-    // right away so a fresh device isn't empty until the next manual sync.
-    // sessionAuth/settings.auth_token is already set above either way, so
-    // connection() resolves the right token. Best-effort — sign-in already
-    // succeeded, so a pull failure shouldn't block the user from getting in.
-    await api.pullUserData().catch(() => {});
-    return result;
-  },
-  signOut: async () => {
-    try { await api.logoutAccount(); } catch (_) { /* token may already be invalid — clear local state regardless */ }
-    sessionAuth = null;
-    await api.updateSettings({ auth_token: '', user_email: '', user_id: null, display_name: '' });
-  },
   syncFromServer: async (overrides = {}) => {
     const config = await connection(overrides);
-    // Flush any pending local bookmark/template/project/checklist edits before
-    // pulling fresh tenders below, so nothing unsynced is at risk of being
-    // superseded by another device's later pull. Best-effort: a push failure
-    // (e.g. offline) shouldn't block the tender sync this function exists for.
-    await api.pushUserData(overrides).catch(() => {});
     const snapshot = await downloadServerSnapshot(config);
     let result;
     const notificationsToEmit = [];
     await updateState((state) => {
       const bookmarks = new Map(state.tenders.map((row) => [String(row.tender_id || row.id), Boolean(row.is_bookmarked)]));
-      const downloaded = new Map(state.tenders.map((row) => [String(row.tender_id || row.id), Boolean(row.client_downloaded)]));
-      // Snapshot of what we had *before* this sync overwrites state.tenders below,
-      // so we can diff against it to detect new tenders / corrigendum / prebid changes.
-      const priorByKey = new Map(state.tenders.map((row) => [String(row.tender_id || row.id), row]));
-      const hadPriorData = state.tenders.length > 0;
-      const bookmarkedOrgs = new Set(state.bookmarkedOrgs || []);
-
+      const previousById = new Map(state.tenders.map((row) => [String(row.tender_id || row.id), row]));
       state.websites = Array.isArray(snapshot.websites) ? snapshot.websites : state.websites;
       state.organizations = Array.isArray(snapshot.organizations) ? snapshot.organizations : state.organizations;
-      state.tenders = snapshot.tenders.map((row) => ({
-        ...row,
-        is_bookmarked: bookmarks.get(String(row.tender_id || row.id)) ?? false,
-        client_downloaded: downloaded.get(String(row.tender_id || row.id)) ?? false,
-      }));
-
-      // Skip on an empty local cache (first sync ever / after a reset) so we don't
-      // flood notifications for every tender that already existed on the server.
-      if (hadPriorData) {
-        const newByOrg = new Map();
-        for (const row of state.tenders) {
-          const key = String(row.tender_id || row.id);
-          const prior = priorByKey.get(key);
-          if (!prior) {
-            const org = String(row.org_chain || '').trim();
-            if (org && bookmarkedOrgs.has(org)) {
-              if (!newByOrg.has(org)) newByOrg.set(org, []);
-              newByOrg.get(org).push(row);
-            }
-            continue;
-          }
-          if (row.is_bookmarked) {
-            const label = row.tender_id || row.title || 'a bookmarked tender';
-            if (Number(row.corrigendum_count || 0) > Number(prior.corrigendum_count || 0)) {
-              notificationsToEmit.push({ type: 'status', message: `New corrigendum for ${label}` });
-            }
-            if (Number(row.prebid_count || 0) > Number(prior.prebid_count || 0)) {
-              notificationsToEmit.push({ type: 'prebid', message: `Pre-bid update for ${label}` });
-            }
-          }
+      state.tenders = snapshot.tenders.map((row) => {
+        const key = String(row.tender_id || row.id);
+        const previous = previousById.get(key);
+        if (previous?.is_bookmarked && previous.closing_date !== row.closing_date) {
+          notificationsToEmit.push({ type: 'status', message: `"${row.title || row.tender_id}" was updated.` });
         }
-        for (const [org, list] of newByOrg) {
-          if (list.length >= 10) {
-            notificationsToEmit.push({ type: 'new', message: `${list.length} new tenders added in ${org}` });
-          } else {
-            for (const row of list) {
-              notificationsToEmit.push({ type: 'new', message: `New tender in ${org}: ${row.title || row.tender_id || 'Untitled'}` });
-            }
-          }
-        }
-      }
-
+        return { ...row, is_bookmarked: bookmarks.get(key) ?? false };
+      });
       state.settings = {
         ...state.settings,
         server_url: config.server_url,
@@ -703,7 +682,8 @@ export const api = {
     return result;
   },
 
-  // ── Cloud sync (bookmarks, templates, projects, checklist) ──────────
+  // ── Cloud sync (bookmarks, templates, projects, checklist, tender column
+  // prefs) ──────────────────────────────────────────────────────────────
   // Whole-state blob, last-push-wins: the server just stores whatever this
   // device last sent and hands it back verbatim. Device-specific fields
   // (folder_path, linked_file_path — local filesystem paths) never travel.
@@ -714,6 +694,7 @@ export const api = {
     const state = await getState();
     const orgIdByName = new Map((state.organizations || []).map((row) => [row.name, row.id]));
     const bookmarkedOrgs = state.bookmarkedOrgs || [];
+    const { tendersTable, tendersView } = useAppStore.getState();
     const data = {
       bookmarks: state.tenders.filter((row) => row.is_bookmarked).map((row) => row.id),
       bookmarkedOrgs,
@@ -722,6 +703,15 @@ export const api = {
       templateItems: state.templateItems,
       projects: state.projects.map(({ folder_path, ...rest }) => rest),
       checklist: state.checklist.map(({ linked_file_path, ...rest }) => rest),
+      // Tenders column show/hide/order/width — see TendersPage in App.jsx.
+      // Kept alongside the rest of this account's synced preferences so a
+      // customized layout follows the login across devices, not just this
+      // browser's localStorage.
+      tenderColumnPrefs: {
+        hiddenColumns: tendersTable.hiddenColumns || [],
+        columnOrder: tendersTable.columnOrder || [],
+        columnWidths: tendersView.tenderColumnWidths || {},
+      },
     };
     return requestClient('/client/sync', { method: 'PUT', body: { data } }, overrides);
   },
@@ -746,6 +736,26 @@ export const api = {
       }
       return state;
     });
+    const columnPrefs = data.tenderColumnPrefs;
+    if (columnPrefs) {
+      const store = useAppStore.getState();
+      if (Array.isArray(columnPrefs.hiddenColumns)) store.setTendersHiddenColumns(columnPrefs.hiddenColumns);
+      if (Array.isArray(columnPrefs.columnOrder)) store.setTendersColumnOrder(columnPrefs.columnOrder);
+      if (columnPrefs.columnWidths && typeof columnPrefs.columnWidths === 'object') {
+        for (const [key, width] of Object.entries(columnPrefs.columnWidths)) store.setTenderColumnWidth(key, width);
+      }
+    }
     return data;
   },
 };
+
+// Column customization lives in the Zustand store (Client UI/src/lib/store.ts),
+// separate from the IndexedDB `state` that updateSyncedState() covers — so it
+// needs its own debounced push whenever it changes, reusing the same 2s
+// collapse-rapid-edits behavior and the same offline-tolerant swallowed catch.
+let _columnSyncPushTimer = null;
+useAppStore.subscribe((state, prevState) => {
+  if (state.tendersTable === prevState.tendersTable && state.tendersView.tenderColumnWidths === prevState.tendersView.tenderColumnWidths) return;
+  clearTimeout(_columnSyncPushTimer);
+  _columnSyncPushTimer = setTimeout(() => { api.pushUserData().catch(() => {}); }, 2000);
+});

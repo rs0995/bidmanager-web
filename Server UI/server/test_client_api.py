@@ -54,6 +54,7 @@ class ClientApiTests(unittest.TestCase):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 email TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
+                password_enc TEXT,
                 display_name TEXT DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'active',
                 created_at REAL NOT NULL,
@@ -189,6 +190,25 @@ class ClientApiTests(unittest.TestCase):
             json={"email": "tester@example.com", "password": "wrong password"},
         )
         self.assertEqual(bad.status_code, 401)
+
+    def test_password_is_stored_reversibly_for_the_admin_console(self):
+        row = self._row("SELECT password_enc FROM client_users WHERE id=?", (self.user_id,))
+        self.assertIsNotNone(dict(row)["password_enc"])
+        self.assertEqual(
+            client_api.security.decrypt_password(dict(row)["password_enc"]),
+            "correct horse battery",
+        )
+        changed = self.client.post(
+            "/client/auth/change-password",
+            headers=self.headers,
+            json={"current_password": "correct horse battery", "new_password": "a brand new secret"},
+        )
+        self.assertEqual(changed.status_code, 200, changed.text)
+        row2 = self._row("SELECT password_enc FROM client_users WHERE id=?", (self.user_id,))
+        self.assertEqual(
+            client_api.security.decrypt_password(dict(row2)["password_enc"]),
+            "a brand new secret",
+        )
 
     def test_logout_revokes_the_token(self):
         logout = self.client.post("/client/auth/logout", headers=self.headers)

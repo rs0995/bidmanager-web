@@ -17,6 +17,9 @@ services:
       BIDMANAGER_PROCESS_ROLE: all
       BIDMANAGER_HEADLESS: "true"
       BIDMANAGER_BROWSER: chromium
+      # System Chromium + version-matched chromedriver from the image (see Dockerfile).
+      BIDMANAGER_CHROME_BINARY: /usr/bin/chromium
+      BIDMANAGER_CHROMEDRIVER: /usr/bin/chromedriver
       BIDMANAGER_WORKER_THREADS: "2"
       BIDMANAGER_RUNTIME_DIR: /var/lib/bidmanager
       BIDMANAGER_PUBLIC_URL: https://${BIDMANAGER_DOMAIN}

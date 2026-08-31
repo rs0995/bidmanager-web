@@ -1058,6 +1058,9 @@ class ScraperBackend:
         discovered_norm = [norm(x) for x in discovered]
         discovered_norm.sort(key=lambda n: (0 if "flash" in n.lower() else 1, 0 if "pro" in n.lower() else 1, n))
         fallback = [
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
             "gemini-2.0-flash",
             "gemini-2.0-flash-lite",
             "gemini-1.5-flash-latest",

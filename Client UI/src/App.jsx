@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback, Fragment } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  LayoutDashboard, Globe, FolderOpen, FileText, Settings,
+  LayoutDashboard, Globe, FolderOpen, FileText, Server, Settings,
   Bell, Sun, Moon, PanelLeftClose, PanelLeft, X, AlertTriangle,
   Activity, Calendar, Edit3, Save,
   Search, Plus, Eye, EyeOff, Copy, ExternalLink, Trash2,
@@ -11,10 +11,10 @@ import {
   ChevronDown, Folder, ArrowUp, Wifi, WifiOff, CheckCircle2,
   Paperclip, FolderCog, Link2, BookOpen, Pencil,
   Palette, RotateCcw, Home, Download, Upload, Rows3, Type, Info, Filter,
-  LogOut, LogIn, UserPlus, KeyRound,
+  LogOut, LogIn, UserPlus, KeyRound, ArrowLeft,
 } from 'lucide-react';
 import { api } from './lib/api';
-import { cn, formatINR, formatCrores } from './lib/utils';
+import { cn, formatINR, formatCrores, timeRemaining } from './lib/utils';
 import { useAppStore } from './lib/store';
 import {
   Badge, TimeBadge, StatusBadge, EmptyState, Spinner, NotificationIcon,
@@ -48,7 +48,7 @@ import {
    calls the same `api` used by the operator app.
    ════════════════════════════════════════════════════════════════════════════ */
 
-// Page keys: 'dashboard' | 'tenders' | 'projects' | 'templates' | 'archived_projects' | 'settings'
+// Page keys: 'dashboard' | 'tenders' | 'projects' | 'templates' | 'archived_projects' | 'files' | 'settings'
 
 /* ═══════════════════════════════════════════════════════════════════════════
    CLIENT-SIDE PREFERENCES
@@ -74,6 +74,7 @@ const STARTUP_PAGE_OPTIONS = [
   { value: 'tenders', label: 'Online Tenders' },
   { value: 'projects', label: 'Projects' },
   { value: 'templates', label: 'Templates' },
+  { value: 'files', label: 'Files' },
 ];
 const DEFAULT_CLIENT_PREFS = {
   accent: '',              // '' = follow theme default
@@ -234,11 +235,14 @@ function Sidebar({ active, onNavigate, collapsed, onToggle }) {
   const mainItems = [
     { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
     { key: 'tenders', label: 'Online Tenders', icon: Globe },
+    { key: 'organizations', label: 'Organizations', icon: Building2 },
+    { key: 'bookmarks', label: 'Bookmarks', icon: Star },
     { key: 'projects', label: 'Projects', icon: FolderOpen },
     { key: 'templates', label: 'Templates', icon: FileText },
   ];
   const bottomItems = [
     { key: 'archived_projects', label: 'Archived Projects', icon: FolderOpen },
+    { key: 'files', label: 'Files', icon: Server },
     { key: 'settings', label: 'Settings', icon: Settings },
   ];
 
@@ -328,12 +332,20 @@ function NotificationPanel({ open, onClose }) {
 /* ═══════════════════════════════════════════════════════════════════════════
    DASHBOARD
    ═══════════════════════════════════════════════════════════════════════════ */
-function DashboardPage() {
-  const { data: stats, isLoading, refetch } = useQuery({
+function DashboardPage({ onNavigate, onOpenProjectWorkspace, onOpenWebsiteOrganizations }) {
+  const qc = useQueryClient();
+  const { data: stats, isLoading } = useQuery({
     queryKey: ['dashboard'],
     queryFn: api.dashboardStats,
     refetchInterval: 60000,
   });
+  const syncNow = useMutation({
+    mutationFn: () => api.syncFromServer(),
+    onSuccess: () => qc.invalidateQueries(),
+    onError: (err) => alert(`Sync failed: ${err?.message || String(err)}`),
+  });
+  const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
+  const { data: activeProjects } = useQuery({ queryKey: ['projects', 'Active', ''], queryFn: () => api.listProjects('', 'Active') });
 
   if (isLoading) {
     return (
@@ -354,11 +366,55 @@ function DashboardPage() {
   }
 
   const statCards = [
-    { label: 'Active Tenders', value: stats.active_tenders, icon: Globe, color: 'text-sky-400', bg: 'bg-sky-500/10' },
-    { label: 'Active Projects', value: stats.active_projects, icon: FolderOpen, color: 'text-emerald-400', bg: 'bg-emerald-500/10' },
-    { label: 'Bookmarked', value: stats.bookmarked_tenders, icon: Bookmark, color: 'text-amber-400', bg: 'bg-amber-500/10' },
-    { label: 'Archived', value: stats.archived_tenders, icon: AlertTriangle, color: 'text-rose-400', bg: 'bg-rose-500/10' },
+    { label: 'Active Tenders', value: stats.active_tenders, icon: Globe, color: 'text-sky-400', bg: 'bg-sky-500/10', target: 'tenders-active' },
+    { label: 'Active Projects', value: stats.active_projects, icon: FolderOpen, color: 'text-emerald-400', bg: 'bg-emerald-500/10', target: 'projects' },
+    { label: 'Bookmarked', value: stats.bookmarked_tenders, icon: Bookmark, color: 'text-amber-400', bg: 'bg-amber-500/10', target: 'bookmarks' },
+    { label: 'Closing < 7 Days', value: stats.closing_soon, icon: Clock, color: 'text-rose-400', bg: 'bg-rose-500/10', target: 'tenders-closing-7d' },
+    { label: 'Archived', value: stats.archived_tenders, icon: AlertTriangle, color: 'text-rose-400', bg: 'bg-rose-500/10', target: 'tenders-archived' },
   ];
+
+  // ── "Needs attention" (item 5) ────────────────────────────────────────────
+  const daysUntil = (dateStr) => {
+    const target = parseDeadlineText(dateStr);
+    if (!target) return null;
+    return Math.floor((target.getTime() - Date.now()) / 86400000);
+  };
+  const projectTenderIds = new Set((activeProjects || []).map((p) => p.source_tender_id).filter(Boolean));
+  const urgentUnclaimedBookmarks = (stats.bookmarked_items || []).filter((t) => {
+    const days = daysUntil(t.closing_date);
+    return days !== null && days >= 0 && days <= 2 && !projectTenderIds.has(t.tender_id);
+  });
+  const syncAgeDays = settings?.last_sync_at ? (Date.now() - new Date(settings.last_sync_at).getTime()) / 86400000 : null;
+  const staleSync = syncAgeDays === null || syncAgeDays > 1;
+  const attentionRows = [
+    ...urgentUnclaimedBookmarks.slice(0, 4).map((t) => ({
+      key: `bm-${t.id}`,
+      icon: AlertTriangle,
+      color: 'text-rose-400',
+      text: `Bookmarked tender "${t.title || t.tender_id}" closes in ${Math.max(0, daysUntil(t.closing_date))}d and has no project yet`,
+      cta: 'Review',
+      onClick: () => onNavigate?.('bookmarks'),
+    })),
+    ...(staleSync ? [{
+      key: 'stale-sync',
+      icon: WifiOff,
+      color: 'text-[var(--text-muted)]',
+      text: settings?.last_sync_at ? `Tender data last synced ${formatAgo(settings.last_sync_at)}` : 'Tender data has not been synced yet',
+      cta: 'Sync now',
+      onClick: () => syncNow.mutate(),
+    }] : []),
+  ].slice(0, 5);
+
+  // ── Upcoming deadlines grouped by urgency (item 7) ────────────────────────
+  const urgencyBand = (days) => (days <= 3 ? { label: 'Critical', color: 'var(--danger)' } : days <= 7 ? { label: 'Soon', color: '#f59e0b' } : { label: 'Comfortable', color: 'var(--text-muted)' });
+  const bandedDeadlines = ['Critical', 'Soon', 'Comfortable'].map((band) => ({
+    band,
+    color: band === 'Critical' ? 'var(--danger)' : band === 'Soon' ? '#f59e0b' : 'var(--text-muted)',
+    rows: stats.upcoming_deadlines.slice(0, 6).filter((d) => {
+      const days = daysUntil(d.closing_date);
+      return days !== null && urgencyBand(Math.max(0, days)).label === band;
+    }),
+  })).filter((g) => g.rows.length > 0);
 
   return (
     <div className="p-6 space-y-6 overflow-auto h-full">
@@ -367,39 +423,37 @@ function DashboardPage() {
           <h1 className="text-2xl font-bold text-[var(--text)]">Dashboard</h1>
           <p className="text-sm text-[var(--text-muted)] mt-0.5">Overview of your tender pipeline</p>
         </div>
-        <button onClick={() => refetch()} className="btn-secondary flex items-center gap-2 text-sm">
-          <RefreshCw size={14} /> Refresh
+        <button type="button" onClick={() => syncNow.mutate()} disabled={syncNow.isPending} className="btn-secondary flex items-center gap-2 text-sm">
+          {syncNow.isPending ? <Spinner size={14} /> : <RefreshCw size={14} />} Sync Now
         </button>
       </div>
 
-      <div className="card p-5">
-        <div className="flex items-center gap-2 mb-4">
-          <Activity size={17} className="text-[var(--accent)]" />
-          <h3 className="text-sm font-semibold text-[var(--text)]">Website Coverage</h3>
-        </div>
-        {(stats.websites || []).length === 0 ? (
-          <p className="rounded-lg bg-[var(--surface-1)] px-4 py-6 text-center text-sm text-[var(--text-muted)]">
-            No website data yet. Sync from the configured cloud server to load tender data.
-          </p>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-            {stats.websites.map((website) => (
-              <div key={website.id} className="rounded-xl bg-[var(--surface-1)] px-5 py-4">
-                <p className="text-base font-semibold text-[var(--text)]">{website.name}</p>
-                <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 text-xs text-[var(--text-muted)]">
-                  <span className="inline-flex items-center gap-1.5"><Building2 size={13} />{website.orgs || 0} orgs</span>
-                  <span className="inline-flex items-center gap-1.5"><FileText size={13} />{website.active_tenders || 0} active</span>
-                  <span className="inline-flex items-center gap-1.5"><CheckSquare size={13} />{website.selected_orgs || 0} selected</span>
-                </div>
+      {attentionRows.length > 0 && (
+        <div className="card p-4 border-amber-500/30">
+          <div className="flex items-center gap-2 mb-3">
+            <AlertTriangle size={16} className="text-amber-400" />
+            <h3 className="text-sm font-semibold text-[var(--text)]">Needs attention</h3>
+          </div>
+          <div className="space-y-2">
+            {attentionRows.map((row) => (
+              <div key={row.key} className="flex items-center gap-3 rounded-lg bg-[var(--surface-1)] px-3 py-2.5">
+                <row.icon size={15} className={cn('shrink-0', row.color)} />
+                <span className="flex-1 text-sm text-[var(--text)]">{row.text}</span>
+                <button type="button" onClick={row.onClick} className="btn-secondary text-xs shrink-0">{row.cta}</button>
               </div>
             ))}
           </div>
-        )}
-      </div>
+        </div>
+      )}
 
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
         {statCards.map((s, i) => (
-          <div key={i} className="card p-4 flex items-center gap-4">
+          <button
+            key={i}
+            type="button"
+            onClick={() => onNavigate?.(s.target)}
+            className="card p-4 flex items-center gap-4 text-left transition-colors hover:bg-[var(--surface-1)]"
+          >
             <div className={cn('w-11 h-11 rounded-xl flex items-center justify-center', s.bg)}>
               <s.icon size={20} className={s.color} />
             </div>
@@ -407,18 +461,50 @@ function DashboardPage() {
               <p className="text-2xl font-bold text-[var(--text)]">{s.value}</p>
               <p className="text-xs text-[var(--text-muted)]">{s.label}</p>
             </div>
-          </div>
+          </button>
         ))}
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <div className="card p-5">
-          <div className="flex items-center gap-2 mb-3">
-            <IndianRupee size={16} className="text-[var(--accent)]" />
-            <h3 className="text-sm font-semibold text-[var(--text)]">Pipeline Value</h3>
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-stretch">
+        <div className="flex flex-col gap-4">
+          <div className="card p-3">
+            <div className="flex items-center gap-2 mb-1">
+              <IndianRupee size={12} className="text-[var(--accent)]" />
+              <h3 className="text-sm font-semibold text-[var(--text)]">Pipeline Value</h3>
+            </div>
+            <p className="text-xl font-bold text-[var(--text)]">{formatCrores(stats.total_pipeline_value)}</p>
+            <p className="text-xs text-[var(--text-muted)]">across selected tenders</p>
           </div>
-          <p className="text-3xl font-bold text-[var(--text)]">{formatCrores(stats.total_pipeline_value)}</p>
-          <p className="text-xs text-[var(--text-muted)] mt-1">across selected tenders</p>
+
+          <div className="card p-4 flex-1">
+            <div className="flex items-center gap-2 mb-3">
+              <Activity size={15} className="text-[var(--accent)]" />
+              <h3 className="text-sm font-semibold text-[var(--text)]">Website Coverage</h3>
+            </div>
+            {(stats.websites || []).length === 0 ? (
+              <p className="rounded-lg bg-[var(--surface-1)] px-3 py-4 text-center text-xs text-[var(--text-muted)]">
+                No website data yet. Sync to load tender data.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {stats.websites.map((website) => (
+                  <button
+                    type="button"
+                    key={website.id}
+                    onClick={() => onOpenWebsiteOrganizations?.(website.name)}
+                    className="w-full rounded-lg bg-[var(--surface-1)] px-3 py-2 text-left transition-colors hover:bg-[var(--surface-2)]"
+                  >
+                    <p className="text-sm font-semibold text-[var(--text)] truncate">{website.name}</p>
+                    <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-[var(--text-muted)]">
+                      <span className="inline-flex items-center gap-1"><Building2 size={11} />{website.orgs || 0} orgs</span>
+                      <span className="inline-flex items-center gap-1"><FileText size={11} />{website.active_tenders || 0} active</span>
+                      <span className="inline-flex items-center gap-1"><CheckSquare size={11} />{website.selected_orgs || 0} selected</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
 
         <div className="card p-5 lg:col-span-2">
@@ -426,17 +512,25 @@ function DashboardPage() {
             <Calendar size={16} className="text-[var(--accent)]" />
             <h3 className="text-sm font-semibold text-[var(--text)]">Upcoming Deadlines</h3>
           </div>
-          <div className="space-y-1">
-            {stats.upcoming_deadlines.length === 0 && (
+          <div>
+            {bandedDeadlines.length === 0 && (
               <p className="text-sm text-[var(--text-muted)] py-4 text-center">No upcoming deadlines</p>
             )}
-            {stats.upcoming_deadlines.slice(0, 6).map((d, i) => (
-              <div key={i} className="flex items-center justify-between py-2 border-b border-[var(--border)] last:border-0">
-                <div className="flex-1 min-w-0 mr-4">
-                  <p className="text-xs font-mono text-[var(--accent)]">{d.tender_id}</p>
-                  <p className="text-sm text-[var(--text)] truncate">{d.title}</p>
+            {bandedDeadlines.map((group) => (
+              <div key={group.band} className="mb-3 last:mb-0">
+                <p className="text-[11px] font-bold uppercase tracking-wider mb-1.5" style={{ color: group.color }}>{group.band}</p>
+                <div className="space-y-1">
+                  {group.rows.map((d, i) => (
+                    <div key={i} className="flex items-center gap-3 py-1.5">
+                      <div className="w-[3px] self-stretch rounded-full shrink-0" style={{ background: group.color }} />
+                      <div className="flex-1 min-w-0 mr-2">
+                        <p className="text-xs font-mono text-[var(--accent)]">{d.tender_id}</p>
+                        <p className="text-sm text-[var(--text)] truncate">{d.title}</p>
+                      </div>
+                      <TimeBadge dateStr={d.closing_date} />
+                    </div>
+                  ))}
                 </div>
-                <TimeBadge dateStr={d.closing_date} />
               </div>
             ))}
           </div>
@@ -456,14 +550,20 @@ function DashboardPage() {
             {(stats.bookmarked_items || []).length === 0 && (
               <p className="py-6 text-center text-sm text-[var(--text-muted)]">No bookmarked tenders</p>
             )}
-            {(stats.bookmarked_items || []).map((tender) => (
-              <div key={tender.id} className="flex items-center justify-between gap-4 border-b border-[var(--border)] py-2.5 last:border-0">
+            {(stats.bookmarked_items || []).map((tender, i) => (
+              <button
+                type="button"
+                key={tender.id}
+                onClick={() => onNavigate?.('bookmarks')}
+                className="flex w-full items-center gap-3 border-b border-[var(--border)] py-2.5 last:border-0 text-left transition-colors hover:bg-[var(--surface-1)] rounded-md px-1.5 -mx-1.5"
+              >
+                <span className="w-5 shrink-0 text-xs text-[var(--text-muted)] text-center">{i + 1}</span>
                 <div className="min-w-0 flex-1">
                   <p className="text-xs font-mono text-[var(--accent)]">{tender.tender_id || 'No tender ID'}</p>
                   <p className="truncate text-sm text-[var(--text)]">{tender.title || 'Untitled tender'}</p>
                 </div>
                 <TimeBadge dateStr={tender.closing_date} />
-              </div>
+              </button>
             ))}
           </div>
         </div>
@@ -480,14 +580,20 @@ function DashboardPage() {
             {(stats.bids_under_preparation || []).length === 0 && (
               <p className="py-6 text-center text-sm text-[var(--text-muted)]">No bids under preparation</p>
             )}
-            {(stats.bids_under_preparation || []).map((project) => (
-              <div key={project.id} className="flex items-center justify-between gap-4 border-b border-[var(--border)] py-2.5 last:border-0">
+            {(stats.bids_under_preparation || []).map((project, i) => (
+              <button
+                type="button"
+                key={project.id}
+                onClick={() => onOpenProjectWorkspace?.(project.id)}
+                className="flex w-full items-center gap-3 border-b border-[var(--border)] py-2.5 last:border-0 text-left transition-colors hover:bg-[var(--surface-1)] rounded-md px-1.5 -mx-1.5"
+              >
+                <span className="w-5 shrink-0 text-xs text-[var(--text-muted)] text-center">{i + 1}</span>
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-medium text-[var(--text)]">{project.title || 'Untitled project'}</p>
                   <p className="truncate text-xs text-[var(--text-muted)]">{project.client_name || project.source_tender_id || 'Local project'}</p>
                 </div>
                 <TimeBadge dateStr={project.deadline} />
-              </div>
+              </button>
             ))}
           </div>
         </div>
@@ -501,8 +607,8 @@ function DashboardPage() {
    no job queue, no CAPTCHA, no live log console)
    ═══════════════════════════════════════════════════════════════════════════ */
 const TENDER_COLUMNS = [
-  { key: '_sr', label: 'Sr. No.', width: 60 },
-  { key: 'is_bookmarked', label: 'Bookmark', width: 90 },
+  { key: '_sr', label: 'Sr. No.', width: 60, fixed: true },
+  { key: 'is_bookmarked', label: 'Bookmark', width: 90, fixed: true },
   { key: 'tender_id', label: 'Tender ID / Work Desc', width: 320 },
   { key: 'title', label: 'Title', width: 300 },
   { key: 'tender_value', label: 'Value', width: 130 },
@@ -515,14 +621,51 @@ const TENDER_COLUMNS = [
   { key: 'location', label: 'Location', width: 180 },
   { key: 'tender_category', label: 'Category', width: 130 },
   { key: 'status', label: 'Status', width: 140 },
-  { key: '_download', label: 'Download', width: 170 },
+  { key: '_download', label: 'Download', width: 170, fixed: true },
   { key: '_time', label: 'Time Left', width: 110 },
-  { key: '_actions', label: 'Actions', width: 100 },
+  { key: '_actions', label: 'Actions', width: 100, fixed: true },
 ];
 
 const TENDER_NON_SORTABLE = new Set(['_sr', 'is_bookmarked', '_prebid_corrigendum', '_download', '_time', '_actions']);
 
 const TENDER_TABLE_WIDTH = TENDER_COLUMNS.reduce((total, column) => total + column.width, 0);
+
+const TENDERS_FILTER_STATE_KEY = 'bm-client:tenders:filters:v1';
+// One-shot flag: OrganizationsPage sets this immediately before navigating
+// here so "view this org's tenders" always opens on Active, then TendersPage
+// reads and clears it on mount.
+const TENDERS_FORCE_TAB_KEY = 'bm-client:tenders:force-tab';
+// One-shot flag: the "Closing < 7 Days" dashboard stat card sets this
+// immediately before navigating here so Tenders opens with that filter
+// already applied; TendersPage reads and clears it on mount.
+const TENDERS_FORCE_CLOSING_KEY = 'bm-client:tenders:force-closing-soon';
+// Not one-shot: set by openOrgTenders and cleared by any other navigation
+// (see App()'s `navigate` helper) — drives whether TendersPage shows a
+// "Back to Organizations" button.
+const TENDERS_CAME_FROM_ORG_KEY = 'bm-client:tenders:came-from-org';
+// Persists the Organizations search box across navigating away and back
+// (e.g. via the Tenders "Back to Organizations" button) — not one-shot,
+// only changes when the user edits the search box.
+const ORGANIZATIONS_SEARCH_KEY = 'bm-client:organizations:search';
+// One-shot flag: a Dashboard Website Coverage card sets this immediately
+// before navigating here so that website is preselected/filtered.
+const ORGANIZATIONS_FORCE_WEBSITE_KEY = 'bm-client:organizations:force-website';
+
+function loadTenderFilterState() {
+  try {
+    const raw = localStorage.getItem(TENDERS_FILTER_STATE_KEY);
+    if (!raw) return { org: '', location: '', category: '', website: '' };
+    const parsed = JSON.parse(raw);
+    return {
+      org: String(parsed?.org || ''),
+      location: String(parsed?.location || ''),
+      category: String(parsed?.category || ''),
+      website: String(parsed?.website || ''),
+    };
+  } catch {
+    return { org: '', location: '', category: '', website: '' };
+  }
+}
 
 function smartCmp(a, b) {
   const na = parseFloat(String(a).replace(/[₹,\s]/g, ''));
@@ -555,67 +698,163 @@ function exportCSV(headers, rows, keys, filename) {
   URL.revokeObjectURL(url);
 }
 
-async function openTender(initUrl, tenderUrl) {
-  if (!tenderUrl) return;
-  if (window.bidmanagerDesktop?.openTender) {
-    const result = await window.bidmanagerDesktop.openTender({ initUrl, tenderUrl });
-    if (!result?.ok) alert(result?.message || 'Could not open tender.');
-    return;
-  }
-  // Non-Electron fallback: revisit the portal's home page first (same trick the
-  // scraper uses to recover from a stale session) before navigating to the tender.
-  const win = window.open(initUrl || tenderUrl, '_blank', 'noopener');
-  if (win && initUrl) {
-    setTimeout(() => { try { win.location.href = tenderUrl; } catch (_) { /* cross-origin set is fine */ } }, 1500);
-  }
+// ── Shared tender column customization (Tenders + Bookmarks pages) ─────────
+// Per-account column show/hide/order/width — persisted in tendersTable/
+// tendersView (Client UI/src/lib/store.ts) and synced across devices via
+// pushUserData/pullUserData (Client UI/src/lib/api.js), same as bookmarks.
+function useTenderColumns(tab) {
+  const { tendersTable, tendersView, setTendersHiddenColumns, setTendersColumnOrder, setTenderColumnWidth } = useAppStore();
+  // Active tenders are active by definition, so the Status column only earns
+  // its place once tenders can carry other statuses — i.e. once archived.
+  const baseTenderColumns = useMemo(
+    () => TENDER_COLUMNS.filter((column) => tab === 'active' ? column.key !== 'status' : true),
+    [tab]
+  );
+  const tenderColOrder = useMemo(
+    () => (tendersTable.columnOrder?.length ? tendersTable.columnOrder : baseTenderColumns.map((c) => c.key)),
+    [tendersTable.columnOrder, baseTenderColumns]
+  );
+  const tenderHidden = useMemo(() => new Set(tendersTable.hiddenColumns || []), [tendersTable.hiddenColumns]);
+  const orderedTenderColumns = useMemo(() => {
+    const byKey = new Map(baseTenderColumns.map((c) => [c.key, c]));
+    const ordered = tenderColOrder.map((k) => byKey.get(k)).filter(Boolean);
+    const missing = baseTenderColumns.filter((c) => !ordered.includes(c));
+    return [...ordered, ...missing];
+  }, [tenderColOrder, baseTenderColumns]);
+  const visibleTenderColumns = useMemo(
+    () => orderedTenderColumns.filter((c) => c.fixed || !tenderHidden.has(c.key)),
+    [orderedTenderColumns, tenderHidden]
+  );
+  const getTenderColWidth = (c) => {
+    const v = tendersView.tenderColumnWidths?.[c.key];
+    return Number.isFinite(v) && v > 0 ? v : c.width;
+  };
+  const tenderTableWidth = useMemo(
+    () => visibleTenderColumns.reduce((total, column) => total + getTenderColWidth(column), 0),
+    [visibleTenderColumns, tendersView.tenderColumnWidths]
+  );
+  const toggleTenderCol = (key) => {
+    const next = new Set(tenderHidden);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    setTendersHiddenColumns(Array.from(next));
+  };
+  const moveTenderCol = (from, to) => {
+    if (from === to) return;
+    const next = [...tenderColOrder];
+    const [item] = next.splice(from, 1);
+    next.splice(to, 0, item);
+    setTendersColumnOrder(next);
+  };
+  // Drag handles in the Columns menu only show/reorder movable columns, but
+  // the persisted order array holds every column (fixed included) — translate
+  // a drag between two movable-list positions into the two real indices.
+  const reorderMovableColumn = (fromMovableIdx, toMovableIdx) => {
+    const movable = orderedTenderColumns.filter((c) => !c.fixed);
+    const fromKey = movable[fromMovableIdx]?.key;
+    const toKey = movable[toMovableIdx]?.key;
+    if (!fromKey || !toKey) return;
+    const from = tenderColOrder.indexOf(fromKey);
+    const to = tenderColOrder.indexOf(toKey);
+    if (from >= 0 && to >= 0) moveTenderCol(from, to);
+  };
+  const startTenderColResize = (col, startX) => {
+    const min = col.key === '_sr' ? 48 : 90;
+    const startWidth = getTenderColWidth(col);
+    const onMove = (e) => setTenderColumnWidth(col.key, Math.max(min, startWidth + (e.clientX - startX)));
+    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+  return {
+    orderedTenderColumns, tenderHidden, visibleTenderColumns,
+    getTenderColWidth, tenderTableWidth, toggleTenderCol, reorderMovableColumn, startTenderColResize,
+  };
 }
 
-const TENDERS_FILTER_STATE_KEY = 'bm-client:tenders:filters:v1';
-
-function loadTenderFilterState() {
-  try {
-    const raw = localStorage.getItem(TENDERS_FILTER_STATE_KEY);
-    if (!raw) return { org: '', location: '', category: '' };
-    const parsed = JSON.parse(raw);
-    return {
-      org: String(parsed?.org || ''),
-      location: String(parsed?.location || ''),
-      category: String(parsed?.category || ''),
-    };
-  } catch {
-    return { org: '', location: '', category: '' };
-  }
+function TenderColumnsMenuButton({ orderedTenderColumns, tenderHidden, toggleTenderCol, reorderMovableColumn }) {
+  const [open, setOpen] = useState(false);
+  const [dragIdx, setDragIdx] = useState(null);
+  const movable = orderedTenderColumns.filter((c) => !c.fixed);
+  return (
+    <div className="relative">
+      <button onClick={() => setOpen((v) => !v)} className="btn-ghost gap-1.5 text-xs"><SlidersHorizontal size={13} />Columns</button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div className="card absolute right-0 top-9 z-50 max-h-80 w-60 overflow-auto border border-[var(--border)] p-2 shadow-xl">
+            <p className="mb-2 border-b border-[var(--border)] px-2 pb-1.5 text-[10px] font-medium uppercase tracking-wider text-[var(--text-muted)]">Drag to reorder · toggle visibility</p>
+            {movable.map((c, i) => (
+              <div
+                key={c.key}
+                draggable
+                onDragStart={() => setDragIdx(i)}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={() => { if (dragIdx !== null) reorderMovableColumn(dragIdx, i); setDragIdx(null); }}
+                className={cn('flex cursor-grab items-center gap-2 rounded px-2 py-1.5 hover:bg-[var(--surface-1)]', dragIdx === i && 'opacity-50')}
+              >
+                <span className="select-none text-xs text-[var(--text-muted)]">⠿</span>
+                <input type="checkbox" checked={!tenderHidden.has(c.key)} onChange={() => toggleTenderCol(c.key)} className="accent-[var(--accent)]" />
+                <span className="flex-1 text-xs">{c.label || c.key}</span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
 }
 
-function TendersPage() {
+// Shared <table> used everywhere a tender list is shown (Tenders, Bookmarks) —
+// same columns, same sort/resize behavior, same row rendering.
+function TenderTable({ columns, getColWidth, tableWidth, sortCol, sortDir, onToggleSort, onStartResize, rows, isLoading, emptyState, renderCell, selectedId, onSelectRow }) {
+  if (isLoading) return <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>;
+  if (!rows.length) return emptyState;
+  return (
+    <table className="data-table" style={{ tableLayout: 'fixed', width: tableWidth, minWidth: tableWidth }}>
+      <thead>
+        <tr>
+          {columns.map((c) => (
+            <th
+              key={c.key}
+              style={{ width: getColWidth(c), textAlign: (c.key === 'is_bookmarked' || c.key === '_sr' || c.key === '_download') ? 'center' : 'left' }}
+              className={cn('relative', !TENDER_NON_SORTABLE.has(c.key) && 'cursor-pointer')}
+              onClick={() => !TENDER_NON_SORTABLE.has(c.key) && onToggleSort(c.key)}
+            >
+              {c.label}{sortCol === c.key && <span className="ml-1">{sortDir === 'asc' ? '▲' : '▼'}</span>}
+              <div
+                className="absolute right-0 top-0 h-full w-2 cursor-col-resize hover:bg-[var(--accent)]/20"
+                onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); onStartResize(c, e.clientX); }}
+              />
+            </th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((t, i) => (
+          <tr key={t.id} onClick={() => onSelectRow?.(t)} className={cn('cursor-pointer', selectedId === t.id && 'row-selected')}>
+            {columns.map((column) => (
+              <td key={column.key} className={column.key === 'is_bookmarked' || column.key === '_sr' || column.key === '_download' ? 'text-center' : ''}>
+                {renderCell(t, column, i)}
+              </td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+// Shared tender-row actions (bookmark toggle, download/request pill, add-to-
+// project, open-tender link) and the cell renderer that wires them into
+// TenderTable — used by both Tenders and Bookmarks so a bookmarked tender
+// behaves identically wherever it's shown.
+function useTenderRowActions() {
   const qc = useQueryClient();
-  const [tab, setTab] = useState('active'); // 'active' | 'archived'
-  const [search, setSearch] = useState('');
-  const [showBookmarkedOnly, setShowBookmarkedOnly] = useState(false);
-  const [sortCol, setSortCol] = useState('closing_date');
-  const [sortDir, setSortDir] = useState('asc');
-  const [selectedId, setSelectedId] = useState(null);
-  const [showFilters, setShowFilters] = useState(false);
-  const [pendingRequestIds, setPendingRequestIds] = useState(() => new Set());
-  const [filters, setFilters] = useState(loadTenderFilterState);
-
-  // Filter selections are saved locally and re-applied automatically to any
-  // freshly-synced tender data (the filter runs client-side over whatever
-  // `tenders` currently holds), so a sync never clears the user's choices.
-  useEffect(() => {
-    try { localStorage.setItem(TENDERS_FILTER_STATE_KEY, JSON.stringify(filters)); } catch { /* ignore storage failures */ }
-  }, [filters]);
-
-  // WIRE: list of tenders visible to the client. Assumes the same
-  // api.listTenders(websiteId, opts) shape as the operator app, called
-  // across all configured sources rather than filtered by a single website.
-  const { data: tenders, isLoading } = useQuery({
-    queryKey: ['client-tenders', tab],
-    // The Bookmarked tab needs both active and archived tenders in one list,
-    // so `archived` is left out of the params entirely for it — listTenders
-    // only applies that filter when the key is present.
-    queryFn: () => api.listTenders(null, tab === 'bookmarked' ? { limit: 5000 } : { archived: tab === 'archived', limit: 5000 }),
-  });
+  const { data: allDocuments } = useQuery({ queryKey: ['client-documents'], queryFn: api.listAllDocuments });
+  const pendingRequestIds = useMemo(
+    () => new Set((allDocuments || []).filter((row) => row.client_status === 'requested').map((row) => row.tender_db_id)),
+    [allDocuments]
+  );
 
   const toggleBookmark = useMutation({
     mutationFn: async (t) => {
@@ -625,92 +864,59 @@ function TendersPage() {
       }
       return api.patchTender(t.id, { is_bookmarked: !t.is_bookmarked });
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['client-tenders', tab] }),
+    onSuccess: () => qc.invalidateQueries(),
     onError: (err) => alert(err instanceof Error ? err.message : String(err)),
   });
 
-  const { data: bookmarkedOrgs } = useQuery({ queryKey: ['bookmarked-orgs'], queryFn: api.listBookmarkedOrgs });
-  const bookmarkedOrgsSet = useMemo(() => new Set(bookmarkedOrgs || []), [bookmarkedOrgs]);
-  const toggleOrgBookmark = useMutation({
-    mutationFn: (org) => api.toggleOrgBookmark(org),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['bookmarked-orgs'] }),
-  });
-  const [orgToAdd, setOrgToAdd] = useState('');
-
-  // Fetches every document available for a tender and downloads them all in
-  // one click — same signed-URL request per file as a single-document
-  // download, just looped over the whole set instead of one file at a time.
+  // Fetches every document available for a tender and saves them all in one
+  // click. Each file goes through api.downloadDocument (signed URL -> Electron
+  // IPC write to <parent_dir>/Tender_Downloads/<tender_id>/<name>) sequentially
+  // — a loop of synthetic <a> clicks only ever lands the first file because
+  // Chromium/Electron throttles rapid programmatic downloads.
   const downloadTenderDocuments = useMutation({
     mutationFn: async (t) => {
-      const docsPage = await api.listTenderDocuments(t.id, { page_size: 200 });
-      const items = docsPage?.items || [];
-      if (!items.length) return { tenderId: t.id, count: 0 };
-      for (const doc of items) {
-        const link = await api.requestDocumentDownload(t.id, doc.id);
-        if (link?.url) {
-          const a = document.createElement('a');
-          a.href = link.url;
-          a.download = doc.name || '';
-          a.rel = 'noopener noreferrer';
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
+      const docsPage = await api.listTenderDocuments(t.id, { page_size: 100 });
+      const items = (docsPage?.items || []).filter((d) => d.downloadable !== false);
+      if (!items.length) return { tenderId: t.id, count: 0, failed: 0, failures: [] };
+      let ok = 0;
+      const failures = [];
+      for (const it of items) {
+        try {
+          await api.downloadDocument({
+            id: it.id,
+            tender_db_id: t.id,
+            tender_id: t.tender_id,
+            file_name: it.name,
+          });
+          ok += 1;
+        } catch (err) {
+          failures.push({ name: it.name || `#${it.id}`, message: err?.message || String(err) });
         }
       }
-      await api.patchTender(t.id, { client_downloaded: true, has_documents: true, document_count: items.length });
-      return { tenderId: t.id, count: items.length };
+      await api.patchTender(t.id, { client_downloaded: ok > 0, has_documents: true, document_count: items.length });
+      return { tenderId: t.id, count: ok, failed: failures.length, failures };
     },
     onSuccess: (result) => {
-      qc.invalidateQueries({ queryKey: ['client-tenders', tab] });
-      if (!result.count) alert('No documents are available yet for this tender.');
+      qc.invalidateQueries();
+      if (!result.count && !result.failed) {
+        alert('No documents are available yet for this tender.');
+      } else if (result.failed) {
+        const reasons = [...new Set(result.failures.map((f) => f.message))].join('; ');
+        alert(`Downloaded ${result.count} file(s). ${result.failed} failed: ${reasons}`);
+      }
     },
     onError: (err) => alert(`Download failed: ${err?.message || String(err)}`),
   });
 
-  // Polls a queued "request-download" job until it completes or fails, then
-  // clears the tender's pending state. On completion the tenders list is
-  // re-fetched — has_documents/document_count are computed live from
-  // downloaded_files server-side, so the row flips to "Download" on its own.
-  const pollTenderRequestStatus = (tender, jobId, attempt = 0) => {
-    const MAX_ATTEMPTS = 40;
-    const clearPending = () => setPendingRequestIds((prev) => {
-      const next = new Set(prev);
-      next.delete(tender.id);
-      return next;
-    });
-    api.getTenderDownloadStatus(tender.id, jobId).then(({ status, error }) => {
-      if (status === 'completed') {
-        clearPending();
-        qc.invalidateQueries({ queryKey: ['client-tenders', tab] });
-        return;
-      }
-      if (status === 'failed') {
-        clearPending();
-        alert(`Request failed: ${error || 'Download failed.'}`);
-        return;
-      }
-      if (attempt >= MAX_ATTEMPTS) {
-        clearPending();
-        alert('Request timed out waiting for the server.');
-        return;
-      }
-      setTimeout(() => pollTenderRequestStatus(tender, jobId, attempt + 1), 15000);
-    }).catch((err) => {
-      clearPending();
-      alert(`Request failed: ${err?.message || String(err)}`);
-    });
-  };
-
   // "Request" — queues the real server-side scrape/download job for a tender
   // that has no documents yet (see Server UI/server/client_api.py
   // request-download, which enqueues the same download_single_tender job the
-  // admin console uses).
+  // admin console uses). api.requestTenderDownload persists the pending state
+  // in the `documents` store and polls in the background (api.js), so it
+  // survives a reload/restart — see api.resumePendingDownloadJobs.
   const requestTenderJob = useMutation({
-    mutationFn: (t) => api.requestTenderDownloadJob(t.id),
-    onSuccess: ({ job_id }, t) => {
-      setPendingRequestIds((prev) => new Set(prev).add(t.id));
-      pollTenderRequestStatus(t, job_id);
-    },
+    mutationFn: (t) => api.requestTenderDownload(t),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['client-documents'] }),
     onError: (err) => alert(`Request failed: ${err?.message || String(err)}`),
   });
 
@@ -730,93 +936,31 @@ function TendersPage() {
     onError: (err) => alert(`Could not create project: ${err?.message || String(err)}`),
   });
 
-  const uniqueOrgs = useMemo(
-    () => [...new Set((tenders || []).map((t) => t.org_chain).filter(Boolean))].sort(),
-    [tenders]
-  );
-  const uniqueLocations = useMemo(
-    () => [...new Set((tenders || []).map((t) => t.location).filter(Boolean))].sort(),
-    [tenders]
-  );
-  const uniqueCategories = useMemo(
-    () => [...new Set((tenders || []).map((t) => t.tender_category).filter(Boolean))].sort(),
-    [tenders]
-  );
-
-  const filtered = useMemo(() => {
-    let list = tenders || [];
-    if (showBookmarkedOnly) list = list.filter((t) => t.is_bookmarked);
-    if (filters.org) list = list.filter((t) => t.org_chain === filters.org);
-    if (filters.location) list = list.filter((t) => t.location === filters.location);
-    if (filters.category) list = list.filter((t) => t.tender_category === filters.category);
-    if (search.trim()) {
-      const q = search.toLowerCase();
-      list = list.filter((t) => Object.values(t).some((v) => String(v ?? '').toLowerCase().includes(q)));
-    }
-    return [...list].sort((a, b) => {
-      const c = smartCmp(a[sortCol] ?? '', b[sortCol] ?? '');
-      return sortDir === 'asc' ? c : -c;
-    });
-  }, [tenders, showBookmarkedOnly, filters, search, sortCol, sortDir]);
-
-  // Bookmarked tab: `tenders` already holds both active+archived when this
-  // tab is selected (see the query above), so this is just the starred subset.
-  const bookmarkedTenderRows = useMemo(() => {
-    const list = (tenders || []).filter((t) => t.is_bookmarked);
-    return [...list].sort((a, b) => {
-      const c = smartCmp(a[sortCol] ?? '', b[sortCol] ?? '');
-      return sortDir === 'asc' ? c : -c;
-    });
-  }, [tenders, sortCol, sortDir]);
-  const orgsAvailableToAdd = useMemo(
-    () => uniqueOrgs.filter((org) => !bookmarkedOrgsSet.has(org)),
-    [uniqueOrgs, bookmarkedOrgsSet]
-  );
-  const tenderCountByOrg = useMemo(() => {
-    const map = new Map();
-    for (const t of tenders || []) {
-      if (!t.org_chain) continue;
-      map.set(t.org_chain, (map.get(t.org_chain) || 0) + 1);
-    }
-    return map;
-  }, [tenders]);
-
-  // Active tenders are active by definition, so the Status column only earns
-  // its place once tenders can carry other statuses — i.e. once archived.
-  const visibleTenderColumns = useMemo(
-    () => TENDER_COLUMNS.filter((column) => tab === 'active' ? column.key !== 'status' : true),
-    [tab]
-  );
-  const tenderTableWidth = useMemo(
-    () => visibleTenderColumns.reduce((total, column) => total + column.width, 0),
-    [visibleTenderColumns]
-  );
-
-  const toggleSort = (key) => {
-    if (sortCol === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
-    else { setSortCol(key); setSortDir('asc'); }
-  };
-
-  const exportCurrent = () => {
-    const exportColumns = visibleTenderColumns.filter((column) => !TENDER_NON_SORTABLE.has(column.key));
-    exportCSV(
-      exportColumns.map((column) => column.label),
-      filtered,
-      exportColumns.map((column) => column.key),
-      `tenders_${tab}_${new Date().toISOString().slice(0, 10)}.csv`
-    );
-  };
-
   const renderTenderCell = (tender, column, index) => {
     if (column.key === '_sr') return <span className="text-xs text-[var(--text-muted)]">{index + 1}</span>;
     if (column.key === '_time') return <TimeBadge dateStr={tender.closing_date} />;
     if (column.key === '_download') {
       const hasDocs = tender.has_documents || Number(tender.document_count) > 0;
       const isDownloaded = hasDocs && tender.client_downloaded;
-      if (isDownloaded) return <Badge variant="success">Downloaded</Badge>;
       const busy = downloadTenderDocuments.isPending && downloadTenderDocuments.variables?.id === tender.id;
       const requesting = pendingRequestIds.has(tender.id)
         || (requestTenderJob.isPending && requestTenderJob.variables?.id === tender.id);
+      if (isDownloaded) {
+        return (
+          <button
+            onClick={(event) => {
+              event.stopPropagation();
+              const proceed = window.confirm('Tender Already Downloaded. Want to download again and overwrite? Additional files will be untouched.');
+              if (proceed) downloadTenderDocuments.mutate(tender);
+            }}
+            disabled={busy}
+            className="inline-flex items-center gap-1 whitespace-nowrap rounded-full border-0 bg-emerald-500/15 px-2.5 py-0.5 text-xs font-medium text-emerald-400 transition-colors hover:bg-emerald-500/25 disabled:opacity-50"
+          >
+            {busy ? <Spinner size={11} /> : <Download size={11} />}
+            {busy ? 'Working…' : 'Downloaded'}
+          </button>
+        );
+      }
       const pillStyles = hasDocs
         ? 'bg-sky-500/15 text-sky-400 hover:bg-sky-500/25'
         : 'bg-[var(--surface-2)] text-[var(--text-muted)] hover:bg-[var(--surface-3)]';
@@ -853,9 +997,9 @@ function TendersPage() {
             <FolderOpen size={14} />
           </button>
           {tender.tender_url && (
-            <button onClick={() => openTender(tender.website_url, tender.tender_url)} className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]" title="Open Tender">
+            <a href={tender.tender_url} target="_blank" rel="noopener noreferrer" className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]" title="Open Tender">
               <ExternalLink size={14} />
-            </button>
+            </a>
           )}
         </div>
       );
@@ -880,66 +1024,205 @@ function TendersPage() {
     return <span className="text-xs">{String(tender[column.key] ?? '') || '—'}</span>;
   };
 
+  return { renderTenderCell, addToProject };
+}
+
+function TendersPage({ onBackToOrganizations }) {
+  const qc = useQueryClient();
+  // A row on Organizations (OrganizationsPage) writes this before navigating
+  // here, so "view this org's tenders" always lands on Active regardless of
+  // whatever tab was last open.
+  const [tab, setTab] = useState(() => {
+    const forced = sessionStorage.getItem(TENDERS_FORCE_TAB_KEY);
+    if (forced) sessionStorage.removeItem(TENDERS_FORCE_TAB_KEY);
+    return forced === 'archived' ? 'archived' : 'active';
+  });
+  // Not one-shot here — App()'s `navigate` helper clears this on any other
+  // navigation, so it stays accurate without TendersPage clearing it itself.
+  const [cameFromOrg] = useState(() => sessionStorage.getItem(TENDERS_CAME_FROM_ORG_KEY) === '1');
+  const [closingSoonOnly, setClosingSoonOnly] = useState(() => {
+    const forced = sessionStorage.getItem(TENDERS_FORCE_CLOSING_KEY);
+    if (forced) sessionStorage.removeItem(TENDERS_FORCE_CLOSING_KEY);
+    return forced === '1';
+  });
+  const [search, setSearch] = useState('');
+  const [showBookmarkedOnly, setShowBookmarkedOnly] = useState(false);
+  const [sortCol, setSortCol] = useState('closing_date');
+  const [sortDir, setSortDir] = useState('asc');
+  const [selectedId, setSelectedId] = useState(null);
+  const [showFilters, setShowFilters] = useState(false);
+  const [filters, setFilters] = useState(loadTenderFilterState);
+  const columns = useTenderColumns(tab);
+  const { renderTenderCell } = useTenderRowActions();
+
+  // Filter selections are saved locally and re-applied automatically to any
+  // freshly-synced tender data (the filter runs client-side over whatever
+  // `tenders` currently holds), so a sync never clears the user's choices.
+  useEffect(() => {
+    try { localStorage.setItem(TENDERS_FILTER_STATE_KEY, JSON.stringify(filters)); } catch { /* ignore storage failures */ }
+  }, [filters]);
+
+  // WIRE: list of tenders visible to the client. Assumes the same
+  // api.listTenders(websiteId, opts) shape as the operator app, called
+  // across all configured sources rather than filtered by a single website.
+  const { data: tenders, isLoading } = useQuery({
+    queryKey: ['client-tenders', tab],
+    queryFn: () => api.listTenders(null, { archived: tab === 'archived', limit: 5000 }),
+  });
+
+  // Same pull as Settings' "Sync Tenders" button (api.js:syncFromServer) —
+  // just reachable without leaving the Online Tenders tab.
+  const refreshTenders = useMutation({
+    mutationFn: () => api.syncFromServer(),
+    onSuccess: () => qc.invalidateQueries(),
+    onError: (err) => alert(`Refresh failed: ${err?.message || String(err)}`),
+  });
+
+  const uniqueOrgs = useMemo(
+    () => [...new Set((tenders || []).map((t) => t.org_chain).filter(Boolean))].sort(),
+    [tenders]
+  );
+  const uniqueLocations = useMemo(
+    () => [...new Set((tenders || []).map((t) => t.location).filter(Boolean))].sort(),
+    [tenders]
+  );
+  const uniqueCategories = useMemo(
+    () => [...new Set((tenders || []).map((t) => t.tender_category).filter(Boolean))].sort(),
+    [tenders]
+  );
+  const uniqueWebsites = useMemo(
+    () => [...new Set((tenders || []).map((t) => t.website_name).filter(Boolean))].sort(),
+    [tenders]
+  );
+
+  // Exactly one website must always be selected — pick the first one the
+  // moment there's a real list and the current selection is empty/stale.
+  useEffect(() => {
+    if (uniqueWebsites.length === 0) return;
+    if (!filters.website || !uniqueWebsites.includes(filters.website)) {
+      setFilters((f) => ({ ...f, website: uniqueWebsites[0] }));
+    }
+  }, [uniqueWebsites, filters.website]);
+
+  const filtered = useMemo(() => {
+    let list = tenders || [];
+    if (showBookmarkedOnly) list = list.filter((t) => t.is_bookmarked);
+    if (filters.org) list = list.filter((t) => t.org_chain === filters.org);
+    if (filters.location) list = list.filter((t) => t.location === filters.location);
+    if (filters.category) list = list.filter((t) => t.tender_category === filters.category);
+    if (filters.website) list = list.filter((t) => t.website_name === filters.website);
+    if (closingSoonOnly) list = list.filter((t) => { const r = timeRemaining(t.closing_date); return !r.expired && r.totalDays >= 0 && r.totalDays <= 7; });
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter((t) => Object.values(t).some((v) => String(v ?? '').toLowerCase().includes(q)));
+    }
+    return [...list].sort((a, b) => {
+      const c = smartCmp(a[sortCol] ?? '', b[sortCol] ?? '');
+      return sortDir === 'asc' ? c : -c;
+    });
+  }, [tenders, showBookmarkedOnly, filters, closingSoonOnly, search, sortCol, sortDir]);
+
+  const toggleSort = (key) => {
+    if (sortCol === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else { setSortCol(key); setSortDir('asc'); }
+  };
+
+  const exportCurrent = () => {
+    const exportColumns = columns.visibleTenderColumns.filter((column) => !TENDER_NON_SORTABLE.has(column.key));
+    exportCSV(
+      exportColumns.map((column) => column.label),
+      filtered,
+      exportColumns.map((column) => column.key),
+      `tenders_${tab}_${new Date().toISOString().slice(0, 10)}.csv`
+    );
+  };
+
   return (
     <div className="flex h-full flex-col">
       {/* Header */}
       <div className="space-y-2 border-b border-[var(--border)] bg-[var(--surface-0)] px-6 py-3">
         <div className="flex items-center justify-between">
-          <h1 className="text-lg font-bold text-[var(--text)]">Online Tenders</h1>
-          <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-xs font-medium text-[var(--text-muted)]">{tab === 'bookmarked' ? bookmarkedTenderRows.length : filtered.length}</span>
-        </div>
-        {tab !== 'bookmarked' && (
-          <>
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="relative min-w-[180px] max-w-sm flex-1">
-                <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search..." className="input-field h-8 w-full text-sm" />
-                {search && <button onClick={() => setSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><X size={14} /></button>}
-              </div>
-              <button
-                onClick={() => setShowBookmarkedOnly((v) => !v)}
-                className={cn('btn-ghost gap-1.5 text-xs', showBookmarkedOnly && 'bg-[var(--accent-bg)] text-[var(--accent)]')}
-              >
-                <Star size={13} />Bookmarked
+          <div className="flex items-center gap-2.5">
+            {cameFromOrg && (
+              <button onClick={onBackToOrganizations} className="btn-ghost gap-1.5 text-xs shrink-0">
+                <ArrowLeft size={13} />Back to Organizations
               </button>
-              <button
-                onClick={() => setShowFilters((v) => !v)}
-                className={cn('btn-ghost gap-1.5 text-xs', (showFilters || filters.org || filters.location || filters.category) && 'bg-[var(--accent-bg)] text-[var(--accent)]')}
-              >
-                <Filter size={13} />Filters
-              </button>
-              <div className="flex-1" />
-              <button onClick={exportCurrent} className="btn-ghost gap-1.5 text-xs"><FileDown size={13} />Export CSV</button>
-            </div>
-            {showFilters && (
-              <div className="grid grid-cols-2 gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3 lg:grid-cols-4">
-                <div>
-                  <label className="mb-1 block text-xs text-[var(--text-muted)]">Organization</label>
-                  <select value={filters.org} onChange={(e) => setFilters((f) => ({ ...f, org: e.target.value }))} className="input-field h-8 w-full text-xs">
-                    <option value="">All</option>
-                    {uniqueOrgs.map((o) => <option key={o} value={o}>{o}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs text-[var(--text-muted)]">Location</label>
-                  <select value={filters.location} onChange={(e) => setFilters((f) => ({ ...f, location: e.target.value }))} className="input-field h-8 w-full text-xs">
-                    <option value="">All</option>
-                    {uniqueLocations.map((l) => <option key={l} value={l}>{l}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs text-[var(--text-muted)]">Category</label>
-                  <select value={filters.category} onChange={(e) => setFilters((f) => ({ ...f, category: e.target.value }))} className="input-field h-8 w-full text-xs">
-                    <option value="">All</option>
-                    {uniqueCategories.map((c) => <option key={c} value={c}>{c}</option>)}
-                  </select>
-                </div>
-                <div className="flex items-end"><button onClick={() => setFilters({ org: '', location: '', category: '' })} className="btn-ghost text-xs">Clear</button></div>
-              </div>
             )}
-          </>
+            <h1 className="text-lg font-bold text-[var(--text)]">Online Tenders</h1>
+            <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-xs font-medium text-[var(--text-muted)]">{filtered.length}</span>
+          </div>
+          <button onClick={() => refreshTenders.mutate()} disabled={refreshTenders.isPending} className="btn-secondary flex items-center gap-2 text-sm">
+            {refreshTenders.isPending ? <Spinner size={14} /> : <RefreshCw size={14} />} Sync Now
+          </button>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="relative min-w-[180px] max-w-sm flex-1">
+            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search..." className="input-field h-8 w-full text-sm" />
+            {search && <button onClick={() => setSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><X size={14} /></button>}
+          </div>
+          <select
+            value={filters.website}
+            onChange={(e) => setFilters((f) => ({ ...f, website: e.target.value }))}
+            className="input-field h-8 w-auto max-w-[180px] text-xs"
+          >
+            {uniqueWebsites.map((w) => <option key={w} value={w}>{w}</option>)}
+          </select>
+          <button
+            onClick={() => setShowBookmarkedOnly((v) => !v)}
+            className={cn('btn-ghost gap-1.5 text-xs', showBookmarkedOnly && 'bg-[var(--accent-bg)] text-[var(--accent)]')}
+          >
+            <Star size={13} />Bookmarked
+          </button>
+          <button
+            onClick={() => setClosingSoonOnly((v) => !v)}
+            className={cn('btn-ghost gap-1.5 text-xs', closingSoonOnly && 'bg-[var(--accent-bg)] text-[var(--accent)]')}
+          >
+            <Clock size={13} />Closing ≤7d
+          </button>
+          <button
+            onClick={() => setShowFilters((v) => !v)}
+            className={cn('btn-ghost gap-1.5 text-xs', (showFilters || filters.org || filters.location || filters.category) && 'bg-[var(--accent-bg)] text-[var(--accent)]')}
+            title="Organization / Location / Category filters"
+          >
+            <Filter size={13} />Filters
+          </button>
+          <div className="flex-1" />
+          <TenderColumnsMenuButton
+            orderedTenderColumns={columns.orderedTenderColumns}
+            tenderHidden={columns.tenderHidden}
+            toggleTenderCol={columns.toggleTenderCol}
+            reorderMovableColumn={columns.reorderMovableColumn}
+          />
+          <button onClick={exportCurrent} className="btn-ghost gap-1.5 text-xs"><FileDown size={13} />Export CSV</button>
+        </div>
+        {showFilters && (
+          <div className="grid grid-cols-2 gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3 lg:grid-cols-4">
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Organization</label>
+              <select value={filters.org} onChange={(e) => setFilters((f) => ({ ...f, org: e.target.value }))} className="input-field h-8 w-full text-xs">
+                <option value="">All</option>
+                {uniqueOrgs.map((o) => <option key={o} value={o}>{o}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Location</label>
+              <select value={filters.location} onChange={(e) => setFilters((f) => ({ ...f, location: e.target.value }))} className="input-field h-8 w-full text-xs">
+                <option value="">All</option>
+                {uniqueLocations.map((l) => <option key={l} value={l}>{l}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Category</label>
+              <select value={filters.category} onChange={(e) => setFilters((f) => ({ ...f, category: e.target.value }))} className="input-field h-8 w-full text-xs">
+                <option value="">All</option>
+                {uniqueCategories.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <div className="flex items-end"><button onClick={() => setFilters((f) => ({ ...f, org: '', location: '', category: '' }))} className="btn-ghost text-xs">Clear</button></div>
+          </div>
         )}
         <div className="-mx-6 -mb-3 mt-1 flex border-t border-[var(--border)] px-6">
-          {[{ key: 'active', label: 'Active Tenders' }, { key: 'archived', label: 'Archived' }, { key: 'bookmarked', label: 'Bookmarked' }].map((t) => (
+          {[{ key: 'active', label: 'Active Tenders' }, { key: 'archived', label: 'Archived' }].map((t) => (
             <button
               key={t.key}
               onClick={() => setTab(t.key)}
@@ -952,125 +1235,239 @@ function TendersPage() {
       </div>
 
       {/* Table */}
-      {tab === 'bookmarked' ? (
-        <div className="flex-1 overflow-auto p-4 space-y-6">
-          <div>
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-[var(--text)]">Bookmarked Organizations</h3>
-              <div className="flex items-center gap-2">
-                <select value={orgToAdd} onChange={(e) => setOrgToAdd(e.target.value)} className="input-field h-8 w-56 text-xs">
-                  <option value="">Select an organization…</option>
-                  {orgsAvailableToAdd.map((org) => <option key={org} value={org}>{org}</option>)}
-                </select>
-                <button
-                  disabled={!orgToAdd || toggleOrgBookmark.isPending}
-                  onClick={() => { toggleOrgBookmark.mutate(orgToAdd); setOrgToAdd(''); }}
-                  className="btn-primary gap-1.5 text-xs"
-                >
-                  <Plus size={13} />Add
-                </button>
-              </div>
-            </div>
-            {isLoading ? (
-              <div className="flex justify-center py-8"><Spinner size={20} className="text-[var(--accent)]" /></div>
-            ) : (bookmarkedOrgs || []).length === 0 ? (
-              <EmptyState icon={Bookmark} title="No bookmarked organizations" description="Add one above to get notified about its new tenders." />
-            ) : (
-              <table className="data-table">
-                <thead><tr><th>Organization</th><th style={{ width: 140 }}>Tenders</th><th style={{ width: 100 }}>Remove</th></tr></thead>
-                <tbody>
-                  {[...bookmarkedOrgs].sort().map((org) => (
-                    <tr key={org}>
-                      <td className="text-sm">{org}</td>
-                      <td className="text-xs">{tenderCountByOrg.get(org) || 0}</td>
-                      <td>
-                        <button onClick={() => toggleOrgBookmark.mutate(org)} className="btn-ghost gap-1 text-xs text-rose-400 hover:text-rose-300">
-                          <X size={12} />Remove
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </div>
+      <div className="flex-1 overflow-auto">
+        <TenderTable
+          columns={columns.visibleTenderColumns}
+          getColWidth={columns.getTenderColWidth}
+          tableWidth={columns.tenderTableWidth}
+          sortCol={sortCol}
+          sortDir={sortDir}
+          onToggleSort={toggleSort}
+          onStartResize={columns.startTenderColResize}
+          rows={filtered}
+          isLoading={isLoading}
+          emptyState={<EmptyState icon={Globe} title="No tenders" description={search ? `No tenders match "${search}"` : 'No tenders to show yet.'} />}
+          renderCell={renderTenderCell}
+          selectedId={selectedId}
+          onSelectRow={(t) => setSelectedId(t.id === selectedId ? null : t.id)}
+        />
+      </div>
+    </div>
+  );
+}
 
-          <div>
-            <h3 className="mb-2 text-sm font-semibold text-[var(--text)]">Bookmarked Tenders</h3>
-            {isLoading ? (
-              <div className="flex justify-center py-8"><Spinner size={20} className="text-[var(--accent)]" /></div>
-            ) : bookmarkedTenderRows.length === 0 ? (
-              <EmptyState icon={Star} title="No bookmarked tenders" description="Star a tender in Active or Archived to see it here." />
-            ) : (
-              <div className="overflow-auto">
-                <table className="data-table" style={{ tableLayout: 'fixed', width: tenderTableWidth, minWidth: tenderTableWidth }}>
-                  <thead>
-                    <tr>
-                      {visibleTenderColumns.map((c) => (
-                        <th
-                          key={c.key}
-                          style={{ width: c.width, textAlign: (c.key === 'is_bookmarked' || c.key === '_sr' || c.key === '_download') ? 'center' : 'left' }}
-                          className={!TENDER_NON_SORTABLE.has(c.key) ? 'cursor-pointer' : ''}
-                          onClick={() => !TENDER_NON_SORTABLE.has(c.key) && toggleSort(c.key)}
-                        >
-                          {c.label}{sortCol === c.key && <span className="ml-1">{sortDir === 'asc' ? '▲' : '▼'}</span>}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {bookmarkedTenderRows.map((t, i) => (
-                      <tr key={t.id} onClick={() => setSelectedId(t.id === selectedId ? null : t.id)} className={cn('cursor-pointer', selectedId === t.id && 'row-selected')}>
-                        {visibleTenderColumns.map((column) => (
-                          <td key={column.key} className={column.key === 'is_bookmarked' || column.key === '_sr' || column.key === '_download' ? 'text-center' : ''}>
-                            {renderTenderCell(t, column, i)}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
+/* ═══════════════════════════════════════════════════════════════════════════
+   ORGANIZATIONS  — browse every organization synced from the server (not just
+   bookmarked ones), bookmark from here, and jump to that org's Active tenders.
+   ═══════════════════════════════════════════════════════════════════════════ */
+function OrganizationsPage({ onOpenOrgTenders }) {
+  const qc = useQueryClient();
+  const { organizationsTable, setOrganizationsColumnWidth } = useAppStore();
+  // Persisted across navigating away and back (e.g. via Tenders' "Back to
+  // Organizations" button) — only changes when the user edits the box.
+  const [search, setSearch] = useState(() => { try { return sessionStorage.getItem(ORGANIZATIONS_SEARCH_KEY) || ''; } catch { return ''; } });
+  // One-shot: a Website Coverage card on the Dashboard sets this immediately
+  // before navigating here so that website is preselected/filtered.
+  const [website, setWebsite] = useState(() => {
+    try {
+      const forced = sessionStorage.getItem(ORGANIZATIONS_FORCE_WEBSITE_KEY);
+      if (forced !== null) { sessionStorage.removeItem(ORGANIZATIONS_FORCE_WEBSITE_KEY); return forced; }
+    } catch { /* ignore storage failures */ }
+    return '';
+  });
+  const [sortCol, setSortCol] = useState('tender_count');
+  const [sortDir, setSortDir] = useState('desc');
+
+  useEffect(() => {
+    try { sessionStorage.setItem(ORGANIZATIONS_SEARCH_KEY, search); } catch { /* ignore storage failures */ }
+  }, [search]);
+
+  const { data: organizations, isLoading } = useQuery({ queryKey: ['organizations'], queryFn: api.listOrganizations });
+  const { data: bookmarkedOrgs } = useQuery({ queryKey: ['bookmarked-orgs'], queryFn: api.listBookmarkedOrgs });
+  const bookmarkedOrgsSet = useMemo(() => new Set(bookmarkedOrgs || []), [bookmarkedOrgs]);
+  const toggleOrgBookmark = useMutation({
+    mutationFn: (org) => api.toggleOrgBookmark(org),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['bookmarked-orgs'] }),
+  });
+
+  const uniqueWebsites = useMemo(
+    () => [...new Set((organizations || []).map((o) => o.website_name).filter(Boolean))].sort(),
+    [organizations]
+  );
+
+  // Exactly one website must always be selected — pick the first one the
+  // moment there's a real list and the current selection is empty/stale.
+  useEffect(() => {
+    if (uniqueWebsites.length === 0) return;
+    if (!website || !uniqueWebsites.includes(website)) setWebsite(uniqueWebsites[0]);
+  }, [uniqueWebsites, website]);
+
+  const filtered = useMemo(() => {
+    let list = organizations || [];
+    if (website) list = list.filter((o) => o.website_name === website);
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter((o) => o.name.toLowerCase().includes(q) || (o.website_name || '').toLowerCase().includes(q));
+    }
+    return [...list].sort((a, b) => {
+      const c = smartCmp(a[sortCol] ?? '', b[sortCol] ?? '');
+      return sortDir === 'asc' ? c : -c;
+    });
+  }, [organizations, website, search, sortCol, sortDir]);
+
+  const toggleSort = (key) => {
+    if (sortCol === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else { setSortCol(key); setSortDir(key === 'tender_count' ? 'desc' : 'asc'); }
+  };
+
+  const columns = [
+    { key: '_sr', label: 'Sr. No.', width: 64 },
+    { key: '_bookmark', label: 'Bookmark', width: 90 },
+    { key: 'name', label: 'Organization', width: 320 },
+    { key: 'website_name', label: 'Website', width: 200 },
+    { key: 'tender_count', label: 'Tenders', width: 110 },
+  ];
+  const NON_SORTABLE_ORG_COLS = new Set(['_sr', '_bookmark']);
+  const getOrgColWidth = (c) => { const v = organizationsTable.columnWidths?.[c.key]; return Number.isFinite(v) && v > 0 ? v : c.width; };
+  const startOrgColResize = (col, startX) => {
+    const min = col.key === '_sr' ? 48 : 70;
+    const sw = getOrgColWidth(col);
+    const onMove = (e) => setOrganizationsColumnWidth(col.key, Math.max(min, sw + (e.clientX - startX)));
+    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp);
+  };
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="space-y-2 border-b border-[var(--border)] bg-[var(--surface-0)] px-6 py-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <h1 className="text-lg font-bold text-[var(--text)]">Organizations</h1>
+            <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-xs font-medium text-[var(--text-muted)]">{filtered.length}</span>
           </div>
         </div>
-      ) : (
-        <div className="flex-1 overflow-auto">
-          {isLoading ? (
-            <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>
-          ) : filtered.length === 0 ? (
-            <EmptyState icon={Globe} title="No tenders" description={search ? `No tenders match "${search}"` : 'No tenders to show yet.'} />
-          ) : (
-            <table className="data-table" style={{ tableLayout: 'fixed', width: tenderTableWidth, minWidth: tenderTableWidth }}>
-              <thead>
-                <tr>
-                  {visibleTenderColumns.map((c) => (
-                    <th
-                      key={c.key}
-                      style={{ width: c.width, textAlign: (c.key === 'is_bookmarked' || c.key === '_sr' || c.key === '_download') ? 'center' : 'left' }}
-                      className={!TENDER_NON_SORTABLE.has(c.key) ? 'cursor-pointer' : ''}
-                      onClick={() => !TENDER_NON_SORTABLE.has(c.key) && toggleSort(c.key)}
-                    >
-                      {c.label}{sortCol === c.key && <span className="ml-1">{sortDir === 'asc' ? '▲' : '▼'}</span>}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.map((t, i) => (
-                  <tr key={t.id} onClick={() => setSelectedId(t.id === selectedId ? null : t.id)} className={cn('cursor-pointer', selectedId === t.id && 'row-selected')}>
-                    {visibleTenderColumns.map((column) => (
-                      <td key={column.key} className={column.key === 'is_bookmarked' || column.key === '_sr' || column.key === '_download' ? 'text-center' : ''}>
-                        {renderTenderCell(t, column, i)}
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="relative min-w-[180px] max-w-sm flex-1">
+            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search organizations..." className="input-field h-8 w-full text-sm" />
+            {search && <button onClick={() => setSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><X size={14} /></button>}
+          </div>
+          <select
+            value={website}
+            onChange={(e) => setWebsite(e.target.value)}
+            className="input-field h-8 w-auto max-w-[180px] text-xs"
+          >
+            {uniqueWebsites.map((w) => <option key={w} value={w}>{w}</option>)}
+          </select>
         </div>
-      )}
+      </div>
+      <div className="flex-1 overflow-auto">
+        {isLoading ? (
+          <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>
+        ) : filtered.length === 0 ? (
+          <EmptyState icon={Building2} title="No organizations" description={search ? `No organizations match "${search}"` : 'Sync from the server to load organizations.'} />
+        ) : (
+          <table className="data-table" style={{ tableLayout: 'fixed', width: '100%' }}>
+            <thead>
+              <tr>
+                {columns.map((c) => (
+                  <th
+                    key={c.key}
+                    style={{ width: getOrgColWidth(c), textAlign: c.key === 'tender_count' || c.key === '_bookmark' || c.key === '_sr' ? 'center' : 'left' }}
+                    className={cn('relative', !NON_SORTABLE_ORG_COLS.has(c.key) && 'cursor-pointer')}
+                    onClick={() => !NON_SORTABLE_ORG_COLS.has(c.key) && toggleSort(c.key)}
+                  >
+                    {c.label}{sortCol === c.key && <span className="ml-1">{sortDir === 'asc' ? '▲' : '▼'}</span>}
+                    <div
+                      className="absolute right-0 top-0 h-full w-2 cursor-col-resize hover:bg-[var(--accent)]/20"
+                      onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); startOrgColResize(c, e.clientX); }}
+                    />
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((org, i) => (
+                <tr key={org.id} className="cursor-pointer" onClick={() => onOpenOrgTenders?.(org.name, org.website_name)}>
+                  <td className="text-center text-xs text-[var(--text-muted)]">{i + 1}</td>
+                  <td className="text-center">
+                    <button
+                      onClick={(event) => { event.stopPropagation(); toggleOrgBookmark.mutate(org.name); }}
+                      className={cn('inline-flex h-7 w-7 items-center justify-center rounded transition-colors', bookmarkedOrgsSet.has(org.name) ? 'text-amber-400' : 'text-[var(--text-muted)] hover:text-amber-400')}
+                      title={bookmarkedOrgsSet.has(org.name) ? 'Remove bookmark' : 'Bookmark organization'}
+                    >
+                      <Bookmark size={16} fill={bookmarkedOrgsSet.has(org.name) ? 'currentColor' : 'none'} />
+                    </button>
+                  </td>
+                  <td className="text-sm">{org.name}</td>
+                  <td className="text-xs text-[var(--text-muted)]">{org.website_name || '—'}</td>
+                  <td className="text-center text-xs">{org.tender_count}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   BOOKMARKS  — saved tenders only (organization bookmarking lives on the
+   Organizations page). Renders through the same TenderTable/column system as
+   Online Tenders so a bookmarked tender looks and behaves identically there.
+   ═══════════════════════════════════════════════════════════════════════════ */
+function BookmarksPage() {
+  const [sortCol, setSortCol] = useState('closing_date');
+  const [sortDir, setSortDir] = useState('asc');
+  const [selectedId, setSelectedId] = useState(null);
+  const columns = useTenderColumns('bookmarks');
+  const { renderTenderCell } = useTenderRowActions();
+
+  // Needs both active and archived tenders in one list — listTenders only
+  // applies the `archived` filter when that key is present in params.
+  const { data: tenders, isLoading } = useQuery({
+    queryKey: ['client-tenders-bookmarked'],
+    queryFn: () => api.listTenders(null, { limit: 5000 }),
+  });
+
+  const bookmarkedRows = useMemo(() => {
+    const list = (tenders || []).filter((t) => t.is_bookmarked);
+    return [...list].sort((a, b) => {
+      const c = smartCmp(a[sortCol] ?? '', b[sortCol] ?? '');
+      return sortDir === 'asc' ? c : -c;
+    });
+  }, [tenders, sortCol, sortDir]);
+
+  const toggleSort = (key) => {
+    if (sortCol === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else { setSortCol(key); setSortDir('asc'); }
+  };
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="border-b border-[var(--border)] bg-[var(--surface-0)] px-6 py-3">
+        <div className="flex items-center gap-2.5">
+          <h1 className="text-lg font-bold text-[var(--text)]">Bookmarks</h1>
+          <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-xs font-medium text-[var(--text-muted)]">{bookmarkedRows.length}</span>
+        </div>
+      </div>
+      <div className="flex-1 overflow-auto">
+        <TenderTable
+          columns={columns.visibleTenderColumns}
+          getColWidth={columns.getTenderColWidth}
+          tableWidth={columns.tenderTableWidth}
+          sortCol={sortCol}
+          sortDir={sortDir}
+          onToggleSort={toggleSort}
+          onStartResize={columns.startTenderColResize}
+          rows={bookmarkedRows}
+          isLoading={isLoading}
+          emptyState={<EmptyState icon={Star} title="No bookmarked tenders" description="Star a tender in Online Tenders to see it here." />}
+          renderCell={renderTenderCell}
+          selectedId={selectedId}
+          onSelectRow={(t) => setSelectedId(t.id === selectedId ? null : t.id)}
+        />
+      </div>
     </div>
   );
 }
@@ -1131,7 +1528,29 @@ function StatsBar({ projects }) {
   );
 }
 
+function Ring({ done, total, size = 34 }) {
+  const pct = total ? done / total : 0;
+  const r = (size - 6) / 2;
+  const c = 2 * Math.PI * r;
+  const col = pct === 1 ? '#10b981' : pct >= 0.6 ? 'var(--accent)' : '#f59e0b';
+  return (
+    <svg width={size} height={size} className="shrink-0">
+      <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="var(--surface-2)" strokeWidth={4} />
+      {total > 0 && (
+        <circle
+          cx={size / 2} cy={size / 2} r={r} fill="none" stroke={col} strokeWidth={4} strokeLinecap="round"
+          strokeDasharray={c} strokeDashoffset={c * (1 - pct)} transform={`rotate(-90 ${size / 2} ${size / 2})`}
+        />
+      )}
+      <text x="50%" y="50%" dominantBaseline="central" textAnchor="middle" fontSize={9} fontWeight={700} fill="var(--text)">{done}/{total}</text>
+    </svg>
+  );
+}
+
 function ProjectCard({ project, isSelected, isFocused, onClick, onDoubleClick }) {
+  const { data: checklist } = useQuery({ queryKey: ['project-checklist-ring', project.id], queryFn: () => api.listChecklist(project.id) });
+  const done = (checklist || []).filter((i) => i.status === 'Completed').length;
+  const total = (checklist || []).length;
   return (
     <div
       onClick={onClick} onDoubleClick={onDoubleClick}
@@ -1144,9 +1563,12 @@ function ProjectCard({ project, isSelected, isFocused, onClick, onDoubleClick })
       )}
     >
       <div className="flex items-start justify-between gap-2">
-        <div className="flex-1 min-w-0">
-          <p className="text-[10px] font-mono text-[var(--accent)] mb-1 truncate">{project.source_tender_id || '—'}</p>
-          <p className="text-sm font-semibold text-[var(--text)] line-clamp-2 leading-snug">{project.title || 'Untitled'}</p>
+        <div className="flex items-start gap-2.5 flex-1 min-w-0">
+          <Ring done={done} total={total} />
+          <div className="flex-1 min-w-0">
+            <p className="text-[10px] font-mono text-[var(--accent)] mb-1 truncate">{project.source_tender_id || '—'}</p>
+            <p className="text-sm font-semibold text-[var(--text)] line-clamp-2 leading-snug">{project.title || 'Untitled'}</p>
+          </div>
         </div>
         <Badge variant={project.status === 'Active' ? 'success' : 'muted'} className="shrink-0 text-[10px]">
           {project.status || 'Active'}
@@ -1203,10 +1625,6 @@ function ProjectsPage({ onOpenProjectWorkspace, archived = false }) {
   const { data: projects, isLoading } = useQuery({ queryKey: ['projects', projectStatus, search], queryFn: () => api.listProjects(search, projectStatus) });
   const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
   const projectsEntryMode = String(settings?.projects_entry_mode || 'inline').toLowerCase() === 'popup' ? 'popup' : 'inline';
-  const setEntryMode = useMutation({
-    mutationFn: (mode) => api.updateSettings({ projects_entry_mode: mode }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['settings'] }),
-  });
   const selectedProject = useMemo(() => (projects || []).find((p) => p.id === selId) || null, [projects, selId]);
   const { data: checklist, isLoading: checklistLoading } = useQuery({ queryKey: ['project-checklist', selId], queryFn: () => api.listChecklist(selId), enabled: !!selId && showDetails });
 
@@ -1479,20 +1897,6 @@ function ProjectsPage({ onOpenProjectWorkspace, archived = false }) {
                   </div>
                 </>
               )}
-            </div>
-          )}
-          {!archived && (
-            <div className="flex items-center rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-0.5 gap-0.5" title="How the New/Edit Project form opens">
-              {['inline', 'popup'].map(mode => (
-                <button
-                  key={mode}
-                  onClick={() => setEntryMode.mutate(mode)}
-                  disabled={setEntryMode.isPending}
-                  className={cn('flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs transition-all', projectsEntryMode === mode ? 'bg-[var(--surface-0)] text-[var(--text)] shadow-sm' : 'text-[var(--text-muted)] hover:text-[var(--text)]')}
-                >
-                  {mode === 'inline' ? 'Inline Form' : 'Popup Form'}
-                </button>
-              ))}
             </div>
           )}
           <div className="flex-1" />
@@ -2643,13 +3047,233 @@ function TemplateItemsList({ templateId, onDelete }) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   FILES  (renamed from "Server Control" — a plain file browser over the
+   shared project storage)
+   — dropped: "Delete files older than N days" bulk-maintenance action. That
+     is an operator/server-hygiene tool, not something a client user should
+     be able to trigger. Browsing + single-folder delete is kept.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const STORAGE_COLUMNS = [
+  { key: 'name', label: 'Name', width: 360 },
+  { key: 'type', label: 'Type', width: 130 },
+  { key: 'size', label: 'Size', width: 140 },
+  { key: 'modified', label: 'Modified', width: 220 },
+];
+
+function formatBytes(bytes) {
+  const b = Number(bytes || 0);
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+  if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(b / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function FilesPage() {
+  const qc = useQueryClient();
+  const {
+    serverStorageTable,
+    setServerStorageHiddenColumns,
+    setServerStorageColumnOrder,
+    setServerStorageColumnWidth,
+  } = useAppStore();
+
+  const [relPath, setRelPath] = useState('');
+  const [selectedRelPath, setSelectedRelPath] = useState('');
+  const [showColsMenu, setShowColsMenu] = useState(false);
+  const [dragIdx, setDragIdx] = useState(null);
+
+  const { data, isLoading, isFetching } = useQuery({
+    queryKey: ['client-files', relPath],
+    queryFn: () => api.listServerStorage(relPath),
+  });
+
+  const selectedItem = useMemo(() => {
+    const items = data?.items || [];
+    return items.find((x) => x.rel_path === selectedRelPath) || null;
+  }, [data?.items, selectedRelPath]);
+
+  const storageColOrder = useMemo(
+    () => (serverStorageTable.columnOrder?.length ? serverStorageTable.columnOrder : STORAGE_COLUMNS.map((c) => c.key)),
+    [serverStorageTable.columnOrder]
+  );
+  const storageHidden = useMemo(() => new Set(serverStorageTable.hiddenColumns || []), [serverStorageTable.hiddenColumns]);
+  const orderedStorageCols = useMemo(() => {
+    const byKey = new Map(STORAGE_COLUMNS.map((c) => [c.key, c]));
+    return storageColOrder.map((k) => byKey.get(k)).filter(Boolean);
+  }, [storageColOrder]);
+  const visibleStorageCols = orderedStorageCols.filter((c) => c.fixed || !storageHidden.has(c.key));
+  const getStorageColWidth = (c) => {
+    const v = serverStorageTable.columnWidths?.[c.key];
+    return Number.isFinite(v) && v > 0 ? v : c.width;
+  };
+  const toggleStorageCol = (key) => {
+    const next = new Set(storageHidden);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    setServerStorageHiddenColumns(Array.from(next));
+  };
+  const moveStorageCol = (from, to) => {
+    if (from === to) return;
+    const next = [...storageColOrder];
+    const [item] = next.splice(from, 1);
+    next.splice(to, 0, item);
+    setServerStorageColumnOrder(next);
+  };
+  const startStorageColResize = (col, startX) => {
+    const startW = getStorageColWidth(col);
+    const onMove = (evt) => {
+      const next = Math.max(90, startW + (evt.clientX - startX));
+      setServerStorageColumnWidth(col.key, next);
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  const deleteFolder = useMutation({
+    mutationFn: (path) => api.deleteServerFolder(path),
+    onSuccess: () => {
+      setSelectedRelPath('');
+      qc.invalidateQueries({ queryKey: ['client-files', relPath] });
+    },
+  });
+
+  const goParent = () => {
+    const parent = data?.parent_rel_path || '';
+    setRelPath(parent);
+    setSelectedRelPath('');
+  };
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="border-b border-[var(--border)] bg-[var(--surface-0)] px-6 py-4">
+        <h1 className="text-lg font-bold text-[var(--text)]">Files</h1>
+        <p className="mt-0.5 text-sm text-[var(--text-muted)]">Browse project storage</p>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <button onClick={goParent} className="btn-ghost gap-1 text-xs" disabled={!data?.parent_rel_path}>
+            <ArrowUp size={12} />
+            Parent
+          </button>
+          <button onClick={() => qc.invalidateQueries({ queryKey: ['client-files', relPath] })} className="btn-ghost gap-1 text-xs">
+            <RefreshCw size={12} className={cn(isFetching && 'animate-spin')} />
+            Refresh
+          </button>
+          <button onClick={() => selectedItem?.is_dir && deleteFolder.mutate(selectedItem.rel_path)} className="btn-danger gap-1 text-xs" disabled={!selectedItem?.is_dir || deleteFolder.isPending}>
+            <Trash2 size={12} />
+            Delete Folder
+          </button>
+          <div className="relative ml-2">
+            <button onClick={() => setShowColsMenu((v) => !v)} className="btn-ghost gap-1 text-xs">
+              <Columns3 size={12} />
+              Columns
+            </button>
+            {showColsMenu && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setShowColsMenu(false)} />
+                <div className="card absolute right-0 top-8 z-50 max-h-72 w-60 overflow-auto border border-[var(--border)] p-2 shadow-xl">
+                  <p className="mb-1 border-b border-[var(--border)] px-2 pb-1 text-xs text-[var(--text-muted)]">Drag to reorder, toggle columns</p>
+                  {orderedStorageCols.map((c, i) => (
+                    <div key={c.key} draggable onDragStart={() => setDragIdx(i)} onDragOver={(e) => e.preventDefault()} onDrop={() => {
+                      if (dragIdx !== null) {
+                        const fromKey = orderedStorageCols[dragIdx]?.key;
+                        const toKey = orderedStorageCols[i]?.key;
+                        if (fromKey && toKey) {
+                          const fi = storageColOrder.indexOf(fromKey);
+                          const ti = storageColOrder.indexOf(toKey);
+                          if (fi >= 0 && ti >= 0) moveStorageCol(fi, ti);
+                        }
+                      }
+                      setDragIdx(null);
+                    }} className={cn('flex cursor-grab items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-[var(--surface-1)]', dragIdx === i && 'opacity-50')}>
+                      <span className="select-none cursor-grab text-[var(--text-muted)]">::</span>
+                      <input type="checkbox" checked={!storageHidden.has(c.key)} onChange={() => toggleStorageCol(c.key)} className="accent-[var(--accent)]" />
+                      <span className="flex-1">{c.label}</span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+        <div className="mt-2 text-xs text-[var(--text-muted)]">
+          Root: <span className="font-mono">{data?.root_folder || '-'}</span>
+          <br />
+          Current: <span className="font-mono">{data?.current_rel_path || '/'}</span>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-auto p-6">
+        {isLoading ? (
+          <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>
+        ) : (
+          <>
+            {!data?.items || data.items.length === 0 ? (
+              <EmptyState icon={Server} title="No items" description="This folder is empty" />
+            ) : (
+              <table className="data-table" style={{ tableLayout: 'fixed', width: '100%' }}>
+                <thead>
+                  <tr>
+                    {visibleStorageCols.map((c) => (
+                      <th key={c.key} style={{ width: getStorageColWidth(c) }} className="relative">
+                        <div className="flex items-center">{c.label}</div>
+                        <div className="absolute right-0 top-0 h-full w-2 cursor-col-resize" onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); startStorageColResize(c, e.clientX); }} />
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.items.map((item) => (
+                    <tr key={item.rel_path || item.name} onClick={() => setSelectedRelPath(item.rel_path)} onDoubleClick={() => {
+                      if (item.is_dir) {
+                        setRelPath(item.rel_path);
+                        setSelectedRelPath('');
+                      }
+                    }} className={cn('cursor-pointer', selectedRelPath === item.rel_path && 'row-selected')}>
+                      {visibleStorageCols.map((c) => {
+                        if (c.key === 'name') return <td key={c.key} className="text-sm"><span className="inline-flex items-center gap-2">{item.is_dir ? <Folder size={14} /> : <FolderOpen size={14} />}{item.name}</span></td>;
+                        if (c.key === 'type') return <td key={c.key} className="text-xs">{item.is_dir ? 'Folder' : 'File'}</td>;
+                        if (c.key === 'size') return <td key={c.key} className="text-xs">{item.is_dir ? '-' : formatBytes(item.size_bytes)}</td>;
+                        if (c.key === 'modified') return <td key={c.key} className="text-xs">{new Date(item.modified_at).toLocaleString()}</td>;
+                        return <td key={c.key} className="text-xs" />;
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    SETTINGS  (client-relevant only)
    — dropped: CAPTCHA AI provider config, Backend/Cloud Run connection
-     config (mode / URL / API & admin keys), Auto-Archive scheduling, and
-     Update Manifest URL — all operator-only concerns. Kept: appearance,
-     projects entry mode, the "show tender info" toggle, directory paths,
-     and a simple read-only connection status.
+     config (mode / URL / API & admin keys), and Update Manifest URL — all
+     operator-only concerns. Kept & expanded: appearance/theming, workspace
+     behavior, projects entry mode, the "show tender info" toggle, directory
+     paths, server connection/sync, and local data & cache controls.
+
+   Two separate stores of settings live on this page:
+     1. Server-relevant `form` fields (unchanged plumbing) — saved via
+        api.updateSettings() and shown under Workspace / Directories / Connection.
+     2. Local-only `prefs` (accent, density, UI scale, startup page) — saved to
+        localStorage via useClientPrefs(), applied instantly, never sent to
+        the backend. See DEFAULT_CLIENT_PREFS above.
    ═══════════════════════════════════════════════════════════════════════════ */
+const SETTINGS_TABS = [
+  { key: 'appearance', label: 'Appearance', icon: Palette },
+  { key: 'workspace', label: 'Workspace', icon: LayoutGrid },
+  { key: 'directories', label: 'Directories', icon: FolderOpen },
+  { key: 'connection', label: 'Connection & Sync', icon: Server },
+  { key: 'data', label: 'Data & Cache', icon: RotateCcw },
+];
+
 function SettingsPage() {
   const { theme, toggleTheme } = useAppStore();
   const qc = useQueryClient();
@@ -2689,14 +3313,11 @@ function SettingsPage() {
   }, [settings]);
 
   const saveMut = useMutation({
-    mutationFn: async (d) => {
-      await api.updateSettings(d);
-      return api.ensureParentFolders(d.parent_dir);
-    },
-    onSuccess: (foldersResult) => {
+    mutationFn: async (patch) => { await api.updateSettings(patch); return api.ensureParentFolders(patch.parent_dir); },
+    onSuccess: (result) => {
       qc.invalidateQueries({ queryKey: ['settings'] });
       window.dispatchEvent(new Event('bm-settings-updated'));
-      setPathStatus(foldersResult?.ok === false ? `Saved settings, but could not create folders: ${foldersResult.message}` : 'Saved.');
+      setPathStatus(result?.ok === false ? `Saved settings, but could not create folders: ${result.message}` : 'Saved.');
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     },
@@ -2704,9 +3325,7 @@ function SettingsPage() {
   });
   const handleSave = () => saveMut.mutate(form);
   const uf = (k, v) => setForm((f) => ({ ...f, [k]: v }));
-  const subPath = (name) => (form.parent_dir
-    ? `${form.parent_dir}${form.parent_dir.endsWith('\\') || form.parent_dir.endsWith('/') ? '' : '\\'}${name}`
-    : '-');
+  const folderPath = (name) => form.parent_dir ? `${form.parent_dir}${form.parent_dir.endsWith('\\') || form.parent_dir.endsWith('/') ? '' : '\\'}${name}` : '-';
 
   const connectionMut = useMutation({
     mutationFn: () => api.testConnection(form),
@@ -2733,7 +3352,7 @@ function SettingsPage() {
       setPwForm({ current_password: '', new_password: '', confirm_password: '' });
       setTimeout(() => { setShowChangePw(false); setPwStatus(''); }, 1500);
     },
-    onError: (error) => setPwStatus(error instanceof Error ? error.message : String(error)),
+    onError: (err) => setPwStatus(err instanceof Error ? err.message : String(err)),
   });
   const submitChangePassword = () => {
     if (pwForm.new_password.length < 8) { setPwStatus('New password must be at least 8 characters.'); return; }
@@ -2757,7 +3376,7 @@ function SettingsPage() {
       <div className="px-6 py-4 border-b border-[var(--border)] bg-[var(--surface-0)]">
         <div className="flex items-center justify-between">
           <h1 className="text-lg font-bold text-[var(--text)]">Settings</h1>
-          <div className="flex items-center gap-2">
+          <div>
             {health ? <Badge variant="success"><Wifi size={10} />Connected v{health.version}</Badge> : <Badge variant="danger"><WifiOff size={10} />Offline</Badge>}
           </div>
         </div>
@@ -2771,14 +3390,26 @@ function SettingsPage() {
               <div className="card p-5 space-y-4">
                 <h3 className="text-sm font-semibold text-[var(--text)]">Appearance</h3>
                 <div className="flex items-center justify-between">
-                  <div><p className="text-sm text-[var(--text)]">Theme</p><p className="text-xs text-[var(--text-muted)]">Light / Dark mode</p></div>
-                  <button onClick={toggleTheme} className="btn-secondary text-sm gap-2">{theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}{theme === 'dark' ? 'Light' : 'Dark'}</button>
+                  <div>
+                    <p className="text-sm text-[var(--text)]">Theme</p>
+                    <p className="text-xs text-[var(--text-muted)]">Light / Dark mode</p>
+                  </div>
+                  <button onClick={toggleTheme} className="btn-secondary text-sm gap-2">
+                    {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
+                    {theme === 'dark' ? 'Light' : 'Dark'}
+                  </button>
                 </div>
                 <div className="flex items-center justify-between">
-                  <div><p className="text-sm text-[var(--text)]">Show Tender Info panel</p><p className="text-xs text-[var(--text-muted)]">In project details view</p></div>
+                  <div>
+                    <p className="text-sm text-[var(--text)]">Show Tender Info panel</p>
+                    <p className="text-xs text-[var(--text-muted)]">In project details view</p>
+                  </div>
                   <input type="checkbox" checked={form.project_details_show_tender_info === 'true'} onChange={(e) => uf('project_details_show_tender_info', e.target.checked ? 'true' : 'false')} className="accent-[var(--accent)] w-5 h-5" />
                 </div>
-                <p className="flex items-start gap-2 text-[11px] text-[var(--text-muted)]"><Info size={12} className="mt-0.5 shrink-0" />The New/Edit Project form's Inline vs Popup mode moved to the Projects page toolbar.</p>
+                <p className="flex items-start gap-2 text-[11px] text-[var(--text-muted)]">
+                  <Info size={12} className="mt-0.5 shrink-0" />
+                  The New/Edit Project form's Inline vs Popup mode moved to the Projects page toolbar.
+                </p>
               </div>
 
               <div className="card p-5 space-y-4">
@@ -2792,10 +3423,10 @@ function SettingsPage() {
                   </div>
                 </div>
                 <div className="grid grid-cols-1 gap-2 text-xs text-[var(--text-muted)]">
-                  <div>Tender Downloads: <span className="text-[var(--text)]">{subPath('Tender_Downloads')}</span></div>
-                  <div>Projects: <span className="text-[var(--text)]">{subPath('My_Tender_Projects')}</span></div>
-                  <div>Archived: <span className="text-[var(--text)]">{subPath('Archived Projects')}</span></div>
-                  <div>Templates: <span className="text-[var(--text)]">{subPath('Checklist_Templates')}</span></div>
+                  <div>Tender Downloads: <span className="text-[var(--text)]">{folderPath('Tender_Downloads')}</span></div>
+                  <div>Projects: <span className="text-[var(--text)]">{folderPath('My_Tender_Projects')}</span></div>
+                  <div>Archived: <span className="text-[var(--text)]">{folderPath('Archived Projects')}</span></div>
+                  <div>Templates: <span className="text-[var(--text)]">{folderPath('Checklist_Templates')}</span></div>
                 </div>
               </div>
             </div>
@@ -2835,9 +3466,7 @@ function SettingsPage() {
                       )}
                     </div>
                   </>
-                ) : (
-                  <p className="text-xs text-[var(--text-muted)]">Not signed in.</p>
-                )}
+                ) : <p className="text-xs text-[var(--text-muted)]">Not signed in.</p>}
               </div>
 
               <div className="card p-5 space-y-4">
@@ -2883,76 +3512,109 @@ function SettingsPage() {
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   SIGN IN  — gates the whole app behind a per-user account (client_users on
+   the server). Register/login both return a personal session token stored as
+   settings.auth_token; api.js sends it as x-client-key on every /client/*
+   call. See Server UI/server/client_api.py's /client/auth/* routes.
+   ═══════════════════════════════════════════════════════════════════════════ */
+function SignInScreen() {
+  const qc = useQueryClient();
+  const [mode, setMode] = useState('login'); // 'login' | 'register'
+  const [form, setForm] = useState({ email: '', password: '', display_name: '' });
+  const [remember, setRemember] = useState(true);
+  const [error, setError] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const uf = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+
+  const submitMut = useMutation({
+    mutationFn: () => api.signIn(form, mode, remember),
+    onSuccess: () => { setError(''); qc.invalidateQueries({ queryKey: ['settings'] }); },
+    onError: (err) => setError(err instanceof Error ? err.message : String(err)),
+  });
+
+  const handleSubmit = (event) => {
+    event.preventDefault();
+    if (!form.email.trim() || !form.password.trim()) { setError('Enter your email and password.'); return; }
+    submitMut.mutate();
+  };
+
+  return (
+    <div className="flex h-screen items-center justify-center bg-[var(--bg)] text-[var(--text)]">
+      <form onSubmit={handleSubmit} className="card w-full max-w-sm space-y-4 p-6">
+        <div className="text-center">
+          <p className="text-sm font-bold tracking-tight text-[var(--accent)]">BID MANAGER</p>
+          <h1 className="mt-1 text-lg font-semibold text-[var(--text)]">{mode === 'register' ? 'Create an account' : 'Sign in'}</h1>
+        </div>
+
+        {mode === 'register' && (
+          <div>
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Name</label>
+            <input value={form.display_name} onChange={(e) => uf('display_name', e.target.value)} className="input-field h-9 w-full text-sm" placeholder="Your name" />
+          </div>
+        )}
+        <div>
+          <label className="mb-1 block text-xs text-[var(--text-muted)]">Email</label>
+          <input type="email" value={form.email} onChange={(e) => uf('email', e.target.value)} className="input-field h-9 w-full text-sm" placeholder="you@example.com" autoComplete="email" required />
+        </div>
+        <div>
+          <label className="mb-1 block text-xs text-[var(--text-muted)]">Password</label>
+          <div className="relative">
+            <input
+              type={showPassword ? 'text' : 'password'} value={form.password} onChange={(e) => uf('password', e.target.value)}
+              className="input-field h-9 w-full pr-9 text-sm" placeholder={mode === 'register' ? 'At least 8 characters' : 'Password'}
+              autoComplete={mode === 'register' ? 'new-password' : 'current-password'} required
+            />
+            <button type="button" onClick={() => setShowPassword((v) => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]">
+              {showPassword ? <EyeOff size={14} /> : <Eye size={14} />}
+            </button>
+          </div>
+        </div>
+
+        <label className="flex items-center gap-2 text-xs text-[var(--text-muted)]">
+          <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} className="accent-[var(--accent)]" />
+          Remember me on this device
+        </label>
+
+        {error && <p className="text-xs text-rose-400">{error}</p>}
+
+        <button type="submit" disabled={submitMut.isPending} className="btn-primary flex w-full items-center justify-center gap-2 text-sm">
+          {submitMut.isPending ? <Spinner size={14} /> : mode === 'register' ? <UserPlus size={14} /> : <LogIn size={14} />}
+          {mode === 'register' ? 'Create account' : 'Sign in'}
+        </button>
+
+        <p className="text-center text-xs text-[var(--text-muted)]">
+          {mode === 'register' ? 'Already have an account?' : "Don't have an account?"}{' '}
+          <button type="button" onClick={() => { setMode(mode === 'register' ? 'login' : 'register'); setError(''); }} className="text-[var(--accent)] hover:underline">
+            {mode === 'register' ? 'Sign in' : 'Create one'}
+          </button>
+        </p>
+      </form>
+    </div>
+  );
+}
+
+function formatAgo(dateStr) {
+  if (!dateStr) return null;
+  const then = new Date(dateStr).getTime();
+  if (!Number.isFinite(then)) return null;
+  const diffMs = Date.now() - then;
+  if (diffMs < 0) return 'just now';
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    APP SHELL
    — dropped: the background "auto-archive" polling loop that used to call
      api.listWebsites / api.checkArchivedTenderStatus / api.archiveCompletedTenders
      on a timer. That whole cycle was the scraper re-checking source portals
      for completed tenders — an operator-only background job.
    ═══════════════════════════════════════════════════════════════════════════ */
-function SignInScreen() {
-  const qc = useQueryClient();
-  const [mode, setMode] = useState('login');
-  const [form, setForm] = useState({ email: '', password: '', display_name: '' });
-  const [remember, setRemember] = useState(true);
-  const [error, setError] = useState('');
-  const uf = (key, value) => setForm((f) => ({ ...f, [key]: value }));
-
-  const mut = useMutation({
-    mutationFn: () => api.signIn(form, mode, remember),
-    onSuccess: () => { setError(''); qc.invalidateQueries({ queryKey: ['settings'] }); },
-    onError: (err) => setError(err instanceof Error ? err.message : String(err)),
-  });
-
-  const submit = (event) => {
-    event.preventDefault();
-    if (!form.email.trim() || !form.password.trim()) { setError('Enter your email and password.'); return; }
-    mut.mutate();
-  };
-
-  return (
-    <div className="h-screen flex items-center justify-center bg-[var(--bg)] text-[var(--text)]">
-      <form onSubmit={submit} className="card w-full max-w-sm p-6 space-y-4">
-        <div>
-          <h1 className="text-lg font-bold">{mode === 'register' ? 'Create Account' : 'Sign In'}</h1>
-          <p className="mt-1 text-xs text-[var(--text-muted)]">BidManager Client</p>
-        </div>
-        {mode === 'register' && (
-          <div>
-            <label className="text-xs text-[var(--text-muted)] mb-1 block">Name</label>
-            <input value={form.display_name} onChange={(event) => uf('display_name', event.target.value)}
-              className="input-field h-9 w-full text-sm" placeholder="Your name" autoComplete="name" />
-          </div>
-        )}
-        <div>
-          <label className="text-xs text-[var(--text-muted)] mb-1 block">Email</label>
-          <input type="email" value={form.email} onChange={(event) => uf('email', event.target.value)}
-            className="input-field h-9 w-full text-sm" placeholder="you@example.com" autoComplete="email" required />
-        </div>
-        <div>
-          <label className="text-xs text-[var(--text-muted)] mb-1 block">Password</label>
-          <input type="password" value={form.password} onChange={(event) => uf('password', event.target.value)}
-            className="input-field h-9 w-full text-sm" placeholder={mode === 'register' ? 'At least 8 characters' : 'Password'}
-            autoComplete={mode === 'register' ? 'new-password' : 'current-password'} required />
-        </div>
-        <label className="flex items-center gap-2 text-xs text-[var(--text-muted)]">
-          <input type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)}
-            className="h-3.5 w-3.5 rounded border-[var(--border)]" />
-          Keep me signed in on this device
-        </label>
-        {error && <p className="text-xs text-[var(--danger)]">{error}</p>}
-        <button type="submit" disabled={mut.isPending} className="btn-primary w-full text-sm justify-center gap-1.5">
-          {mut.isPending ? <Spinner size={13} /> : mode === 'register' ? <UserPlus size={14} /> : <LogIn size={14} />}
-          {mode === 'register' ? 'Create Account' : 'Sign In'}
-        </button>
-        <button type="button" onClick={() => { setMode(mode === 'register' ? 'login' : 'register'); setError(''); }}
-          className="w-full text-xs text-[var(--text-muted)] hover:text-[var(--text)]">
-          {mode === 'register' ? 'Already have an account? Sign in' : 'New here? Create an account'}
-        </button>
-      </form>
-    </div>
-  );
-}
-
 export default function App() {
   const qc = useQueryClient();
   const { theme, toggleTheme, sidebarCollapsed, toggleSidebar, notifications } = useAppStore();
@@ -2964,7 +3626,7 @@ export default function App() {
     retry: false,
   });
   const [page, setPage] = useState(() => {
-    const allowed = ['dashboard', 'tenders', 'projects', 'templates', 'archived_projects', 'settings'];
+    const allowed = ['dashboard', 'tenders', 'organizations', 'bookmarks', 'projects', 'templates', 'archived_projects', 'files', 'settings'];
     const startupPage = readClientPrefs().startupPage;
     if (startupPage && startupPage !== 'resume' && allowed.includes(startupPage)) return startupPage;
     const saved = localStorage.getItem('bm-client-last-page');
@@ -3001,14 +3663,70 @@ export default function App() {
     return () => clearInterval(timer);
   }, [authSettings?.auth_token, qc]);
 
+  // A "Requested…" pill (TendersPage) is backed by a placeholder row in the
+  // local `documents` store with the job id attached, but the setTimeout
+  // polling chain in api.pollTenderDownloadJob only lives as long as the app
+  // stays open — reattach it here so a still-pending request resumes polling
+  // after a reload/restart instead of getting stuck "Requested…" forever.
+  useEffect(() => {
+    if (!authSettings?.auth_token) return;
+    api.resumePendingDownloadJobs().catch(() => {});
+  }, [authSettings?.auth_token]);
+
   if (!authLoading && !authSettings?.auth_token) return <SignInScreen />;
 
+  // Clears the "came from Organizations" flag, then navigates — used by
+  // every navigation path except openOrgTenders itself, so a stale "Back to
+  // Organizations" button can't linger once the user has gone somewhere else.
+  const navigate = (target) => {
+    try { sessionStorage.removeItem(TENDERS_CAME_FROM_ORG_KEY); } catch { /* ignore storage failures */ }
+    setPage(target);
+  };
+
+  // Websites are now a mandatory single-select filter (no "All" option), so
+  // an org's own website must be preset explicitly — otherwise a different
+  // website left selected in Tenders could hide this org's tenders entirely.
+  const openOrgTenders = (orgName, websiteName) => {
+    try {
+      localStorage.setItem(TENDERS_FILTER_STATE_KEY, JSON.stringify({ org: orgName, location: '', category: '', website: websiteName || '' }));
+      sessionStorage.setItem(TENDERS_FORCE_TAB_KEY, 'active');
+      sessionStorage.setItem(TENDERS_CAME_FROM_ORG_KEY, '1');
+    } catch { /* ignore storage failures */ }
+    setPage('tenders');
+  };
+
+  const openWebsiteOrganizations = (websiteName) => {
+    try { sessionStorage.setItem(ORGANIZATIONS_FORCE_WEBSITE_KEY, websiteName || ''); } catch { /* ignore storage failures */ }
+    navigate('organizations');
+  };
+
+  // Dashboard stat cards navigate to a pre-filtered view — same cross-page
+  // mechanism as openOrgTenders, minus the org filter. Deliberately leaves
+  // `website` untouched (read-modify-write) since it's now a mandatory
+  // single-select and shouldn't get silently reset by an unrelated card.
+  const goToDashboardTarget = (target) => {
+    if (target === 'tenders-active' || target === 'tenders-archived' || target === 'tenders-closing-7d') {
+      try {
+        const current = loadTenderFilterState();
+        localStorage.setItem(TENDERS_FILTER_STATE_KEY, JSON.stringify({ ...current, org: '', location: '', category: '' }));
+        sessionStorage.setItem(TENDERS_FORCE_TAB_KEY, target === 'tenders-archived' ? 'archived' : 'active');
+        if (target === 'tenders-closing-7d') sessionStorage.setItem(TENDERS_FORCE_CLOSING_KEY, '1');
+      } catch { /* ignore storage failures */ }
+      navigate('tenders');
+    } else if (target) {
+      navigate(target);
+    }
+  };
+
   const pages = {
-    dashboard: <DashboardPage />,
-    tenders: <TendersPage />,
+    dashboard: <DashboardPage onNavigate={goToDashboardTarget} onOpenProjectWorkspace={(projectId) => setWorkspaceProjectId(projectId)} onOpenWebsiteOrganizations={openWebsiteOrganizations} />,
+    tenders: <TendersPage onBackToOrganizations={() => navigate('organizations')} />,
+    organizations: <OrganizationsPage onOpenOrgTenders={openOrgTenders} />,
+    bookmarks: <BookmarksPage />,
     projects: <ProjectsPage key="projects-active" onOpenProjectWorkspace={(projectId) => setWorkspaceProjectId(projectId)} />,
     archived_projects: <ProjectsPage key="projects-archived" archived onOpenProjectWorkspace={(projectId) => setWorkspaceProjectId(projectId)} />,
     templates: <TemplatesPage />,
+    files: <FilesPage />,
     settings: <SettingsPage />,
   };
 
@@ -3019,9 +3737,11 @@ export default function App() {
         <div className="flex-1" />
         <div className="flex items-center gap-2">
           {connected ? (
-            <span title="Connected to the server"><Badge variant="success"><Wifi size={10} /></Badge></span>
+            <span title="Connected to the server">
+              <Badge variant="success"><Wifi size={10} />{formatAgo(authSettings?.last_sync_at) ? `Synced ${formatAgo(authSettings.last_sync_at)}` : null}</Badge>
+            </span>
           ) : (
-            <span title="Not connected — check Settings › Connection & Sync"><Badge variant="danger"><WifiOff size={10} /></Badge></span>
+            <span title="Not connected — check Settings › Connection & Sync"><Badge variant="danger"><WifiOff size={10} />Offline</Badge></span>
           )}
         </div>
         <div className="flex items-center gap-1">
@@ -3039,7 +3759,7 @@ export default function App() {
       </header>
 
       <div className="flex flex-1 overflow-hidden">
-        <Sidebar active={page} onNavigate={setPage} collapsed={sidebarCollapsed} onToggle={toggleSidebar} />
+        <Sidebar active={page} onNavigate={navigate} collapsed={sidebarCollapsed} onToggle={toggleSidebar} />
         <main className="flex-1 overflow-hidden bg-[var(--bg)]">
           <RenderErrorBoundary>{pages[page]}</RenderErrorBoundary>
         </main>

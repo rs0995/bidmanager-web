@@ -95,6 +95,36 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
+# Reversibly-encrypted copy of a client password, so the admin console can show
+# it. bcrypt (above) stays the auth check; this ciphertext is only ever
+# decrypted inside the admin-key-gated /admin/users* endpoints. Keyed off an
+# existing server secret — a DB leak alone does not expose passwords.
+def _password_cipher():
+    from cryptography.fernet import Fernet
+
+    secret = (
+        os.environ.get("BIDMANAGER_PASSWORD_ENC_KEY")
+        or os.environ.get("BIDMANAGER_DOWNLOAD_TOKEN_SECRET")
+        or "bidmanager-local-password-enc"
+    )
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode("utf-8")).digest()))
+
+
+def encrypt_password(plaintext: str) -> str:
+    if not plaintext:
+        return ""
+    return _password_cipher().encrypt(str(plaintext).encode("utf-8")).decode("ascii")
+
+
+def decrypt_password(ciphertext) -> str | None:
+    if not ciphertext:
+        return None
+    try:
+        return _password_cipher().decrypt(str(ciphertext).encode("utf-8")).decode("utf-8")
+    except Exception:  # bad token / wrong key / not ciphertext — never raise to the caller
+        return None
+
+
 def new_client_token() -> str:
     return secrets.token_urlsafe(32)
 

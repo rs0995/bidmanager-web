@@ -153,9 +153,10 @@ def client_register(body: RegisterRequest) -> dict[str, Any]:
         password_hash = security.hash_password(body.password)
         cur = conn.execute(
             "INSERT INTO client_users "
-            "(email, password_hash, display_name, status, created_at, last_login_at, last_seen_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (email, password_hash, display_name, "active", now, now, now),
+            "(email, password_hash, password_enc, display_name, status, created_at, last_login_at, last_seen_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (email, password_hash, security.encrypt_password(body.password),
+             display_name, "active", now, now, now),
         )
         user_id = int(cur.lastrowid)
         token = _issue_token(conn, user_id)
@@ -223,7 +224,10 @@ def client_change_password(
         if not row or not security.verify_password(body.current_password, str(data.get("password_hash") or "")):
             raise HTTPException(401, "Current password is incorrect.")
         new_hash = security.hash_password(body.new_password)
-        conn.execute("UPDATE client_users SET password_hash=? WHERE id=?", (new_hash, user_id))
+        conn.execute(
+            "UPDATE client_users SET password_hash=?, password_enc=? WHERE id=?",
+            (new_hash, security.encrypt_password(body.new_password), user_id),
+        )
         conn.commit()
     return {"ok": True}
 

@@ -355,6 +355,55 @@ class DurableJobRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_download_single_tender_job_reflects_real_outcome(self):
+        with tempfile.TemporaryDirectory(prefix="bidmanager-dl-outcome-") as tmp:
+            root = self._isolated_server_copy(Path(tmp))
+            result = self._run(
+                root,
+                """
+                import time
+                import api_server as api
+
+                def wait_for(job_id, timeout=8):
+                    deadline = time.time() + timeout
+                    while time.time() < deadline:
+                        with api._job_lock:
+                            status = api._jobs[job_id]['status']
+                        if status in ('completed', 'failed', 'cancelled'):
+                            return status
+                        time.sleep(0.02)
+                    raise AssertionError('timed out: ' + job_id)
+
+                with api.get_db() as conn:
+                    wid = int(conn.execute('SELECT id FROM websites ORDER BY id LIMIT 1').fetchone()[0])
+                    cur = conn.execute(
+                        'INSERT INTO tenders (website_id,tender_id,title) VALUES (?,?,?)',
+                        (wid, 'DL-OUTCOME', 'Download outcome tender'),
+                    )
+                    tender_db_id = int(cur.lastrowid)
+                    conn.commit()
+
+                # Browser/session failed -> download_tenders_logic returns False.
+                api.core.ScraperBackend.download_tenders_logic = staticmethod(
+                    lambda *a, **k: False
+                )
+                failed = api._enqueue_job('download_single_tender', {'tender_db_id': tender_db_id, 'mode': 'full'})['job_id']
+                assert wait_for(failed) == 'failed', 'expected failed'
+
+                # Download ran fine -> True -> job completes.
+                api.core.ScraperBackend.download_tenders_logic = staticmethod(
+                    lambda *a, **k: True
+                )
+                api.core.ScraperBackend.set_setting('dedupe_by_tender_id', 'false')
+                ok = api._enqueue_job('download_single_tender', {'tender_db_id': tender_db_id, 'mode': 'full'})['job_id']
+                assert wait_for(ok) == 'completed', 'expected completed'
+
+                api._scheduler_stop.set()
+                api._job_executor.shutdown(wait=True, cancel_futures=True)
+                """,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

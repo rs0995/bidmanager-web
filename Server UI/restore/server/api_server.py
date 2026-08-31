@@ -5288,7 +5288,7 @@ def _validated_saved_custom_job(body: SavedCustomJobRequest) -> dict:
         raise HTTPException(400, "Select at least one tender")
     return {
         "owner_name": owner, "name": name, "website_id": int(body.website_id),
-        "job_type": job_type, "org_ids": org_ids, "tender_ids": tender_ids,
+        "job_type": job_type, "org_ids": [] if all_organizations else org_ids, "tender_ids": tender_ids,
         "all_organizations": all_organizations, "all_tenders": False,
         "download_mode": mode, "schedule_enabled": schedule_enabled,
         "schedule_mode": schedule_mode, "interval_minutes": interval,

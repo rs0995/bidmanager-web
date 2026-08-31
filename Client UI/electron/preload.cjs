@@ -13,6 +13,5 @@ contextBridge.exposeInMainWorld("bidmanagerDesktop", {
   ensureDirectory: (targetPath) => ipcRenderer.invoke("desktop:ensure-directory", targetPath),
   writeJsonFile: (payload) => ipcRenderer.invoke("desktop:write-json-file", payload),
   clientApiRequest: (payload) => ipcRenderer.invoke("desktop:client-api-request", payload),
-  openTender: (payload) => ipcRenderer.invoke("desktop:open-tender", payload),
   downloadFile: (payload) => ipcRenderer.invoke("desktop:download-file", payload),
 });

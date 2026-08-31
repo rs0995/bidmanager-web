@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import security
 
@@ -69,6 +70,20 @@ class SecurityPolicyTests(unittest.TestCase):
         self.assertFalse(
             security.verify_download_token(token + "x", "tenders/42/spec.pdf", now=1059, environ=env)
         )
+
+
+    def test_password_encryption_round_trips_and_fails_safe(self):
+        env = {"BIDMANAGER_DOWNLOAD_TOKEN_SECRET": "enc-secret"}
+        with mock.patch.dict(security.os.environ, env, clear=False):
+            token = security.encrypt_password("hunter2 correct")
+            self.assertNotEqual(token, "hunter2 correct")
+            self.assertEqual(security.decrypt_password(token), "hunter2 correct")
+        self.assertIsNone(security.decrypt_password(None))
+        self.assertIsNone(security.decrypt_password(""))
+        self.assertIsNone(security.decrypt_password("not-a-real-token"))
+        # A different server secret cannot read the ciphertext.
+        with mock.patch.dict(security.os.environ, {"BIDMANAGER_DOWNLOAD_TOKEN_SECRET": "different"}, clear=False):
+            self.assertIsNone(security.decrypt_password(token))
 
 
 if __name__ == "__main__":

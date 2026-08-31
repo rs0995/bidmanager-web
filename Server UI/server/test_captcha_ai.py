@@ -65,5 +65,60 @@ class CaptchaAiProviderTests(unittest.TestCase):
         self.assertEqual(request["json"]["model"], "vision-model")
 
 
+class ValidateCaptchaAiConfigTests(unittest.TestCase):
+    def _model(self, name):
+        m = mock.Mock()
+        m.name = name
+        m.supported_generation_methods = ["generateContent"]
+        return m
+
+    def _genai(self, list_models):
+        stub = mock.Mock()
+        stub.configure = mock.Mock()
+        stub.list_models = list_models
+        return stub
+
+    def test_non_gemini_provider_is_a_noop(self):
+        app_core.ScraperBackend.validate_captcha_ai_config(
+            {"provider": "openai", "api_key": "", "model": ""}
+        )
+
+    def test_rejected_api_key_raises(self):
+        genai = self._genai(mock.Mock(side_effect=Exception(
+            '400 API key not valid. Please pass a valid API key. [reason: "API_KEY_INVALID"]'
+        )))
+        with mock.patch.object(app_core, "genai", genai), mock.patch.object(
+            app_core, "ensure_scraper_dependencies", return_value=True
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                app_core.ScraperBackend.validate_captcha_ai_config(
+                    {"provider": "gemini", "api_key": "bad", "model": "gemini-2.5-flash"}
+                )
+        self.assertIn("rejected", str(ctx.exception).lower())
+
+    def test_unknown_model_raises_with_hint(self):
+        genai = self._genai(mock.Mock(return_value=[
+            self._model("models/gemini-2.5-flash"), self._model("models/gemini-2.0-flash"),
+        ]))
+        with mock.patch.object(app_core, "genai", genai), mock.patch.object(
+            app_core, "ensure_scraper_dependencies", return_value=True
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                app_core.ScraperBackend.validate_captcha_ai_config(
+                    {"provider": "gemini", "api_key": "ok", "model": "gemini-3.7-flash"}
+                )
+        self.assertIn("gemini-2.5-flash", str(ctx.exception))
+
+    def test_valid_key_and_model_passes(self):
+        genai = self._genai(mock.Mock(return_value=[self._model("models/gemini-2.5-flash")]))
+        with mock.patch.object(app_core, "genai", genai), mock.patch.object(
+            app_core, "ensure_scraper_dependencies", return_value=True
+        ):
+            app_core.ScraperBackend.validate_captcha_ai_config(
+                {"provider": "gemini", "api_key": "ok", "model": "gemini-2.5-flash"}
+            )
+        genai.configure.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

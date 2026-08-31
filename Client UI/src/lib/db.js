@@ -1,5 +1,3 @@
-import { DEFAULT_SERVER_URL } from './cloud-config.js';
-
 const DB_NAME = 'bidmanager-client';
 const DB_VERSION = 1;
 const STORE = 'state';
@@ -14,20 +12,16 @@ const initialState = () => ({
   templates: [],
   templateItems: [],
   documents: [],
-  bookmarkedOrgs: [],
-  // {id, website_id, name} rows, refreshed on every syncFromServer() — used
-  // only to resolve a bookmarked org_chain string to the server's numeric
   // organizations.id when pushing cloud sync data; never rendered directly.
   organizations: [],
+  bookmarkedOrgs: [],
   settings: {
     parent_dir: '',
     project_details_show_tender_info: 'true',
     projects_entry_mode: 'inline',
-    server_url: DEFAULT_SERVER_URL,
+    server_url: 'https://161.118.170.233.sslip.io',
+    client_api_key: '',
     auth_token: '',
-    user_email: '',
-    user_id: null,
-    display_name: '',
     last_sync_at: '',
   },
 });

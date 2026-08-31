@@ -5,6 +5,8 @@ frontend/tsconfig.tsbuildinfo
 dist/
 dist-electron/
 dist-electron-admin/
+dist-electron-cloud/
+Client UI/Archived Installers/
 Server UI/build/
 Server UI/installer/
 dist_new/

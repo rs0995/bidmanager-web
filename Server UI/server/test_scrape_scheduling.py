@@ -9,46 +9,64 @@ import api_server
 IST = ZoneInfo("Asia/Kolkata")
 
 
-def _epoch_at(hour, minute=0):
-    return datetime(2026, 8, 24, hour, minute, tzinfo=IST).timestamp()
-
-
-class ScrapeWindowTests(unittest.TestCase):
-    def test_window_boundaries(self):
-        self.assertFalse(api_server._within_scrape_window(_epoch_at(8, 59)))
-        self.assertTrue(api_server._within_scrape_window(_epoch_at(9, 0)))
-        self.assertTrue(api_server._within_scrape_window(_epoch_at(20, 59)))
-        self.assertFalse(api_server._within_scrape_window(_epoch_at(21, 0)))
-
-    def test_night_hours_are_blocked(self):
-        for hour in (0, 3, 6, 22, 23):
-            with self.subTest(hour=hour):
-                self.assertFalse(api_server._within_scrape_window(_epoch_at(hour)))
-
-    def test_daytime_hours_are_allowed(self):
-        for hour in range(9, 21):
-            with self.subTest(hour=hour):
-                self.assertTrue(api_server._within_scrape_window(_epoch_at(hour)))
+def _epoch_at(hour, minute=0, day=24):
+    return datetime(2026, 8, day, hour, minute, tzinfo=IST).timestamp()
 
 
 class SchedulerGatingTests(unittest.TestCase):
-    def test_consolidated_pass_short_circuits_outside_window_without_touching_the_db(self):
-        # get_db() is deliberately left unmocked here: if this called it
-        # before returning, the test would error trying to open a real
-        # connection — proving the window check runs before any DB access.
-        with mock.patch.object(api_server, "_within_scrape_window", return_value=False), \
+    def test_consolidated_pass_short_circuits_when_both_trigger_families_are_disabled(self):
+        # Neither enabled means nothing to gather — should return before any
+        # DB access (get_db is left unmocked to prove it).
+        with mock.patch.object(api_server, "_scheduler_enabled", return_value=False), \
+             mock.patch.object(api_server, "_saved_job_scheduler_enabled", return_value=False):
+            self.assertEqual(api_server._run_consolidated_scrape_pass(), 0)
+
+
+class SchedulerDowntimeTests(unittest.TestCase):
+    def _settings(self, frm, to):
+        return mock.patch.object(
+            api_server.core.ScraperBackend, "get_setting",
+            side_effect=lambda k, d=None: {
+                "scheduler_downtime_from": frm, "scheduler_downtime_to": to,
+            }.get(k, d),
+        )
+
+    def test_within_downtime_normal_window(self):
+        with self._settings("09:00", "18:00"):
+            self.assertEqual(api_server._downtime_window(), (540, 1080))
+            self.assertTrue(api_server._within_downtime(_epoch_at(12)))
+            self.assertFalse(api_server._within_downtime(_epoch_at(8, 59)))
+            self.assertFalse(api_server._within_downtime(_epoch_at(18, 0)))
+
+    def test_within_downtime_overnight_window(self):
+        with self._settings("22:00", "06:00"):
+            self.assertTrue(api_server._within_downtime(_epoch_at(23)))
+            self.assertTrue(api_server._within_downtime(_epoch_at(3)))
+            self.assertFalse(api_server._within_downtime(_epoch_at(12)))
+
+    def test_within_downtime_disabled_when_unset_or_equal(self):
+        with self._settings("", ""):
+            self.assertIsNone(api_server._downtime_window())
+            self.assertFalse(api_server._within_downtime(_epoch_at(12)))
+        with self._settings("09:00", "09:00"):
+            self.assertIsNone(api_server._downtime_window())
+
+    def test_defer_past_downtime(self):
+        with self._settings("09:00", "18:00"):
+            deferred = api_server._defer_past_downtime(_epoch_at(12))
+            self.assertEqual(deferred, _epoch_at(18, 0))
+            unchanged = api_server._defer_past_downtime(_epoch_at(20))
+            self.assertEqual(unchanged, _epoch_at(20))
+        with self._settings("22:00", "06:00"):
+            # pre-midnight half -> 'to' is the next day
+            deferred = api_server._defer_past_downtime(_epoch_at(23))
+            self.assertEqual(deferred, _epoch_at(6, 0, day=25))
+
+    def test_consolidated_pass_short_circuits_during_downtime_without_touching_the_db(self):
+        with mock.patch.object(api_server, "_within_downtime", return_value=True), \
              mock.patch.object(api_server, "_scheduler_enabled", return_value=True), \
              mock.patch.object(api_server, "_saved_job_scheduler_enabled", return_value=True):
             self.assertEqual(api_server._run_consolidated_scrape_pass(), 0)
-
-    def test_consolidated_pass_short_circuits_when_both_trigger_families_are_disabled(self):
-        # Neither enabled means nothing to gather — should return before even
-        # checking the time window (also DB-free).
-        with mock.patch.object(api_server, "_scheduler_enabled", return_value=False), \
-             mock.patch.object(api_server, "_saved_job_scheduler_enabled", return_value=False), \
-             mock.patch.object(api_server, "_within_scrape_window") as window_mock:
-            self.assertEqual(api_server._run_consolidated_scrape_pass(), 0)
-            window_mock.assert_not_called()
 
 
 class JobDedupeKeyTests(unittest.TestCase):

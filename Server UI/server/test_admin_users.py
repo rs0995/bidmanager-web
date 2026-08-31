@@ -53,6 +53,19 @@ class AdminUsersTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["email"], "a@example.com")
         self.assertEqual(result["items"][0]["activity_count"], 4)
         self.assertNotIn("password_hash", result["items"][0])
+        # No password_enc on the row -> null password, no crash.
+        self.assertIsNone(result["items"][0]["password"])
+
+    def test_list_users_exposes_decrypted_password_when_captured(self):
+        rows = [{
+            "id": 1, "email": "a@example.com", "display_name": "Alice", "status": "active",
+            "created_at": 100.0, "last_login_at": 200.0, "last_seen_at": 300.0, "activity_count": 0,
+            "password_enc": api_server.security.encrypt_password("hunter2"),
+        }]
+        with mock.patch.object(api_server, "get_db", return_value=_DbCtx([_FakeCursor(rows=rows)])):
+            result = api_server.admin_list_users()
+        self.assertEqual(result["items"][0]["password"], "hunter2")
+        self.assertNotIn("password_enc", result["items"][0])
 
     def test_get_user_404s_when_missing(self):
         with mock.patch.object(api_server, "get_db", return_value=_DbCtx([_FakeCursor(one=None)])):

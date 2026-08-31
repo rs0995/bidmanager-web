@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 
 const isDev = !app.isPackaged || process.env.ELECTRON_DEV === '1';
-const rendererUrl = process.env.ELECTRON_RENDERER_URL || 'http://127.0.0.1:5180';
+const rendererUrl = process.env.ELECTRON_RENDERER_URL || 'http://localhost:3000';
 const windowStateFile = () => path.join(app.getPath('userData'), 'window-state.json');
 let mainWindow = null;
 
@@ -42,6 +42,17 @@ function createWindow(projectId = null) {
       sandbox: true,
     },
   });
+  if (isDev) {
+    win.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+      console.log(`[renderer:${level}] ${message} (${sourceId}:${line})`);
+    });
+    win.webContents.on('render-process-gone', (_event, details) => {
+      console.log('[renderer] process gone:', details);
+    });
+    win.webContents.on('did-fail-load', (_event, code, description) => {
+      console.log('[renderer] did-fail-load:', code, description);
+    });
+  }
   const query = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
   if (isDev) win.loadURL(`${rendererUrl}${query}`);
   else win.loadFile(path.join(process.resourcesPath, 'client', 'dist', 'index.html'), { query: projectId ? { projectId: String(projectId) } : {} });
@@ -116,10 +127,10 @@ ipcMain.handle('desktop:ensure-project-folders', (_event, targetPath) => safeRes
 }));
 
 ipcMain.handle('desktop:ensure-directory', (_event, targetPath) => safeResult(() => {
-  const root = path.resolve(String(targetPath || ''));
-  if (!String(targetPath || '').trim()) throw new Error('Folder path is empty.');
-  fs.mkdirSync(root, { recursive: true });
-  return { ok: true, path: root };
+  const resolved = path.resolve(String(targetPath || ''));
+  if (!String(targetPath || '').trim()) throw new Error('Path is empty.');
+  fs.mkdirSync(resolved, { recursive: true });
+  return { ok: true, path: resolved };
 }));
 
 ipcMain.handle('desktop:write-json-file', (_event, payload = {}) => safeResult(() => {
@@ -140,10 +151,11 @@ ipcMain.handle('desktop:client-api-request', async (_event, payload = {}) => {
     if (!route.startsWith('/client/')) throw new Error('Only /client/* API routes are allowed.');
     const method = String(payload.method || 'GET').toUpperCase();
     if (!['GET', 'POST'].includes(method)) throw new Error('Unsupported client API method.');
+    // /client/auth/register and /client/auth/login are the only routes that
+    // legitimately have no key yet — that's the point of signing in.
+    const isAuthRoute = route.startsWith('/client/auth/register') || route.startsWith('/client/auth/login');
     const clientKey = String(payload.clientKey || '').trim();
-    // Auth routes (/client/auth/register, /client/auth/login) are called
-    // before a token exists, so an empty key is valid — the server decides
-    // whether the route requires one.
+    if (!clientKey && !isAuthRoute) throw new Error('Please sign in.');
     const headers = { Accept: 'application/json' };
     if (clientKey) headers['x-client-key'] = clientKey;
     const options = { method, headers };
@@ -157,26 +169,13 @@ ipcMain.handle('desktop:client-api-request', async (_event, payload = {}) => {
     try { data = text ? JSON.parse(text) : null; } catch (_) { data = null; }
     if (!response.ok) {
       const detail = data?.detail;
-      const message = (detail && typeof detail === 'object' ? detail.message : detail)
-        || `Client API returned HTTP ${response.status}.`;
-      const reason = detail && typeof detail === 'object' ? detail.reason : null;
-      return { ok: false, status: response.status, reason, message };
+      const message = Array.isArray(detail)
+        ? detail.map((d) => d.msg || d.type).join('; ')
+        : (detail && typeof detail === 'object' ? detail.message : detail)
+          || `Client API returned HTTP ${response.status}.`;
+      return { ok: false, status: response.status, message };
     }
     return { ok: true, data, status: response.status };
-  } catch (error) {
-    return { ok: false, message: String(error?.message || error) };
-  }
-});
-
-ipcMain.handle('desktop:open-tender', async (_event, payload = {}) => {
-  try {
-    const initUrl = String(payload.initUrl || '').trim();
-    const tenderUrl = String(payload.tenderUrl || '').trim();
-    if (!tenderUrl) return { ok: false, message: 'Tender URL is empty.' };
-    const win = new BrowserWindow({ show: true, autoHideMenuBar: true, width: 1280, height: 900 });
-    if (initUrl) await win.loadURL(initUrl);
-    await win.loadURL(tenderUrl);
-    return { ok: true };
   } catch (error) {
     return { ok: false, message: String(error?.message || error) };
   }
