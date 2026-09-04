@@ -979,8 +979,7 @@ def _init_db_schema(conn):
         file_type TEXT DEFAULT 'document',
         source_url TEXT,
         local_path TEXT,
-        downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(tender_id) REFERENCES tenders(tender_id)
+        downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
 
     c.execute('''CREATE TABLE IF NOT EXISTS checklist_templates (
@@ -1178,6 +1177,21 @@ def _init_db_schema(conn):
         try:
             c.execute(f"ALTER TABLE downloaded_files ADD COLUMN {col} {ddl}")
         except sqlite3.OperationalError:
+            pass
+    if db_compat.using_postgres():
+        # Drop the legacy downloaded_files.tender_id -> tenders.tender_id text FK.
+        # It has no ON UPDATE CASCADE, so a re-scrape that rewrites
+        # tenders.tender_id (or a dedupe DELETE) for an already-downloaded tender
+        # raised "update or delete on table tenders violates foreign key
+        # constraint downloaded_files_tender_id_fkey" and aborted the whole
+        # scrape transaction. Referential integrity is already enforced by
+        # downloaded_files.tender_db_id -> tenders(id) ON DELETE CASCADE.
+        try:
+            c.execute(
+                "ALTER TABLE downloaded_files "
+                "DROP CONSTRAINT IF EXISTS downloaded_files_tender_id_fkey"
+            )
+        except Exception:
             pass
     try:
         c.execute("ALTER TABLE projects ADD COLUMN source_tender_id TEXT")
@@ -2841,6 +2855,38 @@ class ScraperBackend:
             conn = sqlite3.connect(DB_FILE)
             return conn
 
+        def _run_isolated(fn):
+            """Run one write inside a SAVEPOINT so a row-level DB error (e.g. a
+            foreign-key violation on an already-downloaded tender) rolls back
+            just that statement instead of aborting the whole scrape
+            transaction ("current transaction is aborted ..."). Returns
+            (ok, result_or_exc)."""
+            try:
+                conn.execute("SAVEPOINT scrape_row")
+            except Exception:
+                # No active transaction / backend doesn't support it — just run.
+                try:
+                    return True, fn()
+                except Exception as exc:
+                    return False, exc
+            try:
+                out = fn()
+            except Exception as exc:
+                try:
+                    conn.execute("ROLLBACK TO SAVEPOINT scrape_row")
+                    conn.execute("RELEASE SAVEPOINT scrape_row")
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                return False, exc
+            try:
+                conn.execute("RELEASE SAVEPOINT scrape_row")
+            except Exception:
+                pass
+            return True, out
+
         # One connection is reused for the whole job (page saves, org schedule
         # updates, final dedupe/archive) instead of reconnecting per page/org —
         # each reconnect is a fresh network round trip when DATABASE_URL points at
@@ -2992,24 +3038,34 @@ class ScraperBackend:
                             page_db_errors = 0
                             dead = False
                             for t in tenders_to_save:
-                                try:
-                                    result = ScraperBackend.upsert_tender_row(conn, t)
-                                    if result == "inserted":
+                                ok, res = _run_isolated(lambda t=t: ScraperBackend.upsert_tender_row(conn, t))
+                                if ok:
+                                    if res == "inserted":
                                         inserted_count += 1
-                                    elif result == "updated":
+                                    elif res == "updated":
                                         updated_count += 1
                                     else:
                                         unchanged_count += 1
-                                except Exception as e:
-                                    if _conn_is_dead(e):
-                                        dead = True
-                                        break
+                                elif _conn_is_dead(res):
+                                    dead = True
+                                    break
+                                else:
                                     page_db_errors += 1
-                                    log_to_gui(f"Upsert failed for tender '{t[2]}': {e}")
+                                    log_to_gui(f"Upsert failed for tender '{t[2]}': {res}")
                             if not dead:
                                 try:
-                                    removed = ScraperBackend.dedupe_tenders_for_website(conn, website_id)
-                                    conn.commit()
+                                    d_ok, d_res = _run_isolated(
+                                        lambda: ScraperBackend.dedupe_tenders_for_website(conn, website_id)
+                                    )
+                                    if d_ok:
+                                        removed = d_res
+                                    elif _conn_is_dead(d_res):
+                                        dead = True
+                                    else:
+                                        page_db_errors += 1
+                                        log_to_gui(f"Page dedupe skipped for {org_name}: {d_res}")
+                                    if not dead:
+                                        conn.commit()
                                 except Exception as e:
                                     if _conn_is_dead(e):
                                         dead = True
@@ -3051,6 +3107,10 @@ class ScraperBackend:
             if org_scrape_ok:
                 scraped_org_seen_ids[org_name] = org_seen_ids
                 try:
+                    conn.rollback()  # clear any lingering aborted-txn state before the next write
+                except Exception:
+                    pass
+                try:
                     for _sched_try in (1, 2):
                         try:
                             org_row = conn.execute(
@@ -3077,7 +3137,16 @@ class ScraperBackend:
             else:
                 failed_orgs.add(org_name)
           try:
-            removed = ScraperBackend.dedupe_tenders_for_website(conn, website_id)
+            try:
+                conn.rollback()  # start the post-scrape pass on a clean transaction
+            except Exception:
+                pass
+            _dd_ok, _dd_res = _run_isolated(
+                lambda: ScraperBackend.dedupe_tenders_for_website(conn, website_id)
+            )
+            removed = _dd_res if _dd_ok else 0
+            if not _dd_ok:
+                log_to_gui(f"Post-scrape dedupe skipped: {_dd_res}")
             archived_missing = 0
             for org_name, seen_ids in scraped_org_seen_ids.items():
                 archived_missing += ScraperBackend.archive_missing_tenders_for_org(
@@ -3100,6 +3169,12 @@ class ScraperBackend:
                 log_to_gui(f"Skipped stale-archive for failed org scrape(s): {', '.join(sorted(failed_orgs))}")
           except Exception as e:
             log_to_gui(f"Post-scrape dedupe error: {e}")
+          if db_errors:
+            log_to_gui(
+                f"Tender fetching finished with {db_errors} database error(s) — some tenders "
+                f"may not have been saved. Check the connection and re-run."
+            )
+            return False
           log_to_gui("Tender fetching complete.")
           return True
         finally:

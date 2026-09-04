@@ -1536,7 +1536,7 @@ function ScraperPanel({ toast, base, adminKey }) {
       await api.deleteSavedCustomJob(job.id, job.owner_name || ownerName.trim());
       // Remaining jobs are auto-renumbered on the server, so any cached id
       // (edit target / selection) can now point at a different row — reset.
-      setEditingJobId(null); setEditingJobOwner(null); setJobName(''); setSelectedSavedJobId(null);
+      setEditingJobId(null); setEditingJobOwner(null); setJobName(''); setSelectedSavedJobId(null); setAllOrgsMode(false);
       toast('Saved job deleted');
       await loadSavedJobs();
     } catch (err) { toast(err.message || 'Could not delete saved job'); }
@@ -1929,7 +1929,11 @@ let _logLineSeq = 0;
 // Real log lines are plain strings — level/source aren't tagged upstream, so
 // they're guessed from the message text (best-effort, not fabricated data).
 function _classifyLogLine(raw) {
-  const text = String(raw);
+  // raw is either a plain string (older server) or { text, ts } where ts is
+  // epoch seconds when the line was actually emitted.
+  const text = String(raw && typeof raw === 'object' ? (raw.text ?? '') : raw);
+  const tsSec = raw && typeof raw === 'object' ? raw.ts : null;
+  const ts = Number.isFinite(tsSec) ? new Date(tsSec * 1000) : new Date();
   const lower = text.toLowerCase();
   const level = /error|exception|traceback/.test(lower) ? 'error' : /warn/.test(lower) ? 'warn' : 'info';
   let source = 'api';
@@ -1937,7 +1941,7 @@ function _classifyLogLine(raw) {
   else if (/upload|download|gcs|drive|storage|bucket/.test(lower)) source = 'storage';
   else if (/\bjob\b|queued|claimed|worker/.test(lower)) source = 'worker';
   else if (/\bsql\b|postgres|sqlite|upsert|database|\btable\b/.test(lower)) source = 'db';
-  return { id: ++_logLineSeq, ts: new Date(), level, source, message: text };
+  return { id: ++_logLineSeq, ts, level, source, message: text };
 }
 
 function LogsPanel({ base, adminKey }) {
@@ -1972,7 +1976,7 @@ function LogsPanel({ base, adminKey }) {
         try {
           const payload = await apiFetch(base, `/admin/logs/live?since_seq=${sinceSeq}`, { adminKey });
           sinceSeq = payload.next_seq ?? sinceSeq;
-          (payload.lines || []).forEach(appendLine);
+          (payload.entries || payload.lines || []).forEach(appendLine);
         } catch {}
       };
       tick();
