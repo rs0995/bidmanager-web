@@ -425,8 +425,15 @@ class DashboardStats(BaseModel):
     upcoming_deadlines: List[dict]
 
 
+class LiveLogEntry(BaseModel):
+    seq: int
+    ts: float  # epoch seconds when the line was emitted
+    text: str
+
+
 class LiveLogsResponse(BaseModel):
-    lines: List[str]
+    lines: List[str]  # kept for older clients
+    entries: List[LiveLogEntry] = []
     next_seq: int
 
 class TemplateOut(BaseModel):
@@ -1849,7 +1856,7 @@ _captcha_lock = threading.Lock()
 _CAPTCHA_TTL_SECONDS = 300
 _live_log_lock = threading.Lock()
 _live_log_seq = 0
-_live_log_buffer: list[tuple[int, str]] = []
+_live_log_buffer: list[tuple[int, float, str]] = []  # (seq, emit_epoch, text)
 _LIVE_LOG_MAX = 20000
 _log_context = threading.local()
 _db_live_log_seen: set[tuple[str, int, str]] = set()
@@ -1867,15 +1874,16 @@ def _job_execution_enabled() -> bool:
     return _process_role() in {"all", "worker"}
 
 
-def _append_live_log(message: str) -> int:
+def _append_live_log(message: str, ts: Optional[float] = None) -> int:
     global _live_log_seq
     txt = str(message or "").strip()
     if not txt:
         with _live_log_lock:
             return int(_live_log_seq)
+    stamp = float(ts) if ts else time.time()
     with _live_log_lock:
         _live_log_seq += 1
-        _live_log_buffer.append((int(_live_log_seq), txt))
+        _live_log_buffer.append((int(_live_log_seq), stamp, txt))
         if len(_live_log_buffer) > _LIVE_LOG_MAX:
             del _live_log_buffer[: len(_live_log_buffer) - _LIVE_LOG_MAX]
         return int(_live_log_seq)
@@ -1887,8 +1895,8 @@ def _sync_db_job_logs_to_live_buffer() -> None:
     try:
         with get_db() as conn:
             rows = conn.execute(
-                "SELECT id,action,logs_json FROM background_jobs "
-                "WHERE COALESCE(logs_json,'[]')!='[]' "
+                "SELECT id,action,logs_json,COALESCE(finished_at,started_at,created_at) "
+                "FROM background_jobs WHERE COALESCE(logs_json,'[]')!='[]' "
                 "ORDER BY created_at DESC LIMIT 30"
             ).fetchall()
     except Exception:
@@ -1899,6 +1907,10 @@ def _sync_db_job_logs_to_live_buffer() -> None:
         job_id = str(row[0])
         action = str(row[1] or "job")
         logs = _json_load(row[2], [])
+        try:
+            job_ts = float(row[3]) if row[3] else None
+        except (TypeError, ValueError):
+            job_ts = None
         if not isinstance(logs, list):
             continue
         for index, line in enumerate(logs[-300:]):
@@ -1909,14 +1921,14 @@ def _sync_db_job_logs_to_live_buffer() -> None:
             if seen_key in _db_live_log_seen:
                 continue
             _db_live_log_seen.add(seen_key)
-            pending_lines.append(text)
+            pending_lines.append((text, job_ts))
 
     if len(_db_live_log_seen) > _DB_LIVE_LOG_SEEN_MAX:
         overflow = len(_db_live_log_seen) - _DB_LIVE_LOG_SEEN_MAX
         for key in list(_db_live_log_seen)[:overflow]:
             _db_live_log_seen.discard(key)
-    for line in pending_lines:
-        _append_live_log(line)
+    for line, line_ts in pending_lines:
+        _append_live_log(line, ts=line_ts)
 
 
 def _install_live_log_bridge_once():
@@ -2401,6 +2413,10 @@ def _run_job(job_id: str):
         _release_execution_slot()
         if requeue_requested:
             _job_futures[job_id] = _job_executor.submit(_run_job, job_id)
+        else:
+            # Terminal (completed / failed / cancelled): record the real finish
+            # time on any saved custom job this job ran for.
+            _touch_saved_job_last_run(job_id, time.time())
 
 
 def _queue_limit() -> int:
@@ -2827,11 +2843,32 @@ def _enqueue_saved_custom_job(saved_job_id: int, scheduled_trigger: bool = False
     else:
         with get_db() as conn:
             conn.execute(
-                "UPDATE saved_custom_jobs SET last_run_at=?,last_job_id=?,updated_at=? WHERE id=?",
-                (now, queued_ids_str, now, definition["id"]),
+                "UPDATE saved_custom_jobs SET last_job_id=?,updated_at=? WHERE id=?",
+                (queued_ids_str, now, definition["id"]),
             )
             conn.commit()
     return queued
+
+
+def _touch_saved_job_last_run(job_id: str, ts: float) -> None:
+    # Stamp saved_custom_jobs.last_run_at with the REAL completion time of the
+    # background job(s) that ran for it — called from _run_job when a job
+    # reaches a terminal state. last_job_id is usually a single id but can be a
+    # comma-joined list; _run_consolidated_scrape_pass also shares one merged
+    # job id across every saved job on a website (all match here).
+    jid = str(job_id or "").strip()
+    if not jid:
+        return
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE saved_custom_jobs SET last_run_at=? "
+                "WHERE last_job_id=? OR last_job_id LIKE ? OR last_job_id LIKE ? OR last_job_id LIKE ?",
+                (ts, jid, jid + ",%", "%," + jid, "%," + jid + ",%"),
+            )
+            conn.commit()
+    except Exception:
+        pass
 
 
 def _advance_saved_custom_job_schedule(
@@ -2850,11 +2887,13 @@ def _advance_saved_custom_job_schedule(
         if not row:
             return
         schedule_mode, interval_minutes, next_run_at = row
+        # last_run_at is NOT set here — it is stamped with the real completion
+        # time by _touch_saved_job_last_run() when the queued job terminates.
         if schedule_mode == "once":
             conn.execute(
-                "UPDATE saved_custom_jobs SET last_run_at=?,last_job_id=?,schedule_enabled=0,"
+                "UPDATE saved_custom_jobs SET last_job_id=?,schedule_enabled=0,"
                 "next_run_at=0,updated_at=? WHERE id=?",
-                (now, job_id, now, int(saved_job_id)),
+                (job_id, now, int(saved_job_id)),
             )
         elif schedule_mode == "interval" and int(interval_minutes or 0) > 0:
             interval_seconds = int(interval_minutes) * 60
@@ -2866,13 +2905,13 @@ def _advance_saved_custom_job_schedule(
                 next_run = previous_next + elapsed_intervals * interval_seconds
             next_run = _defer_past_downtime(next_run)
             conn.execute(
-                "UPDATE saved_custom_jobs SET last_run_at=?,last_job_id=?,next_run_at=?,updated_at=? WHERE id=?",
-                (now, job_id, next_run, now, int(saved_job_id)),
+                "UPDATE saved_custom_jobs SET last_job_id=?,next_run_at=?,updated_at=? WHERE id=?",
+                (job_id, next_run, now, int(saved_job_id)),
             )
         else:
             conn.execute(
-                "UPDATE saved_custom_jobs SET last_run_at=?,last_job_id=?,updated_at=? WHERE id=?",
-                (now, job_id, now, int(saved_job_id)),
+                "UPDATE saved_custom_jobs SET last_job_id=?,updated_at=? WHERE id=?",
+                (job_id, now, int(saved_job_id)),
             )
         conn.commit()
 
@@ -3261,14 +3300,15 @@ def get_live_logs(
     _sync_db_job_logs_to_live_buffer()
     with _live_log_lock:
         if since_seq > 0:
-            selected = [(seq, line) for seq, line in _live_log_buffer if seq > int(since_seq)]
+            selected = [t for t in _live_log_buffer if t[0] > int(since_seq)]
         else:
             selected = list(_live_log_buffer[-int(limit):])
         if len(selected) > int(limit):
             selected = selected[-int(limit):]
         next_seq = int(selected[-1][0]) if selected else int(_live_log_seq)
-        lines = [line for _, line in selected]
-    return {"lines": lines, "next_seq": next_seq}
+        lines = [txt for _seq, _ts, txt in selected]
+        entries = [{"seq": _seq, "ts": _ts, "text": txt} for _seq, _ts, txt in selected]
+    return {"lines": lines, "entries": entries, "next_seq": next_seq}
 
 
 @app.get("/v1/captcha/pending", response_model=Optional[CaptchaPendingResponse])
@@ -5916,8 +5956,10 @@ def admin_log_stream(_auth: None = Depends(require_admin_key)):
         while True:
             payload = get_live_logs(limit=100, since_seq=next_seq)
             next_seq = int(payload.get("next_seq") or next_seq)
-            for line in payload.get("lines") or []:
-                yield f"data: {json.dumps({'line': line, 'seq': next_seq})}\n\n"
+            for entry in payload.get("entries") or []:
+                yield "data: " + json.dumps({
+                    "line": entry["text"], "ts": entry["ts"], "seq": entry["seq"],
+                }) + "\n\n"
             time.sleep(2)
 
     return StreamingResponse(events(), media_type="text/event-stream")

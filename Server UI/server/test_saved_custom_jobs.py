@@ -571,6 +571,72 @@ class SavedCustomJobTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_last_run_at_is_the_real_completion_time_not_the_schedule_time(self):
+        # Enqueue stamps last_job_id + next_run_at but NOT last_run_at; the real
+        # finish time is written back by _touch_saved_job_last_run when the
+        # background job terminates.
+        with tempfile.TemporaryDirectory(prefix="bidmanager-lastrun-") as tmp:
+            root = Path(tmp)
+            for source in SOURCE_DIR.glob("*.py"):
+                if not source.name.startswith("test_"):
+                    shutil.copy2(source, root / source.name)
+            env = os.environ.copy()
+            for key in ("K_SERVICE", "DATABASE_URL", "POSTGRES_URL", "POSTGRES_CONNECTION_STRING"):
+                env.pop(key, None)
+            env["BIDMANAGER_ENV"] = "local"
+            result = subprocess.run(
+                [sys.executable, "-c", textwrap.dedent("""
+                    import time
+                    import api_server as api
+                    api._scheduler_stop.set()
+                    if getattr(api, "_scheduler_thread", None):
+                        api._scheduler_thread.join(timeout=10)
+                    with api.get_db() as conn:
+                        conn.execute(
+                            "INSERT INTO organizations (website_id,name,tender_count,tenders_url) "
+                            "VALUES (1,'Org A',1,'https://example.test/a')"
+                        )
+                        org_id = conn.execute("SELECT id FROM organizations WHERE name='Org A'").fetchone()[0]
+                        conn.commit()
+
+                    captured = []
+                    def fake_enqueue(action, payload=None):
+                        captured.append((action, dict(payload or {})))
+                        return {'job_id': 'job_run_1', 'status': 'queued', 'created': True}
+                    api._enqueue_job = fake_enqueue
+
+                    job = api.create_saved_custom_job(api.SavedCustomJobRequest(
+                        owner_name='Ivy', name='Interval scrape', website_id=1,
+                        job_type='scrape', org_ids=[org_id], schedule_enabled=True,
+                        schedule_mode='interval', interval_minutes=60,
+                    ), None)
+
+                    enqueue_now = time.time()
+                    api.run_saved_custom_job(job['id'], 'Ivy', None)
+                    row = api.list_saved_custom_jobs('Ivy', None)['jobs'][0]
+                    assert row['last_job_id'] == 'job_run_1', row
+                    assert row['next_run_at'] > enqueue_now, row
+                    # Not stamped at enqueue time.
+                    assert row['last_run_at'] in (None, 0) or abs(row['last_run_at'] - enqueue_now) > 30, row
+
+                    # Simulate the background job finishing later.
+                    finish_ts = enqueue_now + 300
+                    api._touch_saved_job_last_run('job_run_1', finish_ts)
+                    row = api.list_saved_custom_jobs('Ivy', None)['jobs'][0]
+                    assert abs(row['last_run_at'] - finish_ts) < 1, row
+                    assert row['next_run_at'] > enqueue_now, row  # schedule untouched
+
+                    api.delete_saved_custom_job(job['id'], 'Ivy', None)
+                """)],
+                cwd=root,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_ids_auto_renumber_on_create_and_delete(self):
         # No manual renumber step: deleting a middle job compacts ids to 1..N,
         # and the next create lands on the next low id.
