@@ -456,6 +456,18 @@ const toDateTimeLocal = (epochSeconds = (Date.now() / 1000) + 3600) => {
   const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
   return local.toISOString().slice(0, 16);
 };
+// Server UI-wide date display: always D/M/YYYY (day-first), never the
+// browser's locale-default M/D/YYYY. `value` is a Date, epoch ms, or an
+// ISO/date string; pass { seconds: false } to drop the seconds component.
+const fmtDateTime = (value, { seconds = true } = {}) => {
+  if (value == null || value === '') return '—';
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return '—';
+  const time = date.toLocaleTimeString('en-US', {
+    hour: 'numeric', minute: '2-digit', ...(seconds ? { second: '2-digit' } : {}), hour12: true,
+  });
+  return `${date.getDate()}/${date.getMonth() + 1}/${date.getFullYear()}, ${time}`;
+};
 
 function Mono({ children, style, className = '' }) {
   return <span className={className} style={{ fontFamily: mono, ...style }}>{children}</span>;
@@ -739,7 +751,7 @@ function ServerPanel({ toast, base, adminKey }) {
             <RegisterRow label="Revision" value={h.revision} />
             <RegisterRow label="Image" value={h.image.split('/').pop()} />
             <RegisterRow label="Region" value={h.region} />
-            <RegisterRow label="Last deploy" value={new Date(h.lastDeploy).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })} />
+            <RegisterRow label="Last deploy" value={fmtDateTime(h.lastDeploy, { seconds: false })} />
           </div>
           <div>
             <RegisterRow label="Instances" value={`${h.instances} active · min ${h.minInstances} / max ${h.maxInstances}`} />
@@ -1561,7 +1573,7 @@ function ScraperPanel({ toast, base, adminKey }) {
     const mode = job.schedule_mode || (job.schedule_enabled ? 'interval' : 'manual');
     if (mode === 'once') {
       return job.schedule_enabled && job.next_run_at
-        ? `once · ${new Date(job.next_run_at * 1000).toLocaleString()}`
+        ? `once · ${fmtDateTime(job.next_run_at * 1000)}`
         : 'once · completed';
     }
     if (mode === 'interval' && job.schedule_enabled) return `every ${repeatLabel(job.interval_minutes)}`;
@@ -1652,7 +1664,7 @@ function ScraperPanel({ toast, base, adminKey }) {
                   job.job_type !== 'scrape' ? `${job.tender_ids.length} tenders` : '',
                 ].filter(Boolean).join(' Â· ')}</td>
                 <td className="px-3 py-2"><Pill state={job.schedule_enabled ? 'info' : 'neutral'}><span style={{ display: 'inline-block', minWidth: 104, textAlign: 'center' }}>{savedJobScheduleLabel(job)}</span></Pill></td>
-                <td className="px-3 py-2"><Mono style={{ fontSize: 10.5, color: c.ink60 }}>{job.last_run_at ? new Date(job.last_run_at * 1000).toLocaleString() : 'Never'}<br />{job.schedule_enabled && job.next_run_at ? `Next: ${new Date(job.next_run_at * 1000).toLocaleString()}` : ''}</Mono></td>
+                <td className="px-3 py-2"><Mono style={{ fontSize: 10.5, color: c.ink60 }}>{job.last_run_at ? fmtDateTime(job.last_run_at * 1000) : 'Never'}<br />{job.schedule_enabled && job.next_run_at ? `Next: ${fmtDateTime(job.next_run_at * 1000)}` : ''}</Mono></td>
                 <td className="px-3 py-2 text-right whitespace-nowrap"><div className="inline-flex gap-1.5"><Btn size="sm" onClick={() => editSavedJob(job)}>Edit</Btn><Btn size="sm" variant="primary" icon={Play} busy={busy === `run-${job.id}`} onClick={() => runSavedJob(job)}>Run once</Btn><Btn size="sm" variant="danger" icon={Trash2} busy={busy === `delete-${job.id}`} onClick={() => deleteSavedJob(job)}>Delete</Btn></div></td>
               </tr>)}</tbody>
             </table>
@@ -1694,7 +1706,7 @@ function ScraperPanel({ toast, base, adminKey }) {
               }} style={{ accentColor: c.indigo }} /></td>
               <td className="px-3 py-2" style={{ fontSize: 12.5, color: c.ink }}>{org.name}</td>
               <td className="px-3 py-2"><Mono style={{ fontSize: 11.5, color: c.ink60 }}>{org.tender_count ?? 0}</Mono></td>
-              <td className="px-3 py-2"><Mono style={{ fontSize: 11.5, color: c.ink60 }}>{org.last_scraped_at ? new Date(org.last_scraped_at * 1000).toLocaleString() : '—'}</Mono></td>
+              <td className="px-3 py-2"><Mono style={{ fontSize: 11.5, color: c.ink60 }}>{org.last_scraped_at ? fmtDateTime(org.last_scraped_at * 1000) : '—'}</Mono></td>
             </tr>)}</tbody>
           </table>
           {!loading && shownOrgs.length === 0 && <Empty icon={Layers} title="No organizations match this search." />}
@@ -1723,7 +1735,7 @@ function ScraperPanel({ toast, base, adminKey }) {
               <td className="px-3 py-2"><input type="checkbox" checked={selectedTenders.has(tender.id)} onChange={() => toggle(setSelectedTenders, tender.id)} style={{ accentColor: c.indigo }} /></td>
               <td className="px-3 py-2"><Mono style={{ fontSize: 11.5, color: c.ink }}>{tender.tender_id || '—'}</Mono></td>
               <td className="px-3 py-2" style={{ minWidth: 260 }}><div style={{ fontSize: 12, color: c.ink }}>{tender.org_chain || '—'}</div><div style={{ fontSize: 11.5, color: c.ink60, marginTop: 2 }}>{tender.title || '—'}</div></td>
-              <td className="px-3 py-2"><Mono style={{ fontSize: 11, color: c.ink60 }}>{tender.last_scraped_at ? new Date(tender.last_scraped_at * 1000).toLocaleString() : '—'}</Mono></td>
+              <td className="px-3 py-2"><Mono style={{ fontSize: 11, color: c.ink60 }}>{tender.last_scraped_at ? fmtDateTime(tender.last_scraped_at * 1000) : '—'}</Mono></td>
               <td className="px-3 py-2"><Pill state={tender.scrape_enabled ? 'info' : 'neutral'}>{tender.scrape_enabled ? `${tender.scrape_interval_minutes} min` : 'off'}</Pill></td>
               <td className="px-3 py-2"><Pill state={tender.download_status === 'complete' ? 'ok' : tender.download_status === 'failed' ? 'error' : 'neutral'}>{tender.download_status || 'not downloaded'}</Pill></td>
             </tr>)}</tbody>
@@ -1910,7 +1922,7 @@ function StoragePanel({ toast, env, base, adminKey, storageUrl, localScope }) {
                 <FileText size={14} style={{ color: c.ink40, flexShrink: 0 }} />
                 <span className="truncate flex-1" style={{ fontFamily: mono, fontSize: 12.5, color: c.ink }}>{f.name}</span>
                 <Mono className="hidden sm:inline" style={{ fontSize: 11.5, color: c.ink40 }}>
-                  {new Date(f.modified).toLocaleString('en-GB', { dateStyle: 'short', timeStyle: 'short' })}
+                  {fmtDateTime(f.modified, { seconds: false })}
                 </Mono>
                 <Mono style={{ fontSize: 11.5, color: c.ink60, width: 68, textAlign: 'right' }}>{fmtBytes(f.size)}</Mono>
                 <button onClick={() => getLinkForFile(f.name)} style={{ color: c.ink40, cursor: 'pointer' }} aria-label={`Copy link for ${f.name}`}>
@@ -1989,7 +2001,9 @@ function LogsPanel({ base, adminKey }) {
       es.onmessage = (evt) => {
         try {
           const payload = JSON.parse(evt.data);
-          if (payload && payload.line != null) appendLine(payload.line);
+          if (payload && payload.line != null) {
+            appendLine(payload.ts != null ? { text: payload.line, ts: payload.ts } : payload.line);
+          }
         } catch {}
       };
       es.onerror = () => {
@@ -2311,7 +2325,7 @@ function UsersPanel({ toast, base, adminKey }) {
 
   const counts = users.reduce((a, u) => ({ ...a, [u.status]: (a[u.status] || 0) + 1 }), {});
   const shown = filter === 'all' ? users : users.filter((u) => u.status === filter);
-  const fmt = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : '—');
+  const fmt = (ts) => (ts ? fmtDateTime(ts * 1000) : '—');
 
   return (
     <Panel
