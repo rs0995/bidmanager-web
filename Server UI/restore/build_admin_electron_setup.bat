@@ -99,19 +99,15 @@ if exist "%INSTALLER%" for %%F in ("%INSTALLER%") do set "NEW_STAMP=%%~tF"
 echo.
 if not exist "%INSTALLER%" (
     echo [ERROR] No installer at %INSTALLER%
-    endlocal
     exit /b 1
 )
-if "%OLD_STAMP%"=="%NEW_STAMP%" goto :stale
+if "%OLD_STAMP%"=="%NEW_STAMP%" (
+    echo [ERROR] Installer timestamp did not change (%NEW_STAMP%) - build did NOT refresh it.
+    exit /b 1
+)
 echo Done.  Fresh installer: %INSTALLER%
 echo   was: %OLD_STAMP%
 echo   now: %NEW_STAMP%
 echo.
-endlocal
-exit /b 0
 
-:stale
-echo [ERROR] Installer timestamp did not change - build did NOT refresh it.
-echo   stamp: %NEW_STAMP%
 endlocal
-exit /b 1
