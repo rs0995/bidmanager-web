@@ -2735,13 +2735,15 @@ def _saved_custom_job_from_row(row) -> dict:
         "last_job_id": str(row[16] or ""),
         "created_at": float(row[17] or 0),
         "updated_at": float(row[18] or 0),
+        "created_by": "user" if str(row[19] or "admin").strip().lower() == "user" else "admin",
     }
 
 
 _SAVED_CUSTOM_JOB_SELECT = (
     "SELECT id,owner_name,name,website_id,job_type,org_ids_json,tender_ids_json,"
     "all_organizations,all_tenders,download_mode,schedule_enabled,schedule_mode,interval_minutes,"
-    "scheduled_for_at,next_run_at,last_run_at,last_job_id,created_at,updated_at FROM saved_custom_jobs "
+    "scheduled_for_at,next_run_at,last_run_at,last_job_id,created_at,updated_at,"
+    "COALESCE(created_by,'admin') AS created_by FROM saved_custom_jobs "
 )
 
 
@@ -5336,15 +5338,86 @@ def _validated_saved_custom_job(body: SavedCustomJobRequest) -> dict:
     }
 
 
+@app.get("/admin/bookmark-scrape/suppressed")
+def list_bookmark_scrape_suppressed(_auth: None = Depends(require_admin_key)):
+    # Websites where an admin deleted the auto-managed "Bookmarks · <site>" job.
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT b.website_id, COALESCE(w.name,''), b.suppressed_at "
+            "FROM bookmark_scrape_suppressed b LEFT JOIN websites w ON w.id=b.website_id "
+            "ORDER BY b.suppressed_at DESC"
+        ).fetchall()
+    return {"items": [
+        {"website_id": int(r[0]), "website_name": str(r[1] or f"Website {int(r[0])}"),
+         "suppressed_at": float(r[2] or 0)}
+        for r in rows
+    ]}
+
+
+class BookmarkScrapeResumeRequest(BaseModel):
+    website_id: int
+
+
+@app.post("/admin/bookmark-scrape/resume")
+def resume_bookmark_scrape(body: BookmarkScrapeResumeRequest, _auth: None = Depends(require_admin_key)):
+    with get_db() as conn:
+        conn.execute("DELETE FROM bookmark_scrape_suppressed WHERE website_id=?", (int(body.website_id),))
+        conn.commit()
+    try:
+        import client_api
+        client_api._reconcile_bookmark_jobs()
+    except Exception:
+        pass
+    return {"ok": True}
+
+
 @app.get("/admin/custom-jobs")
 def list_saved_custom_jobs(owner: str, _auth: None = Depends(require_admin_key)):
     owner_name = " ".join(str(owner or "").split())
     with get_db() as conn:
-        rows = conn.execute(
-            _SAVED_CUSTOM_JOB_SELECT + "WHERE owner_name=? ORDER BY updated_at DESC,id DESC",
-            (owner_name,),
-        ).fetchall()
+        if owner_name in {"", "*", "all"}:
+            rows = conn.execute(
+                _SAVED_CUSTOM_JOB_SELECT + "ORDER BY updated_at DESC,id DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                _SAVED_CUSTOM_JOB_SELECT + "WHERE owner_name=? ORDER BY updated_at DESC,id DESC",
+                (owner_name,),
+            ).fetchall()
     return {"jobs": [_saved_custom_job_from_row(row) for row in rows]}
+
+
+class SavedJobScheduleRequest(BaseModel):
+    enabled: bool
+
+
+@app.post("/admin/custom-jobs/{saved_job_id}/schedule")
+def set_saved_custom_job_schedule(
+    saved_job_id: int, body: SavedJobScheduleRequest, _auth: None = Depends(require_admin_key)
+):
+    # Pause / resume a saved job without editing its targets. Used for the
+    # auto-managed "Bookmarks" jobs, which are otherwise not editable.
+    now = time.time()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT interval_minutes FROM saved_custom_jobs WHERE id=?", (int(saved_job_id),)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Saved custom job not found")
+        if body.enabled:
+            interval = int((dict(row).get("interval_minutes") if hasattr(row, "get") else row[0]) or 0) or 1440
+            conn.execute(
+                "UPDATE saved_custom_jobs SET schedule_enabled=1,schedule_mode='interval',"
+                "interval_minutes=?,next_run_at=?,scheduled_for_at=?,updated_at=? WHERE id=?",
+                (interval, now + interval * 60, now + interval * 60, now, int(saved_job_id)),
+            )
+        else:
+            conn.execute(
+                "UPDATE saved_custom_jobs SET schedule_enabled=0,updated_at=? WHERE id=?",
+                (now, int(saved_job_id)),
+            )
+        conn.commit()
+    return {"ok": True, "enabled": bool(body.enabled)}
 
 
 @app.post("/admin/custom-jobs")
@@ -5358,13 +5431,13 @@ def create_saved_custom_job(body: SavedCustomJobRequest, _auth: None = Depends(r
                 "INSERT INTO saved_custom_jobs "
                 "(owner_name,name,website_id,job_type,org_ids_json,tender_ids_json,all_organizations,"
                 "all_tenders,download_mode,schedule_enabled,schedule_mode,interval_minutes,scheduled_for_at,"
-                "next_run_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "next_run_at,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     value["owner_name"], value["name"], value["website_id"], value["job_type"],
                     _json_dump(value["org_ids"]), _json_dump(value["tender_ids"]),
                     int(value["all_organizations"]), int(value["all_tenders"]), value["download_mode"],
                     int(value["schedule_enabled"]), value["schedule_mode"], value["interval_minutes"],
-                    value["scheduled_for_at"], next_run, now, now,
+                    value["scheduled_for_at"], next_run, "admin", now, now,
                 ),
             )
             _ = int(cur.lastrowid)
@@ -5420,13 +5493,30 @@ def run_saved_custom_job(saved_job_id: int, owner: str, _auth: None = Depends(re
 
 @app.delete("/admin/custom-jobs/{saved_job_id}")
 def delete_saved_custom_job(saved_job_id: int, owner: str, _auth: None = Depends(require_admin_key)):
+    owner_name = " ".join(str(owner or "").split())
     with get_db() as conn:
+        pre = conn.execute(
+            "SELECT COALESCE(created_by,'admin'),website_id FROM saved_custom_jobs "
+            "WHERE id=? AND (owner_name=? OR ?='*')",
+            (int(saved_job_id), owner_name, owner_name),
+        ).fetchone()
         cur = conn.execute(
-            "DELETE FROM saved_custom_jobs WHERE id=? AND owner_name=?",
-            (int(saved_job_id), " ".join(str(owner or "").split())),
+            "DELETE FROM saved_custom_jobs WHERE id=? AND (owner_name=? OR ?='*')",
+            (int(saved_job_id), owner_name, owner_name),
         )
         changed = int(cur.rowcount or 0)
         if changed == 1:
+            row = dict(pre) if pre is not None else {}
+            created_by = str(row.get("COALESCE(created_by,'admin')") or (pre[0] if pre else "admin"))
+            website_id = int(row.get("website_id") or (pre[1] if pre else 0))
+            if created_by == "user" and website_id:
+                # An admin removing the auto-managed bookmark job = "stop
+                # bookmark scraping for this website"; don't let the next sync
+                # push recreate it until they Resume.
+                conn.execute(
+                    "INSERT OR REPLACE INTO bookmark_scrape_suppressed (website_id, suppressed_at) VALUES (?,?)",
+                    (website_id, time.time()),
+                )
             _renumber_saved_custom_jobs(conn)
         conn.commit()
     if changed != 1:
@@ -5702,6 +5792,89 @@ def admin_list_users(_auth: None = Depends(require_admin_key)):
     return {"items": [_public_client_user(row, int(dict(row).get("activity_count") or 0)) for row in rows]}
 
 
+def _client_user_sync_view(conn, user_id: int) -> dict[str, Any]:
+    """The user's whole-blob cloud sync (client_user_sync.data_json), resolved
+    for the admin Users panel: counts, human-readable bookmark/project/template
+    lists, tender column prefs, plus the raw blob for a full-fidelity view."""
+    row = conn.execute(
+        "SELECT data_json,updated_at FROM client_user_sync WHERE user_id=?", (user_id,)
+    ).fetchone()
+    try:
+        blob = json.loads((dict(row).get("data_json") if row else None) or "{}")
+    except (TypeError, ValueError):
+        blob = {}
+    if not isinstance(blob, dict):
+        blob = {}
+
+    bookmark_ids = []
+    for value in (blob.get("bookmarks") or [])[:1000]:
+        try:
+            bookmark_ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    bookmarks = []
+    if bookmark_ids:
+        placeholders = ",".join("?" for _ in bookmark_ids)
+        for t in conn.execute(
+            "SELECT t.id,COALESCE(t.tender_id,'') AS tender_id,COALESCE(t.title,'') AS title,"
+            "COALESCE(t.org_chain,'') AS org_chain,COALESCE(w.name,'') AS website_name "
+            f"FROM tenders t LEFT JOIN websites w ON w.id=t.website_id WHERE t.id IN ({placeholders})",
+            tuple(bookmark_ids),
+        ).fetchall():
+            bookmarks.append(dict(t))
+
+    projects = [dict(p) for p in (blob.get("projects") or []) if isinstance(p, dict)]
+    templates = [dict(x) for x in (blob.get("templates") or []) if isinstance(x, dict)]
+    template_items = [dict(x) for x in (blob.get("templateItems") or []) if isinstance(x, dict)]
+    checklist = [dict(x) for x in (blob.get("checklist") or []) if isinstance(x, dict)]
+    bookmarked_orgs = [str(x) for x in (blob.get("bookmarkedOrgs") or [])]
+    column_prefs = blob.get("tenderColumnPrefs") if isinstance(blob.get("tenderColumnPrefs"), dict) else {}
+
+    return {
+        "synced_at": float(dict(row).get("updated_at") or 0) if row else 0,
+        "counts": {
+            "bookmarks": len(blob.get("bookmarks") or []),
+            "bookmarked_orgs": len(bookmarked_orgs),
+            "projects": len(projects),
+            "templates": len(templates),
+            "template_items": len(template_items),
+            "checklist": len(checklist),
+            "has_column_prefs": bool(column_prefs),
+        },
+        "bookmarks": bookmarks,
+        "bookmarked_orgs": bookmarked_orgs,
+        "projects": [
+            {
+                "id": p.get("id"),
+                "title": str(p.get("title") or ""),
+                "status": str(p.get("status") or "Active"),
+                "client_name": str(p.get("client_name") or ""),
+            }
+            for p in projects
+        ],
+        "templates": [
+            {
+                "id": x.get("id"),
+                "organization": str(x.get("organization") or ""),
+                "template_name": str(x.get("template_name") or x.get("description") or ""),
+                "description": str(x.get("description") or ""),
+            }
+            for x in templates
+        ],
+        "checklist": [
+            {
+                "project_id": x.get("project_id"),
+                "req_file_name": str(x.get("req_file_name") or ""),
+                "subfolder": str(x.get("subfolder") or ""),
+                "status": str(x.get("status") or ""),
+            }
+            for x in checklist[:500]
+        ],
+        "tender_column_prefs": column_prefs,
+        "raw": blob,
+    }
+
+
 @app.get("/admin/users/{user_id}")
 def admin_get_user(user_id: int, _auth: None = Depends(require_admin_key)):
     with get_db() as conn:
@@ -5717,9 +5890,25 @@ def admin_get_user(user_id: int, _auth: None = Depends(require_admin_key)):
             "WHERE user_id=? ORDER BY created_at DESC LIMIT 100",
             (user_id,),
         ).fetchall()
+        sync_view = _client_user_sync_view(conn, user_id)
     user = _public_client_user(row, len(activity_rows))
     user["recent_activity"] = [dict(item) for item in activity_rows]
+    user["sync"] = sync_view
     return user
+
+
+@app.post("/admin/users/{user_id}/reset-sync")
+def admin_reset_user_sync(user_id: int, _auth: None = Depends(require_admin_key)):
+    # Clears only the SERVER copy of this user's whole-blob sync
+    # (client_user_sync). Their app keeps its local data and re-seeds the
+    # server on its next change; a fresh install/login then pulls {}.
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM client_users WHERE id=?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "User not found.")
+        conn.execute("DELETE FROM client_user_sync WHERE user_id=?", (user_id,))
+        conn.commit()
+    return {"ok": True}
 
 
 @app.post("/admin/users/{user_id}/suspend")

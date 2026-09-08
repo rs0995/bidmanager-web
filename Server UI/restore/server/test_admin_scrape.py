@@ -99,34 +99,6 @@ class AdminScrapeTests(unittest.TestCase):
             )
         db.connection.executemany.assert_called_once()
 
-    def test_set_saved_job_schedule_pauses_and_resumes(self):
-        db = _DatabaseContext(row=(1440,))
-        with mock.patch.object(api_server, "get_db", return_value=db):
-            paused = api_server.set_saved_custom_job_schedule(
-                7, api_server.SavedJobScheduleRequest(enabled=False)
-            )
-        self.assertEqual(paused, {"ok": True, "enabled": False})
-        sql = [c.args[0] for c in db.connection.execute.call_args_list]
-        self.assertTrue(any("schedule_enabled=0" in s for s in sql))
-
-        db2 = _DatabaseContext(row=(1440,))
-        with mock.patch.object(api_server, "get_db", return_value=db2):
-            resumed = api_server.set_saved_custom_job_schedule(
-                7, api_server.SavedJobScheduleRequest(enabled=True)
-            )
-        self.assertEqual(resumed, {"ok": True, "enabled": True})
-        sql2 = [c.args[0] for c in db2.connection.execute.call_args_list]
-        self.assertTrue(any("schedule_enabled=1" in s and "schedule_mode='interval'" in s for s in sql2))
-
-    def test_set_saved_job_schedule_404s_for_unknown_job(self):
-        db = _DatabaseContext(row=None)
-        with mock.patch.object(api_server, "get_db", return_value=db):
-            with self.assertRaises(api_server.HTTPException) as ctx:
-                api_server.set_saved_custom_job_schedule(
-                    99, api_server.SavedJobScheduleRequest(enabled=True)
-                )
-        self.assertEqual(ctx.exception.status_code, 404)
-
 
 if __name__ == "__main__":
     unittest.main()

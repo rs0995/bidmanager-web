@@ -347,6 +347,23 @@ function createApi(base, adminKey) {
         method: 'DELETE', adminKey,
       });
     },
+    // WIRE: POST /admin/custom-jobs/{id}/schedule — pause/resume a job without editing it
+    async savedJobSetSchedule(id, enabled) {
+      return apiFetch(base, `/admin/custom-jobs/${Number(id)}/schedule`, {
+        method: 'POST', adminKey, body: { enabled: Boolean(enabled) },
+      });
+    },
+    // WIRE: GET /admin/bookmark-scrape/suppressed — websites where an admin deleted
+    // the auto-managed "Bookmarks · <site>" job (won't be recreated until resumed).
+    async bookmarkScrapeSuppressed() {
+      const raw = await apiFetch(base, '/admin/bookmark-scrape/suppressed', { adminKey });
+      return raw.items || [];
+    },
+    async bookmarkScrapeResume(websiteId) {
+      return apiFetch(base, '/admin/bookmark-scrape/resume', {
+        method: 'POST', adminKey, body: { website_id: Number(websiteId) },
+      });
+    },
 
     // WIRE: GET /admin/users — every account that has ever signed in from the client app
     async clientUsers() {
@@ -1310,6 +1327,7 @@ function ScraperPanel({ toast, base, adminKey }) {
   const [repeatUnit, setRepeatUnit] = useState('hours');
   const [ownerName, setOwnerName] = useState(() => localStorage.getItem('bidmanager.admin.owner.v1') || 'default');
   const [savedJobs, setSavedJobs] = useState([]);
+  const [suppressedSites, setSuppressedSites] = useState([]);
   const [jobName, setJobName] = useState('');
   const [jobType, setJobType] = useState('scrape');
   const [scrapeAllOrgs, setScrapeAllOrgs] = useState(false);
@@ -1375,23 +1393,24 @@ function ScraperPanel({ toast, base, adminKey }) {
   }, [organizations, allOrgsMode]);
 
   const loadSavedJobs = useCallback(async () => {
-    const owner = ownerName.trim();
-    if (!owner) return setSavedJobs([]);
     try {
-      const isAdmin = owner.toLowerCase() === 'admin';
-      const lists = await Promise.all(
-        isAdmin ? [api.savedCustomJobs(owner)] : [api.savedCustomJobs(owner), api.savedCustomJobs('admin')]
-      );
-      const merged = new Map();
-      lists.flat().forEach((job) => merged.set(job.id, job));
-      setSavedJobs(Array.from(merged.values()).sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0)));
+      // '*' returns every owner — admin jobs + the auto-managed "(bookmarks)" ones.
+      const jobs = await api.savedCustomJobs('*');
+      setSavedJobs(jobs.slice().sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0)));
     } catch (err) { toast(err.message || 'Could not load saved jobs'); }
-  }, [api, ownerName, toast]);
+  }, [api, toast]);
+
+  const loadSuppressedSites = useCallback(async () => {
+    try {
+      setSuppressedSites(await api.bookmarkScrapeSuppressed());
+    } catch { /* endpoint may be missing on an old backend — non-fatal */ }
+  }, [api]);
 
   useEffect(() => {
     localStorage.setItem('bidmanager.admin.owner.v1', ownerName);
     loadSavedJobs();
-  }, [ownerName, loadSavedJobs]);
+    loadSuppressedSites();
+  }, [ownerName, loadSavedJobs, loadSuppressedSites]);
 
   const changeWebsite = (nextWebsiteId) => {
     setWebsiteId(nextWebsiteId);
@@ -1655,24 +1674,47 @@ function ScraperPanel({ toast, base, adminKey }) {
       </Card>
 
       <Card pad={false} style={{ marginBottom: 10 }}>
-        {savedJobs.length === 0 ? <Empty icon={Clock} title="No jobs saved for this user." /> : (
+        {savedJobs.length === 0 ? <Empty icon={Clock} title="No saved jobs yet." /> : (
           <div className="overflow-x-auto">
             <table className="w-full" style={{ borderCollapse: 'collapse' }}>
               <thead><tr style={{ background: c.paper }}>
-                {['Name', 'Type', 'Scope', 'Schedule', 'Last / next run', ''].map((th) => <th key={th} className="text-left px-3 py-2" style={{ fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60, borderBottom: `1px solid ${c.rule}`, fontWeight: 500 }}>{th}</th>)}
+                {['Name', 'Type', 'Created by', 'Scope', 'Schedule', 'Last / next run', ''].map((th) => <th key={th} className="text-left px-3 py-2" style={{ fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60, borderBottom: `1px solid ${c.rule}`, fontWeight: 500 }}>{th}</th>)}
               </tr></thead>
-              <tbody>{savedJobs.map((job) => <tr key={job.id} style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
+              <tbody>{savedJobs.map((job) => { const isUser = job.created_by === 'user'; return (
+              <tr key={job.id} style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
                 <td className="px-3 py-2"><span style={{ fontSize: 12.5, color: c.ink }}><Mono style={{ fontSize: 11, color: c.ink40 }}>#{job.id}</Mono> {job.name}</span></td>
                 <td className="px-3 py-2"><Pill state={job.job_type === 'scrape' ? 'info' : 'ok'}>{job.job_type}</Pill></td>
+                <td className="px-3 py-2"><Pill state={isUser ? 'ok' : 'neutral'}>{isUser ? 'User' : 'Admin'}</Pill></td>
                 <td className="px-3 py-2" style={{ fontSize: 11.5, color: c.ink60 }}>{[
                   job.job_type !== 'download' ? (job.all_organizations ? (job.org_ids.length ? 'Whole website · refresh + scrape all' : 'Whole website · refresh orgs') : `${job.org_ids.length} organizations`) : '',
                   job.job_type !== 'scrape' ? `${job.tender_ids.length} tenders` : '',
-                ].filter(Boolean).join(' Â· ')}</td>
+                ].filter(Boolean).join(' · ')}</td>
                 <td className="px-3 py-2"><Pill state={job.schedule_enabled ? 'info' : 'neutral'}><span style={{ display: 'inline-block', minWidth: 104, textAlign: 'center' }}>{savedJobScheduleLabel(job)}</span></Pill></td>
                 <td className="px-3 py-2"><Mono style={{ fontSize: 10.5, color: c.ink60 }}>{job.last_run_at ? fmtDateTime(job.last_run_at * 1000) : 'Never'}<br />{job.schedule_enabled && job.next_run_at ? `Next: ${fmtDateTime(job.next_run_at * 1000)}` : ''}</Mono></td>
-                <td className="px-3 py-2 text-right whitespace-nowrap"><div className="inline-flex gap-1.5"><Btn size="sm" onClick={() => editSavedJob(job)}>Edit</Btn><Btn size="sm" variant="primary" icon={Play} busy={busy === `run-${job.id}`} onClick={() => runSavedJob(job)}>Run once</Btn><Btn size="sm" variant="danger" icon={Trash2} busy={busy === `delete-${job.id}`} onClick={() => deleteSavedJob(job)}>Delete</Btn></div></td>
-              </tr>)}</tbody>
+                <td className="px-3 py-2 text-right whitespace-nowrap"><div className="inline-flex gap-1.5">
+                  {isUser ? (
+                    <Btn size="sm" busy={busy === `sched-${job.id}`} onClick={() => toggleJobSchedule(job)}>{job.schedule_enabled ? 'Pause' : 'Resume'}</Btn>
+                  ) : (
+                    <>
+                      <Btn size="sm" onClick={() => editSavedJob(job)}>Edit</Btn>
+                      <Btn size="sm" variant="primary" icon={Play} busy={busy === `run-${job.id}`} onClick={() => runSavedJob(job)}>Run once</Btn>
+                    </>
+                  )}
+                  <Btn size="sm" variant="danger" icon={Trash2} busy={busy === `delete-${job.id}`} onClick={() => deleteSavedJob(job)}>Delete</Btn>
+                </div></td>
+              </tr>
+              ); })}</tbody>
             </table>
+          </div>
+        )}
+        {suppressedSites.length > 0 && (
+          <div style={{ borderTop: `1px solid ${c.rule}` }}>
+            {suppressedSites.map((s) => (
+              <div key={s.website_id} className="flex items-center justify-between gap-3 px-3 py-2" style={{ fontSize: 12, color: c.ink60 }}>
+                <span>Bookmark auto-scrape is <b>off</b> for <span style={{ color: c.ink }}>{s.website_name}</span> (job was deleted).</span>
+                <Btn size="sm" busy={busy === `resume-${s.website_id}`} onClick={() => resumeBookmarkSite(s)}>Resume</Btn>
+              </div>
+            ))}
           </div>
         )}
       </Card>
@@ -2539,8 +2581,14 @@ function UsersPanel({ toast, base, adminKey }) {
               </thead>
               <tbody>
                 {shown.map((u) => (
-                  <tr key={u.id} style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
-                    <td className="px-3 py-2" style={{ fontSize: 12.5, color: c.ink }}>{u.email}</td>
+                  <React.Fragment key={u.id}>
+                  <tr style={{ borderBottom: `1px solid ${expandedId === u.id ? 'transparent' : c.ruleSoft}` }}>
+                    <td className="px-3 py-2" style={{ fontSize: 12.5, color: c.ink }}>
+                      <button onClick={() => toggleExpand(u.id)} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: c.ink }} aria-label="Show user data">
+                        {expandedId === u.id ? <ChevronDown size={13} style={{ color: c.ink40 }} /> : <ChevronRight size={13} style={{ color: c.ink40 }} />}
+                        {u.email}
+                      </button>
+                    </td>
                     <td className="px-3 py-2" style={{ fontSize: 12.5, color: c.ink60 }}>{u.display_name || '—'}</td>
                     <td className="px-3 py-2" style={{ fontSize: 12, color: c.ink60 }}>
                       {u.password == null ? (
@@ -2565,6 +2613,20 @@ function UsersPanel({ toast, base, adminKey }) {
                       )}
                     </td>
                   </tr>
+                  {expandedId === u.id && (
+                    <tr style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
+                      <td colSpan={8} style={{ padding: 0 }}>
+                        <UserSyncDetail
+                          user={u}
+                          detail={details[u.id]}
+                          onReset={resetSync}
+                          resetBusy={resetBusyId === u.id}
+                          toast={toast}
+                        />
+                      </td>
+                    </tr>
+                  )}
+                  </React.Fragment>
                 ))}
               </tbody>
             </table>

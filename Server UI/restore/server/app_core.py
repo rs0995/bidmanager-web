@@ -1323,6 +1323,9 @@ def _init_db_schema(conn):
     for col, ddl in [
         ("schedule_mode", "TEXT DEFAULT 'manual'"),
         ("scheduled_for_at", "REAL DEFAULT 0"),
+        # 'admin' = hand-built in the console · 'user' = auto-managed from the
+        # union of client-app bookmarks (client_api._reconcile_bookmark_jobs).
+        ("created_by", "TEXT DEFAULT 'admin'"),
     ]:
         try:
             c.execute(f"ALTER TABLE saved_custom_jobs ADD COLUMN {col} {ddl}")
@@ -1440,6 +1443,26 @@ def _init_db_schema(conn):
         data_json TEXT NOT NULL DEFAULT '{}',
         updated_at REAL NOT NULL DEFAULT 0,
         FOREIGN KEY(user_id) REFERENCES client_users(id)
+    )''')
+
+    # One row per organization / individual tender that at least one client user
+    # currently bookmarks. The bookmark sync push (client_api._apply_bookmark_
+    # schedules) reconciles this against the union of every user's bookmarks:
+    # it turns on a shared 24h recurring scrape for the target and turns it off
+    # again once the last bookmarker drops it. managed=1 means that reconcile
+    # owns the scrape_enabled/interval/next_scrape_at columns on the underlying
+    # organizations/tenders row and may disable them; managed=0 means an admin
+    # schedule or an active saved_custom_job is already keeping it fresh, so the
+    # reconcile leaves those columns alone.
+    c.execute('''CREATE TABLE IF NOT EXISTS bookmark_scrape_targets (
+        kind TEXT NOT NULL,
+        ref_id INTEGER NOT NULL,
+        bookmarker_count INTEGER NOT NULL DEFAULT 0,
+        managed INTEGER NOT NULL DEFAULT 0,
+        covered_by_saved_job INTEGER,
+        first_enabled_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY (kind, ref_id)
     )''')
 
     conn.commit()
@@ -1972,8 +1995,7 @@ class ScraperBackend:
             file_type TEXT DEFAULT 'document',
             source_url TEXT,
             local_path TEXT,
-            downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(tender_id) REFERENCES tenders(tender_id)
+            downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
         download_migrations = [
             ("file_type", "TEXT DEFAULT 'document'"),
@@ -2891,7 +2913,7 @@ class ScraperBackend:
         # updates, final dedupe/archive) instead of reconnecting per page/org —
         # each reconnect is a fresh network round trip when DATABASE_URL points at
         # Postgres, which otherwise dominates scrape wall-clock time. If the
-        # remote (Neon) drops that connection mid-run, the write sites below
+        # remote Postgres drops that connection mid-run, the write sites below
         # reconnect once and retry rather than failing every remaining tender.
         try:
           for org_id, org_name, url in selected_orgs:

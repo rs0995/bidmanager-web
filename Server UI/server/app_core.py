@@ -1323,6 +1323,9 @@ def _init_db_schema(conn):
     for col, ddl in [
         ("schedule_mode", "TEXT DEFAULT 'manual'"),
         ("scheduled_for_at", "REAL DEFAULT 0"),
+        # 'admin' = hand-built in the console · 'user' = auto-managed from the
+        # union of client-app bookmarks (client_api._reconcile_bookmark_jobs).
+        ("created_by", "TEXT DEFAULT 'admin'"),
     ]:
         try:
             c.execute(f"ALTER TABLE saved_custom_jobs ADD COLUMN {col} {ddl}")
@@ -1441,6 +1444,17 @@ def _init_db_schema(conn):
         updated_at REAL NOT NULL DEFAULT 0,
         FOREIGN KEY(user_id) REFERENCES client_users(id)
     )''')
+
+    # Websites where an admin deleted the auto-managed "Bookmarks · <site>" job.
+    # client_api._reconcile_bookmark_jobs won't recreate it while a row is here;
+    # POST /admin/bookmark-scrape/resume clears it.
+    c.execute('''CREATE TABLE IF NOT EXISTS bookmark_scrape_suppressed (
+        website_id INTEGER PRIMARY KEY,
+        suppressed_at REAL NOT NULL DEFAULT 0
+    )''')
+    # Legacy: the earlier per-row bookmark-scrape registry is gone (bookmark
+    # scraping now lives in saved_custom_jobs). Drop it if an old DB has one.
+    c.execute("DROP TABLE IF EXISTS bookmark_scrape_targets")
 
     conn.commit()
 
@@ -2890,7 +2904,7 @@ class ScraperBackend:
         # updates, final dedupe/archive) instead of reconnecting per page/org —
         # each reconnect is a fresh network round trip when DATABASE_URL points at
         # Postgres, which otherwise dominates scrape wall-clock time. If the
-        # remote (Neon) drops that connection mid-run, the write sites below
+        # remote Postgres drops that connection mid-run, the write sites below
         # reconnect once and retry rather than failing every remaining tender.
         try:
           for org_id, org_name, url in selected_orgs:

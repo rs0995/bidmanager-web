@@ -403,41 +403,31 @@ class ClientApiTests(unittest.TestCase):
         response = self.client.put("/client/sync", json={"data": blob}, headers=self.headers)
         self.assertEqual(response.status_code, 413)
 
-    def _user_job(self, website_id=1):
-        return self._row(
-            "SELECT id,org_ids_json,schedule_enabled,interval_minutes,schedule_mode "
-            "FROM saved_custom_jobs WHERE created_by='user' AND website_id=?",
-            (website_id,),
-        )
-
-    def test_bookmark_creates_one_user_scrape_job_per_website(self):
-        # Bookmark tender 1 (org 'Road Authority' = org id 1) and org id 2 ->
-        # one auto-managed saved_custom_jobs row holding both org ids.
+    def test_sync_push_enables_scrape_schedule_for_newly_bookmarked_tender_and_org(self):
         response = self.client.put(
             "/client/sync",
             json={"data": {"bookmarks": [1], "bookmarkedOrgIds": [2]}},
             headers=self.headers,
         )
         self.assertEqual(response.status_code, 200, response.text)
-        job = self._user_job()
-        self.assertIsNotNone(job)
-        self.assertEqual(sorted(json.loads(job["org_ids_json"])), [1, 2])
-        self.assertEqual(job["schedule_enabled"], 1)
-        self.assertEqual(job["interval_minutes"], 1440)
-        self.assertEqual(job["schedule_mode"], "interval")
-        # Exactly one user job for this website.
-        count = self._row(
-            "SELECT COUNT(*) AS n FROM saved_custom_jobs WHERE created_by='user' AND website_id=1"
+        tender_row = self._row(
+            "SELECT scrape_enabled, scrape_interval_minutes FROM tenders WHERE id=1"
         )
-        self.assertEqual(count["n"], 1)
-
-    def test_second_bookmarked_org_merges_into_the_same_user_job(self):
-        self.client.put("/client/sync", json={"data": {"bookmarkedOrgIds": [1]}}, headers=self.headers)
-        first = self._user_job()
-        self.client.put("/client/sync", json={"data": {"bookmarkedOrgIds": [1, 2]}}, headers=self.headers)
-        second = self._user_job()
-        self.assertEqual(first["id"], second["id"])  # same row grew, no new job
-        self.assertEqual(sorted(json.loads(second["org_ids_json"])), [1, 2])
+        self.assertEqual((tender_row["scrape_enabled"], tender_row["scrape_interval_minutes"]), (1, 1440))
+        org_row = self._row(
+            "SELECT scrape_enabled, scrape_interval_minutes FROM organizations WHERE id=2"
+        )
+        self.assertEqual((org_row["scrape_enabled"], org_row["scrape_interval_minutes"]), (1, 1440))
+        # A registry row tracks each bookmarked target (1 bookmarker, managed by us).
+        reg = self._row(
+            "SELECT bookmarker_count, managed FROM bookmark_scrape_targets WHERE kind='tender' AND ref_id=1"
+        )
+        self.assertEqual((reg["bookmarker_count"], reg["managed"]), (1, 1))
+        # Tender 2 / org 1 were not bookmarked, so their schedules stay off.
+        untouched_tender = self._row("SELECT scrape_enabled FROM tenders WHERE id=2")
+        self.assertEqual(untouched_tender["scrape_enabled"], 0)
+        untouched_org = self._row("SELECT scrape_enabled FROM organizations WHERE id=1")
+        self.assertEqual(untouched_org["scrape_enabled"], 0)
 
     def test_sync_push_resolves_bookmarked_org_by_name_when_id_is_missing(self):
         response = self.client.put(
@@ -446,17 +436,48 @@ class ClientApiTests(unittest.TestCase):
             headers=self.headers,
         )
         self.assertEqual(response.status_code, 200, response.text)
-        job = self._user_job()
-        self.assertIsNotNone(job)
-        self.assertEqual(json.loads(job["org_ids_json"]), [2])
+        org_row = self._row(
+            "SELECT scrape_enabled, scrape_interval_minutes FROM organizations WHERE id=2"
+        )
+        self.assertEqual((org_row["scrape_enabled"], org_row["scrape_interval_minutes"]), (1, 1440))
 
-    def test_admin_job_coverage_means_no_user_job(self):
+    def test_sync_push_never_overrides_an_already_configured_schedule(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "UPDATE tenders SET scrape_enabled=1, scrape_interval_minutes=30 WHERE id=1"
+        )
+        conn.commit()
+        conn.close()
+        response = self.client.put(
+            "/client/sync", json={"data": {"bookmarks": [1]}}, headers=self.headers
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        row = self._row("SELECT scrape_interval_minutes FROM tenders WHERE id=1")
+        self.assertEqual(row["scrape_interval_minutes"], 30)  # unchanged, not reset to 1440
+        reg = self._row(
+            "SELECT managed FROM bookmark_scrape_targets WHERE kind='tender' AND ref_id=1"
+        )
+        self.assertEqual(reg["managed"], 0)  # admin schedule — we don't manage it
+
+    def test_last_bookmarker_removal_disables_the_managed_schedule(self):
+        self.client.put(
+            "/client/sync", json={"data": {"bookmarks": [1]}}, headers=self.headers
+        )
+        self.assertEqual(self._row("SELECT scrape_enabled FROM tenders WHERE id=1")["scrape_enabled"], 1)
+        # Same user drops the bookmark -> nobody has it -> schedule off, registry gone.
+        self.client.put("/client/sync", json={"data": {"bookmarks": []}}, headers=self.headers)
+        self.assertEqual(self._row("SELECT scrape_enabled FROM tenders WHERE id=1")["scrape_enabled"], 0)
+        self.assertIsNone(
+            self._row("SELECT 1 FROM bookmark_scrape_targets WHERE kind='tender' AND ref_id=1")
+        )
+
+    def test_active_saved_job_coverage_defers_the_bookmark_schedule(self):
         now = time.time()
         conn = sqlite3.connect(self.db_path)
         conn.execute(
             "INSERT INTO saved_custom_jobs (owner_name,name,website_id,job_type,org_ids_json,"
-            "schedule_enabled,schedule_mode,interval_minutes,next_run_at,created_by,created_at,updated_at) "
-            "VALUES ('admin','nightly',1,'scrape','[2]',1,'interval',30,?,'admin',?,?)",
+            "schedule_enabled,schedule_mode,interval_minutes,next_run_at,created_at,updated_at) "
+            "VALUES ('admin','nightly',1,'scrape','[2]',1,'interval',1440,?,?,?)",
             (now + 60, now, now),
         )
         conn.commit()
@@ -464,38 +485,12 @@ class ClientApiTests(unittest.TestCase):
         self.client.put(
             "/client/sync", json={"data": {"bookmarkedOrgIds": [2]}}, headers=self.headers
         )
-        # Org 2 is already kept fresh by the admin job -> no user job at all.
-        self.assertIsNone(self._user_job())
-        # The admin job is left exactly as it was.
-        admin = self._row("SELECT interval_minutes FROM saved_custom_jobs WHERE owner_name='admin'")
-        self.assertEqual(admin["interval_minutes"], 30)
-
-    def test_last_bookmarker_removal_deletes_the_user_job(self):
-        self.client.put("/client/sync", json={"data": {"bookmarkedOrgIds": [2]}}, headers=self.headers)
-        self.assertIsNotNone(self._user_job())
-        self.client.put("/client/sync", json={"data": {"bookmarkedOrgIds": []}}, headers=self.headers)
-        self.assertIsNone(self._user_job())
-
-    def test_reconcile_respects_a_pause_and_a_suppression(self):
-        self.client.put("/client/sync", json={"data": {"bookmarkedOrgIds": [2]}}, headers=self.headers)
-        job = self._user_job()
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("UPDATE saved_custom_jobs SET schedule_enabled=0 WHERE id=?", (job["id"],))
-        conn.commit()
-        conn.close()
-        # Another bookmark push must refresh coverage but NOT re-enable the schedule.
-        self.client.put("/client/sync", json={"data": {"bookmarkedOrgIds": [1, 2]}}, headers=self.headers)
-        job = self._user_job()
-        self.assertEqual(job["schedule_enabled"], 0)
-        self.assertEqual(sorted(json.loads(job["org_ids_json"])), [1, 2])
-        # Delete it and suppress the website -> reconcile won't recreate it.
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("DELETE FROM saved_custom_jobs WHERE id=?", (job["id"],))
-        conn.execute("INSERT INTO bookmark_scrape_suppressed (website_id, suppressed_at) VALUES (1, ?)", (time.time(),))
-        conn.commit()
-        conn.close()
-        self.client.put("/client/sync", json={"data": {"bookmarkedOrgIds": [1, 2]}}, headers=self.headers)
-        self.assertIsNone(self._user_job())
+        org_row = self._row("SELECT scrape_enabled FROM organizations WHERE id=2")
+        self.assertEqual(org_row["scrape_enabled"], 0)  # saved job already covers it
+        reg = self._row(
+            "SELECT managed, covered_by_saved_job FROM bookmark_scrape_targets WHERE kind='org' AND ref_id=2"
+        )
+        self.assertEqual((reg["managed"], reg["covered_by_saved_job"]), (0, 1))
 
     def test_changes_feed_reports_closing_date_change_and_new_tender(self):
         # First call establishes the cursor without alerting on the back-catalogue.

@@ -334,109 +334,144 @@ def _saved_job_coverage(conn) -> tuple[set[int], dict[int, set[int]], dict[int, 
     return website_all_org_scrape, scrape_orgs, download_tenders
 
 
-def _bookmark_wanted_orgs_by_website(conn) -> dict[int, set[int]]:
-    """Per website, the set of org ids that client bookmarks want kept fresh:
-    every bookmarked org, plus the parent org of every bookmarked tender."""
-    tender_counts, org_counts = _bookmark_union(conn)
-    wanted: dict[int, set[int]] = {}
-    if org_counts:
-        placeholders = ",".join("?" for _ in org_counts)
-        for oid, website_id in conn.execute(
-            f"SELECT id, website_id FROM organizations WHERE id IN ({placeholders})",
-            tuple(org_counts),
-        ).fetchall():
-            wanted.setdefault(int(website_id or 0), set()).add(int(oid))
-    if tender_counts:
-        placeholders = ",".join("?" for _ in tender_counts)
-        for website_id, org_id in conn.execute(
-            f"SELECT t.website_id, o.id FROM tenders t "
-            f"JOIN organizations o ON o.website_id=t.website_id AND o.name=t.org_chain "
-            f"WHERE t.id IN ({placeholders})",
-            tuple(tender_counts),
-        ).fetchall():
-            wanted.setdefault(int(website_id or 0), set()).add(int(org_id))
-    wanted.pop(0, None)
-    return wanted
-
-
-def _reconcile_bookmark_jobs() -> None:
-    """Keep one auto-managed 'Bookmarks · <site>' scrape job per website in
-    saved_custom_jobs (created_by='user'), holding every bookmarked org not
-    already covered by an admin scrape job. Never touches an admin job; never
-    re-enables a paused user job; never recreates one an admin deleted (see
-    bookmark_scrape_suppressed)."""
+def _reconcile_bookmark_schedules() -> None:
     now = time.time()
-    interval_s = BOOKMARK_SCRAPE_INTERVAL_MINUTES * 60
     with _get_db() as conn:
-        wanted = _bookmark_wanted_orgs_by_website(conn)
-        all_org_sites, cov_orgs, _cov_tenders = _saved_job_coverage(conn)
-        suppressed = {
-            int(r[0]) for r in conn.execute(
-                "SELECT website_id FROM bookmark_scrape_suppressed"
-            ).fetchall()
-        }
-        existing = {
-            int(r[1]): {"id": int(r[0])}
+        tender_counts, org_counts = _bookmark_union(conn)
+
+        org_meta: dict[int, dict[str, Any]] = {}
+        if org_counts:
+            placeholders = ",".join("?" for _ in org_counts)
             for r in conn.execute(
-                "SELECT id, website_id FROM saved_custom_jobs "
-                "WHERE COALESCE(created_by,'admin')='user' AND job_type='scrape'"
+                f"SELECT id, website_id, COALESCE(scrape_enabled,0), COALESCE(scrape_interval_minutes,0) "
+                f"FROM organizations WHERE id IN ({placeholders})",
+                tuple(org_counts),
+            ).fetchall():
+                org_meta[int(r[0])] = {
+                    "website_id": int(r[1] or 0),
+                    "enabled": bool(r[2]),
+                    "interval": int(r[3] or 0),
+                }
+        tender_meta: dict[int, dict[str, Any]] = {}
+        if tender_counts:
+            placeholders = ",".join("?" for _ in tender_counts)
+            for r in conn.execute(
+                f"SELECT t.id, t.website_id, COALESCE(t.scrape_enabled,0), "
+                f"COALESCE(t.scrape_interval_minutes,0), o.id "
+                f"FROM tenders t LEFT JOIN organizations o "
+                f"ON o.website_id=t.website_id AND o.name=t.org_chain "
+                f"WHERE t.id IN ({placeholders})",
+                tuple(tender_counts),
+            ).fetchall():
+                tender_meta[int(r[0])] = {
+                    "website_id": int(r[1] or 0),
+                    "enabled": bool(r[2]),
+                    "interval": int(r[3] or 0),
+                    "org_id": int(r[4]) if r[4] is not None else None,
+                }
+
+        all_org_sites, cov_orgs, cov_tenders = _saved_job_coverage(conn)
+        existing = {
+            (str(r[0]), int(r[1])): {"managed": bool(r[2])}
+            for r in conn.execute(
+                "SELECT kind, ref_id, managed FROM bookmark_scrape_targets"
             ).fetchall()
         }
-        website_names = {
-            int(r[0]): str(r[1] or f"Website {int(r[0])}")
-            for r in conn.execute("SELECT id, name FROM websites").fetchall()
-        }
 
-        for website_id, job in list(existing.items()):
-            if website_id not in wanted or website_id in suppressed:
-                conn.execute("DELETE FROM saved_custom_jobs WHERE id=?", (job["id"],))
-                existing.pop(website_id, None)
+        # Plan the per-row scrape changes (executed after the connection closes,
+        # since set_*_scrape_schedule opens its own connection).
+        enable_orgs: list[int] = []
+        enable_tenders: list[int] = []
+        disable_orgs: list[int] = []
+        disable_tenders: list[int] = []
 
-        for website_id, orgs in wanted.items():
-            if website_id in suppressed:
+        def _covered_org(org_id: int, website_id: int) -> bool:
+            return website_id in all_org_sites or org_id in cov_orgs.get(website_id, set())
+
+        for org_id, count in org_counts.items():
+            meta = org_meta.get(org_id)
+            if not meta:
                 continue
-            uncovered = (
-                set() if website_id in all_org_sites
-                else {oid for oid in orgs if oid not in cov_orgs.get(website_id, set())}
-            )
-            job = existing.get(website_id)
-            if not uncovered:
-                if job:
-                    conn.execute("DELETE FROM saved_custom_jobs WHERE id=?", (job["id"],))
-                continue
-            org_ids_json = json.dumps(sorted(uncovered))
-            if job:
-                # Refresh coverage only — leave schedule_enabled / mode /
-                # interval / next_run_at exactly as the admin's Pause left them.
-                conn.execute(
-                    "UPDATE saved_custom_jobs SET org_ids_json=?, all_organizations=0, "
-                    "updated_at=? WHERE id=?",
-                    (org_ids_json, now, job["id"]),
-                )
+            reg = existing.get(("org", org_id))
+            covered_job = _covered_org(org_id, meta["website_id"])
+            if reg and reg["managed"]:
+                managed = True
+            elif covered_job:
+                managed = False
+            elif meta["enabled"]:
+                managed = False  # pre-existing admin schedule
             else:
-                name = f"Bookmarks · {website_names.get(website_id, f'Website {website_id}')}"
-                conn.execute(
-                    "INSERT INTO saved_custom_jobs "
-                    "(owner_name,name,website_id,job_type,org_ids_json,tender_ids_json,"
-                    "all_organizations,all_tenders,download_mode,schedule_enabled,schedule_mode,"
-                    "interval_minutes,scheduled_for_at,next_run_at,created_by,created_at,updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        "(bookmarks)", name, website_id, "scrape", org_ids_json, "[]",
-                        0, 0, "full", 1, "interval",
-                        BOOKMARK_SCRAPE_INTERVAL_MINUTES, now + interval_s, now + interval_s,
-                        "user", now, now,
-                    ),
-                )
+                managed = True
+            conn.execute(
+                "INSERT INTO bookmark_scrape_targets "
+                "(kind, ref_id, bookmarker_count, managed, covered_by_saved_job, first_enabled_at, updated_at) "
+                "VALUES ('org', ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(kind, ref_id) DO UPDATE SET "
+                "bookmarker_count=excluded.bookmarker_count, managed=excluded.managed, "
+                "covered_by_saved_job=excluded.covered_by_saved_job, updated_at=excluded.updated_at",
+                (org_id, count, 1 if managed else 0, 1 if covered_job else None, now, now),
+            )
+            if managed and (not meta["enabled"] or meta["interval"] != BOOKMARK_SCRAPE_INTERVAL_MINUTES):
+                enable_orgs.append(org_id)
+
+        for tender_id, count in tender_counts.items():
+            meta = tender_meta.get(tender_id)
+            if not meta:
+                continue
+            reg = existing.get(("tender", tender_id))
+            covered_job = (
+                (meta["org_id"] is not None and _covered_org(meta["org_id"], meta["website_id"]))
+                or tender_id in cov_tenders.get(meta["website_id"], set())
+            )
+            if reg and reg["managed"]:
+                managed = True
+            elif covered_job:
+                managed = False
+            elif meta["enabled"]:
+                managed = False
+            else:
+                managed = True
+            conn.execute(
+                "INSERT INTO bookmark_scrape_targets "
+                "(kind, ref_id, bookmarker_count, managed, covered_by_saved_job, first_enabled_at, updated_at) "
+                "VALUES ('tender', ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(kind, ref_id) DO UPDATE SET "
+                "bookmarker_count=excluded.bookmarker_count, managed=excluded.managed, "
+                "covered_by_saved_job=excluded.covered_by_saved_job, updated_at=excluded.updated_at",
+                (tender_id, count, 1 if managed else 0, 1 if covered_job else None, now, now),
+            )
+            if managed and (not meta["enabled"] or meta["interval"] != BOOKMARK_SCRAPE_INTERVAL_MINUTES):
+                enable_tenders.append(tender_id)
+
+        # Orphans: registry rows for refs nobody bookmarks any more.
+        for (kind, ref_id), reg in existing.items():
+            if kind == "org" and ref_id in org_counts:
+                continue
+            if kind == "tender" and ref_id in tender_counts:
+                continue
+            if reg["managed"]:
+                (disable_orgs if kind == "org" else disable_tenders).append(ref_id)
+            conn.execute(
+                "DELETE FROM bookmark_scrape_targets WHERE kind=? AND ref_id=?", (kind, ref_id)
+            )
         conn.commit()
+
+    for org_id in enable_orgs:
+        core.ScraperBackend.set_org_scrape_schedule(org_id, BOOKMARK_SCRAPE_INTERVAL_MINUTES, True)
+    for tender_id in enable_tenders:
+        core.ScraperBackend.set_tender_scrape_schedule(tender_id, BOOKMARK_SCRAPE_INTERVAL_MINUTES, True)
+    for org_id in disable_orgs:
+        core.ScraperBackend.set_org_scrape_schedule(org_id, 0, False)
+    for tender_id in disable_tenders:
+        core.ScraperBackend.set_tender_scrape_schedule(tender_id, 0, False)
 
 
 def _apply_bookmark_schedules(data: dict[str, Any]) -> None:
-    # Side effect of a sync push: reconcile the auto-managed per-website
-    # "Bookmarks" scrape job against the union of all users' bookmarks.
+    # Side effect of a sync push: reconcile the shared recurring-scrape schedule
+    # for every bookmarked org/tender against the union of all users' bookmarks.
     # Best-effort — a failure here must never fail the sync push itself.
     try:
-        _reconcile_bookmark_jobs()
+        _reconcile_bookmark_schedules()
     except Exception:
         pass
 
