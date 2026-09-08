@@ -365,6 +365,11 @@ function createApi(base, adminKey) {
     async reactivateClientUser(id) {
       return apiFetch(base, `/admin/users/${Number(id)}/reactivate`, { method: 'POST', adminKey });
     },
+    // WIRE: POST /admin/users/{id}/reset-sync — wipes the server copy of this
+    // user's cloud sync blob (bookmarks/projects/templates/checklist).
+    async clientUserResetSync(id) {
+      return apiFetch(base, `/admin/users/${Number(id)}/reset-sync`, { method: 'POST', adminKey });
+    },
 
     // WIRE: GET /admin/storage?prefix=
     async storage(prefix) {
@@ -2279,6 +2284,133 @@ function CaptchaPanel({ toast, captchas, setCaptchas, base, adminKey }) {
   );
 }
 
+// Expanded detail for one user row: their cloud-synced blob (bookmarks,
+// projects, templates, checklist, column prefs — from client_user_sync),
+// recent client activity, the raw JSON, and a reset action.
+function UserSyncDetail({ user, detail, onReset, resetBusy, toast }) {
+  const [rawOpen, setRawOpen] = useState(false);
+  if (detail === 'loading' || detail == null) {
+    return <div className="px-3 py-4"><Empty icon={Loader2} title="Loading user data…" /></div>;
+  }
+  if (detail.error) {
+    return <div className="px-3 py-3" style={{ fontSize: 12.5, color: c.stamp }}>{detail.error}</div>;
+  }
+  const sync = detail.sync || { counts: {}, bookmarks: [], bookmarked_orgs: [], projects: [], templates: [], checklist: [], tender_column_prefs: {}, raw: {} };
+  const activity = detail.recent_activity || [];
+  const cnt = sync.counts || {};
+  const hasAnySync = (sync.synced_at || 0) > 0 || Object.values(cnt).some((v) => v && v !== 0 && v !== false);
+  const prefs = sync.tender_column_prefs || {};
+  const Section = ({ title, children }) => (
+    <div className="mb-3">
+      <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60, marginBottom: 6 }}>{title}</div>
+      {children}
+    </div>
+  );
+
+  return (
+    <div className="px-3 py-3" style={{ background: c.paper, borderTop: `1px solid ${c.rule}` }}>
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+        <span style={{ fontSize: 12, color: c.ink60 }}>
+          {sync.synced_at ? <>Last synced <Mono style={{ fontSize: 11.5 }}>{fmtDateTime(sync.synced_at * 1000)}</Mono></> : 'Never synced'}
+        </span>
+        <Btn size="sm" variant="danger" icon={Trash2} busy={resetBusy} disabled={!hasAnySync}
+          onClick={() => onReset(user)}>Reset synced data</Btn>
+      </div>
+
+      {!hasAnySync ? (
+        <Empty icon={Database} title="This user hasn't synced any data yet." />
+      ) : (
+        <>
+          <StatStrip items={[
+            ['Bookmarks', String(cnt.bookmarks || 0).padStart(2, '0'), c.indigo],
+            ['Bkmk orgs', String(cnt.bookmarked_orgs || 0).padStart(2, '0'), c.indigo],
+            ['Projects', String(cnt.projects || 0).padStart(2, '0'), c.seal],
+            ['Templates', String(cnt.templates || 0).padStart(2, '0'), c.seal],
+            ['Checklist', String(cnt.checklist || 0).padStart(2, '0'), c.ink60],
+          ]} />
+
+          <div className="grid gap-3 md:grid-cols-2 mt-3">
+            <Card>
+              <Section title={`Bookmarked tenders (${sync.bookmarks.length})`}>
+                {sync.bookmarks.length === 0 ? <span style={{ fontSize: 12, color: c.ink40 }}>None</span> : (
+                  <div style={{ maxHeight: 180, overflow: 'auto' }}>
+                    {sync.bookmarks.map((b) => (
+                      <div key={b.id} className="py-1" style={{ borderBottom: `1px solid ${c.ruleSoft}`, fontSize: 12 }}>
+                        <Mono style={{ fontSize: 10.5, color: c.ink40 }}>#{b.tender_id || b.id}</Mono>{' '}
+                        <span style={{ color: c.ink }}>{b.title || '—'}</span>
+                        <span style={{ color: c.ink40 }}> · {b.org_chain || b.website_name || '—'}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </Section>
+              <Section title={`Bookmarked organizations (${sync.bookmarked_orgs.length})`}>
+                {sync.bookmarked_orgs.length === 0 ? <span style={{ fontSize: 12, color: c.ink40 }}>None</span> : (
+                  <div className="flex flex-wrap gap-1">
+                    {sync.bookmarked_orgs.map((name) => <Pill key={name} state="neutral">{name}</Pill>)}
+                  </div>
+                )}
+              </Section>
+            </Card>
+
+            <Card>
+              <Section title={`Projects (${sync.projects.length})`}>
+                {sync.projects.length === 0 ? <span style={{ fontSize: 12, color: c.ink40 }}>None</span> : sync.projects.map((p, i) => (
+                  <div key={p.id ?? i} className="py-1" style={{ borderBottom: `1px solid ${c.ruleSoft}`, fontSize: 12 }}>
+                    <span style={{ color: c.ink }}>{p.title || '—'}</span>
+                    <span style={{ color: c.ink40 }}> · {p.status || 'Active'}{p.client_name ? ` · ${p.client_name}` : ''}</span>
+                  </div>
+                ))}
+              </Section>
+              <Section title={`Templates (${sync.templates.length})`}>
+                {sync.templates.length === 0 ? <span style={{ fontSize: 12, color: c.ink40 }}>None</span> : sync.templates.map((t, i) => (
+                  <div key={t.id ?? i} className="py-1" style={{ borderBottom: `1px solid ${c.ruleSoft}`, fontSize: 12, color: c.ink }}>
+                    {t.template_name || t.organization || t.description || '—'}
+                  </div>
+                ))}
+              </Section>
+              <Section title="Checklist / column prefs">
+                <div style={{ fontSize: 12, color: c.ink60 }}>
+                  {cnt.checklist || 0} checklist item{(cnt.checklist || 0) === 1 ? '' : 's'} · {(prefs.hiddenColumns || []).length} hidden column{(prefs.hiddenColumns || []).length === 1 ? '' : 's'} · {(prefs.columnOrder || []).length ? 'custom order' : 'default order'} · {Object.keys(prefs.columnWidths || {}).length} sized
+                </div>
+              </Section>
+            </Card>
+          </div>
+
+          <Card style={{ marginTop: 12 }}>
+            <div className="flex items-center justify-between">
+              <button onClick={() => setRawOpen((v) => !v)} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer', background: 'none', border: 'none', padding: 0, fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60 }}>
+                {rawOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />} Raw JSON
+              </button>
+              <button onClick={async () => { try { await navigator.clipboard.writeText(JSON.stringify(sync.raw, null, 2)); toast('Raw data copied'); } catch {} }} style={{ color: c.ink40, cursor: 'pointer' }} aria-label="Copy raw JSON"><Copy size={12} /></button>
+            </div>
+            {rawOpen && (
+              <pre style={{ marginTop: 8, maxHeight: 320, overflow: 'auto', background: c.console, color: c.consoleInk || c.ink, fontFamily: mono, fontSize: 11, padding: 10, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                {JSON.stringify(sync.raw, null, 2)}
+              </pre>
+            )}
+          </Card>
+        </>
+      )}
+
+      <Card style={{ marginTop: 12 }}>
+        <Section title={`Recent activity (${activity.length})`}>
+          {activity.length === 0 ? <span style={{ fontSize: 12, color: c.ink40 }}>None recorded</span> : (
+            <div style={{ maxHeight: 200, overflow: 'auto' }}>
+              {activity.map((a, i) => (
+                <div key={i} className="py-1 flex items-baseline justify-between gap-3" style={{ borderBottom: `1px solid ${c.ruleSoft}`, fontSize: 12 }}>
+                  <Mono style={{ fontSize: 11, color: c.ink }}>{a.route}{a.tender_id ? ` · ${a.tender_id}` : ''}</Mono>
+                  <Mono style={{ fontSize: 10.5, color: c.ink40, whiteSpace: 'nowrap' }}>{a.created_at ? fmtDateTime(a.created_at * 1000, { seconds: false }) : '—'}</Mono>
+                </div>
+              ))}
+            </div>
+          )}
+        </Section>
+      </Card>
+    </div>
+  );
+}
+
 function UsersPanel({ toast, base, adminKey }) {
   const api = useMemo(() => createApi(base, adminKey), [base, adminKey]);
   const [users, setUsers] = useState(null);
@@ -2288,6 +2420,41 @@ function UsersPanel({ toast, base, adminKey }) {
   const [filter, setFilter] = useState('all');
   const [revealed, setRevealed] = useState(() => new Set());
   const toggleReveal = (id) => setRevealed((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  const [expandedId, setExpandedId] = useState(null);
+  const [details, setDetails] = useState({}); // id -> 'loading' | detailObj | { error }
+  const [resetBusyId, setResetBusyId] = useState(null);
+
+  const fetchDetail = useCallback(async (id) => {
+    setDetails((d) => ({ ...d, [id]: 'loading' }));
+    try {
+      const detail = await api.clientUserDetail(id); // WIRE: GET /admin/users/{id}
+      setDetails((d) => ({ ...d, [id]: detail }));
+    } catch (err) {
+      setDetails((d) => ({ ...d, [id]: { error: err.message || 'Could not load user detail' } }));
+    }
+  }, [api]);
+
+  const toggleExpand = (id) => {
+    setExpandedId((cur) => {
+      const next = cur === id ? null : id;
+      if (next != null && !details[next]) fetchDetail(next);
+      return next;
+    });
+  };
+
+  const resetSync = async (u) => {
+    if (!window.confirm(`Clear ${u.email}'s server-side synced data (bookmarks, projects, templates, checklist)?\n\nTheir app keeps its local copy and re-seeds the server on the next change.`)) return;
+    setResetBusyId(u.id);
+    try {
+      await api.clientUserResetSync(u.id); // WIRE: POST /admin/users/{id}/reset-sync
+      toast('Synced data cleared');
+      await fetchDetail(u.id);
+    } catch (err) {
+      toast(err.message || 'Reset failed');
+    } finally {
+      setResetBusyId(null);
+    }
+  };
 
   const load = useCallback(async () => {
     if (loadingRef.current) return;
@@ -2491,7 +2658,7 @@ function DbPanel({ toast, env, base, adminKey, dbUrl, localScope }) {
             <div key={b.id} className="flex items-center justify-between gap-2 py-2" style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
               <div className="min-w-0">
                 <Mono style={{ fontSize: 12, color: c.ink, display: 'block' }}>
-                  {new Date(b.at).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })}
+                  {fmtDateTime(b.at, { seconds: false })}
                 </Mono>
                 <span style={{ fontSize: 11, color: c.ink40 }}>{b.kind} · {fmtBytes(b.size)}</span>
               </div>

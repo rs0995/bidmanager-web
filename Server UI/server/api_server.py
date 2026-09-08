@@ -3912,7 +3912,7 @@ def _write_project_metadata_file(
     if not folder:
         return
     if folder.startswith("gdrive://"):
-        # Project metadata is authoritative in Neon. Avoid creating a fake local
+        # Project metadata is authoritative in Postgres. Avoid creating a fake local
         # directory whose name merely resembles a Drive URI.
         return
     os.makedirs(folder, exist_ok=True)
@@ -4178,7 +4178,7 @@ def restore_projects_from_folders():
     if admin_providers.active_storage_provider().metadata()["provider"] == "google-drive":
         raise HTTPException(
             501,
-            "Folder-based project restoration is a local-mode recovery tool; cloud projects are restored from Neon.",
+            "Folder-based project restoration is a local-mode recovery tool; cloud projects are restored from Postgres.",
         )
     root_folder = core._resolve_path(core.ROOT_FOLDER)
     if not os.path.isdir(root_folder):
@@ -5702,6 +5702,89 @@ def admin_list_users(_auth: None = Depends(require_admin_key)):
     return {"items": [_public_client_user(row, int(dict(row).get("activity_count") or 0)) for row in rows]}
 
 
+def _client_user_sync_view(conn, user_id: int) -> dict[str, Any]:
+    """The user's whole-blob cloud sync (client_user_sync.data_json), resolved
+    for the admin Users panel: counts, human-readable bookmark/project/template
+    lists, tender column prefs, plus the raw blob for a full-fidelity view."""
+    row = conn.execute(
+        "SELECT data_json,updated_at FROM client_user_sync WHERE user_id=?", (user_id,)
+    ).fetchone()
+    try:
+        blob = json.loads((dict(row).get("data_json") if row else None) or "{}")
+    except (TypeError, ValueError):
+        blob = {}
+    if not isinstance(blob, dict):
+        blob = {}
+
+    bookmark_ids = []
+    for value in (blob.get("bookmarks") or [])[:1000]:
+        try:
+            bookmark_ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    bookmarks = []
+    if bookmark_ids:
+        placeholders = ",".join("?" for _ in bookmark_ids)
+        for t in conn.execute(
+            "SELECT t.id,COALESCE(t.tender_id,'') AS tender_id,COALESCE(t.title,'') AS title,"
+            "COALESCE(t.org_chain,'') AS org_chain,COALESCE(w.name,'') AS website_name "
+            f"FROM tenders t LEFT JOIN websites w ON w.id=t.website_id WHERE t.id IN ({placeholders})",
+            tuple(bookmark_ids),
+        ).fetchall():
+            bookmarks.append(dict(t))
+
+    projects = [dict(p) for p in (blob.get("projects") or []) if isinstance(p, dict)]
+    templates = [dict(x) for x in (blob.get("templates") or []) if isinstance(x, dict)]
+    template_items = [dict(x) for x in (blob.get("templateItems") or []) if isinstance(x, dict)]
+    checklist = [dict(x) for x in (blob.get("checklist") or []) if isinstance(x, dict)]
+    bookmarked_orgs = [str(x) for x in (blob.get("bookmarkedOrgs") or [])]
+    column_prefs = blob.get("tenderColumnPrefs") if isinstance(blob.get("tenderColumnPrefs"), dict) else {}
+
+    return {
+        "synced_at": float(dict(row).get("updated_at") or 0) if row else 0,
+        "counts": {
+            "bookmarks": len(blob.get("bookmarks") or []),
+            "bookmarked_orgs": len(bookmarked_orgs),
+            "projects": len(projects),
+            "templates": len(templates),
+            "template_items": len(template_items),
+            "checklist": len(checklist),
+            "has_column_prefs": bool(column_prefs),
+        },
+        "bookmarks": bookmarks,
+        "bookmarked_orgs": bookmarked_orgs,
+        "projects": [
+            {
+                "id": p.get("id"),
+                "title": str(p.get("title") or ""),
+                "status": str(p.get("status") or "Active"),
+                "client_name": str(p.get("client_name") or ""),
+            }
+            for p in projects
+        ],
+        "templates": [
+            {
+                "id": x.get("id"),
+                "organization": str(x.get("organization") or ""),
+                "template_name": str(x.get("template_name") or x.get("description") or ""),
+                "description": str(x.get("description") or ""),
+            }
+            for x in templates
+        ],
+        "checklist": [
+            {
+                "project_id": x.get("project_id"),
+                "req_file_name": str(x.get("req_file_name") or ""),
+                "subfolder": str(x.get("subfolder") or ""),
+                "status": str(x.get("status") or ""),
+            }
+            for x in checklist[:500]
+        ],
+        "tender_column_prefs": column_prefs,
+        "raw": blob,
+    }
+
+
 @app.get("/admin/users/{user_id}")
 def admin_get_user(user_id: int, _auth: None = Depends(require_admin_key)):
     with get_db() as conn:
@@ -5717,9 +5800,25 @@ def admin_get_user(user_id: int, _auth: None = Depends(require_admin_key)):
             "WHERE user_id=? ORDER BY created_at DESC LIMIT 100",
             (user_id,),
         ).fetchall()
+        sync_view = _client_user_sync_view(conn, user_id)
     user = _public_client_user(row, len(activity_rows))
     user["recent_activity"] = [dict(item) for item in activity_rows]
+    user["sync"] = sync_view
     return user
+
+
+@app.post("/admin/users/{user_id}/reset-sync")
+def admin_reset_user_sync(user_id: int, _auth: None = Depends(require_admin_key)):
+    # Clears only the SERVER copy of this user's whole-blob sync
+    # (client_user_sync). Their app keeps its local data and re-seeds the
+    # server on its next change; a fresh install/login then pulls {}.
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM client_users WHERE id=?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "User not found.")
+        conn.execute("DELETE FROM client_user_sync WHERE user_id=?", (user_id,))
+        conn.commit()
+    return {"ok": True}
 
 
 @app.post("/admin/users/{user_id}/suspend")

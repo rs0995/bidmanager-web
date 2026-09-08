@@ -2413,6 +2413,10 @@ def _run_job(job_id: str):
         _release_execution_slot()
         if requeue_requested:
             _job_futures[job_id] = _job_executor.submit(_run_job, job_id)
+        else:
+            # Terminal (completed / failed / cancelled): record the real finish
+            # time on any saved custom job this job ran for.
+            _touch_saved_job_last_run(job_id, time.time())
 
 
 def _queue_limit() -> int:
@@ -3908,7 +3912,7 @@ def _write_project_metadata_file(
     if not folder:
         return
     if folder.startswith("gdrive://"):
-        # Project metadata is authoritative in Neon. Avoid creating a fake local
+        # Project metadata is authoritative in Postgres. Avoid creating a fake local
         # directory whose name merely resembles a Drive URI.
         return
     os.makedirs(folder, exist_ok=True)
@@ -4174,7 +4178,7 @@ def restore_projects_from_folders():
     if admin_providers.active_storage_provider().metadata()["provider"] == "google-drive":
         raise HTTPException(
             501,
-            "Folder-based project restoration is a local-mode recovery tool; cloud projects are restored from Neon.",
+            "Folder-based project restoration is a local-mode recovery tool; cloud projects are restored from Postgres.",
         )
     root_folder = core._resolve_path(core.ROOT_FOLDER)
     if not os.path.isdir(root_folder):
