@@ -366,16 +366,9 @@ class HybridStorageProvider(StorageProvider):
             file_id = self._drive_id_for_path(normalized_path)
             if not file_id:
                 raise ValueError("Item not found.")
-            # Trash rather than permanently delete: the service account only
-            # has writer access on a shared folder, so files().delete on items
-            # it doesn't own returns 404. A stale listing pointing at an
-            # already-gone id also 404s here — treat that as done.
-            try:
-                drive_storage.trash(file_id)
-            except Exception as exc:
-                if getattr(getattr(exc, "resp", None), "status", None) in (404, "404"):
-                    return {"ok": True}
-                raise
+            drive_storage._drive_service().files().delete(
+                fileId=file_id, supportsAllDrives=True
+            ).execute()
             return {"ok": True}
         target = self._resolve_local_target(normalized_path)
         if not target.exists():

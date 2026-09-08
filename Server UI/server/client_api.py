@@ -459,18 +459,35 @@ def client_pull_sync(user_id: int = Depends(require_client_user)) -> dict[str, A
 
 @router.put("/sync", dependencies=[Depends(require_client_user)])
 def client_push_sync(body: SyncPushRequest, user_id: int = Depends(require_client_user)) -> dict[str, Any]:
-    payload = json.dumps(body.data, ensure_ascii=False)
-    if len(payload.encode("utf-8")) > MAX_SYNC_PAYLOAD_BYTES:
-        raise HTTPException(413, "Sync payload is too large.")
     now = time.time()
     with _get_db() as conn:
+        row = conn.execute(
+            "SELECT data_json FROM client_user_sync WHERE user_id=?", (user_id,)
+        ).fetchone()
+        stored: dict[str, Any] = {}
+        if row:
+            try:
+                parsed = json.loads(dict(row).get("data_json") or "{}")
+                if isinstance(parsed, dict):
+                    stored = parsed
+            except (TypeError, ValueError):
+                stored = {}
+        # Key-preserving merge: the incoming blob wins for every key it
+        # carries, but a key it OMITS is kept from the stored blob. This
+        # stops a thin/stale push from one client (e.g. the mobile app on a
+        # fresh origin) from wiping desktop-owned sections like `templates`.
+        # An explicit `key: []` still clears that key — that's a real edit.
+        merged = {**stored, **(body.data if isinstance(body.data, dict) else {})}
+        payload = json.dumps(merged, ensure_ascii=False)
+        if len(payload.encode("utf-8")) > MAX_SYNC_PAYLOAD_BYTES:
+            raise HTTPException(413, "Sync payload is too large.")
         conn.execute(
             "INSERT INTO client_user_sync (user_id, data_json, updated_at) VALUES (?,?,?) "
             "ON CONFLICT(user_id) DO UPDATE SET data_json=excluded.data_json, updated_at=excluded.updated_at",
             (user_id, payload, now),
         )
         conn.commit()
-    _apply_bookmark_schedules(body.data)
+    _apply_bookmark_schedules(merged)
     return {"ok": True, "updated_at": now}
 
 

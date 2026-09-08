@@ -77,14 +77,13 @@ class SavedCustomJobTests(unittest.TestCase):
                     assert updated['interval_minutes'] == 30 and updated['next_run_at'] > 0
                     assert updated['last_job_id'] == 'manual-1'
                     scheduled_next = updated['next_run_at']
-                    before_manual = time.time()
                     api.run_saved_custom_job(saved_id, 'Alice', None)
                     after_manual_run = next(
                         job for job in api.list_saved_custom_jobs('Alice', None)['jobs'] if job['id'] == saved_id
                     )
-                    # A hand-run of an interval job restarts its clock from now.
-                    assert after_manual_run['next_run_at'] != scheduled_next
-                    assert abs(after_manual_run['next_run_at'] - (before_manual + 30 * 60)) < 5
+                    # A hand-run does NOT touch the schedule: it still fires at
+                    # its scheduled time.
+                    assert abs(after_manual_run['next_run_at'] - scheduled_next) < 1
 
                     once_at = time.time() + 120
                     once = api.create_saved_custom_job(api.SavedCustomJobRequest(
@@ -561,6 +560,72 @@ class SavedCustomJobTests(unittest.TestCase):
                     assert payload.get('followup_all_organizations') is True, payload
 
                     api.delete_saved_custom_job(scheduled['id'], 'Hank', None)
+                """)],
+                cwd=root,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_last_run_at_is_the_real_completion_time_not_the_schedule_time(self):
+        # Enqueue stamps last_job_id + next_run_at but NOT last_run_at; the real
+        # finish time is written back by _touch_saved_job_last_run when the
+        # background job terminates.
+        with tempfile.TemporaryDirectory(prefix="bidmanager-lastrun-") as tmp:
+            root = Path(tmp)
+            for source in SOURCE_DIR.glob("*.py"):
+                if not source.name.startswith("test_"):
+                    shutil.copy2(source, root / source.name)
+            env = os.environ.copy()
+            for key in ("K_SERVICE", "DATABASE_URL", "POSTGRES_URL", "POSTGRES_CONNECTION_STRING"):
+                env.pop(key, None)
+            env["BIDMANAGER_ENV"] = "local"
+            result = subprocess.run(
+                [sys.executable, "-c", textwrap.dedent("""
+                    import time
+                    import api_server as api
+                    api._scheduler_stop.set()
+                    if getattr(api, "_scheduler_thread", None):
+                        api._scheduler_thread.join(timeout=10)
+                    with api.get_db() as conn:
+                        conn.execute(
+                            "INSERT INTO organizations (website_id,name,tender_count,tenders_url) "
+                            "VALUES (1,'Org A',1,'https://example.test/a')"
+                        )
+                        org_id = conn.execute("SELECT id FROM organizations WHERE name='Org A'").fetchone()[0]
+                        conn.commit()
+
+                    captured = []
+                    def fake_enqueue(action, payload=None):
+                        captured.append((action, dict(payload or {})))
+                        return {'job_id': 'job_run_1', 'status': 'queued', 'created': True}
+                    api._enqueue_job = fake_enqueue
+
+                    job = api.create_saved_custom_job(api.SavedCustomJobRequest(
+                        owner_name='Ivy', name='Interval scrape', website_id=1,
+                        job_type='scrape', org_ids=[org_id], schedule_enabled=True,
+                        schedule_mode='interval', interval_minutes=60,
+                    ), None)
+
+                    enqueue_now = time.time()
+                    api.run_saved_custom_job(job['id'], 'Ivy', None)
+                    row = api.list_saved_custom_jobs('Ivy', None)['jobs'][0]
+                    assert row['last_job_id'] == 'job_run_1', row
+                    assert row['next_run_at'] > enqueue_now, row
+                    # Not stamped at enqueue time.
+                    assert row['last_run_at'] in (None, 0) or abs(row['last_run_at'] - enqueue_now) > 30, row
+
+                    # Simulate the background job finishing later.
+                    finish_ts = enqueue_now + 300
+                    api._touch_saved_job_last_run('job_run_1', finish_ts)
+                    row = api.list_saved_custom_jobs('Ivy', None)['jobs'][0]
+                    assert abs(row['last_run_at'] - finish_ts) < 1, row
+                    assert row['next_run_at'] > enqueue_now, row  # schedule untouched
+
+                    api.delete_saved_custom_job(job['id'], 'Ivy', None)
                 """)],
                 cwd=root,
                 env=env,

@@ -394,6 +394,31 @@ class ClientApiTests(unittest.TestCase):
         self.assertEqual(pulled.json()["data"], blob)
         self.assertGreater(pulled.json()["updated_at"], 0)
 
+    def test_sync_push_preserves_keys_the_client_omitted(self):
+        # A thin/stale push (e.g. the mobile app on a fresh origin) must not
+        # wipe desktop-owned sections it never sends.
+        first = self.client.put(
+            "/client/sync",
+            json={"data": {"templates": [{"id": 1, "template_name": "Standard"}], "bookmarks": [1]}},
+            headers=self.headers,
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.client.put(
+            "/client/sync", json={"data": {"bookmarks": [1, 2]}}, headers=self.headers
+        )
+        self.assertEqual(second.status_code, 200, second.text)
+        merged = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(merged["templates"], [{"id": 1, "template_name": "Standard"}])
+        self.assertEqual(merged["bookmarks"], [1, 2])
+        # An explicit empty value is still a real edit and clears that key.
+        third = self.client.put(
+            "/client/sync", json={"data": {"templates": []}}, headers=self.headers
+        )
+        self.assertEqual(third.status_code, 200, third.text)
+        after = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(after["templates"], [])
+        self.assertEqual(after["bookmarks"], [1, 2])
+
     def test_sync_push_requires_auth(self):
         response = self.client.put("/client/sync", json={"data": {}})
         self.assertEqual(response.status_code, 401)

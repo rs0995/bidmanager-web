@@ -117,17 +117,6 @@ def _ensure_child_folder(parent_id: str, name: str) -> str:
     return created["id"]
 
 
-def trash(file_id: str) -> None:
-    # Move an item to Drive trash. Unlike files().delete (a permanent delete
-    # that Drive only allows the *owner* to do — a service account with mere
-    # writer access on a shared My Drive folder gets a 404), trashing is
-    # allowed for any writer, and _list_files already filters trashed=false
-    # so the item disappears from the Files panel right away.
-    _drive_service().files().update(
-        fileId=str(file_id), body={"trashed": True}, supportsAllDrives=True
-    ).execute()
-
-
 def ensure_folder_path(parent_id: str, path: str) -> str:
     folder_id = str(parent_id or "").strip()
     for part in normalize_relative_path(path).split("/"):

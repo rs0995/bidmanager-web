@@ -6269,12 +6269,74 @@ def admin_db_backup(_auth: None = Depends(require_admin_key)):
         raise HTTPException(500, str(exc))
 
 
+def _storage_backend_exc(exc: Exception) -> HTTPException:
+    # A Drive/googleapiclient HttpError (or anything else non-ValueError) must
+    # not escape as an unhandled 500 wrapped in an ASGI TaskGroup exception —
+    # that tears the connection and the browser only sees "Failed to fetch".
+    return HTTPException(502, f"Storage backend error: {exc}")
+
+
+def _forget_deleted_downloads(path: str) -> None:
+    # After a folder/file is removed from storage, drop its download-ledger
+    # rows and clear the tender's downloaded flags so it no longer shows as
+    # downloaded (and _resolve_download_mode stops trusting the stale ledger).
+    try:
+        prefix = str(
+            core.ScraperBackend.get_setting("storage_prefix", "tenders/") or ""
+        ).replace("\\", "/").strip("/")
+        rel = str(path or "").replace("\\", "/").strip("/")
+        if prefix:
+            if rel == prefix or not rel.startswith(prefix + "/"):
+                return
+            rel = rel[len(prefix) + 1:]
+        parts = [p for p in rel.split("/") if p]
+        if not parts:
+            return
+        tid = parts[0]
+        file_name = parts[-1] if len(parts) > 1 else ""
+        canon = core.ScraperBackend.canonical_tender_id(tid)
+        with get_db() as conn:
+            if file_name:
+                conn.execute(
+                    "DELETE FROM downloaded_files "
+                    "WHERE UPPER(TRIM(COALESCE(tender_id,'')))=? AND file_name=?",
+                    (canon, file_name),
+                )
+                low = file_name.lower()
+                is_main = (
+                    low.startswith("tendernotice_") and low.endswith(".pdf")
+                ) or low.endswith(".zip") or low.endswith(".rar")
+                if is_main:
+                    conn.execute(
+                        "UPDATE tenders SET is_downloaded=0, download_status='partial' "
+                        "WHERE UPPER(TRIM(COALESCE(tender_id,'')))=?",
+                        (canon,),
+                    )
+            else:
+                conn.execute(
+                    "DELETE FROM downloaded_files "
+                    "WHERE UPPER(TRIM(COALESCE(tender_id,'')))=?",
+                    (canon,),
+                )
+                conn.execute(
+                    "UPDATE tenders SET is_downloaded=0, download_status='deleted', "
+                    "last_downloaded_at=NULL, initial_download_completed_at=NULL, "
+                    "last_download_error='' WHERE UPPER(TRIM(COALESCE(tender_id,'')))=?",
+                    (canon,),
+                )
+            conn.commit()
+    except Exception as exc:  # bookkeeping only — never fail the delete
+        core.log_to_gui(f"Could not update download ledger after delete of '{path}': {exc}")
+
+
 @app.get("/admin/storage")
 def admin_storage(prefix: str = Query("", max_length=500), _auth: None = Depends(require_admin_key)):
     try:
         return admin_providers.active_storage_provider().list_items(prefix)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise _storage_backend_exc(exc)
 
 
 @app.get("/admin/storage/usage")
@@ -6288,14 +6350,20 @@ def admin_storage_create_folder(body: AdminStorageFolder, _auth: None = Depends(
         return admin_providers.active_storage_provider().create_folder(body.prefix, body.name)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise _storage_backend_exc(exc)
 
 
 @app.delete("/admin/storage")
 def admin_storage_delete(body: AdminStorageDelete, _auth: None = Depends(require_admin_key)):
     try:
-        return admin_providers.active_storage_provider().delete(body.path)
+        result = admin_providers.active_storage_provider().delete(body.path)
     except ValueError as exc:
         raise HTTPException(404, str(exc))
+    except Exception as exc:
+        raise _storage_backend_exc(exc)
+    _forget_deleted_downloads(body.path)
+    return result
 
 
 @app.post("/admin/storage/signed-url")
@@ -6312,6 +6380,8 @@ def admin_storage_signed_url(
         )
     except ValueError as exc:
         raise HTTPException(404, str(exc))
+    except Exception as exc:
+        raise _storage_backend_exc(exc)
 
 
 @app.get("/admin/storage/download")
