@@ -2263,6 +2263,7 @@ def _release_execution_slot() -> None:
                 ).fetchone()[0]
             )
         if active == 0:
+            core.ScraperBackend.close_download_session()
             core.ScraperBackend.set_setting("drain_mode", "false")
             _append_live_log("Drain completed; the scraper is accepting new jobs again.")
 
@@ -3104,6 +3105,7 @@ def _scheduler_loop() -> None:
         try:
             _run_consolidated_scrape_pass()
             _run_expired_tender_sweep()
+            core.ScraperBackend.close_idle_download_session()
         except Exception as exc:
             _append_live_log(f"Scheduler error: {exc}")
         _scheduler_stop.wait(15)
@@ -5197,6 +5199,7 @@ ADMIN_CONFIG_KEYS = {
     "portal_eprocure": "false",
     "max_concurrent_sessions": "1",
     "page_load_timeout_s": "45",
+    "download_session_idle_min": "15",
     "retry_attempts": "3",
     "retry_backoff_s": "20",
     "headless": "true",
@@ -6024,6 +6027,14 @@ def admin_put_config(body: AdminConfigPatch, _auth: None = Depends(require_admin
             )
             conn.commit()
         core.ScraperBackend.invalidate_settings_cache()
+        changed_keys = {k for k, _ in updates}
+        if changed_keys & {
+            "captcha_ai_provider", "captcha_ai_api_key", "captcha_ai_model",
+            "captcha_ai_endpoint", "headless", "browser",
+        }:
+            # A new captcha key/model or browser change only takes effect on a
+            # fresh browser session.
+            core.ScraperBackend.close_download_session()
     return _admin_config_payload()
 
 

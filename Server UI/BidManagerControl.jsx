@@ -66,6 +66,7 @@ const DEFAULT_CONFIG = {
   portal_eprocure: false,
   max_concurrent_sessions: 2,
   page_load_timeout_s: 45,
+  download_session_idle_min: 15,
   retry_attempts: 3,
   retry_backoff_s: 20,
   headless: true,
@@ -1042,6 +1043,9 @@ function ConfigPanel({ toast, env, base, adminKey, setBase, dbUrl, setDbUrl, sto
             </Field>
             <Field label="Page load timeout" dirty={isDirty('page_load_timeout_s')}>
               <NumIn value={draft.page_load_timeout_s} onChange={(v) => set('page_load_timeout_s', v)} suffix="s" />
+            </Field>
+            <Field label="Download session idle timeout" hint="The download browser stays open this long between downloads so the CAPTCHA is solved once per website session; a longer gap rebuilds it and re-solves." dirty={isDirty('download_session_idle_min')}>
+              <NumIn value={draft.download_session_idle_min} onChange={(v) => set('download_session_idle_min', v)} min={1} max={120} suffix="min" />
             </Field>
             <Field label="Retry attempts" dirty={isDirty('retry_attempts')}>
               <NumIn value={draft.retry_attempts} onChange={(v) => set('retry_attempts', v)} />

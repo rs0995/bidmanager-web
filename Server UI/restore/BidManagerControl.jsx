@@ -1043,6 +1043,9 @@ function ConfigPanel({ toast, env, base, adminKey, setBase, dbUrl, setDbUrl, sto
             <Field label="Page load timeout" dirty={isDirty('page_load_timeout_s')}>
               <NumIn value={draft.page_load_timeout_s} onChange={(v) => set('page_load_timeout_s', v)} suffix="s" />
             </Field>
+            <Field label="Download session idle timeout" hint="The download browser stays open this long between downloads so the CAPTCHA is solved once per website session; a longer gap rebuilds it and re-solves." dirty={isDirty('download_session_idle_min')}>
+              <NumIn value={draft.download_session_idle_min} onChange={(v) => set('download_session_idle_min', v)} min={1} max={120} suffix="min" />
+            </Field>
             <Field label="Retry attempts" dirty={isDirty('retry_attempts')}>
               <NumIn value={draft.retry_attempts} onChange={(v) => set('retry_attempts', v)} />
             </Field>
@@ -1567,6 +1570,7 @@ function ScraperPanel({ toast, base, adminKey }) {
   };
 
   const deleteSavedJob = async (job) => {
+    if (job.created_by === 'user' && !window.confirm(`Delete "${job.name}"? Bookmark auto-scrape for this website stays OFF until you press Resume.`)) return;
     setBusy(`delete-${job.id}`);
     try {
       await api.deleteSavedCustomJob(job.id, job.owner_name || ownerName.trim());
@@ -1574,8 +1578,28 @@ function ScraperPanel({ toast, base, adminKey }) {
       // (edit target / selection) can now point at a different row — reset.
       setEditingJobId(null); setEditingJobOwner(null); setJobName(''); setSelectedSavedJobId(null); setAllOrgsMode(false);
       toast('Saved job deleted');
-      await loadSavedJobs();
+      await Promise.all([loadSavedJobs(), loadSuppressedSites()]);
     } catch (err) { toast(err.message || 'Could not delete saved job'); }
+    setBusy('');
+  };
+
+  const toggleJobSchedule = async (job) => {
+    setBusy(`sched-${job.id}`);
+    try {
+      await api.savedJobSetSchedule(job.id, !job.schedule_enabled);
+      toast(job.schedule_enabled ? 'Job paused' : 'Job resumed');
+      await loadSavedJobs();
+    } catch (err) { toast(err.message || 'Could not change schedule'); }
+    setBusy('');
+  };
+
+  const resumeBookmarkSite = async (site) => {
+    setBusy(`resume-${site.website_id}`);
+    try {
+      await api.bookmarkScrapeResume(site.website_id);
+      toast('Bookmark auto-scrape resumed');
+      await Promise.all([loadSavedJobs(), loadSuppressedSites()]);
+    } catch (err) { toast(err.message || 'Could not resume'); }
     setBusy('');
   };
 

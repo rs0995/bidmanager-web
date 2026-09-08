@@ -2263,6 +2263,7 @@ def _release_execution_slot() -> None:
                 ).fetchone()[0]
             )
         if active == 0:
+            core.ScraperBackend.close_download_session()
             core.ScraperBackend.set_setting("drain_mode", "false")
             _append_live_log("Drain completed; the scraper is accepting new jobs again.")
 
@@ -3104,6 +3105,7 @@ def _scheduler_loop() -> None:
         try:
             _run_consolidated_scrape_pass()
             _run_expired_tender_sweep()
+            core.ScraperBackend.close_idle_download_session()
         except Exception as exc:
             _append_live_log(f"Scheduler error: {exc}")
         _scheduler_stop.wait(15)
@@ -5197,6 +5199,7 @@ ADMIN_CONFIG_KEYS = {
     "portal_eprocure": "false",
     "max_concurrent_sessions": "1",
     "page_load_timeout_s": "45",
+    "download_session_idle_min": "15",
     "retry_attempts": "3",
     "retry_backoff_s": "20",
     "headless": "true",
@@ -5496,7 +5499,7 @@ def delete_saved_custom_job(saved_job_id: int, owner: str, _auth: None = Depends
     owner_name = " ".join(str(owner or "").split())
     with get_db() as conn:
         pre = conn.execute(
-            "SELECT COALESCE(created_by,'admin'),website_id FROM saved_custom_jobs "
+            "SELECT COALESCE(created_by,'admin') AS created_by, website_id FROM saved_custom_jobs "
             "WHERE id=? AND (owner_name=? OR ?='*')",
             (int(saved_job_id), owner_name, owner_name),
         ).fetchone()
@@ -5506,9 +5509,8 @@ def delete_saved_custom_job(saved_job_id: int, owner: str, _auth: None = Depends
         )
         changed = int(cur.rowcount or 0)
         if changed == 1:
-            row = dict(pre) if pre is not None else {}
-            created_by = str(row.get("COALESCE(created_by,'admin')") or (pre[0] if pre else "admin"))
-            website_id = int(row.get("website_id") or (pre[1] if pre else 0))
+            created_by = str((pre[0] if pre is not None else "admin") or "admin")
+            website_id = int((pre[1] if pre is not None else 0) or 0)
             if created_by == "user" and website_id:
                 # An admin removing the auto-managed bookmark job = "stop
                 # bookmark scraping for this website"; don't let the next sync

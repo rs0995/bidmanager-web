@@ -215,7 +215,11 @@ def new_chromium_options():
 GECKODRIVER_VERSION = "v0.37.1"
 
 
-def new_browser_driver():
+def new_browser_driver(register=True):
+    # register=False keeps the driver OUT of _job_runtime.resources, so
+    # clear_job_runtime() at the end of a job won't quit it — used for the
+    # persistent download session that must survive across download jobs.
+    _finalize = register_job_driver if register else _apply_driver_timeout_only
     if configured_browser() == "chromium":
         options = new_chromium_options()
         # Use the system chromedriver when present (the OCI container ships a
@@ -227,10 +231,10 @@ def new_browser_driver():
             or "/usr/bin/chromedriver"
         )
         service = ChromeService(executable_path=driver_path) if os.path.exists(driver_path) else ChromeService()
-        return register_job_driver(ChromeWebDriver(service=service, options=options))
+        return _finalize(ChromeWebDriver(service=service, options=options))
     options = new_firefox_options()
     service = FirefoxService(GeckoDriverManager(version=GECKODRIVER_VERSION).install())
-    return register_job_driver(FirefoxWebDriver(service=service, options=options))
+    return _finalize(FirefoxWebDriver(service=service, options=options))
 
 
 _socket_timeout_applied = False
@@ -249,12 +253,12 @@ def _apply_browser_command_timeout():
     _socket_timeout_applied = True
 
 
-def create_browser_driver(attempts=2):
+def create_browser_driver(attempts=2, register=True):
     _apply_browser_command_timeout()
     last_error = None
     for attempt in range(1, max(1, int(attempts)) + 1):
         try:
-            return new_browser_driver()
+            return new_browser_driver(register=register)
         except Exception as e:
             last_error = e
             if attempt < attempts:
@@ -800,15 +804,19 @@ def clear_job_runtime():
             delattr(_job_runtime, name)
 
 
-def register_job_driver(driver):
-    resources = getattr(_job_runtime, "resources", None)
-    if isinstance(resources, list):
-        resources.append(driver)
+def _apply_driver_timeout_only(driver):
     try:
         driver.set_page_load_timeout(setting_int("page_load_timeout_s", 45, minimum=5, maximum=300))
     except Exception:
         pass
     return driver
+
+
+def register_job_driver(driver):
+    resources = getattr(_job_runtime, "resources", None)
+    if isinstance(resources, list):
+        resources.append(driver)
+    return _apply_driver_timeout_only(driver)
 
 
 def check_job_cancelled():
@@ -1486,6 +1494,87 @@ def init_db(_recovery_attempted=False):
 # --- SCRAPER BACKEND ---
 class ScraperBackend:
     captcha_solved_in_session = False
+
+    # Persistent headless-browser session for tender-document downloads. Kept
+    # alive across download jobs so the portal CAPTCHA is solved once per live
+    # session per website, not per download. Rebuilt (and the CAPTCHA re-solved)
+    # when the website changes, the browser dies, the portal session goes stale,
+    # or it has been idle past download_session_idle_min.
+    _download_driver = None
+    _download_driver_website = None
+    _download_driver_started = 0.0
+    _download_driver_last_used = 0.0
+    _download_lock = threading.Lock()
+
+    @staticmethod
+    def _download_session_idle_seconds():
+        return setting_int("download_session_idle_min", 15, minimum=1, maximum=120) * 60
+
+    @staticmethod
+    def close_download_session():
+        drv = ScraperBackend._download_driver
+        ScraperBackend._download_driver = None
+        ScraperBackend._download_driver_website = None
+        ScraperBackend._download_driver_started = 0.0
+        ScraperBackend._download_driver_last_used = 0.0
+        ScraperBackend.captcha_solved_in_session = False
+        if drv is not None:
+            try:
+                drv.quit()
+            except Exception:
+                pass
+
+    @staticmethod
+    def close_idle_download_session():
+        if ScraperBackend._download_driver is None:
+            return
+        if time.time() - ScraperBackend._download_driver_last_used > ScraperBackend._download_session_idle_seconds():
+            log_to_gui("Closing the idle download browser session.")
+            ScraperBackend.close_download_session()
+
+    @staticmethod
+    def _download_page_is_stale(driver):
+        try:
+            title = (driver.title or "").lower()
+        except Exception:
+            return True
+        return "stale session" in title or title.strip() == "error"
+
+    @staticmethod
+    def _acquire_download_driver(website_id, base_url):
+        """Return a live browser on `base_url` for this website. Reuses the
+        cached session when it's the same website, still alive, not idle-expired
+        and not showing a stale/error page; otherwise builds a fresh one and
+        clears captcha_solved_in_session so the CAPTCHA is solved again.
+        Caller holds ScraperBackend._download_lock."""
+        drv = ScraperBackend._download_driver
+        reusable = (
+            drv is not None
+            and ScraperBackend._download_driver_website == website_id
+            and (time.time() - ScraperBackend._download_driver_last_used
+                 <= ScraperBackend._download_session_idle_seconds())
+        )
+        if reusable:
+            try:
+                _ = drv.title  # liveness probe
+                drv.get(base_url)
+                time.sleep(2)
+                if not ScraperBackend._download_page_is_stale(drv):
+                    ScraperBackend._download_driver_last_used = time.time()
+                    return drv
+                log_to_gui("Download session went stale; starting a fresh browser and CAPTCHA.")
+            except Exception:
+                log_to_gui("Download browser was lost; starting a fresh session.")
+        ScraperBackend.close_download_session()
+        drv = create_browser_driver(register=False)
+        drv.get(base_url)
+        time.sleep(4)
+        ScraperBackend._download_driver = drv
+        ScraperBackend._download_driver_website = website_id
+        ScraperBackend._download_driver_started = time.time()
+        ScraperBackend._download_driver_last_used = time.time()
+        ScraperBackend.captcha_solved_in_session = False
+        return drv
     captcha_ai_client = None
     captcha_ai_signature = None
     session = None
@@ -2207,6 +2296,9 @@ class ScraperBackend:
     def refresh_selenium_session(driver, init_url, tender_url):
         if not ensure_scraper_dependencies():
             return False
+        # The portal session is gone, so whatever CAPTCHA was solved for it is
+        # gone too — force the next handle_captcha_interaction to solve again.
+        ScraperBackend.captcha_solved_in_session = False
         try:
             driver.get(init_url)
             time.sleep(2)
@@ -3840,18 +3932,27 @@ class ScraperBackend:
 
         log_to_gui(f"Starting download for {len(to_download)} tenders...")
 
-        driver = None
-        # Establish Selenium session once (same pattern as tender_scraper.py).
+        # One persistent browser session, serialized across download jobs. The
+        # CAPTCHA solved for it carries over to every tender on this website
+        # until the session goes stale / idle / the browser is restarted.
+        ScraperBackend._download_lock.acquire()
         try:
-            driver = create_browser_driver()
+            return ScraperBackend._run_download_loop(
+                website_id, base_url, to_download, mode_override
+            )
+        finally:
+            ScraperBackend._download_driver_last_used = time.time()
+            ScraperBackend._download_lock.release()
+
+    @staticmethod
+    def _run_download_loop(website_id, base_url, to_download, mode_override):
+        driver = None
+        try:
+            driver = ScraperBackend._acquire_download_driver(website_id, base_url)
             wait = WebDriverWait(driver, 20)
-            ScraperBackend.captcha_solved_in_session = False
-            driver.get(base_url)
-            time.sleep(4)
         except Exception as e:
             log_to_gui(f"Failed to initialize Selenium session: {e}")
-            if driver is not None:
-                driver.quit()
+            ScraperBackend.close_download_session()
             return False
 
         for db_id, t_id, title, url, last_dl, existing_folder in to_download:
@@ -4072,24 +4173,18 @@ class ScraperBackend:
                 conn.close()
                 if isinstance(e, (WebDriverException, TimeoutException)):
                     log_to_gui("Browser connection was lost; restarting the browser to continue with the remaining tenders...")
+                    ScraperBackend.close_download_session()
                     try:
-                        driver.quit()
-                    except Exception:
-                        pass
-                    driver = None
-                    try:
-                        driver = create_browser_driver()
+                        driver = ScraperBackend._acquire_download_driver(website_id, base_url)
                         wait = WebDriverWait(driver, 20)
-                        driver.get(base_url)
-                        time.sleep(4)
                     except Exception as restart_error:
                         log_to_gui(f"Could not restart the browser: {restart_error}. Stopping remaining downloads.")
                         break
             finally:
                 storage_runtime.cleanup_scratch_folder(save_dir)
 
-        if driver is not None:
-            driver.quit()
+        # The browser session is kept alive on purpose — see _acquire_download_driver.
+        ScraperBackend._download_driver_last_used = time.time()
         log_to_gui("Download process finished.")
         return True
 
