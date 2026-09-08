@@ -6027,6 +6027,14 @@ def admin_put_config(body: AdminConfigPatch, _auth: None = Depends(require_admin
             )
             conn.commit()
         core.ScraperBackend.invalidate_settings_cache()
+        changed_keys = {k for k, _ in updates}
+        if changed_keys & {
+            "captcha_ai_provider", "captcha_ai_api_key", "captcha_ai_model",
+            "captcha_ai_endpoint", "headless", "browser",
+        }:
+            # A new captcha key/model or browser change only takes effect on a
+            # fresh browser session.
+            core.ScraperBackend.close_download_session()
     return _admin_config_payload()
 
 

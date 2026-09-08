@@ -229,7 +229,6 @@ class DurableJobRuntimeTests(unittest.TestCase):
                 api._scheduler_stop.set()
                 api._job_executor.shutdown(wait=True, cancel_futures=True)
                 """,
-                timeout=45,
             )
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
 

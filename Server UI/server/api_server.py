@@ -2547,23 +2547,58 @@ def _load_and_recover_jobs(*, recover_running: bool = True, submit_queued: bool 
             "FROM background_jobs ORDER BY created_at ASC"
         ).fetchall()
 
+    try:
+        recover_retry_limit = max(1, min(10, int(core.ScraperBackend.get_setting("retry_attempts", "3"))))
+    except Exception:
+        recover_retry_limit = 3
+
     recover_ids = []
+    resumed = 0
     for row in rows:
         job_id = str(row[0])
         job = _job_from_row(row)
         if recover_running and job["status"] == "running":
-            job.update(
-                status="failed",
-                error="The previous worker stopped before this job completed. Retry is safe after reviewing its logs.",
-                finished_at=time.time(),
-                heartbeat_at=time.time(),
-            )
-            _persist_job(job_id, job)
+            attempts = int(job.get("attempt_count") or 0)
+            if job.get("cancel_requested"):
+                job.update(
+                    status="cancelled",
+                    error=str(job.get("error") or "Cancelled before the worker restarted."),
+                    finished_at=time.time(),
+                    heartbeat_at=time.time(),
+                )
+                _persist_job(job_id, job)
+            elif attempts < recover_retry_limit:
+                # The worker died under it (deploy / crash). Put it back on the
+                # queue instead of surfacing a red FAILED — it re-runs below.
+                job.update(
+                    status="queued",
+                    error="",
+                    started_at=None,
+                    finished_at=None,
+                    heartbeat_at=time.time(),
+                    worker_id="",
+                )
+                _persist_job(job_id, job)
+                resumed += 1
+            else:
+                job.update(
+                    status="failed",
+                    error=(
+                        f"The worker stopped {attempts} times before this job finished — "
+                        f"not retrying automatically. Use Retry to run it again."
+                    ),
+                    finished_at=time.time(),
+                    heartbeat_at=time.time(),
+                )
+                _persist_job(job_id, job)
         with _job_lock:
             _jobs[job_id] = job
         if submit_queued and job["status"] == "queued" and not job.get("cancel_requested"):
             _persist_job(job_id, job)
             recover_ids.append(job_id)
+
+    if resumed:
+        _append_live_log(f"Re-queued {resumed} job(s) interrupted by a worker restart.")
 
     for job_id in recover_ids:
         _job_futures[job_id] = _job_executor.submit(_run_job, job_id)

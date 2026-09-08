@@ -66,6 +66,7 @@ const DEFAULT_CONFIG = {
   portal_eprocure: false,
   max_concurrent_sessions: 2,
   page_load_timeout_s: 45,
+  download_session_idle_min: 15,
   retry_attempts: 3,
   retry_backoff_s: 20,
   headless: true,
@@ -2009,14 +2010,23 @@ function StoragePanel({ toast, env, base, adminKey, storageUrl, localScope }) {
 }
 
 let _logLineSeq = 0;
+// Module-level ring buffer so the last lines survive LogsPanel unmounting on a
+// tab change (it holds `lines` in local state and is fully torn down when the
+// tab isn't 'logs'). Deduped by the server's stable per-line `seq`.
+const _LOG_RING_MAX = 500;
+let _logRing = [];
+let _logRingLastSeq = 0;
+
 // Real log lines are plain strings — level/source aren't tagged upstream, so
 // they're guessed from the message text (best-effort, not fabricated data).
 function _classifyLogLine(raw) {
-  // raw is either a plain string (older server) or { text, ts } where ts is
-  // epoch seconds when the line was actually emitted.
-  const text = String(raw && typeof raw === 'object' ? (raw.text ?? '') : raw);
-  const tsSec = raw && typeof raw === 'object' ? raw.ts : null;
+  // raw is either a plain string (older server) or { text, ts, seq } where ts
+  // is epoch seconds when the line was emitted and seq is a monotonic id.
+  const isObj = raw && typeof raw === 'object';
+  const text = String(isObj ? (raw.text ?? '') : raw);
+  const tsSec = isObj ? raw.ts : null;
   const ts = Number.isFinite(tsSec) ? new Date(tsSec * 1000) : new Date();
+  const seq = isObj && Number.isFinite(raw.seq) ? raw.seq : null;
   const lower = text.toLowerCase();
   const level = /error|exception|traceback/.test(lower) ? 'error' : /warn/.test(lower) ? 'warn' : 'info';
   let source = 'api';
@@ -2024,12 +2034,25 @@ function _classifyLogLine(raw) {
   else if (/upload|download|gcs|drive|storage|bucket/.test(lower)) source = 'storage';
   else if (/\bjob\b|queued|claimed|worker/.test(lower)) source = 'worker';
   else if (/\bsql\b|postgres|sqlite|upsert|database|\btable\b/.test(lower)) source = 'db';
-  return { id: ++_logLineSeq, ts, level, source, message: text };
+  return { id: ++_logLineSeq, seq, ts, level, source, message: text };
+}
+
+// Classify + append to the shared ring, skipping any line we've already seen
+// (server `seq`). Returns the line when it was added, else null.
+function _pushLogLine(raw) {
+  const line = _classifyLogLine(raw);
+  if (line.seq != null && line.seq <= _logRingLastSeq) return null;
+  if (line.seq != null) _logRingLastSeq = line.seq;
+  _logRing.push(line);
+  if (_logRing.length > _LOG_RING_MAX) _logRing = _logRing.slice(-_LOG_RING_MAX);
+  return line;
 }
 
 function LogsPanel({ base, adminKey }) {
   const savedFilters = useMemo(loadLogFilters, []);
-  const [lines, setLines] = useState([]);
+  // Seed from the shared ring so a return to this tab shows the last lines
+  // immediately instead of an empty panel.
+  const [lines, setLines] = useState(() => _logRing.slice());
   const [levels, setLevels] = useState(() => new Set(savedFilters.levels));
   const [source, setSource] = useState(savedFilters.source);
   const [q, setQ] = useState(savedFilters.q);
@@ -2051,7 +2074,17 @@ function LogsPanel({ base, adminKey }) {
     let pollTimer = null;
     let sinceSeq = 0;
 
-    const appendLine = (raw) => setLines((l) => [...l.slice(-400), _classifyLogLine(raw)]);
+    // Push through the shared ring (dedups by server seq) and re-render from it.
+    const appendLine = (raw) => { if (_pushLogLine(raw)) setLines(() => _logRing.slice()); };
+
+    // Backfill anything that streamed while this tab was elsewhere (server keeps
+    // the last few hundred lines); dedup by seq keeps it from doubling.
+    (async () => {
+      try {
+        const payload = await apiFetch(base, `/admin/logs/live?since_seq=0`, { adminKey });
+        (payload.entries || payload.lines || []).forEach(appendLine);
+      } catch {}
+    })();
 
     const startPolling = () => {
       if (pollTimer || stopped) return;
@@ -2073,7 +2106,9 @@ function LogsPanel({ base, adminKey }) {
         try {
           const payload = JSON.parse(evt.data);
           if (payload && payload.line != null) {
-            appendLine(payload.ts != null ? { text: payload.line, ts: payload.ts } : payload.line);
+            appendLine((payload.ts != null || payload.seq != null)
+              ? { text: payload.line, ts: payload.ts, seq: payload.seq }
+              : payload.line);
           }
         } catch {}
       };
