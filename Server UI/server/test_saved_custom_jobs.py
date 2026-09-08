@@ -77,14 +77,13 @@ class SavedCustomJobTests(unittest.TestCase):
                     assert updated['interval_minutes'] == 30 and updated['next_run_at'] > 0
                     assert updated['last_job_id'] == 'manual-1'
                     scheduled_next = updated['next_run_at']
-                    before_manual = time.time()
                     api.run_saved_custom_job(saved_id, 'Alice', None)
                     after_manual_run = next(
                         job for job in api.list_saved_custom_jobs('Alice', None)['jobs'] if job['id'] == saved_id
                     )
-                    # A hand-run of an interval job restarts its clock from now.
-                    assert after_manual_run['next_run_at'] != scheduled_next
-                    assert abs(after_manual_run['next_run_at'] - (before_manual + 30 * 60)) < 5
+                    # A hand-run does NOT touch the schedule: it still fires at
+                    # its scheduled time.
+                    assert abs(after_manual_run['next_run_at'] - scheduled_next) < 1
 
                     once_at = time.time() + 120
                     once = api.create_saved_custom_job(api.SavedCustomJobRequest(
@@ -683,6 +682,64 @@ class SavedCustomJobTests(unittest.TestCase):
                     api.delete_saved_custom_job(d, 'Zed', None)
                     listed = sorted(api.list_saved_custom_jobs('Zed', None)['jobs'], key=lambda j: j['id'])
                     assert [(j['id'], j['name']) for j in listed] == [(1, 'A'), (2, 'C')], listed
+                """)],
+                cwd=root,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_same_name_create_auto_suffixes_instead_of_409(self):
+        # "Save as new" reuses the same name; the backend disambiguates with
+        # _1, _2, … per owner instead of rejecting the create.
+        with tempfile.TemporaryDirectory(prefix="bidmanager-suffix-") as tmp:
+            root = Path(tmp)
+            for source in SOURCE_DIR.glob("*.py"):
+                if not source.name.startswith("test_"):
+                    shutil.copy2(source, root / source.name)
+            env = os.environ.copy()
+            for key in ("K_SERVICE", "DATABASE_URL", "POSTGRES_URL", "POSTGRES_CONNECTION_STRING"):
+                env.pop(key, None)
+            env["BIDMANAGER_ENV"] = "local"
+            result = subprocess.run(
+                [sys.executable, "-c", textwrap.dedent("""
+                    import api_server as api
+                    api._scheduler_stop.set()
+                    if getattr(api, "_scheduler_thread", None):
+                        api._scheduler_thread.join(timeout=10)
+                    with api.get_db() as conn:
+                        conn.execute(
+                            "INSERT INTO organizations (website_id,name,tender_count,tenders_url) "
+                            "VALUES (1,'Org A',1,'https://example.test/a')"
+                        )
+                        org_id = conn.execute("SELECT id FROM organizations WHERE name='Org A'").fetchone()[0]
+                        conn.commit()
+
+                    def mk():
+                        return api.create_saved_custom_job(api.SavedCustomJobRequest(
+                            owner_name='Nia', name='Nightly', website_id=1,
+                            job_type='scrape', org_ids=[org_id], schedule_enabled=False,
+                        ), None)
+
+                    first = mk()
+                    assert first['name'] == 'Nightly', first
+                    second = mk()
+                    assert second['name'] == 'Nightly_1', second
+                    third = mk()
+                    assert third['name'] == 'Nightly_2', third
+
+                    names = sorted(j['name'] for j in api.list_saved_custom_jobs('Nia', None)['jobs'])
+                    assert names == ['Nightly', 'Nightly_1', 'Nightly_2'], names
+
+                    # A different owner is unaffected.
+                    other = api.create_saved_custom_job(api.SavedCustomJobRequest(
+                        owner_name='Omar', name='Nightly', website_id=1,
+                        job_type='scrape', org_ids=[org_id], schedule_enabled=False,
+                    ), None)
+                    assert other['name'] == 'Nightly', other
                 """)],
                 cwd=root,
                 env=env,

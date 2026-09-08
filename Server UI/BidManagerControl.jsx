@@ -1488,11 +1488,11 @@ function ScraperPanel({ toast, base, adminKey }) {
     setBusy('');
   };
 
-  const saveNamedJob = async () => {
+  const saveNamedJob = async (asNew = false) => {
     const owner = ownerName.trim();
     const name = jobName.trim();
     if (!owner || !name) return toast('Enter both user/owner and job name');
-    if (jobType === 'scrape' && !scrapeAllOrgs && selectedOrgs.size === 0) return toast('Select at least one organization, or check "Entire website"');
+    if (jobType === 'scrape' && !scrapeAllOrgs && selectedOrgs.size === 0) return toast('Select at least one organization, or check "Website"');
     if (jobType === 'download' && selectedTenders.size === 0) return toast('Select at least one tender');
     const scheduledForAt = savedJobScheduleMode === 'manual' ? 0 : new Date(savedJobScheduleAt).getTime() / 1000;
     if (savedJobScheduleMode !== 'manual' && (!Number.isFinite(scheduledForAt) || scheduledForAt <= Date.now() / 1000)) {
@@ -1500,10 +1500,11 @@ function ScraperPanel({ toast, base, adminKey }) {
     }
     const intervalMinutes = (Number(repeatInterval) || 0) * ({ minutes: 1, hours: 60, days: 1440 }[repeatUnit] || 1);
     if (savedJobScheduleMode === 'interval' && intervalMinutes <= 0) return toast('Enter a positive repeat interval');
+    const useEdit = editingJobId && !asNew;
     setBusy('save-custom');
     try {
       const saved = await api.saveCustomJob({
-        owner_name: editingJobId ? (editingJobOwner || owner) : owner, name, website_id: Number(websiteId), job_type: jobType,
+        owner_name: useEdit ? (editingJobOwner || owner) : owner, name, website_id: Number(websiteId), job_type: jobType,
         // When "Whole website" is on, a non-empty org_ids is the signal for
         // "refresh, then scrape every org" — only send it when live select-all
         // is active, otherwise the job stays refresh-only.
@@ -1514,10 +1515,17 @@ function ScraperPanel({ toast, base, adminKey }) {
         schedule_mode: savedJobScheduleMode,
         interval_minutes: savedJobScheduleMode === 'interval' ? intervalMinutes : 0,
         scheduled_for_at: scheduledForAt,
-      }, editingJobId);
-      const savedId = Number(saved.id || editingJobId);
-      toast(editingJobId ? 'Saved job updated' : 'Custom job saved');
-      setEditingJobId(savedId);
+      }, useEdit ? editingJobId : null);
+      const savedId = Number(saved.id || (useEdit ? editingJobId : 0));
+      const savedName = saved.name || name;
+      if (useEdit) {
+        toast('Saved job updated');
+      } else {
+        toast(savedName !== name ? `Saved as "${savedName}"` : 'Custom job saved');
+        setEditingJobId(null);
+        setJobName(savedName);
+      }
+      if (useEdit) setEditingJobId(savedId);
       setSelectedSavedJobId(savedId);
       await loadSavedJobs();
     } catch (err) { toast(err.message || 'Could not save custom job'); }
@@ -1673,7 +1681,7 @@ function ScraperPanel({ toast, base, adminKey }) {
               <label className="flex items-center gap-1.5" style={{ fontSize: 12, color: c.ink60, cursor: 'pointer' }}
                 title="Refreshes the whole website's organization list and per-org tender counts. Also tick 'select all' in the Organizations list and the job will refresh, then scrape every org.">
                 <Toggle checked={scrapeAllOrgs} onChange={setScrapeAllOrgs} />
-                {scrapeAllOrgs && allOrgsMode ? 'Whole website (refresh + scrape all)' : 'Whole website (refresh orgs)'}
+                {scrapeAllOrgs && allOrgsMode ? 'Website + scrape all' : 'Website'}
               </label>
             )}
             <Select value={savedJobScheduleMode} onChange={setSavedJobScheduleMode} w={118} options={[
@@ -1690,7 +1698,8 @@ function ScraperPanel({ toast, base, adminKey }) {
                 { value: 'days', label: 'Days' },
               ]} />
             </>}
-            <Btn size="sm" busy={busy === 'save-custom'} disabled={!jobName.trim() || !selectionReady} onClick={saveNamedJob}>{editingJobId ? 'Update' : 'Save'}</Btn>
+            <Btn size="sm" busy={busy === 'save-custom'} disabled={!jobName.trim() || !selectionReady} onClick={() => saveNamedJob(false)}>{editingJobId ? 'Update' : 'Save'}</Btn>
+            {editingJobId && <Btn size="sm" busy={busy === 'save-custom'} disabled={!jobName.trim() || !selectionReady} onClick={() => saveNamedJob(true)}>Save as new</Btn>}
             <Btn size="sm" variant="primary" icon={Play} busy={selectedSavedJobId && busy === `run-${selectedSavedJobId}`} disabled={!selectedSavedJobId} onClick={() => runSavedJob({ id: selectedSavedJobId })}>Run</Btn>
             {editingJobId && <Btn size="sm" variant="ghost" onClick={() => { setEditingJobId(null); setEditingJobOwner(null); setSelectedSavedJobId(null); setJobName(''); setScrapeAllOrgs(false); }}>Close edit</Btn>}
           </div>
@@ -1711,7 +1720,7 @@ function ScraperPanel({ toast, base, adminKey }) {
                 <td className="px-3 py-2"><Pill state={job.job_type === 'scrape' ? 'info' : 'ok'}>{job.job_type}</Pill></td>
                 <td className="px-3 py-2"><Pill state={isUser ? 'ok' : 'neutral'}>{isUser ? 'User' : 'Admin'}</Pill></td>
                 <td className="px-3 py-2" style={{ fontSize: 11.5, color: c.ink60 }}>{[
-                  job.job_type !== 'download' ? (job.all_organizations ? (job.org_ids.length ? 'Whole website · refresh + scrape all' : 'Whole website · refresh orgs') : `${job.org_ids.length} organizations`) : '',
+                  job.job_type !== 'download' ? (job.all_organizations ? (job.org_ids.length ? 'Website · refresh + scrape all' : 'Website · refresh orgs') : `${job.org_ids.length} organizations`) : '',
                   job.job_type !== 'scrape' ? `${job.tender_ids.length} tenders` : '',
                 ].filter(Boolean).join(' · ')}</td>
                 <td className="px-3 py-2"><Pill state={job.schedule_enabled ? 'info' : 'neutral'}><span style={{ display: 'inline-block', minWidth: 104, textAlign: 'center' }}>{savedJobScheduleLabel(job)}</span></Pill></td>

@@ -2875,10 +2875,9 @@ def _enqueue_saved_custom_job(saved_job_id: int, scheduled_trigger: bool = False
     queued_ids_str = ",".join(queued_ids)
     if scheduled_trigger and definition["schedule_mode"] in ("once", "interval"):
         _advance_saved_custom_job_schedule(definition["id"], now, queued_ids_str)
-    elif definition["schedule_enabled"] and definition["schedule_mode"] == "interval":
-        # A hand-run of an interval job restarts its clock from now.
-        _advance_saved_custom_job_schedule(definition["id"], now, queued_ids_str, restart_from_now=True)
     else:
+        # A manual "Run once" just runs — it does NOT touch next_run_at, so the
+        # job still fires at its scheduled time.
         with get_db() as conn:
             conn.execute(
                 "UPDATE saved_custom_jobs SET last_job_id=?,updated_at=? WHERE id=?",
@@ -2910,13 +2909,12 @@ def _touch_saved_job_last_run(job_id: str, ts: float) -> None:
 
 
 def _advance_saved_custom_job_schedule(
-    saved_job_id: int, now: float, job_id: str, restart_from_now: bool = False
+    saved_job_id: int, now: float, job_id: str
 ) -> None:
-    # Shared by the manual "scheduled_trigger=True" path in
-    # _enqueue_saved_custom_job and by _run_consolidated_scrape_pass, so a
-    # saved job's next_run_at only ever advances through this one place.
-    # restart_from_now=True (a hand-run) resets an interval job's clock to
-    # now + interval instead of keeping the fixed cadence.
+    # Shared by the "scheduled_trigger=True" path in _enqueue_saved_custom_job
+    # and by _run_consolidated_scrape_pass, so a saved job's next_run_at only
+    # ever advances through this one place. A manual "Run once" does NOT call
+    # this — a hand-run leaves the scheduled time untouched.
     with get_db() as conn:
         row = conn.execute(
             "SELECT schedule_mode,interval_minutes,next_run_at FROM saved_custom_jobs WHERE id=?",
@@ -2935,12 +2933,9 @@ def _advance_saved_custom_job_schedule(
             )
         elif schedule_mode == "interval" and int(interval_minutes or 0) > 0:
             interval_seconds = int(interval_minutes) * 60
-            if restart_from_now:
-                next_run = now + interval_seconds
-            else:
-                previous_next = float(next_run_at or now)
-                elapsed_intervals = max(1, int((now - previous_next) // interval_seconds) + 1)
-                next_run = previous_next + elapsed_intervals * interval_seconds
+            previous_next = float(next_run_at or now)
+            elapsed_intervals = max(1, int((now - previous_next) // interval_seconds) + 1)
+            next_run = previous_next + elapsed_intervals * interval_seconds
             next_run = _defer_past_downtime(next_run)
             conn.execute(
                 "UPDATE saved_custom_jobs SET last_job_id=?,next_run_at=?,updated_at=? WHERE id=?",
@@ -5465,13 +5460,27 @@ def create_saved_custom_job(body: SavedCustomJobRequest, _auth: None = Depends(r
     next_run = value["scheduled_for_at"] if value["schedule_enabled"] else 0
     try:
         with get_db() as conn:
+            # Auto-suffix _1, _2, … on a same-owner name collision instead of
+            # rejecting — lets "Save as new" copy an edited job in one click.
+            existing = {
+                str(r[0]) for r in conn.execute(
+                    "SELECT name FROM saved_custom_jobs WHERE owner_name=?",
+                    (value["owner_name"],),
+                ).fetchall()
+            }
+            name = value["name"]
+            if name in existing:
+                i = 1
+                while f"{name}_{i}" in existing:
+                    i += 1
+                name = f"{name}_{i}"
             cur = conn.execute(
                 "INSERT INTO saved_custom_jobs "
                 "(owner_name,name,website_id,job_type,org_ids_json,tender_ids_json,all_organizations,"
                 "all_tenders,download_mode,schedule_enabled,schedule_mode,interval_minutes,scheduled_for_at,"
                 "next_run_at,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    value["owner_name"], value["name"], value["website_id"], value["job_type"],
+                    value["owner_name"], name, value["website_id"], value["job_type"],
                     _json_dump(value["org_ids"]), _json_dump(value["tender_ids"]),
                     int(value["all_organizations"]), int(value["all_tenders"]), value["download_mode"],
                     int(value["schedule_enabled"]), value["schedule_mode"], value["interval_minutes"],
@@ -5482,14 +5491,14 @@ def create_saved_custom_job(body: SavedCustomJobRequest, _auth: None = Depends(r
             _renumber_saved_custom_jobs(conn)
             saved_id = int(conn.execute(
                 "SELECT id FROM saved_custom_jobs WHERE owner_name=? AND name=?",
-                (value["owner_name"], value["name"]),
+                (value["owner_name"], name),
             ).fetchone()[0])
             conn.commit()
     except Exception as exc:
         if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
             raise HTTPException(409, "This user already has a saved job with that name")
         raise
-    return {"ok": True, "id": saved_id}
+    return {"ok": True, "id": saved_id, "name": name}
 
 
 @app.put("/admin/custom-jobs/{saved_job_id}")

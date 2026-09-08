@@ -2547,23 +2547,58 @@ def _load_and_recover_jobs(*, recover_running: bool = True, submit_queued: bool 
             "FROM background_jobs ORDER BY created_at ASC"
         ).fetchall()
 
+    try:
+        recover_retry_limit = max(1, min(10, int(core.ScraperBackend.get_setting("retry_attempts", "3"))))
+    except Exception:
+        recover_retry_limit = 3
+
     recover_ids = []
+    resumed = 0
     for row in rows:
         job_id = str(row[0])
         job = _job_from_row(row)
         if recover_running and job["status"] == "running":
-            job.update(
-                status="failed",
-                error="The previous worker stopped before this job completed. Retry is safe after reviewing its logs.",
-                finished_at=time.time(),
-                heartbeat_at=time.time(),
-            )
-            _persist_job(job_id, job)
+            attempts = int(job.get("attempt_count") or 0)
+            if job.get("cancel_requested"):
+                job.update(
+                    status="cancelled",
+                    error=str(job.get("error") or "Cancelled before the worker restarted."),
+                    finished_at=time.time(),
+                    heartbeat_at=time.time(),
+                )
+                _persist_job(job_id, job)
+            elif attempts < recover_retry_limit:
+                # The worker died under it (deploy / crash). Put it back on the
+                # queue instead of surfacing a red FAILED — it re-runs below.
+                job.update(
+                    status="queued",
+                    error="",
+                    started_at=None,
+                    finished_at=None,
+                    heartbeat_at=time.time(),
+                    worker_id="",
+                )
+                _persist_job(job_id, job)
+                resumed += 1
+            else:
+                job.update(
+                    status="failed",
+                    error=(
+                        f"The worker stopped {attempts} times before this job finished — "
+                        f"not retrying automatically. Use Retry to run it again."
+                    ),
+                    finished_at=time.time(),
+                    heartbeat_at=time.time(),
+                )
+                _persist_job(job_id, job)
         with _job_lock:
             _jobs[job_id] = job
         if submit_queued and job["status"] == "queued" and not job.get("cancel_requested"):
             _persist_job(job_id, job)
             recover_ids.append(job_id)
+
+    if resumed:
+        _append_live_log(f"Re-queued {resumed} job(s) interrupted by a worker restart.")
 
     for job_id in recover_ids:
         _job_futures[job_id] = _job_executor.submit(_run_job, job_id)
@@ -2840,10 +2875,9 @@ def _enqueue_saved_custom_job(saved_job_id: int, scheduled_trigger: bool = False
     queued_ids_str = ",".join(queued_ids)
     if scheduled_trigger and definition["schedule_mode"] in ("once", "interval"):
         _advance_saved_custom_job_schedule(definition["id"], now, queued_ids_str)
-    elif definition["schedule_enabled"] and definition["schedule_mode"] == "interval":
-        # A hand-run of an interval job restarts its clock from now.
-        _advance_saved_custom_job_schedule(definition["id"], now, queued_ids_str, restart_from_now=True)
     else:
+        # A manual "Run once" just runs — it does NOT touch next_run_at, so the
+        # job still fires at its scheduled time.
         with get_db() as conn:
             conn.execute(
                 "UPDATE saved_custom_jobs SET last_job_id=?,updated_at=? WHERE id=?",
@@ -2875,13 +2909,12 @@ def _touch_saved_job_last_run(job_id: str, ts: float) -> None:
 
 
 def _advance_saved_custom_job_schedule(
-    saved_job_id: int, now: float, job_id: str, restart_from_now: bool = False
+    saved_job_id: int, now: float, job_id: str
 ) -> None:
-    # Shared by the manual "scheduled_trigger=True" path in
-    # _enqueue_saved_custom_job and by _run_consolidated_scrape_pass, so a
-    # saved job's next_run_at only ever advances through this one place.
-    # restart_from_now=True (a hand-run) resets an interval job's clock to
-    # now + interval instead of keeping the fixed cadence.
+    # Shared by the "scheduled_trigger=True" path in _enqueue_saved_custom_job
+    # and by _run_consolidated_scrape_pass, so a saved job's next_run_at only
+    # ever advances through this one place. A manual "Run once" does NOT call
+    # this — a hand-run leaves the scheduled time untouched.
     with get_db() as conn:
         row = conn.execute(
             "SELECT schedule_mode,interval_minutes,next_run_at FROM saved_custom_jobs WHERE id=?",
@@ -2900,12 +2933,9 @@ def _advance_saved_custom_job_schedule(
             )
         elif schedule_mode == "interval" and int(interval_minutes or 0) > 0:
             interval_seconds = int(interval_minutes) * 60
-            if restart_from_now:
-                next_run = now + interval_seconds
-            else:
-                previous_next = float(next_run_at or now)
-                elapsed_intervals = max(1, int((now - previous_next) // interval_seconds) + 1)
-                next_run = previous_next + elapsed_intervals * interval_seconds
+            previous_next = float(next_run_at or now)
+            elapsed_intervals = max(1, int((now - previous_next) // interval_seconds) + 1)
+            next_run = previous_next + elapsed_intervals * interval_seconds
             next_run = _defer_past_downtime(next_run)
             conn.execute(
                 "UPDATE saved_custom_jobs SET last_job_id=?,next_run_at=?,updated_at=? WHERE id=?",
