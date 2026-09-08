@@ -4173,24 +4173,18 @@ class ScraperBackend:
                 conn.close()
                 if isinstance(e, (WebDriverException, TimeoutException)):
                     log_to_gui("Browser connection was lost; restarting the browser to continue with the remaining tenders...")
+                    ScraperBackend.close_download_session()
                     try:
-                        driver.quit()
-                    except Exception:
-                        pass
-                    driver = None
-                    try:
-                        driver = create_browser_driver()
+                        driver = ScraperBackend._acquire_download_driver(website_id, base_url)
                         wait = WebDriverWait(driver, 20)
-                        driver.get(base_url)
-                        time.sleep(4)
                     except Exception as restart_error:
                         log_to_gui(f"Could not restart the browser: {restart_error}. Stopping remaining downloads.")
                         break
             finally:
                 storage_runtime.cleanup_scratch_folder(save_dir)
 
-        if driver is not None:
-            driver.quit()
+        # The browser session is kept alive on purpose — see _acquire_download_driver.
+        ScraperBackend._download_driver_last_used = time.time()
         log_to_gui("Download process finished.")
         return True
 

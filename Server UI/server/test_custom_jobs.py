@@ -102,15 +102,35 @@ class CustomJobTests(unittest.TestCase):
                 )
 
     def test_auto_download_mode_uses_existing_main_files(self):
+        # Blobs present AND both main files recorded as completed downloads.
         with mock.patch.object(
             api_server.core.ScraperBackend,
             "_has_required_full_download_artifacts",
+            return_value=(True, []),
+        ), mock.patch.object(
+            api_server.core.ScraperBackend,
+            "_main_download_ledger_complete",
             return_value=(True, []),
         ):
             self.assertEqual(
                 api_server.core.ScraperBackend._resolve_download_mode("auto", "T-1", "folder"),
                 "update",
             )
+        # Blobs present but the ledger has no completed row for the zip -> full.
+        with mock.patch.object(
+            api_server.core.ScraperBackend,
+            "_has_required_full_download_artifacts",
+            return_value=(True, []),
+        ), mock.patch.object(
+            api_server.core.ScraperBackend,
+            "_main_download_ledger_complete",
+            return_value=(False, ["zip"]),
+        ):
+            self.assertEqual(
+                api_server.core.ScraperBackend._resolve_download_mode("auto", "T-1", "folder"),
+                "full",
+            )
+        # Blobs missing -> full, ledger not consulted.
         with mock.patch.object(
             api_server.core.ScraperBackend,
             "_has_required_full_download_artifacts",
@@ -120,6 +140,65 @@ class CustomJobTests(unittest.TestCase):
                 api_server.core.ScraperBackend._resolve_download_mode("auto", "T-1", "folder"),
                 "full",
             )
+
+    def test_main_download_ledger_complete_requires_completed_rows(self):
+        import os
+        import sqlite3
+        import tempfile
+
+        backend = api_server.core.ScraperBackend
+        tmpdir = tempfile.TemporaryDirectory(prefix="bidmanager-ledger-", ignore_cleanup_errors=True)
+        db_path = os.path.join(tmpdir.name, "ledger.db")
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "CREATE TABLE downloaded_files ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, tender_id TEXT, file_name TEXT, "
+                "file_type TEXT, download_status TEXT DEFAULT 'complete', file_size_bytes INTEGER)"
+            )
+            conn.commit()
+            conn.close()
+
+            with mock.patch.object(api_server.core, "DB_FILE", db_path):
+                self.assertEqual(
+                    backend._main_download_ledger_complete("T-1"), (False, ["notice", "zip"])
+                )
+
+                conn = sqlite3.connect(db_path)
+                conn.executemany(
+                    "INSERT INTO downloaded_files "
+                    "(tender_id,file_name,file_type,download_status,file_size_bytes) VALUES (?,?,?,?,?)",
+                    [
+                        ("T-1", "Tendernotice_T-1.pdf", "notice", "complete", 1234),
+                        ("T-1", "T-1.zip", "zip", "complete", 999999),
+                    ],
+                )
+                conn.commit()
+                conn.close()
+                self.assertEqual(backend._main_download_ledger_complete("t-1"), (True, []))
+
+                conn = sqlite3.connect(db_path)
+                conn.execute(
+                    "UPDATE downloaded_files SET download_status='partial' WHERE file_type='zip'"
+                )
+                conn.commit()
+                conn.close()
+                self.assertEqual(backend._main_download_ledger_complete("T-1"), (False, ["zip"]))
+
+                conn = sqlite3.connect(db_path)
+                conn.execute(
+                    "UPDATE downloaded_files SET download_status='complete' WHERE file_type='zip'"
+                )
+                conn.execute(
+                    "UPDATE downloaded_files SET file_size_bytes=0 WHERE file_type='notice'"
+                )
+                conn.commit()
+                conn.close()
+                self.assertEqual(
+                    backend._main_download_ledger_complete("T-1"), (False, ["notice"])
+                )
+        finally:
+            tmpdir.cleanup()
 
     def test_download_worker_receives_batch_scope(self):
         with mock.patch.object(
