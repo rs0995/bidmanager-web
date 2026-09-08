@@ -1,4 +1,4 @@
-import { getState, nextId, updateState } from './db.js';
+import { getState, getQueuedState, nextId, updateState } from './db.js';
 import { useAppStore } from './store';
 import { timeRemaining } from './utils';
 
@@ -73,7 +73,7 @@ async function requestClient(route, options = {}, overrides = {}, { requireAuth 
   const headers = { Accept: 'application/json' };
   if (config.auth_token) headers['x-client-key'] = config.auth_token;
   const fetchOptions = { method, headers };
-  if (method === 'POST') {
+  if (method !== 'GET') {
     headers['Content-Type'] = 'application/json';
     fetchOptions.body = JSON.stringify(options.body ?? {});
   }
@@ -159,20 +159,89 @@ async function downloadServerSnapshot(overrides = {}) {
 
 // Wraps updateState() for mutations that touch cloud-synced data (bookmarks,
 // templates, projects, checklist) — after the local write lands, it schedules
-// a debounced push to /client/sync so other devices pick it up. Rapid edits
-// collapse into one push instead of one per keystroke/toggle; failures are
-// swallowed (offline-tolerant, matches the app's existing sync posture) and
-// never block the caller, since the local write already succeeded.
+// a near-instant push to /client/sync so other devices pick it up right away.
+// The short delay (rather than 0) still collapses a tight synchronous burst
+// (e.g. creating N checklist items when applying a template) into one push
+// instead of N, since each call clears/reschedules the same timer.
+//
+// Crucially, `_syncPushPending` only clears once the push actually SUCCEEDS —
+// this backend/proxy is known to intermittently 502/timeout (see the
+// Downloads panel's own retry logic), and a push that fails must stay
+// "pending" so a later pull can't mistake the missing edit for something
+// that was never made. A failed push re-arms itself with capped backoff
+// instead of being silently dropped.
+const SYNC_PUSH_DELAY_MS = 150;
+const SYNC_PUSH_MAX_DELAY_MS = 30000;
 let _syncPushTimer = null;
+let _syncPushPending = false;
+// The last /client/sync blob the server handed us (set by pullUserData). Used
+// to compute the `removed` delta on push — items that were in the server's
+// copy but the user has since deleted locally — so the server's additive
+// merge can honour a real removal without letting a stale/partial push wipe
+// a whole collection.
+let _lastServerBlob = {};
+const _idSet = (values) => new Set((values || []).map(Number).filter(Number.isFinite));
+const _rowIdSet = (rows) => new Set((rows || []).map((r) => Number(r?.id)).filter(Number.isFinite));
+function armSyncPushTimer(delay) {
+  clearTimeout(_syncPushTimer);
+  _syncPushTimer = setTimeout(async () => {
+    try {
+      await api.pushUserData();
+      _syncPushPending = false;
+    } catch {
+      armSyncPushTimer(Math.min(delay * 2, SYNC_PUSH_MAX_DELAY_MS));
+    }
+  }, delay);
+}
 function updateSyncedState(mutator) {
   const result = updateState(mutator);
-  clearTimeout(_syncPushTimer);
-  _syncPushTimer = setTimeout(() => { api.pushUserData().catch(() => {}); }, 2000);
+  _syncPushPending = true;
+  armSyncPushTimer(SYNC_PUSH_DELAY_MS);
   return result;
+}
+
+// A pull (pullUserData) overwrites local state wholesale from the server —
+// if a push from updateSyncedState is still pending (scheduled OR failed and
+// awaiting retry) when that happens, the pull would resurrect whatever the
+// local edit just removed/added (e.g. a deleted checklist item, or a newly
+// bookmarked tender that never actually reached the server), then the stale
+// timer would push that resurrection right back. Flushing — and actually
+// confirming success — first closes that race. If the flush itself fails,
+// this throws so pullUserData can skip overwriting local state this round
+// entirely, rather than trust a server copy known to be missing this
+// device's still-unconfirmed edit.
+async function flushPendingSyncPush() {
+  if (!_syncPushPending) return;
+  clearTimeout(_syncPushTimer);
+  try {
+    await api.pushUserData();
+    _syncPushPending = false;
+  } catch (error) {
+    armSyncPushTimer(SYNC_PUSH_DELAY_MS);
+    throw error;
+  }
+}
+
+// api.js is a plain module with no React Query access, but a background job
+// completing (syncTenderDocuments/patchTender) can change fields a mounted
+// query is already showing (e.g. a tender's has_documents). This lets App.jsx
+// subscribe once and invalidate the right queries without api.js importing
+// react-query at all.
+const _tendersChangedListeners = new Set();
+function notifyTendersChanged() {
+  _tendersChangedListeners.forEach((fn) => { try { fn(); } catch { /* listener's problem, not ours */ } });
 }
 
 export const api = {
   defaultServerUrl: DEFAULT_SERVER_URL,
+
+  // Subscribe to "a tender's local fields changed outside of a React
+  // mutation" (e.g. a background download job completing). Returns an
+  // unsubscribe function.
+  onTendersChanged: (fn) => {
+    _tendersChangedListeners.add(fn);
+    return () => _tendersChangedListeners.delete(fn);
+  },
 
   // ── Auth ───────────────────────────────────────────────────────────
   registerAccount: (input, overrides = {}) => requestClient(
@@ -316,8 +385,14 @@ export const api = {
       // Real rows now exist server-side, so the locally-issued placeholder
       // request row (negative id) for this tender is superseded.
       state.documents = [...others, ...merged];
+      // Also flip the tender row itself so the "Request"/"Download" pill
+      // updates immediately, without waiting for a full manual Sync.
+      state.tenders = state.tenders.map((row) => (
+        row.id === tenderDbId ? { ...row, has_documents: true, document_count: merged.length } : row
+      ));
       return state;
     });
+    notifyTendersChanged();
     return serverRows;
   },
   // "Request Download" — asks the server to fetch a tender with no documents
@@ -342,11 +417,17 @@ export const api = {
     api.pollTenderDownloadJob(tender, jobId, overrides, 0);
     return placeholder;
   },
-  // Fire-and-forget: polls the server download job every 15s (capped at ~10
-  // minutes) until it completes or fails, then refreshes this tender's real
-  // document list or marks the placeholder row failed with the server's reason.
-  pollTenderDownloadJob: async (tender, jobId, overrides = {}, attempt = 0) => {
-    const MAX_ATTEMPTS = 40;
+  // Fire-and-forget: polls the server download job every 15s (capped at ~30
+  // minutes, to tolerate the server running jobs one-at-a-time by default —
+  // see max_concurrent_sessions in Server UI/server/api_server.py) until it
+  // completes or fails, then refreshes this tender's real document list or
+  // marks the placeholder row failed with the server's reason. A single
+  // transient poll error (network blip, one-off 502 from whatever sits in
+  // front of the server) doesn't fail the job outright — only 3 in a row do,
+  // so a momentary hiccup can't kill an otherwise-fine download.
+  pollTenderDownloadJob: async (tender, jobId, overrides = {}, attempt = 0, consecutiveErrors = 0) => {
+    const MAX_ATTEMPTS = 120;
+    const MAX_CONSECUTIVE_ERRORS = 3;
     try {
       const { status, error } = await api.getTenderDownloadStatus(tender.id, jobId, overrides);
       if (status === 'completed') {
@@ -362,9 +443,13 @@ export const api = {
         await api.upsertDocument({ id: -Number(tender.id), client_status: 'failed', error: 'Timed out waiting for the server.' });
         return;
       }
-      setTimeout(() => api.pollTenderDownloadJob(tender, jobId, overrides, attempt + 1), 15000);
+      setTimeout(() => api.pollTenderDownloadJob(tender, jobId, overrides, attempt + 1, 0), 15000);
     } catch (error) {
-      await api.upsertDocument({ id: -Number(tender.id), client_status: 'failed', error: error?.message || String(error) });
+      if (consecutiveErrors + 1 >= MAX_CONSECUTIVE_ERRORS) {
+        await api.upsertDocument({ id: -Number(tender.id), client_status: 'failed', error: error?.message || String(error) });
+        return;
+      }
+      setTimeout(() => api.pollTenderDownloadJob(tender, jobId, overrides, attempt + 1, consecutiveErrors + 1), 15000);
     }
   },
   // Call once at app startup: the setTimeout chain in pollTenderDownloadJob only
@@ -388,7 +473,18 @@ export const api = {
   // browser download when running outside Electron, where the destination
   // folder can't be controlled).
   downloadDocument: async (doc, overrides = {}) => {
-    await api.upsertDocument({ id: doc.id, client_status: 'downloading', error: null });
+    // tender_db_id/tender_id/tender_title travel on every patch this function
+    // makes, not just the caller's own upsert — otherwise a document row with
+    // no prior syncTenderDocuments/requestTenderDownload row behind it
+    // (upsertDocument's default base carries none of these) ends up titleless
+    // in the Downloads panel ("Untitled tender") and, missing tender_db_id,
+    // invisible to the downloadedTenderIds ledger — so the tender's pill
+    // never flips to "Downloaded" even though the file downloaded fine.
+    const identity = {};
+    if (doc.tender_db_id != null) identity.tender_db_id = doc.tender_db_id;
+    if (doc.tender_id) identity.tender_id = doc.tender_id;
+    if (doc.tender_title) identity.tender_title = doc.tender_title;
+    await api.upsertDocument({ id: doc.id, ...identity, client_status: 'downloading', error: null });
     try {
       const { url } = await api.requestDocumentDownload(doc.tender_db_id, doc.id, overrides);
       const bridge = desktop();
@@ -400,7 +496,7 @@ export const api = {
         const result = await bridge.downloadFile({ url, destinationPath });
         if (!result?.ok) throw new Error(result?.message || 'Download failed.');
         return api.upsertDocument({
-          id: doc.id, client_status: 'downloaded', local_path: result.path,
+          id: doc.id, ...identity, client_status: 'downloaded', local_path: result.path,
           downloaded_at: new Date().toISOString(), error: null,
         });
       }
@@ -412,13 +508,22 @@ export const api = {
       anchor.click();
       anchor.remove();
       return api.upsertDocument({
-        id: doc.id, client_status: 'downloaded', local_path: null,
+        id: doc.id, ...identity, client_status: 'downloaded', local_path: null,
         downloaded_at: new Date().toISOString(), error: null,
       });
     } catch (error) {
-      await api.upsertDocument({ id: doc.id, client_status: 'failed', error: error?.message || String(error) });
+      await api.upsertDocument({ id: doc.id, ...identity, client_status: 'failed', error: error?.message || String(error) });
       throw error;
     }
+  },
+  // Folder a tender's downloaded files land in — same construction
+  // downloadDocument uses, exposed so callers (e.g. the Downloads panel)
+  // don't need to duplicate the leaf/joinPath path logic.
+  getTenderDownloadFolder: async (tenderId) => {
+    const settings = (await getState()).settings;
+    const parentDir = String(settings.parent_dir || '').trim();
+    if (!parentDir) throw new Error('Set a parent folder in Settings before opening downloads.');
+    return joinPath(parentDir, 'Tender_Downloads', leaf(tenderId));
   },
 
   listWebsites: async () => (await getState()).websites,
@@ -450,6 +555,7 @@ export const api = {
       state.tenders = state.tenders.map((row) => row.id === id ? (result = { ...row, ...patch }) : row);
       return state;
     });
+    notifyTendersChanged();
     return result;
   },
 
@@ -459,6 +565,11 @@ export const api = {
     return filterRows(rows, search, ['title', 'client_name', 'source_tender_id', 'description']);
   },
   createProject: async (data) => {
+    const sourceTenderId = String(data?.source_tender_id || '').trim();
+    if (sourceTenderId) {
+      const existing = (await getState()).projects.find((row) => String(row.source_tender_id || '').trim() === sourceTenderId);
+      if (existing) throw new Error('Tender already added to Projects.');
+    }
     let result;
     await updateSyncedState((state) => {
       result = { id: nextId(state.projects), folder_path: null, ...data, status: data.status || 'Active' };
@@ -647,17 +758,37 @@ export const api = {
     const config = await connection(overrides);
     const snapshot = await downloadServerSnapshot(config);
     let result;
+    let changesSince = 0;
     const notificationsToEmit = [];
+    // New tenders under a bookmarked org are collected here instead of
+    // notified immediately, so a website's first-ever big batch (or just an
+    // org with a lot of activity) can collapse into one message instead of
+    // one per tender — see the post-loop flush below.
+    const newTendersByOrg = new Map();
     await updateState((state) => {
       const bookmarks = new Map(state.tenders.map((row) => [String(row.tender_id || row.id), Boolean(row.is_bookmarked)]));
       const previousById = new Map(state.tenders.map((row) => [String(row.tender_id || row.id), row]));
+      const bookmarkedOrgsSet = new Set(state.bookmarkedOrgs || []);
+      changesSince = Number(state.settings?.last_changes_at) || 0;
       state.websites = Array.isArray(snapshot.websites) ? snapshot.websites : state.websites;
       state.organizations = Array.isArray(snapshot.organizations) ? snapshot.organizations : state.organizations;
       state.tenders = snapshot.tenders.map((row) => {
         const key = String(row.tender_id || row.id);
         const previous = previousById.get(key);
-        if (previous?.is_bookmarked && previous.closing_date !== row.closing_date) {
-          notificationsToEmit.push({ type: 'status', message: `"${row.title || row.tender_id}" was updated.` });
+        if (previous?.is_bookmarked) {
+          // closing_date is covered by the /client/changes feed below; the
+          // local diff owns status + pre-bid/corrigendum, which the server's
+          // tender_history snapshot doesn't track.
+          if (previous.status !== row.status) {
+            notificationsToEmit.push({ type: 'status', message: `"${row.title || row.tender_id}" status changed to ${row.status || 'unknown'}.` });
+          }
+          if ((Number(previous.prebid_count) || 0) !== (Number(row.prebid_count) || 0) || (Number(previous.corrigendum_count) || 0) !== (Number(row.corrigendum_count) || 0)) {
+            notificationsToEmit.push({ type: 'prebid', message: `"${row.title || row.tender_id}" has a new pre-bid or corrigendum.` });
+          }
+        } else if (!previous && row.org_chain && bookmarkedOrgsSet.has(row.org_chain)) {
+          const bucket = newTendersByOrg.get(row.org_chain) || [];
+          bucket.push(row);
+          newTendersByOrg.set(row.org_chain, bucket);
         }
         return { ...row, is_bookmarked: bookmarks.get(key) ?? false };
       });
@@ -669,6 +800,40 @@ export const api = {
       result = { tenders: state.tenders.length, websites: state.websites.length, syncedAt: state.settings.last_sync_at };
       return state;
     });
+    for (const [org, rows] of newTendersByOrg) {
+      if (rows.length > 10) {
+        notificationsToEmit.push({ type: 'new', message: `${rows.length} new tenders added under ${org}.` });
+      } else {
+        rows.forEach((row) => notificationsToEmit.push({ type: 'new', message: `"${row.title || row.tender_id}" added under ${org}.` }));
+      }
+    }
+    // Server-recorded changes for this account's bookmarks (closing-date
+    // changes + new tenders under bookmarked orgs) since our last cursor.
+    // First sync (no cursor) only advances the cursor — no back-catalogue spam.
+    try {
+      const changes = await requestClient(`/client/changes?since=${changesSince}`, {}, overrides);
+      if (changesSince > 0) {
+        (changes?.tenders || []).forEach((t) => {
+          if ((t.changed_fields || []).includes('closing_date')) {
+            notificationsToEmit.push({ type: 'status', message: `"${t.title || `Tender #${t.id}`}" — closing date changed.` });
+          }
+        });
+        for (const [org, items] of Object.entries(changes?.new_by_org || {})) {
+          const list = items || [];
+          if (list.length > 10) {
+            notificationsToEmit.push({ type: 'new', message: `${list.length} new tenders added under ${org}.` });
+          } else {
+            list.forEach((t) => notificationsToEmit.push({ type: 'new', message: `"${t.title || t.tender_id}" added under ${org}.` }));
+          }
+        }
+      }
+      if (changes?.now) {
+        await updateState((state) => {
+          state.settings = { ...state.settings, last_changes_at: changes.now };
+          return state;
+        });
+      }
+    } catch { /* offline / endpoint unavailable — local diff still ran */ }
     if (notificationsToEmit.length) {
       const { addNotification } = useAppStore.getState();
       const time = new Date().toLocaleString();
@@ -676,8 +841,9 @@ export const api = {
     }
     // Reconcile with whatever another device may have pushed since this
     // device's last sync. Runs after the notification diff above (which
-    // intentionally uses this device's own pre-sync bookmark state) and after
-    // the push above (so this device's own edits are never clobbered by it).
+    // intentionally uses this device's own pre-sync bookmark state).
+    // pullUserData flushes any of this device's own not-yet-pushed edits
+    // first, so they're never clobbered by the incoming server copy.
     await api.pullUserData(overrides).catch(() => {});
     return result;
   },
@@ -687,11 +853,17 @@ export const api = {
   // Whole-state blob, last-push-wins: the server just stores whatever this
   // device last sent and hands it back verbatim. Device-specific fields
   // (folder_path, linked_file_path — local filesystem paths) never travel.
-  // Bookmarking a tender/org also flips on a 3-hour server-side scrape
-  // schedule for it, the first time, server-side (see Server UI/server/
-  // client_api.py client_push_sync) — nothing to do here for that part.
+  // Bookmarking a tender/org also flips on a 24-hour server-side scrape
+  // schedule for it (shared across every user who bookmarks it, and clubbed
+  // per website into one scrape run), server-side (see Server UI/server/
+  // client_api.py _reconcile_bookmark_schedules) — nothing to do here for that.
   pushUserData: async (overrides = {}) => {
-    const state = await getState();
+    // getQueuedState (not plain getState) — waits for any in-flight
+    // updateState write (e.g. a bookmark toggle, or syncFromServer's own
+    // tender-replacement write) to actually commit first, so this never
+    // ships an incomplete snapshot that then wipes the missing data on the
+    // next pull. See Client UI/src/lib/db.js.
+    const state = await getQueuedState();
     const orgIdByName = new Map((state.organizations || []).map((row) => [row.name, row.id]));
     const bookmarkedOrgs = state.bookmarkedOrgs || [];
     const { tendersTable, tendersView } = useAppStore.getState();
@@ -713,29 +885,74 @@ export const api = {
         columnWidths: tendersView.tenderColumnWidths || {},
       },
     };
-    return requestClient('/client/sync', { method: 'PUT', body: { data } }, overrides);
+    // Removal delta: what the server last gave us but is gone locally now. The
+    // server unions the rest, so this is the only way a delete propagates.
+    const localBookmarks = _idSet(data.bookmarks);
+    const localOrgs = new Set(bookmarkedOrgs);
+    const localProjectIds = _rowIdSet(data.projects);
+    const localChecklistIds = _rowIdSet(data.checklist);
+    const removed = {
+      bookmarks: [...(_lastServerBlob.bookmarks || [])].map(Number).filter((id) => Number.isFinite(id) && !localBookmarks.has(id)),
+      bookmarkedOrgs: [...(_lastServerBlob.bookmarkedOrgs || [])].filter((name) => !localOrgs.has(name)),
+      projects: [...(_lastServerBlob.projects || [])].map((r) => Number(r?.id)).filter((id) => Number.isFinite(id) && !localProjectIds.has(id)),
+      checklist: [...(_lastServerBlob.checklist || [])].map((r) => Number(r?.id)).filter((id) => Number.isFinite(id) && !localChecklistIds.has(id)),
+    };
+    return requestClient('/client/sync', { method: 'PUT', body: { data, removed } }, overrides);
   },
   pullUserData: async (overrides = {}) => {
+    // Send any not-yet-pushed local edit first — otherwise this pull could
+    // overwrite it with the server's still-stale copy (see flushPendingSyncPush).
+    // If that flush itself fails (e.g. the backend is briefly 502ing), skip
+    // this pull entirely rather than overwrite local state with a server
+    // copy we already know is missing this device's unconfirmed edit — a
+    // retry is already armed, and the next sync will try again.
+    try {
+      await flushPendingSyncPush();
+    } catch {
+      return {};
+    }
     const response = await requestClient('/client/sync', {}, overrides);
     const data = response?.data || {};
+    // Reconcile against the server as authoritative, but keep a local item the
+    // server lacks when it's a genuine unsynced local ADD (present locally,
+    // absent from BOTH the server copy and the last server copy we saw). That
+    // survives a pull that races ahead of this device's own not-yet-confirmed
+    // push; anything the server dropped (a remove from another device, or a
+    // phantom) is let go.
+    const prevServerBookmarks = _idSet(_lastServerBlob.bookmarks);
+    const prevServerOrgs = new Set(_lastServerBlob.bookmarkedOrgs || []);
+    const prevServerProjectIds = _rowIdSet(_lastServerBlob.projects);
+    const prevServerChecklistIds = _rowIdSet(_lastServerBlob.checklist);
     await updateState((state) => {
-      const bookmarkedIds = new Set((data.bookmarks || []).map((value) => Number(value)));
       if (Array.isArray(data.bookmarks)) {
-        state.tenders = state.tenders.map((row) => ({ ...row, is_bookmarked: bookmarkedIds.has(Number(row.id)) }));
+        const serverIds = _idSet(data.bookmarks);
+        state.tenders = state.tenders.map((row) => {
+          const id = Number(row.id);
+          const localAdd = row.is_bookmarked && !serverIds.has(id) && !prevServerBookmarks.has(id);
+          return { ...row, is_bookmarked: serverIds.has(id) || localAdd };
+        });
       }
-      if (Array.isArray(data.bookmarkedOrgs)) state.bookmarkedOrgs = data.bookmarkedOrgs;
+      if (Array.isArray(data.bookmarkedOrgs)) {
+        const localAdds = (state.bookmarkedOrgs || []).filter((n) => !prevServerOrgs.has(n));
+        state.bookmarkedOrgs = [...new Set([...data.bookmarkedOrgs, ...localAdds])];
+      }
       if (Array.isArray(data.templates)) state.templates = data.templates;
       if (Array.isArray(data.templateItems)) state.templateItems = data.templateItems;
       if (Array.isArray(data.projects)) {
         const localFolders = new Map(state.projects.map((row) => [row.id, row.folder_path]));
-        state.projects = data.projects.map((row) => ({ ...row, folder_path: localFolders.get(row.id) || null }));
+        const serverIds = _rowIdSet(data.projects);
+        const localAdds = state.projects.filter((r) => !serverIds.has(Number(r.id)) && !prevServerProjectIds.has(Number(r.id)));
+        state.projects = [...data.projects, ...localAdds].map((row) => ({ ...row, folder_path: localFolders.get(row.id) || row.folder_path || null }));
       }
       if (Array.isArray(data.checklist)) {
         const localPaths = new Map(state.checklist.map((row) => [row.id, row.linked_file_path]));
-        state.checklist = data.checklist.map((row) => ({ ...row, linked_file_path: localPaths.get(row.id) || '' }));
+        const serverIds = _rowIdSet(data.checklist);
+        const localAdds = state.checklist.filter((r) => !serverIds.has(Number(r.id)) && !prevServerChecklistIds.has(Number(r.id)));
+        state.checklist = [...data.checklist, ...localAdds].map((row) => ({ ...row, linked_file_path: localPaths.get(row.id) || row.linked_file_path || '' }));
       }
       return state;
     });
+    _lastServerBlob = data;
     const columnPrefs = data.tenderColumnPrefs;
     if (columnPrefs) {
       const store = useAppStore.getState();
@@ -751,11 +968,11 @@ export const api = {
 
 // Column customization lives in the Zustand store (Client UI/src/lib/store.ts),
 // separate from the IndexedDB `state` that updateSyncedState() covers — so it
-// needs its own debounced push whenever it changes, reusing the same 2s
+// needs its own near-instant push whenever it changes, reusing the same
 // collapse-rapid-edits behavior and the same offline-tolerant swallowed catch.
 let _columnSyncPushTimer = null;
 useAppStore.subscribe((state, prevState) => {
   if (state.tendersTable === prevState.tendersTable && state.tendersView.tenderColumnWidths === prevState.tendersView.tenderColumnWidths) return;
   clearTimeout(_columnSyncPushTimer);
-  _columnSyncPushTimer = setTimeout(() => { api.pushUserData().catch(() => {}); }, 2000);
+  _columnSyncPushTimer = setTimeout(() => { api.pushUserData().catch(() => {}); }, SYNC_PUSH_DELAY_MS);
 });

@@ -394,6 +394,88 @@ class ClientApiTests(unittest.TestCase):
         self.assertEqual(pulled.json()["data"], blob)
         self.assertGreater(pulled.json()["updated_at"], 0)
 
+    def test_sync_push_preserves_keys_the_client_omitted(self):
+        # A thin/stale push (e.g. the mobile app on a fresh origin) must not
+        # wipe desktop-owned sections it never sends.
+        first = self.client.put(
+            "/client/sync",
+            json={"data": {"templates": [{"id": 1, "template_name": "Standard"}], "bookmarks": [1]}},
+            headers=self.headers,
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.client.put(
+            "/client/sync", json={"data": {"bookmarks": [1, 2]}}, headers=self.headers
+        )
+        self.assertEqual(second.status_code, 200, second.text)
+        merged = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(merged["templates"], [{"id": 1, "template_name": "Standard"}])
+        self.assertEqual(merged["bookmarks"], [1, 2])
+        # An explicit empty value is still a real edit and clears that key.
+        third = self.client.put(
+            "/client/sync", json={"data": {"templates": []}}, headers=self.headers
+        )
+        self.assertEqual(third.status_code, 200, third.text)
+        after = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(after["templates"], [])
+        self.assertEqual(after["bookmarks"], [1, 2])
+
+    def test_sync_push_unions_bookmark_sets_across_devices(self):
+        # Device A bookmarks tender 1; device B (which only knows about 2)
+        # pushes [2]. The server must end up with both — a partial view can't
+        # shrink the set.
+        self.client.put("/client/sync", json={"data": {"bookmarks": [1]}}, headers=self.headers)
+        self.client.put("/client/sync", json={"data": {"bookmarks": [2]}}, headers=self.headers)
+        merged = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(merged["bookmarks"], [1, 2])
+
+    def test_sync_push_removes_only_what_the_removed_delta_names(self):
+        self.client.put("/client/sync", json={"data": {"bookmarks": [1, 2]}}, headers=self.headers)
+        # Un-bookmark 1 on this device: it drops from local and is named in `removed`.
+        self.client.put(
+            "/client/sync",
+            json={"data": {"bookmarks": [2]}, "removed": {"bookmarks": [1]}},
+            headers=self.headers,
+        )
+        merged = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(merged["bookmarks"], [2])
+
+    def test_sync_push_drops_bookmarks_for_tenders_that_do_not_exist(self):
+        self.client.put(
+            "/client/sync", json={"data": {"bookmarks": [1, 999999]}}, headers=self.headers
+        )
+        merged = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(merged["bookmarks"], [1])  # 999999 is not a real tender
+
+    def test_sync_push_merges_projects_by_id_and_honours_removed(self):
+        self.client.put(
+            "/client/sync",
+            json={"data": {"projects": [{"id": 1, "title": "A"}]}},
+            headers=self.headers,
+        )
+        self.client.put(
+            "/client/sync",
+            json={"data": {"projects": [{"id": 2, "title": "B"}]}},
+            headers=self.headers,
+        )
+        merged = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual({p["id"] for p in merged["projects"]}, {1, 2})
+        self.client.put(
+            "/client/sync",
+            json={"data": {"projects": [{"id": 2, "title": "B2"}]}, "removed": {"projects": [1]}},
+            headers=self.headers,
+        )
+        after = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(after["projects"], [{"id": 2, "title": "B2"}])
+
+    def test_sync_push_derives_bookmarked_org_ids_from_names(self):
+        self.client.put(
+            "/client/sync",
+            json={"data": {"bookmarkedOrgs": ["Road Authority"], "bookmarkedOrgIds": [999]}},
+            headers=self.headers,
+        )
+        merged = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(merged["bookmarkedOrgIds"], [1])  # resolved from the name, not the bogus 999
+
     def test_sync_push_requires_auth(self):
         response = self.client.put("/client/sync", json={"data": {}})
         self.assertEqual(response.status_code, 401)

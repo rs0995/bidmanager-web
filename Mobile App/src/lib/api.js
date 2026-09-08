@@ -48,5 +48,9 @@ export const api = {
   // ── Cross-device sync blob (see lib/sync.js for the merge-preserving
   // read-modify-write this app performs against it) ───────────────────
   getSync: () => request('/client/sync'),
-  putSync: (data) => request('/client/sync', { method: 'PUT', body: { data } }),
+  putSync: (data, removed) => request('/client/sync', { method: 'PUT', body: { data, removed } }),
+
+  // Server-recorded changes to this user's bookmarked tenders/orgs since the
+  // epoch-seconds `since` returned as `now` on the previous call.
+  changes: (since) => request(`/client/changes?since=${encodeURIComponent(Number(since) || 0)}`),
 };

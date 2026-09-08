@@ -419,6 +419,63 @@ class ClientApiTests(unittest.TestCase):
         self.assertEqual(after["templates"], [])
         self.assertEqual(after["bookmarks"], [1, 2])
 
+    def test_sync_push_unions_bookmark_sets_across_devices(self):
+        # Device A bookmarks tender 1; device B (which only knows about 2)
+        # pushes [2]. The server must end up with both — a partial view can't
+        # shrink the set.
+        self.client.put("/client/sync", json={"data": {"bookmarks": [1]}}, headers=self.headers)
+        self.client.put("/client/sync", json={"data": {"bookmarks": [2]}}, headers=self.headers)
+        merged = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(merged["bookmarks"], [1, 2])
+
+    def test_sync_push_removes_only_what_the_removed_delta_names(self):
+        self.client.put("/client/sync", json={"data": {"bookmarks": [1, 2]}}, headers=self.headers)
+        # Un-bookmark 1 on this device: it drops from local and is named in `removed`.
+        self.client.put(
+            "/client/sync",
+            json={"data": {"bookmarks": [2]}, "removed": {"bookmarks": [1]}},
+            headers=self.headers,
+        )
+        merged = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(merged["bookmarks"], [2])
+
+    def test_sync_push_drops_bookmarks_for_tenders_that_do_not_exist(self):
+        self.client.put(
+            "/client/sync", json={"data": {"bookmarks": [1, 999999]}}, headers=self.headers
+        )
+        merged = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(merged["bookmarks"], [1])  # 999999 is not a real tender
+
+    def test_sync_push_merges_projects_by_id_and_honours_removed(self):
+        self.client.put(
+            "/client/sync",
+            json={"data": {"projects": [{"id": 1, "title": "A"}]}},
+            headers=self.headers,
+        )
+        self.client.put(
+            "/client/sync",
+            json={"data": {"projects": [{"id": 2, "title": "B"}]}},
+            headers=self.headers,
+        )
+        merged = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual({p["id"] for p in merged["projects"]}, {1, 2})
+        self.client.put(
+            "/client/sync",
+            json={"data": {"projects": [{"id": 2, "title": "B2"}]}, "removed": {"projects": [1]}},
+            headers=self.headers,
+        )
+        after = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(after["projects"], [{"id": 2, "title": "B2"}])
+
+    def test_sync_push_derives_bookmarked_org_ids_from_names(self):
+        self.client.put(
+            "/client/sync",
+            json={"data": {"bookmarkedOrgs": ["Road Authority"], "bookmarkedOrgIds": [999]}},
+            headers=self.headers,
+        )
+        merged = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(merged["bookmarkedOrgIds"], [1])  # resolved from the name, not the bogus 999
+
     def test_sync_push_requires_auth(self):
         response = self.client.put("/client/sync", json={"data": {}})
         self.assertEqual(response.status_code, 401)
@@ -498,7 +555,12 @@ class ClientApiTests(unittest.TestCase):
     def test_last_bookmarker_removal_deletes_the_user_job(self):
         self.client.put("/client/sync", json={"data": {"bookmarkedOrgIds": [2]}}, headers=self.headers)
         self.assertIsNotNone(self._user_job())
-        self.client.put("/client/sync", json={"data": {"bookmarkedOrgIds": []}}, headers=self.headers)
+        # Real clients signal a removal with the `removed` delta, not a bare [].
+        self.client.put(
+            "/client/sync",
+            json={"data": {"bookmarkedOrgIds": []}, "removed": {"bookmarkedOrgIds": [2]}},
+            headers=self.headers,
+        )
         self.assertIsNone(self._user_job())
 
     def test_reconcile_respects_a_pause_and_a_suppression(self):

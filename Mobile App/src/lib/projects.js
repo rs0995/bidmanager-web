@@ -2,10 +2,20 @@ import { useSyncExternalStore } from 'react';
 import { schedulePush } from './sync.js';
 import { addAlert } from './alerts.js';
 
-// Local-first projects + checklist, mirroring the shape of the desktop
-// Client UI's `project`/`checklist` rows (Client UI/src/lib/api.js) closely
-// enough that /client/sync's shared blob can carry them cross-device (see
-// sync.js). There is no /client/* endpoint for projects — same as desktop.
+// Local-first projects + checklist. Field names are made to match the
+// desktop Client UI's rows EXACTLY (Client UI/src/App.jsx), because both
+// apps read/write the same /client/sync `projects`/`checklist` blob fields —
+// a mismatched field name here silently renders as "-" on the other app
+// rather than erroring, so this is not just a style choice.
+//   Project:        { id, title, client_name, source_tender_id,
+//                      project_value, emd, deadline, prebid, status,
+//                      description }
+//   Checklist item: { id, project_id, sr_no, req_file_name, description,
+//                      subfolder, status: 'Pending' | 'Completed',
+//                      attachment }   (attachment is mobile-only metadata;
+//                      desktop's equivalent, linked_file_path, is a local
+//                      file path desktop sets itself and this app never
+//                      touches)
 //
 // File attachments are NOT persisted (a File object can't survive
 // localStorage/JSON): only {name, size, type} metadata is stored, and the
@@ -61,7 +71,9 @@ let checklistViewCache = new Map();
 export function getChecklist(projectId) {
   const key = Number(projectId);
   if (!checklistViewCache.has(key)) {
-    checklistViewCache.set(key, checklistCache.filter((row) => row.project_id === key));
+    const rows = checklistCache.filter((row) => row.project_id === key);
+    rows.sort((a, b) => (a.sr_no || 0) - (b.sr_no || 0));
+    checklistViewCache.set(key, rows);
   }
   return checklistViewCache.get(key);
 }
@@ -73,7 +85,7 @@ export function createProjectFromTender(tender) {
   const project = {
     id: nextProjectId++,
     title: tender.title || tender.tender_id || 'Untitled project',
-    client: tender.organization || tender.website_name || '',
+    client_name: tender.organization || tender.website_name || '',
     source_tender_id: tender.tender_id || '',
     project_value: tender.tender_value || 0,
     emd: tender.emd || 0,
@@ -97,18 +109,20 @@ export function archiveProject(id) {
 }
 
 export function folderNames(projectId) {
-  const used = getChecklist(projectId).map((row) => row.folder);
+  const used = getChecklist(projectId).map((row) => row.subfolder);
   return [...new Set([...DEFAULT_FOLDERS, ...used])];
 }
 
-export function addChecklistItem(projectId, { name, folder, note }) {
+export function addChecklistItem(projectId, { req_file_name, subfolder, description }) {
+  const siblings = getChecklist(projectId);
   const item = {
     id: nextItemId++,
     project_id: Number(projectId),
-    name,
-    folder: folder || DEFAULT_FOLDERS[0],
-    note: note || '',
-    done: false,
+    sr_no: siblings.length + 1,
+    req_file_name,
+    subfolder: subfolder || DEFAULT_FOLDERS[0],
+    description: description || '',
+    status: 'Pending',
     attachment: null, // { name, size, type } — see fileObjects for the live File
   };
   checklistCache = [...checklistCache, item];
@@ -116,22 +130,22 @@ export function addChecklistItem(projectId, { name, folder, note }) {
   return item;
 }
 
-export function toggleChecklistItem(itemId, done) {
+export function setChecklistItemStatus(itemId, status) {
   let justCompleted = false;
   checklistCache = checklistCache.map((row) => {
     if (row.id !== Number(itemId)) return row;
-    justCompleted = done && !row.done;
-    return { ...row, done };
+    justCompleted = status === 'Completed' && row.status !== 'Completed';
+    return { ...row, status };
   });
   persist();
-  maybeNotifyProjectComplete(itemId, justCompleted);
+  if (justCompleted) maybeNotifyProjectComplete(itemId);
 }
 
 function maybeNotifyProjectComplete(itemId) {
   const item = checklistCache.find((row) => row.id === Number(itemId));
   if (!item) return;
   const siblings = getChecklist(item.project_id);
-  if (siblings.length > 0 && siblings.every((row) => row.done)) {
+  if (siblings.length > 0 && siblings.every((row) => row.status === 'Completed')) {
     const project = getProject(item.project_id);
     addAlert({ kind: 'success', message: `"${project?.title || 'Project'}" checklist reached 100%.` });
   }
@@ -141,16 +155,17 @@ export function attachFile(itemId, file) {
   fileObjects.set(Number(itemId), file);
   checklistCache = checklistCache.map((row) => (
     row.id === Number(itemId)
-      ? { ...row, attachment: { name: file.name, size: file.size, type: file.type }, done: true }
+      ? { ...row, attachment: { name: file.name, size: file.size, type: file.type }, status: 'Completed' }
       : row
   ));
   persist();
+  maybeNotifyProjectComplete(itemId);
 }
 
 export function removeAttachment(itemId) {
   fileObjects.delete(Number(itemId));
   checklistCache = checklistCache.map((row) => (
-    row.id === Number(itemId) ? { ...row, attachment: null, done: false } : row
+    row.id === Number(itemId) ? { ...row, attachment: null, status: 'Pending' } : row
   ));
   persist();
 }
@@ -169,18 +184,19 @@ export function deleteChecklistItem(itemId) {
 // from another device. Local-only fields (attachment metadata refers to a
 // File that only exists on the device that attached it) are dropped on pull
 // from a foreign write, but preserved when the row is this device's own.
-export function mergeFromServer(serverProjects, serverChecklist) {
-  // Additive merge, not a replace: a project/checklist row created locally
-  // seconds ago may not have round-tripped through a successful push yet
-  // (schedulePush debounces 2s and silently swallows failures), so a pull
-  // that races ahead of it must not delete it. Anything the server DOES
-  // know about wins (it's the merged, cross-device truth); anything only
-  // known locally is kept alongside it.
+export function mergeFromServer(serverProjects, serverChecklist, prevBlob = {}) {
+  // Server is authoritative, but a row created locally that hasn't round-
+  // tripped through a successful push yet must survive a pull that races
+  // ahead of it. "Hasn't synced yet" = the id is absent from BOTH the server
+  // copy and the LAST server copy we saw (prevBlob) — i.e. a genuine local
+  // add, not something the server deliberately deleted.
+  const prevProjIds = new Set((prevBlob.projects || []).map((r) => r && r.id));
+  const prevChkIds = new Set((prevBlob.checklist || []).map((r) => r && r.id));
   if (Array.isArray(serverProjects)) {
     const localById = new Map(projectsCache.map((row) => [row.id, row]));
     const merged = serverProjects.map((row) => ({ ...localById.get(row.id), ...row }));
     const serverIds = new Set(serverProjects.map((row) => row.id));
-    const localOnly = projectsCache.filter((row) => !serverIds.has(row.id));
+    const localOnly = projectsCache.filter((row) => !serverIds.has(row.id) && !prevProjIds.has(row.id));
     projectsCache = [...merged, ...localOnly];
     nextProjectId = 1 + projectsCache.reduce((m, p) => Math.max(m, p.id), 0);
   }
@@ -193,7 +209,7 @@ export function mergeFromServer(serverProjects, serverChecklist) {
       return { ...row, attachment: local?.attachment ?? row.attachment ?? null };
     });
     const serverIds = new Set(serverChecklist.map((row) => row.id));
-    const localOnly = checklistCache.filter((row) => !serverIds.has(row.id));
+    const localOnly = checklistCache.filter((row) => !serverIds.has(row.id) && !prevChkIds.has(row.id));
     checklistCache = [...merged, ...localOnly];
     nextItemId = 1 + checklistCache.reduce((m, c) => Math.max(m, c.id), 0);
   }

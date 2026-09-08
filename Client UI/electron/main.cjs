@@ -150,7 +150,7 @@ ipcMain.handle('desktop:client-api-request', async (_event, payload = {}) => {
     const route = String(payload.route || '');
     if (!route.startsWith('/client/')) throw new Error('Only /client/* API routes are allowed.');
     const method = String(payload.method || 'GET').toUpperCase();
-    if (!['GET', 'POST'].includes(method)) throw new Error('Unsupported client API method.');
+    if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) throw new Error('Unsupported client API method.');
     // /client/auth/register and /client/auth/login are the only routes that
     // legitimately have no key yet — that's the point of signing in.
     const isAuthRoute = route.startsWith('/client/auth/register') || route.startsWith('/client/auth/login');
@@ -159,7 +159,7 @@ ipcMain.handle('desktop:client-api-request', async (_event, payload = {}) => {
     const headers = { Accept: 'application/json' };
     if (clientKey) headers['x-client-key'] = clientKey;
     const options = { method, headers };
-    if (method === 'POST') {
+    if (method !== 'GET') {
       headers['Content-Type'] = 'application/json';
       options.body = JSON.stringify(payload.body ?? {});
     }
@@ -191,7 +191,21 @@ ipcMain.handle('desktop:download-file', async (_event, payload = {}) => {
     const destinationPath = String(payload.destinationPath || '').trim();
     if (!destinationPath) throw new Error('Destination path is empty.');
     const destination = path.resolve(destinationPath);
-    const response = await net.fetch(url);
+    // Without a timeout, a hung/unresponsive backend leaves this fetch never
+    // resolving — the renderer's mutation stays "pending" forever, silently
+    // disabling that tender's Download button with no error and no way to
+    // retry short of restarting the app.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000);
+    let response;
+    try {
+      response = await net.fetch(url, { signal: controller.signal });
+    } catch (fetchError) {
+      if (fetchError?.name === 'AbortError') throw new Error('Download timed out.');
+      throw fetchError;
+    } finally {
+      clearTimeout(timeout);
+    }
     if (!response.ok) throw new Error(`Download failed with HTTP ${response.status}.`);
     const buffer = Buffer.from(await response.arrayBuffer());
     fs.mkdirSync(path.dirname(destination), { recursive: true });

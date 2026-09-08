@@ -237,6 +237,11 @@ MAX_SYNC_PAYLOAD_BYTES = 2 * 1024 * 1024
 
 class SyncPushRequest(BaseModel):
     data: dict[str, Any]
+    # Optional per-collection removal deltas: ids/names the pushing client had
+    # in the last blob the server gave it but has since deleted locally. Lets
+    # the additive merge below honour a real removal without a client being
+    # able to wipe a collection just by holding a stale/partial copy.
+    removed: dict[str, Any] | None = None
 
 
 def _coerce_id_set(values: Any) -> set[int]:
@@ -457,6 +462,97 @@ def client_pull_sync(user_id: int = Depends(require_client_user)) -> dict[str, A
     return {"data": parsed, "updated_at": float(data.get("updated_at") or 0)}
 
 
+# Collections in the sync blob that must merge ADDITIVELY across devices — a
+# client holding only a subset (fresh install, was offline, dev origin) must
+# never be able to shrink them just by pushing. Removals travel as an explicit
+# `removed` delta instead.
+_SYNC_ID_SET_KEYS = ("bookmarks", "bookmarkedOrgIds")   # integer ids
+_SYNC_NAME_SET_KEYS = ("bookmarkedOrgs",)               # strings
+_SYNC_ROW_KEYS = ("projects", "checklist")              # list[dict] keyed by "id"
+
+
+def _row_id(row: Any) -> Any:
+    if isinstance(row, dict):
+        try:
+            return int(row.get("id"))
+        except (TypeError, ValueError):
+            return row.get("id")
+    return None
+
+
+def _merge_sync_blob(stored: dict, incoming: dict, removed: dict, conn) -> dict:
+    merged = dict(stored)
+    removed = removed if isinstance(removed, dict) else {}
+
+    for key in _SYNC_ID_SET_KEYS:
+        if key not in incoming:
+            continue
+        union = _coerce_id_set(stored.get(key)) | _coerce_id_set(incoming.get(key))
+        union -= _coerce_id_set(removed.get(key))
+        merged[key] = sorted(union)
+
+    for key in _SYNC_NAME_SET_KEYS:
+        if key not in incoming:
+            continue
+        gone = {str(v) for v in (removed.get(key) or [])}
+        names = {str(v) for v in (stored.get(key) or [])} | {str(v) for v in (incoming.get(key) or [])}
+        merged[key] = sorted(names - gone)
+
+    for key in _SYNC_ROW_KEYS:
+        if key not in incoming:
+            continue
+        gone = _coerce_id_set(removed.get(key))
+        by_id: dict[Any, Any] = {}
+        order: list[Any] = []
+        for row in list(stored.get(key) or []) + list(incoming.get(key) or []):
+            rid = _row_id(row)
+            if rid in gone:
+                continue
+            if rid not in by_id:
+                order.append(rid)
+            by_id[rid] = row  # incoming (later) wins for the same id
+        merged[key] = [by_id[rid] for rid in order]
+
+    for key, value in incoming.items():
+        if key in _SYNC_ID_SET_KEYS or key in _SYNC_NAME_SET_KEYS or key in _SYNC_ROW_KEYS:
+            continue
+        merged[key] = value  # key-preserving: incoming wins, omitted keys kept
+
+    # Supplement bookmarkedOrgIds with ids resolved from the merged names, so a
+    # device that only sent names still contributes to the id set.
+    names = merged.get("bookmarkedOrgs")
+    if isinstance(names, list) and names and ("bookmarkedOrgs" in incoming or "bookmarkedOrgIds" in incoming):
+        placeholders = ",".join("?" for _ in names)
+        resolved = {
+            int(r[0])
+            for r in conn.execute(
+                f"SELECT id FROM organizations WHERE name IN ({placeholders})",
+                tuple(str(n) for n in names),
+            ).fetchall()
+        }
+        gone = _coerce_id_set((removed or {}).get("bookmarkedOrgIds"))
+        merged["bookmarkedOrgIds"] = sorted(
+            (_coerce_id_set(merged.get("bookmarkedOrgIds")) | resolved) - gone
+        )
+
+    # Phantom cleanup: drop bookmarked tender / org ids that no longer exist here.
+    for key, table in (("bookmarks", "tenders"), ("bookmarkedOrgIds", "organizations")):
+        ids = _coerce_id_set(merged.get(key))
+        if not ids:
+            continue
+        placeholders = ",".join("?" for _ in ids)
+        real = {
+            int(r[0])
+            for r in conn.execute(
+                f"SELECT id FROM {table} WHERE id IN ({placeholders})", tuple(ids)
+            ).fetchall()
+        }
+        if real != ids:
+            merged[key] = sorted(real)
+
+    return merged
+
+
 @router.put("/sync", dependencies=[Depends(require_client_user)])
 def client_push_sync(body: SyncPushRequest, user_id: int = Depends(require_client_user)) -> dict[str, Any]:
     now = time.time()
@@ -472,12 +568,12 @@ def client_push_sync(body: SyncPushRequest, user_id: int = Depends(require_clien
                     stored = parsed
             except (TypeError, ValueError):
                 stored = {}
-        # Key-preserving merge: the incoming blob wins for every key it
-        # carries, but a key it OMITS is kept from the stored blob. This
-        # stops a thin/stale push from one client (e.g. the mobile app on a
-        # fresh origin) from wiping desktop-owned sections like `templates`.
-        # An explicit `key: []` still clears that key — that's a real edit.
-        merged = {**stored, **(body.data if isinstance(body.data, dict) else {})}
+        incoming = body.data if isinstance(body.data, dict) else {}
+        # Additive merge: bookmark sets union (minus an explicit `removed`
+        # delta), projects/checklist merge by id, everything else keeps a key
+        # the client omitted. A stale/partial push can add and can remove what
+        # it names, but can't silently drop the rest.
+        merged = _merge_sync_blob(stored, incoming, body.removed or {}, conn)
         payload = json.dumps(merged, ensure_ascii=False)
         if len(payload.encode("utf-8")) > MAX_SYNC_PAYLOAD_BYTES:
             raise HTTPException(413, "Sync payload is too large.")

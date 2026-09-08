@@ -14,7 +14,6 @@ import { addAlert } from './alerts.js';
 // lastBlob is PERSISTED (bm.syncBlob) so a reload doesn't start from {} and
 // let a push before the first pull blank out desktop-owned fields.
 const SYNC_BLOB_KEY = 'bm.syncBlob';
-const SYNC_READY_KEY = 'bm.syncReady';          // '1' once a pull has merged the server blob in
 const SNAPSHOT_KEY = 'bm.tenderSnapshot';       // { [id]: { closing_date, status, prebid_count, corrigendum_count } }
 const LAST_CHANGES_KEY = 'bm.lastChangesAt';    // epoch seconds cursor for GET /client/changes
 
@@ -30,46 +29,65 @@ function setLastBlob(blob) {
   writeJSON(SYNC_BLOB_KEY, lastBlob);
 }
 
-// This install must PULL the server's blob and merge it in before it is
-// allowed to PUSH — otherwise a fresh / dev-mode / offline origin whose
-// localStorage holds a stale `bm.bookmarks` / `bm.projects` would ship that
-// as authoritative and the server (a blind whole-blob replace) would clobber
-// the account. Persisted so a reload doesn't re-open the push gate.
-let syncReady = false;
-try { syncReady = localStorage.getItem(SYNC_READY_KEY) === '1'; } catch { /* private mode */ }
+// A sync is always PULL -> reconcile -> PUSH. A push never fires before a
+// /client/sync GET has succeeded this session, so a device that made changes
+// while offline / not-yet-synced fetches the server's copy and merges into it
+// first, instead of shipping a stale/partial blob. Session-scoped (not
+// persisted) on purpose — every launch re-pulls before it pushes.
+let pulledThisSession = false;
+let pullInFlight = null;
 
 // ── Push ─────────────────────────────────────────────────────────────────
-function buildPushData() {
+function idsOf(rows) {
+  return (rows || []).map((r) => Number(r && r.id)).filter((id) => Number.isFinite(id));
+}
+
+function buildPushBody() {
   const orgIdByName = getOrgIdByName();
   const bookmarkedOrgs = [...getBookmarkedOrgs()];
-  return {
+  const localBm = getBookmarks();
+  const localOrg = getBookmarkedOrgs();
+  const { projects, checklist } = projectsForSync();
+  const localProjIds = new Set(idsOf(projects));
+  const localChkIds = new Set(idsOf(checklist));
+  const data = {
     ...lastBlob,
-    bookmarks: [...getBookmarks()],
+    bookmarks: [...localBm],
     bookmarkedOrgs,
     bookmarkedOrgIds: bookmarkedOrgs.map((n) => orgIdByName[n]).filter((id) => Number.isFinite(id)),
-    ...projectsForSync(),
+    projects,
+    checklist,
   };
+  delete data.removed;
+  // Removal delta: what the last server blob had but is gone locally now —
+  // the server unions everything else, so this is the only way a delete
+  // propagates.
+  const removed = {
+    bookmarks: (lastBlob.bookmarks || []).map(Number).filter((id) => Number.isFinite(id) && !localBm.has(id)),
+    bookmarkedOrgs: (lastBlob.bookmarkedOrgs || []).filter((n) => !localOrg.has(n)),
+    projects: idsOf(lastBlob.projects).filter((id) => !localProjIds.has(id)),
+    checklist: idsOf(lastBlob.checklist).filter((id) => !localChkIds.has(id)),
+  };
+  return { data, removed };
 }
 
 let pushTimer = null;
 let inFlightPush = null;
 
 export function schedulePush() {
-  if (!syncReady) return;   // not reconciled with the server yet — see syncReady
   clearTimeout(pushTimer);
   pushTimer = setTimeout(() => { flushPush(); }, 2000);
 }
 
-// Run any pending push immediately and return its promise. Called before
-// every pull (desktop's flush-before-pull) and on tab hide, so a local
-// edit made in the debounce window is never clobbered by the server copy.
+// Run any pending push now. If we haven't pulled yet this session, pull &
+// reconcile first (its trailing flushPush sends the merged result).
 export function flushPush() {
-  if (!syncReady) return Promise.resolve();   // never push before the first pull
   clearTimeout(pushTimer);
   pushTimer = null;
-  const data = buildPushData();
+  if (!pulledThisSession) return pullBookmarks();
+  const { data, removed } = buildPushBody();
   setLastBlob(data);
-  inFlightPush = api.putSync(data)
+  inFlightPush = api.putSync(data, removed)
     .catch(() => { /* offline-tolerant: local write already succeeded */ })
     .finally(() => { inFlightPush = null; });
   return inFlightPush;
@@ -77,36 +95,39 @@ export function flushPush() {
 
 // ── Pull ─────────────────────────────────────────────────────────────────
 export async function pullBookmarks() {
-  if (syncReady) await flushPush();   // first run: nothing safe to push yet
+  if (pullInFlight) { await pullInFlight; return; }
+  pullInFlight = (async () => {
+    const res = await api.getSync().catch(() => null);
+    if (!res) return;   // offline — stay local-only; a later pull reconciles + pushes
 
-  const res = await api.getSync().catch(() => null);
-  // Server unreachable — stay local-only and NOT ready, so a later edit can't
-  // push a blob we never reconciled. (Don't blank lastBlob here either.)
-  if (!res) return;
+    const blob = res.data || {};
+    const prev = lastBlob;
 
-  const blob = res.data || {};
-  setLastBlob(blob);
+    if (Array.isArray(blob.bookmarks)) {
+      // server is authoritative, but keep a local bookmark that is a genuine
+      // unsynced ADD (not on the server AND not in the last server blob we
+      // saw). Drop anything the server dropped — real removals + phantoms.
+      const serverSet = new Set(blob.bookmarks.map(Number));
+      const prevSet = new Set((prev.bookmarks || []).map(Number));
+      const localAdds = [...getBookmarks()].filter((id) => !serverSet.has(id) && !prevSet.has(id));
+      setBookmarks([...serverSet, ...localAdds]);
+    }
+    if (Array.isArray(blob.bookmarkedOrgs)) {
+      const serverSet = new Set(blob.bookmarkedOrgs);
+      const prevSet = new Set(prev.bookmarkedOrgs || []);
+      const localAdds = [...getBookmarkedOrgs()].filter((n) => !serverSet.has(n) && !prevSet.has(n));
+      setBookmarkedOrgs([...serverSet, ...localAdds]);
+    }
+    mergeProjectsFromServer(blob.projects, blob.checklist, prev);
 
-  if (Array.isArray(blob.bookmarks)) {
-    // Union with the current local set — belt-and-braces against a push
-    // that failed just before this pull.
-    const merged = new Set([...getBookmarks(), ...blob.bookmarks.map(Number)]);
-    setBookmarks([...merged]);
-  }
-  if (Array.isArray(blob.bookmarkedOrgs)) {
-    const merged = new Set([...getBookmarkedOrgs(), ...blob.bookmarkedOrgs]);
-    setBookmarkedOrgs([...merged]);
-  }
-  mergeProjectsFromServer(blob.projects, blob.checklist);
+    setLastBlob(blob);
+    pulledThisSession = true;
+  })().finally(() => { pullInFlight = null; });
+  await pullInFlight;
 
-  if (!syncReady) {
-    // The server blob is now merged in — pushes are safe from here on.
-    syncReady = true;
-    try { localStorage.setItem(SYNC_READY_KEY, '1'); } catch { /* private mode */ }
-    // Propagate anything the union just brought together (a local-only
-    // bookmark/project the server didn't have yet).
-    schedulePush();
-  }
+  // Reconciled — push our merged state (adds the other device should see +
+  // the `removed` delta). Skipped if the pull failed (still not ready).
+  if (pulledThisSession) await flushPush();
 }
 
 // ── Full "Sync now" (More screen + Overview banner) ──────────────────────
