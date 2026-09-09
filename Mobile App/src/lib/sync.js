@@ -103,10 +103,11 @@ async function doPull() {
   if (!res) return false;
   const blob = res.data || {};
 
-  // Server is authoritative — replace local user-data with its copy.
-  if (Array.isArray(blob.bookmarks)) setBookmarks(blob.bookmarks.map(Number));
-  if (Array.isArray(blob.bookmarkedOrgs)) setBookmarkedOrgs(blob.bookmarkedOrgs);
-  mergeProjectsFromServer(blob.projects, blob.checklist);
+  // Server is the source of truth — HARD-MIRROR local user-data to its copy.
+  // A collection the server blob omits is cleared locally too.
+  setBookmarks((blob.bookmarks || []).map(Number));
+  setBookmarkedOrgs(blob.bookmarkedOrgs || []);
+  mergeProjectsFromServer(blob.projects || [], blob.checklist || []);
 
   setLastBlob(blob);
   if (res.updated_at) setBase(res.updated_at);

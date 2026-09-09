@@ -974,38 +974,34 @@ export const api = {
     }
     const response = await requestClient('/client/sync', {}, overrides);
     const data = response?.data || {};
-    // The server is authoritative and flushPendingSyncPush() above already sent
-    // this device's queued edits, so this is a straight REPLACE from the
-    // server copy. Device-local filesystem paths (folder_path /
-    // linked_file_path) are carried over by id.
+    // The server is the source of truth: a pull HARD-MIRRORS local user-data
+    // to the server blob — every synced collection is set unconditionally,
+    // defaulting to empty, so a key the server omits (or a "Reset synced
+    // data") clears the stale local copy too. Device-local filesystem paths
+    // (folder_path / linked_file_path) are carried over by id.
     await updateState((state) => {
-      if (Array.isArray(data.bookmarks)) {
-        const serverIds = _idSet(data.bookmarks);
-        state.tenders = state.tenders.map((row) => ({ ...row, is_bookmarked: serverIds.has(Number(row.id)) }));
-      }
-      if (Array.isArray(data.bookmarkedOrgs)) state.bookmarkedOrgs = [...data.bookmarkedOrgs];
-      if (Array.isArray(data.templates)) state.templates = data.templates;
-      if (Array.isArray(data.templateItems)) state.templateItems = data.templateItems;
-      if (Array.isArray(data.projects)) {
-        const localFolders = new Map(state.projects.map((row) => [row.id, row.folder_path]));
-        state.projects = data.projects.map((row) => ({ ...row, folder_path: localFolders.get(row.id) || row.folder_path || null }));
-      }
-      if (Array.isArray(data.checklist)) {
-        const localPaths = new Map(state.checklist.map((row) => [row.id, row.linked_file_path]));
-        state.checklist = data.checklist.map((row) => ({ ...row, linked_file_path: localPaths.get(row.id) || row.linked_file_path || '' }));
-      }
+      const serverIds = _idSet(data.bookmarks || []);
+      state.tenders = state.tenders.map((row) => ({ ...row, is_bookmarked: serverIds.has(Number(row.id)) }));
+      state.bookmarkedOrgs = Array.isArray(data.bookmarkedOrgs) ? [...data.bookmarkedOrgs] : [];
+      state.templates = Array.isArray(data.templates) ? data.templates : [];
+      state.templateItems = Array.isArray(data.templateItems) ? data.templateItems : [];
+      const localFolders = new Map(state.projects.map((row) => [row.id, row.folder_path]));
+      state.projects = (Array.isArray(data.projects) ? data.projects : []).map((row) => ({
+        ...row, folder_path: localFolders.get(row.id) || row.folder_path || null,
+      }));
+      const localPaths = new Map(state.checklist.map((row) => [row.id, row.linked_file_path]));
+      state.checklist = (Array.isArray(data.checklist) ? data.checklist : []).map((row) => ({
+        ...row, linked_file_path: localPaths.get(row.id) || row.linked_file_path || '',
+      }));
       return state;
     });
     await saveSyncBaseline(data, response?.updated_at);
-    const columnPrefs = data.tenderColumnPrefs;
-    if (columnPrefs) {
-      const store = useAppStore.getState();
-      if (Array.isArray(columnPrefs.hiddenColumns)) store.setTendersHiddenColumns(columnPrefs.hiddenColumns);
-      if (Array.isArray(columnPrefs.columnOrder)) store.setTendersColumnOrder(columnPrefs.columnOrder);
-      if (columnPrefs.columnWidths && typeof columnPrefs.columnWidths === 'object') {
-        for (const [key, width] of Object.entries(columnPrefs.columnWidths)) store.setTenderColumnWidth(key, width);
-      }
-    }
+    const columnPrefs = data.tenderColumnPrefs || {};
+    const store = useAppStore.getState();
+    store.setTendersHiddenColumns(Array.isArray(columnPrefs.hiddenColumns) ? columnPrefs.hiddenColumns : []);
+    store.setTendersColumnOrder(Array.isArray(columnPrefs.columnOrder) ? columnPrefs.columnOrder : []);
+    const widths = (columnPrefs.columnWidths && typeof columnPrefs.columnWidths === 'object') ? columnPrefs.columnWidths : {};
+    for (const [key, width] of Object.entries(widths)) store.setTenderColumnWidth(key, width);
     return data;
   },
 };
