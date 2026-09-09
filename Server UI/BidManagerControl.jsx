@@ -2402,7 +2402,7 @@ function CaptchaPanel({ toast, captchas, setCaptchas, base, adminKey }) {
 // Expanded detail for one user row: their cloud-synced blob (bookmarks,
 // projects, templates, checklist, column prefs — from client_user_sync),
 // recent client activity, the raw JSON, and a reset action.
-function UserSyncDetail({ user, detail, onReset, resetBusy, toast }) {
+function UserSyncDetail({ user, detail, onReset, onRefresh, resetBusy, toast }) {
   const [rawOpen, setRawOpen] = useState(false);
   if (detail === 'loading' || detail == null) {
     return <div className="px-3 py-4"><Empty icon={Loader2} title="Loading user data…" /></div>;
@@ -2428,8 +2428,13 @@ function UserSyncDetail({ user, detail, onReset, resetBusy, toast }) {
         <span style={{ fontSize: 12, color: c.ink60 }}>
           {sync.synced_at ? <>Last synced <Mono style={{ fontSize: 11.5 }}>{fmtDateTime(sync.synced_at * 1000)}</Mono></> : 'Never synced'}
         </span>
-        <Btn size="sm" variant="danger" icon={Trash2} busy={resetBusy} disabled={!hasAnySync}
-          onClick={() => onReset(user)}>Reset synced data</Btn>
+        <div className="flex items-center gap-2">
+          {onRefresh && (
+            <Btn size="sm" icon={RefreshCw} busy={detail === 'loading'} onClick={() => onRefresh(user)}>Refresh</Btn>
+          )}
+          <Btn size="sm" variant="danger" icon={Trash2} busy={resetBusy} disabled={!hasAnySync}
+            onClick={() => onReset(user)}>Reset synced data</Btn>
+        </div>
       </div>
 
       {!hasAnySync ? (
@@ -2531,11 +2536,14 @@ function UsersPanel({ toast, base, adminKey }) {
   const [users, setUsers] = useState(null);
   const [loadError, setLoadError] = useState('');
   const loadingRef = useRef(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState(null);
   const [filter, setFilter] = useState('all');
   const [revealed, setRevealed] = useState(() => new Set());
   const toggleReveal = (id) => setRevealed((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
   const [expandedId, setExpandedId] = useState(null);
+  const expandedIdRef = useRef(null);
+  useEffect(() => { expandedIdRef.current = expandedId; }, [expandedId]);
   const [details, setDetails] = useState({}); // id -> 'loading' | detailObj | { error }
   const [resetBusyId, setResetBusyId] = useState(null);
 
@@ -2574,9 +2582,14 @@ function UsersPanel({ toast, base, adminKey }) {
   const load = useCallback(async () => {
     if (loadingRef.current) return;
     loadingRef.current = true;
+    setRefreshing(true);
     try {
       setLoadError('');
       setUsers(await api.clientUsers()); // WIRE: GET /admin/users
+      // Also refresh the currently-open user's sync detail — the header
+      // Refresh (and the 15s interval) otherwise only reload the list.
+      const ex = expandedIdRef.current;
+      if (ex != null) fetchDetail(ex);
     } catch (err) {
       const message = err.message || 'Could not load users';
       setLoadError(message);
@@ -2584,8 +2597,9 @@ function UsersPanel({ toast, base, adminKey }) {
       toast(message);
     } finally {
       loadingRef.current = false;
+      setRefreshing(false);
     }
-  }, [api, toast]);
+  }, [api, toast, fetchDetail]);
   useEffect(() => { load(); }, [load]);
   useEffect(() => { const t = setInterval(load, 15000); return () => clearInterval(t); }, [load]);
 
@@ -2612,7 +2626,7 @@ function UsersPanel({ toast, base, adminKey }) {
   return (
     <Panel
       code="USR" title="Users" note="Every account signed in from the client app"
-      right={<Btn size="sm" icon={RefreshCw} onClick={load}>Refresh</Btn>}
+      right={<Btn size="sm" icon={RefreshCw} busy={refreshing} onClick={load}>Refresh</Btn>}
     >
       {loadError && (
         <Card style={{ marginBottom: 10 }}>
@@ -2693,6 +2707,7 @@ function UsersPanel({ toast, base, adminKey }) {
                           user={u}
                           detail={details[u.id]}
                           onReset={resetSync}
+                          onRefresh={() => fetchDetail(u.id)}
                           resetBusy={resetBusyId === u.id}
                           toast={toast}
                         />
