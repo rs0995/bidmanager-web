@@ -3870,44 +3870,44 @@ class ScraperBackend:
         )
 
         log_to_gui(f"Refreshing details for {len(targets)} tender(s)...")
-        driver = None
-        try:
-            driver = create_browser_driver()
-            for db_id, tender_url in targets:
-                try:
-                    if not ScraperBackend.open_tender_page_with_recovery(driver, base_url, tender_url):
-                        log_to_gui(f"  Could not open tender page for id {db_id}. Skipping.")
-                        continue
-                    d_soup = BeautifulSoup(driver.page_source, 'html.parser')
-                    updates = {}
-                    for column, labels, allow_contains in detail_fields:
-                        value = ScraperBackend.get_detail_by_label(d_soup, labels, allow_contains=allow_contains)
-                        if value:
-                            updates[column] = value
-                    prebid_count, corrigendum_count = ScraperBackend.extract_prebid_corrigendum_counts(d_soup)
-                    if prebid_count is not None:
-                        updates["prebid_count"] = prebid_count
-                    if corrigendum_count is not None:
-                        updates["corrigendum_count"] = corrigendum_count
-                    if not updates:
-                        log_to_gui(f"  No fields found on the tender page for id {db_id}; nothing updated.")
-                        continue
-                    set_clause = ",".join(f"{col}=?" for col in updates)
-                    conn = sqlite3.connect(DB_FILE)
-                    conn.execute(
-                        f"UPDATE tenders SET {set_clause},last_scraped_at=? WHERE id=?",
-                        (*updates.values(), time.time(), db_id),
-                    )
-                    conn.commit()
-                    conn.close()
-                    log_to_gui(f"  Refreshed {', '.join(updates.keys())} for id {db_id}.")
-                except (WebDriverException, TimeoutException) as e:
-                    log_to_gui(f"  Browser error refreshing id {db_id}: {e}")
-                except Exception as e:
-                    log_to_gui(f"  Error refreshing id {db_id}: {e}")
-        finally:
-            if driver is not None:
-                driver.quit()
+        # Read the tender's own detail page as raw HTML — the same way
+        # fetch_tenders_logic (and backend/'s reference scraper) does. A live
+        # browser is not needed here: the detail page's text (Critical Dates,
+        # Work Item Details, corrigendum list) is public; only the file
+        # downloads are captcha-gated. Using the JS-rendered DOM here let
+        # get_detail_by_label grab dynamic page-clock cells for the date
+        # fields.
+        for db_id, tender_url in targets:
+            try:
+                d_res = ScraperBackend.safe_request(tender_url)
+                if not d_res:
+                    log_to_gui(f"  Could not open tender page for id {db_id}. Skipping.")
+                    continue
+                d_soup = BeautifulSoup(d_res.text, 'html.parser')
+                updates = {}
+                for column, labels, allow_contains in detail_fields:
+                    value = ScraperBackend.get_detail_by_label(d_soup, labels, allow_contains=allow_contains)
+                    if value:
+                        updates[column] = value
+                prebid_count, corrigendum_count = ScraperBackend.extract_prebid_corrigendum_counts(d_soup)
+                if prebid_count is not None:
+                    updates["prebid_count"] = prebid_count
+                if corrigendum_count is not None:
+                    updates["corrigendum_count"] = corrigendum_count
+                if not updates:
+                    log_to_gui(f"  No fields found on the tender page for id {db_id}; nothing updated.")
+                    continue
+                set_clause = ",".join(f"{col}=?" for col in updates)
+                conn = sqlite3.connect(DB_FILE)
+                conn.execute(
+                    f"UPDATE tenders SET {set_clause},last_scraped_at=? WHERE id=?",
+                    (*updates.values(), time.time(), db_id),
+                )
+                conn.commit()
+                conn.close()
+                log_to_gui(f"  Refreshed {', '.join(updates.keys())} for id {db_id}.")
+            except Exception as e:
+                log_to_gui(f"  Error refreshing id {db_id}: {e}")
         log_to_gui("Tender detail refresh complete.")
         return True
 
@@ -4045,6 +4045,12 @@ class ScraperBackend:
                             t_id, notice_filename, notice_path, file_type="notice"
                         ):
                             log_to_gui("  Checking Tender Notice...")
+                            # Re-open the tender page first, the same way sections 3 & 4
+                            # (and backend/'s per-section download flow) do. The shared
+                            # CAPTCHA step in section 0 can leave the driver on the status
+                            # view, so the unlocked "DirectLink_N" anchors are only present
+                            # on a fresh load of the tender URL.
+                            ScraperBackend.open_tender_page_with_recovery(driver, base_url, url)
                             # The document's numeric "DirectLink_N" id isn't stable across
                             # tenders (it depends on how many other links precede it on the
                             # page), so match the link by its visible filename text first,
