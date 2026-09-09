@@ -476,6 +476,83 @@ class ClientApiTests(unittest.TestCase):
         merged = self.client.get("/client/sync", headers=self.headers).json()["data"]
         self.assertEqual(merged["bookmarkedOrgIds"], [1])  # resolved from the name, not the bogus 999
 
+    # ── per-item concurrency: any online edit beats an offline edit ──────
+
+    def _push(self, data, base=None, removed=None):
+        body = {"data": data}
+        if base is not None:
+            body["base_updated_at"] = base
+        if removed is not None:
+            body["removed"] = removed
+        r = self.client.put("/client/sync", json=body, headers=self.headers)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["updated_at"]
+
+    def _blob(self):
+        return self.client.get("/client/sync", headers=self.headers).json()["data"]
+
+    def test_online_edit_beats_a_stale_offline_edit(self):
+        t1 = self._push({"projects": [{"id": 5, "title": "A"}]}, base=1.0)
+        # An "online" device (up to date) edits id 5.
+        self._push({"projects": [{"id": 5, "title": "ONLINE"}]}, base=t1)
+        # A device that was offline since t1 pushes its stale edit of id 5.
+        self._push({"projects": [{"id": 5, "title": "offline"}]}, base=t1)
+        rows = {p["id"]: p["title"] for p in self._blob()["projects"]}
+        self.assertEqual(rows[5], "ONLINE")
+
+    def test_online_delete_beats_a_stale_offline_edit(self):
+        t1 = self._push({"projects": [{"id": 5, "title": "A"}]}, base=1.0)
+        self._push({"projects": []}, base=t1, removed={"projects": [5]})
+        self._push({"projects": [{"id": 5, "title": "offline"}]}, base=t1)
+        self.assertEqual(self._blob().get("projects", []), [])
+
+    def test_non_conflicting_offline_edit_still_applies(self):
+        t1 = self._push({"projects": [{"id": 5, "title": "A"}, {"id": 6, "title": "B"}]}, base=1.0)
+        self._push({"projects": [{"id": 5, "title": "ONLINE"}]}, base=t1)   # touches only 5
+        self._push({"projects": [{"id": 6, "title": "B2"}]}, base=t1)        # stale, touches only 6
+        rows = {p["id"]: p["title"] for p in self._blob()["projects"]}
+        self.assertEqual(rows[5], "ONLINE")
+        self.assertEqual(rows[6], "B2")
+
+    def test_online_delete_beats_a_stale_offline_re_add_of_a_bookmark(self):
+        t1 = self._push({"bookmarks": [1]}, base=1.0)
+        self._push({"bookmarks": []}, base=t1, removed={"bookmarks": [1]})   # online un-bookmark
+        self._push({"bookmarks": [1]}, base=t1)                             # stale re-add
+        self.assertEqual(self._blob().get("bookmarks", []), [])
+
+    def test_lost_baseline_push_is_ignored_server_wins(self):
+        self._push({"bookmarks": [1]}, base=1.0)
+        # base_updated_at=0 with a real stored blob => the server's copy wins.
+        self._push({"bookmarks": [2]}, base=0)
+        self.assertEqual(self._blob()["bookmarks"], [1])
+
+    def test_fresh_push_matching_current_updated_at_always_applies(self):
+        t1 = self._push({"projects": [{"id": 1, "title": "A"}]}, base=1.0)
+        t2 = self._push({"projects": [{"id": 1, "title": "A"}, {"id": 2, "title": "B"}]}, base=t1)
+        self._push(
+            {"projects": [{"id": 1, "title": "A"}, {"id": 2, "title": "B"}, {"id": 3, "title": "C"}]},
+            base=t2,
+        )
+        self.assertEqual({p["id"] for p in self._blob()["projects"]}, {1, 2, 3})
+
+    def test_stale_version_entries_are_pruned(self):
+        t1 = self._push({"projects": [{"id": 5, "title": "A"}]}, base=1.0)
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute(
+            "SELECT data_json FROM client_user_sync WHERE user_id=?", (self.user_id,)
+        ).fetchone()
+        blob = json.loads(row[0])
+        blob["_v"]["projects"]["5"] = time.time() - 40 * 24 * 3600
+        conn.execute(
+            "UPDATE client_user_sync SET data_json=? WHERE user_id=?",
+            (json.dumps(blob), self.user_id),
+        )
+        conn.commit()
+        conn.close()
+        self._push({"bookmarks": [1]}, base=t1)   # any push triggers a prune
+        blob = self._blob()
+        self.assertNotIn("5", blob.get("_v", {}).get("projects", {}))
+
     def test_sync_push_requires_auth(self):
         response = self.client.put("/client/sync", json={"data": {}})
         self.assertEqual(response.status_code, 401)

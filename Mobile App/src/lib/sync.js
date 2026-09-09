@@ -6,36 +6,36 @@ import {
 import { mergeFromServer as mergeProjectsFromServer, forSync as projectsForSync, getProjects } from './projects.js';
 import { addAlert } from './alerts.js';
 
-// /client/sync is a single whole-user JSON blob shared with the desktop
-// Client UI, which also stores templates/templateItems/tenderColumnPrefs in
-// it (see Client UI/src/lib/api.js pushUserData). This app must never
-// overwrite the blob wholesale — only merge its own fields in.
-//
-// lastBlob is PERSISTED (bm.syncBlob) so a reload doesn't start from {} and
-// let a push before the first pull blank out desktop-owned fields.
-const SYNC_BLOB_KEY = 'bm.syncBlob';
-const SNAPSHOT_KEY = 'bm.tenderSnapshot';       // { [id]: { closing_date, status, prebid_count, corrigendum_count } }
-const LAST_CHANGES_KEY = 'bm.lastChangesAt';    // epoch seconds cursor for GET /client/changes
+// /client/sync is one whole-user JSON blob shared with the desktop Client UI.
+// The SERVER is the source of truth: every local change is pushed (immediately
+// when online, queued durably when offline), and a sync is always
+// PUSH-the-queue -> PULL -> replace-local. The server merges additively and
+// resolves conflicts per item ("any online edit beats an offline edit") using
+// the `base_updated_at` we send, so pushing the queue first can never clobber
+// a change another device made online.
+const SYNC_BLOB_KEY = 'bm.syncBlob';    // last server blob (offline-render cache)
+const SYNC_BASE_KEY = 'bm.syncBase';    // its `updated_at` — our concurrency baseline
+const SYNC_DIRTY_KEY = 'bm.syncDirty';  // '1' while there are unpushed local changes
+const SNAPSHOT_KEY = 'bm.tenderSnapshot';
+const LAST_CHANGES_KEY = 'bm.lastChangesAt';
 
 function readJSON(key, fallback) {
   try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; }
   catch { return fallback; }
 }
-function writeJSON(key, value) { localStorage.setItem(key, JSON.stringify(value)); }
+function writeJSON(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* private mode */ } }
 
 let lastBlob = readJSON(SYNC_BLOB_KEY, {});
 function setLastBlob(blob) {
   lastBlob = blob || {};
   writeJSON(SYNC_BLOB_KEY, lastBlob);
 }
+function getBase() { const n = Number(localStorage.getItem(SYNC_BASE_KEY)); return Number.isFinite(n) && n > 0 ? n : 0; }
+function setBase(ts) { const n = Number(ts); if (Number.isFinite(n) && n > 0) { try { localStorage.setItem(SYNC_BASE_KEY, String(n)); } catch { /* private */ } } }
 
-// A sync is always PULL -> reconcile -> PUSH. A push never fires before a
-// /client/sync GET has succeeded this session, so a device that made changes
-// while offline / not-yet-synced fetches the server's copy and merges into it
-// first, instead of shipping a stale/partial blob. Session-scoped (not
-// persisted) on purpose — every launch re-pulls before it pushes.
-let pulledThisSession = false;
-let pullInFlight = null;
+function isDirty() { try { return localStorage.getItem(SYNC_DIRTY_KEY) === '1'; } catch { return false; } }
+function markDirty() { try { localStorage.setItem(SYNC_DIRTY_KEY, '1'); } catch { /* private */ } }
+function clearDirty() { try { localStorage.removeItem(SYNC_DIRTY_KEY); } catch { /* private */ } }
 
 // ── Push ─────────────────────────────────────────────────────────────────
 function idsOf(rows) {
@@ -51,88 +51,92 @@ function buildPushBody() {
   const localProjIds = new Set(idsOf(projects));
   const localChkIds = new Set(idsOf(checklist));
   const data = {
-    ...lastBlob,
     bookmarks: [...localBm],
     bookmarkedOrgs,
     bookmarkedOrgIds: bookmarkedOrgs.map((n) => orgIdByName[n]).filter((id) => Number.isFinite(id)),
     projects,
     checklist,
   };
-  delete data.removed;
-  // Removal delta: what the last server blob had but is gone locally now —
-  // the server unions everything else, so this is the only way a delete
-  // propagates.
+  // Removal delta: what the last server blob had but is gone locally now.
   const removed = {
     bookmarks: (lastBlob.bookmarks || []).map(Number).filter((id) => Number.isFinite(id) && !localBm.has(id)),
     bookmarkedOrgs: (lastBlob.bookmarkedOrgs || []).filter((n) => !localOrg.has(n)),
     projects: idsOf(lastBlob.projects).filter((id) => !localProjIds.has(id)),
     checklist: idsOf(lastBlob.checklist).filter((id) => !localChkIds.has(id)),
   };
-  return { data, removed };
+  return { data, removed, base_updated_at: getBase() };
 }
 
 let pushTimer = null;
 let inFlightPush = null;
 
-export function schedulePush() {
-  clearTimeout(pushTimer);
-  pushTimer = setTimeout(() => { flushPush(); }, 2000);
-}
-
-// Run any pending push now. If we haven't pulled yet this session, pull &
-// reconcile first (its trailing flushPush sends the merged result).
-export function flushPush() {
+// Low-level push. Resolves true on success (queue cleared), false on failure
+// (queue kept for the next attempt).
+async function doPush() {
   clearTimeout(pushTimer);
   pushTimer = null;
-  if (!pulledThisSession) return pullBookmarks();
-  const { data, removed } = buildPushBody();
-  setLastBlob(data);
-  inFlightPush = api.putSync(data, removed)
-    .catch(() => { /* offline-tolerant: local write already succeeded */ })
-    .finally(() => { inFlightPush = null; });
+  if (inFlightPush) { try { await inFlightPush; } catch { /* ignore */ } }
+  const { data, removed, base_updated_at } = buildPushBody();
+  inFlightPush = (async () => {
+    try {
+      const res = await api.putSync(data, removed, base_updated_at);
+      clearDirty();
+      setLastBlob(data);
+      if (res && res.updated_at) setBase(res.updated_at);
+      return true;
+    } catch {
+      return false;   // offline-tolerant: local write already persisted
+    }
+  })().finally(() => { inFlightPush = null; });
   return inFlightPush;
 }
 
-// ── Pull ─────────────────────────────────────────────────────────────────
-export async function pullBookmarks() {
-  if (pullInFlight) { await pullInFlight; return; }
-  pullInFlight = (async () => {
-    const res = await api.getSync().catch(() => null);
-    if (!res) return;   // offline — stay local-only; a later pull reconciles + pushes
-
-    const blob = res.data || {};
-    const prev = lastBlob;
-
-    if (Array.isArray(blob.bookmarks)) {
-      // server is authoritative, but keep a local bookmark that is a genuine
-      // unsynced ADD (not on the server AND not in the last server blob we
-      // saw). Drop anything the server dropped — real removals + phantoms.
-      const serverSet = new Set(blob.bookmarks.map(Number));
-      const prevSet = new Set((prev.bookmarks || []).map(Number));
-      const localAdds = [...getBookmarks()].filter((id) => !serverSet.has(id) && !prevSet.has(id));
-      setBookmarks([...serverSet, ...localAdds]);
-    }
-    if (Array.isArray(blob.bookmarkedOrgs)) {
-      const serverSet = new Set(blob.bookmarkedOrgs);
-      const prevSet = new Set(prev.bookmarkedOrgs || []);
-      const localAdds = [...getBookmarkedOrgs()].filter((n) => !serverSet.has(n) && !prevSet.has(n));
-      setBookmarkedOrgs([...serverSet, ...localAdds]);
-    }
-    mergeProjectsFromServer(blob.projects, blob.checklist, prev);
-
-    setLastBlob(blob);
-    pulledThisSession = true;
-  })().finally(() => { pullInFlight = null; });
-  await pullInFlight;
-
-  // Reconciled — push our merged state (adds the other device should see +
-  // the `removed` delta). Skipped if the pull failed (still not ready).
-  if (pulledThisSession) await flushPush();
+export function schedulePush() {
+  markDirty();
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => { syncUserData(); }, 1000);
 }
+
+// ── Pull ─────────────────────────────────────────────────────────────────
+async function doPull() {
+  const res = await api.getSync().catch(() => null);
+  if (!res) return false;
+  const blob = res.data || {};
+
+  // Server is authoritative — replace local user-data with its copy.
+  if (Array.isArray(blob.bookmarks)) setBookmarks(blob.bookmarks.map(Number));
+  if (Array.isArray(blob.bookmarkedOrgs)) setBookmarkedOrgs(blob.bookmarkedOrgs);
+  mergeProjectsFromServer(blob.projects, blob.checklist);
+
+  setLastBlob(blob);
+  if (res.updated_at) setBase(res.updated_at);
+  return true;
+}
+
+// The one orchestrator: flush the queue FIRST (safe — the server merges per
+// item), THEN pull and replace local. If the flush fails (offline) we keep
+// the queue and skip the pull so local edits are never lost.
+let syncInFlight = null;
+export async function syncUserData() {
+  if (syncInFlight) { await syncInFlight; return; }
+  syncInFlight = (async () => {
+    if (isDirty()) {
+      const ok = await doPush();
+      if (!ok) return;
+    }
+    await doPull();
+    if (isDirty()) await doPush();
+  })().finally(() => { syncInFlight = null; });
+  await syncInFlight;
+}
+
+// Back-compat aliases for existing callers.
+export const pullBookmarks = syncUserData;
+export const flushPush = doPush;
 
 // ── Full "Sync now" (More screen + Overview banner) ──────────────────────
 export async function syncNow() {
-  await pullBookmarks();
+  await syncUserData();
 
   const projectTenderIds = getProjects().map((p) => p.source_tender_id).filter(Boolean);
   const ids = new Set([...getBookmarks(), ...projectTenderIds]);
@@ -154,9 +158,6 @@ export async function syncNow() {
     const prev = snapshot[id];
     if (!prev) continue;
 
-    // closing_date is covered by the server change feed (fetchServerChanges);
-    // the local diff owns status + pre-bid/corrigendum, which the server's
-    // tender_history snapshot doesn't track.
     if (prev.status !== cur.status) {
       changedCount += 1;
       addAlert({ kind: 'status', message: `"${tender.title}" status changed to ${cur.status || 'unknown'}.` });
@@ -174,11 +175,8 @@ export async function syncNow() {
   return { changedCount };
 }
 
-// Pull server-recorded changes for this user's bookmarks (closing-date changes
-// on bookmarked tenders + new tenders under bookmarked orgs) since our cursor,
-// and raise alerts. Replaces the old per-org tender paging — the server already
-// knows what changed via tender_history / first_seen_at. The very first run
-// (no cursor) only stores the cursor so we don't alert on the back-catalogue.
+// Pull server-recorded changes for this user's bookmarks since our cursor and
+// raise alerts. First run (no cursor) only stores the cursor.
 async function fetchServerChanges() {
   const stored = Number(localStorage.getItem(LAST_CHANGES_KEY)) || 0;
   let resp;
@@ -211,10 +209,12 @@ async function fetchServerChanges() {
   return count;
 }
 
-// Flush a pending push before the tab is backgrounded/closed.
+// ── Triggers ─────────────────────────────────────────────────────────────
 if (typeof window !== 'undefined') {
+  window.addEventListener('online', () => { syncUserData().catch(() => {}); });
   window.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden' && pushTimer) flushPush();
+    if (document.visibilityState === 'visible') syncUserData().catch(() => {});
+    else if (isDirty()) doPush().catch(() => {});
   });
-  window.addEventListener('pagehide', () => { if (pushTimer) flushPush(); });
+  window.addEventListener('pagehide', () => { if (isDirty()) doPush().catch(() => {}); });
 }

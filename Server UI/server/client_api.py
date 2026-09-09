@@ -242,6 +242,12 @@ class SyncPushRequest(BaseModel):
     # the additive merge below honour a real removal without a client being
     # able to wipe a collection just by holding a stale/partial copy.
     removed: dict[str, Any] | None = None
+    # The blob `updated_at` this client last pulled. Enables per-item
+    # "any online edit beats an offline edit": an incoming change to an item
+    # the server changed AFTER this timestamp is skipped. `None` = a legacy
+    # client with no concurrency control (plain additive merge). `0` = "I have
+    # no trustworthy baseline" -> the server's copy wins outright.
+    base_updated_at: float | None = None
 
 
 def _coerce_id_set(values: Any) -> set[int]:
@@ -480,43 +486,146 @@ def _row_id(row: Any) -> Any:
     return None
 
 
-def _merge_sync_blob(stored: dict, incoming: dict, removed: dict, conn) -> dict:
-    merged = dict(stored)
-    removed = removed if isinstance(removed, dict) else {}
+_VERSION_PRUNE_SECONDS = 30 * 24 * 3600
 
+
+def _prune_version_map(vmap: dict, now: float) -> dict:
+    out: dict[str, dict] = {}
+    for key, entries in (vmap or {}).items():
+        kept = {
+            item: ts for item, ts in (entries or {}).items()
+            if isinstance(ts, (int, float)) and now - float(ts) <= _VERSION_PRUNE_SECONDS
+        }
+        if kept:
+            out[key] = kept
+    return out
+
+
+def _merge_sync_blob(
+    stored: dict, incoming: dict, removed: dict, conn,
+    base_updated_at: float | None = None, now: float | None = None,
+) -> dict:
+    # `now` MUST be the same value client_push_sync writes as `updated_at`, so
+    # an item stamped by this push has `_v ts == updated_at` and a later push
+    # whose `base_updated_at` equals that `updated_at` is NOT treated as stale.
+    now = time.time() if now is None else float(now)
+    merged = {k: v for k, v in (stored or {}).items()}
+    removed = removed if isinstance(removed, dict) else {}
+    incoming = incoming if isinstance(incoming, dict) else {}
+
+    # Per-item "last changed" / "deleted at" clocks live inside the blob.
+    versions: dict[str, dict] = {k: dict(v or {}) for k, v in (stored.get("_v") or {}).items()}
+    deleted: dict[str, dict] = {k: dict(v or {}) for k, v in (stored.get("_deleted") or {}).items()}
+
+    gated = base_updated_at is not None
+    base = float(base_updated_at or 0)
+
+    # Lost baseline: a client that declares base=0 while a real blob exists
+    # can't be trusted to express deltas — the server's copy wins outright.
+    meaningful = [k for k in (stored or {}) if not k.startswith("_")]
+    if gated and base <= 0 and meaningful:
+        return merged
+
+    def _mk(x: Any) -> str:
+        return str(x)
+
+    def _online_changed(key: str, item: Any) -> bool:
+        if not gated or base <= 0:
+            return False
+        mk = _mk(item)
+        v = versions.get(key, {}).get(mk)
+        d = deleted.get(key, {}).get(mk)
+        return (isinstance(v, (int, float)) and float(v) > base) or (
+            isinstance(d, (int, float)) and float(d) > base
+        )
+
+    def _stamp_add(key: str, item: Any) -> None:
+        versions.setdefault(key, {})[_mk(item)] = now
+        deleted.get(key, {}).pop(_mk(item), None)
+
+    def _stamp_del(key: str, item: Any) -> None:
+        deleted.setdefault(key, {})[_mk(item)] = now
+        versions.get(key, {}).pop(_mk(item), None)
+
+    # ── integer id sets ─────────────────────────────────────────────────
     for key in _SYNC_ID_SET_KEYS:
         if key not in incoming:
             continue
-        union = _coerce_id_set(stored.get(key)) | _coerce_id_set(incoming.get(key))
-        union -= _coerce_id_set(removed.get(key))
-        merged[key] = sorted(union)
+        cur = _coerce_id_set(stored.get(key))
+        result = set(cur)
+        for item in _coerce_id_set(incoming.get(key)) - cur:
+            if _online_changed(key, item):
+                continue
+            result.add(item)
+            _stamp_add(key, item)
+        for item in _coerce_id_set(removed.get(key)):
+            if _online_changed(key, item):
+                continue
+            result.discard(item)
+            _stamp_del(key, item)
+        merged[key] = sorted(result)
 
+    # ── string name sets ────────────────────────────────────────────────
     for key in _SYNC_NAME_SET_KEYS:
         if key not in incoming:
             continue
-        gone = {str(v) for v in (removed.get(key) or [])}
-        names = {str(v) for v in (stored.get(key) or [])} | {str(v) for v in (incoming.get(key) or [])}
-        merged[key] = sorted(names - gone)
+        cur = {str(v) for v in (stored.get(key) or [])}
+        result = set(cur)
+        for item in {str(v) for v in (incoming.get(key) or [])} - cur:
+            if _online_changed(key, item):
+                continue
+            result.add(item)
+            _stamp_add(key, item)
+        for item in {str(v) for v in (removed.get(key) or [])}:
+            if _online_changed(key, item):
+                continue
+            result.discard(item)
+            _stamp_del(key, item)
+        merged[key] = sorted(result)
 
+    # ── row collections keyed by "id" ──────────────────────────────────
     for key in _SYNC_ROW_KEYS:
         if key not in incoming:
             continue
-        gone = _coerce_id_set(removed.get(key))
         by_id: dict[Any, Any] = {}
         order: list[Any] = []
-        for row in list(stored.get(key) or []) + list(incoming.get(key) or []):
+        for row in list(stored.get(key) or []):
             rid = _row_id(row)
-            if rid in gone:
+            if rid not in by_id:
+                order.append(rid)
+            by_id[rid] = row
+        for row in list(incoming.get(key) or []):
+            rid = _row_id(row)
+            if rid is None or _online_changed(key, rid):
                 continue
             if rid not in by_id:
                 order.append(rid)
-            by_id[rid] = row  # incoming (later) wins for the same id
-        merged[key] = [by_id[rid] for rid in order]
+            by_id[rid] = row
+            _stamp_add(key, rid)
+        for item in _coerce_id_set(removed.get(key)):
+            if _online_changed(key, item):
+                continue
+            by_id.pop(item, None)
+            _stamp_del(key, item)
+        merged[key] = [by_id[rid] for rid in order if rid in by_id]
 
     for key, value in incoming.items():
         if key in _SYNC_ID_SET_KEYS or key in _SYNC_NAME_SET_KEYS or key in _SYNC_ROW_KEYS:
             continue
+        if key.startswith("_"):
+            continue
         merged[key] = value  # key-preserving: incoming wins, omitted keys kept
+
+    pruned_v = _prune_version_map(versions, now)
+    pruned_del = _prune_version_map(deleted, now)
+    if pruned_v:
+        merged["_v"] = pruned_v
+    else:
+        merged.pop("_v", None)
+    if pruned_del:
+        merged["_deleted"] = pruned_del
+    else:
+        merged.pop("_deleted", None)
 
     # Supplement bookmarkedOrgIds with ids resolved from the merged names, so a
     # device that only sent names still contributes to the id set.
@@ -569,11 +678,14 @@ def client_push_sync(body: SyncPushRequest, user_id: int = Depends(require_clien
             except (TypeError, ValueError):
                 stored = {}
         incoming = body.data if isinstance(body.data, dict) else {}
-        # Additive merge: bookmark sets union (minus an explicit `removed`
-        # delta), projects/checklist merge by id, everything else keeps a key
-        # the client omitted. A stale/partial push can add and can remove what
-        # it names, but can't silently drop the rest.
-        merged = _merge_sync_blob(stored, incoming, body.removed or {}, conn)
+        # Additive merge with per-item concurrency: bookmark sets union (minus
+        # an explicit `removed` delta), projects/checklist merge by id,
+        # everything else keeps a key the client omitted. When the client
+        # sends `base_updated_at`, an incoming change to an item the server
+        # changed after that timestamp is skipped (online beats offline).
+        merged = _merge_sync_blob(
+            stored, incoming, body.removed or {}, conn, body.base_updated_at, now
+        )
         payload = json.dumps(merged, ensure_ascii=False)
         if len(payload.encode("utf-8")) > MAX_SYNC_PAYLOAD_BYTES:
             raise HTTPException(413, "Sync payload is too large.")

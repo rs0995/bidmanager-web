@@ -602,6 +602,104 @@ function DashboardPage({ onNavigate, onOpenProjectWorkspace, onOpenWebsiteOrgani
   );
 }
 
+// ── Downloads Panel ────────────────────────────────────────────────────────
+// Shows only documents the user actually acted on (requested/downloading/
+// downloaded/failed) — not the much larger pool of merely-known, never-
+// touched rows that `documents` also carries.
+const DOWNLOAD_STATUS_META = {
+  requested: { icon: Spinner, label: 'Requested…', color: 'text-sky-400' },
+  downloading: { icon: Spinner, label: 'Downloading…', color: 'text-sky-400' },
+  downloaded: { icon: CheckCircle2, label: 'Ready', color: 'text-emerald-400' },
+  failed: { icon: AlertTriangle, label: 'Failed', color: 'text-rose-400' },
+};
+
+function DownloadsPanel({ open, onClose, onOpenTender }) {
+  const qc = useQueryClient();
+  const { data: documents } = useQuery({ queryKey: ['client-documents'], queryFn: api.listAllDocuments, enabled: open });
+  const rows = useMemo(() => {
+    const list = (documents || []).filter((d) => d.client_status && d.client_status !== 'synced');
+    return [...list].sort((a, b) => String(b.downloaded_at || b.requested_at || b.updated_at || '').localeCompare(String(a.downloaded_at || a.requested_at || a.updated_at || '')));
+  }, [documents]);
+  const retry = useMutation({
+    // A negative id is the "request" placeholder row (documents didn't exist
+    // server-side yet — re-run the scrape job). A positive id is a real,
+    // already-known document that just failed to fetch — re-fetch that exact
+    // file instead of re-queuing a scrape job for a tender that's already
+    // been scraped.
+    mutationFn: (d) => (d.id < 0
+      ? api.requestTenderDownload({ id: d.tender_db_id, tender_id: d.tender_id, title: d.tender_title })
+      : api.downloadDocument({ id: d.id, tender_db_id: d.tender_db_id, tender_id: d.tender_id, tender_title: d.tender_title, file_name: d.file_name })),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['client-documents'] }),
+  });
+  const openFolder = useMutation({
+    mutationFn: async (d) => {
+      const folder = await api.getTenderDownloadFolder(d.tender_id);
+      const bridge = window.bidmanagerDesktop;
+      if (!bridge?.openPath) throw new Error('Open Folder is available in the desktop app.');
+      const result = await bridge.openPath(folder);
+      if (!result?.ok) throw new Error(result?.message || 'Could not open the folder.');
+    },
+    onError: (err) => alert(err instanceof Error ? err.message : String(err)),
+  });
+  if (!open) return null;
+  return (
+    <>
+      <div className="fixed inset-0 z-40" onClick={onClose} />
+      <div className="absolute top-10 right-12 w-80 z-50 card shadow-xl border border-[var(--border)] overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border)]">
+          <span className="text-sm font-semibold text-[var(--text)]">Downloads</span>
+          <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text)]"><X size={14} /></button>
+        </div>
+        <div className="max-h-80 overflow-auto">
+          {rows.length === 0 && (
+            <p className="text-sm text-[var(--text-muted)] text-center py-8">No downloads yet</p>
+          )}
+          {rows.map((d) => {
+            const meta = DOWNLOAD_STATUS_META[d.client_status] || DOWNLOAD_STATUS_META.requested;
+            const Icon = meta.icon;
+            const retrying = retry.isPending && retry.variables?.id === d.id;
+            const openingFolder = openFolder.isPending && openFolder.variables?.id === d.id;
+            return (
+              <div
+                key={d.id}
+                onClick={() => d.tender_db_id && onOpenTender?.(d.tender_db_id)}
+                className={cn('flex items-start gap-3 px-4 py-3 border-b border-[var(--border)] last:border-0 transition-colors', d.tender_db_id && 'cursor-pointer hover:bg-[var(--surface-1)]')}
+              >
+                <Icon size={16} className={cn('mt-0.5 shrink-0', meta.color)} />
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm text-[var(--text)] truncate">{d.tender_title || d.tender_id || 'Untitled tender'}</p>
+                  <p className="text-xs text-[var(--text-muted)] mt-0.5 truncate">{d.file_name || 'All documents'}</p>
+                  {d.client_status === 'failed' && d.error && <p className="text-xs text-rose-400 mt-0.5 truncate">{d.error}</p>}
+                </div>
+                {d.client_status === 'failed' ? (
+                  <button
+                    onClick={(event) => { event.stopPropagation(); retry.mutate(d); }}
+                    disabled={retrying}
+                    className="text-xs shrink-0 text-[var(--accent)] hover:underline disabled:opacity-50"
+                  >
+                    {retrying ? 'Retrying…' : 'Retry'}
+                  </button>
+                ) : d.client_status === 'downloaded' ? (
+                  <button
+                    title="Open Folder"
+                    disabled={!d.tender_id || openingFolder}
+                    onClick={(event) => { event.stopPropagation(); openFolder.mutate(d); }}
+                    className="shrink-0 rounded p-1 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)] disabled:opacity-40"
+                  >
+                    {openingFolder ? <Spinner size={14} /> : <FolderOpen size={14} />}
+                  </button>
+                ) : (
+                  <span className={cn('text-xs shrink-0', meta.color)}>{meta.label}</span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </>
+  );
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    TENDERS  (browse + bookmark only — no scraping, no org/website management,
    no job queue, no CAPTCHA, no live log console)
@@ -630,6 +728,17 @@ const TENDER_NON_SORTABLE = new Set(['_sr', 'is_bookmarked', '_prebid_corrigendu
 
 const TENDER_TABLE_WIDTH = TENDER_COLUMNS.reduce((total, column) => total + column.width, 0);
 
+// Shared between OrganizationsPage and Bookmarks' Organizations sub-tab (see
+// useOrganizationColumns/OrganizationTable below).
+const ORG_COLUMNS = [
+  { key: '_sr', label: 'Sr. No.', width: 64 },
+  { key: '_bookmark', label: 'Bookmark', width: 90 },
+  { key: 'name', label: 'Organization', width: 320 },
+  { key: 'website_name', label: 'Website', width: 200 },
+  { key: 'tender_count', label: 'Tenders', width: 110 },
+];
+const ORG_NON_SORTABLE_COLS = new Set(['_sr', '_bookmark']);
+
 // Permanent (localStorage): remembers the last website and, per website, the
 // last Organization/Location/Category picked — but NOT whether a filter is
 // currently active. See TENDERS_ACTIVE_FILTER_KEY for that.
@@ -650,6 +759,11 @@ const TENDERS_FORCE_TAB_KEY = 'bm-client:tenders:force-tab';
 // immediately before navigating here so Tenders opens with that filter
 // already applied; TendersPage reads and clears it on mount.
 const TENDERS_FORCE_CLOSING_KEY = 'bm-client:tenders:force-closing-soon';
+// One-shot flag: the Downloads panel sets this immediately before navigating
+// here so the clicked tender's row is selected/highlighted once tenders
+// load; TendersPage reads and clears it on mount. Tolerates the tender no
+// longer being present (e.g. archived/removed) — simply selects nothing.
+const TENDERS_FORCE_SELECT_KEY = 'bm-client:tenders:force-select';
 // Not one-shot: set by openOrgTenders and cleared by any other navigation
 // (see App()'s `navigate` helper) — drives whether TendersPage shows a
 // "Back to Organizations" button.
@@ -873,6 +987,71 @@ function TenderTable({ columns, getColWidth, tableWidth, sortCol, sortDir, onTog
   );
 }
 
+// Shared resize/width logic for the Organizations table — used by both
+// OrganizationsPage and Bookmarks' Organizations sub-tab so column widths
+// stay in sync between them (same persisted store slice).
+function useOrganizationColumns() {
+  const { organizationsTable, setOrganizationsColumnWidth } = useAppStore();
+  const getOrgColWidth = (c) => { const v = organizationsTable.columnWidths?.[c.key]; return Number.isFinite(v) && v > 0 ? v : c.width; };
+  const startOrgColResize = (col, startX) => {
+    const min = col.key === '_sr' ? 48 : 70;
+    const sw = getOrgColWidth(col);
+    const onMove = (e) => setOrganizationsColumnWidth(col.key, Math.max(min, sw + (e.clientX - startX)));
+    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp);
+  };
+  return { getOrgColWidth, startOrgColResize };
+}
+
+// Shared organizations table — used by both OrganizationsPage and Bookmarks'
+// Organizations sub-tab so a bookmarked organization looks and behaves
+// identically wherever it's shown (mirrors TenderTable's role above).
+function OrganizationTable({ rows, isLoading, emptyState, sortCol, sortDir, onToggleSort, getColWidth, onStartResize, bookmarkedOrgsSet, onToggleBookmark, onRowClick }) {
+  if (isLoading) return <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>;
+  if (!rows.length) return emptyState;
+  return (
+    <table className="data-table" style={{ tableLayout: 'fixed', width: '100%' }}>
+      <thead>
+        <tr>
+          {ORG_COLUMNS.map((c) => (
+            <th
+              key={c.key}
+              style={{ width: getColWidth(c), textAlign: c.key === 'tender_count' || c.key === '_bookmark' || c.key === '_sr' ? 'center' : 'left' }}
+              className={cn('relative', !ORG_NON_SORTABLE_COLS.has(c.key) && 'cursor-pointer')}
+              onClick={() => !ORG_NON_SORTABLE_COLS.has(c.key) && onToggleSort(c.key)}
+            >
+              {c.label}{sortCol === c.key && <span className="ml-1">{sortDir === 'asc' ? '▲' : '▼'}</span>}
+              <div
+                className="absolute right-0 top-0 h-full w-2 cursor-col-resize hover:bg-[var(--accent)]/20"
+                onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); onStartResize(c, e.clientX); }}
+              />
+            </th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((org, i) => (
+          <tr key={org.id} className="cursor-pointer" onClick={() => onRowClick?.(org)}>
+            <td className="text-center text-xs text-[var(--text-muted)]">{i + 1}</td>
+            <td className="text-center">
+              <button
+                onClick={(event) => { event.stopPropagation(); onToggleBookmark?.(org); }}
+                className={cn('inline-flex h-7 w-7 items-center justify-center rounded transition-colors', bookmarkedOrgsSet.has(org.name) ? 'text-amber-400' : 'text-[var(--text-muted)] hover:text-amber-400')}
+                title={bookmarkedOrgsSet.has(org.name) ? 'Remove bookmark' : 'Bookmark organization'}
+              >
+                <Bookmark size={16} fill={bookmarkedOrgsSet.has(org.name) ? 'currentColor' : 'none'} />
+              </button>
+            </td>
+            <td className="text-sm">{org.name}</td>
+            <td className="text-xs text-[var(--text-muted)]">{org.website_name || '—'}</td>
+            <td className="text-center text-xs">{org.tender_count}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 // Shared tender-row actions (bookmark toggle, download/request pill, add-to-
 // project, open-tender link) and the cell renderer that wires them into
 // TenderTable — used by both Tenders and Bookmarks so a bookmarked tender
@@ -882,6 +1061,14 @@ function useTenderRowActions() {
   const { data: allDocuments } = useQuery({ queryKey: ['client-documents'], queryFn: api.listAllDocuments });
   const pendingRequestIds = useMemo(
     () => new Set((allDocuments || []).filter((row) => row.client_status === 'requested').map((row) => row.tender_db_id)),
+    [allDocuments]
+  );
+  // The durable, sync-safe record of what's actually been downloaded — read
+  // from the local `documents` ledger (never touched by syncFromServer's
+  // wholesale tender-array replacement) instead of the tender row's own
+  // `client_downloaded` flag, which gets silently dropped on every sync.
+  const downloadedTenderIds = useMemo(
+    () => new Set((allDocuments || []).filter((row) => row.client_status === 'downloaded' && row.tender_db_id).map((row) => Number(row.tender_db_id))),
     [allDocuments]
   );
 
@@ -915,6 +1102,7 @@ function useTenderRowActions() {
             id: it.id,
             tender_db_id: t.id,
             tender_id: t.tender_id,
+            tender_title: t.title,
             file_name: it.name,
           });
           ok += 1;
@@ -962,7 +1150,23 @@ function useTenderRowActions() {
       status: 'Active',
     }),
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['projects'] }); qc.invalidateQueries({ queryKey: ['dashboard'] }); },
-    onError: (err) => alert(`Could not create project: ${err?.message || String(err)}`),
+    onError: (err) => {
+      const message = err?.message || String(err);
+      alert(message === 'Tender already added to Projects.' ? message : `Could not create project: ${message}`);
+    },
+  });
+
+  // Opens the folder a tender's documents were downloaded into — same
+  // mechanism as the Downloads panel's own Open Folder button.
+  const openTenderFolder = useMutation({
+    mutationFn: async (t) => {
+      const folder = await api.getTenderDownloadFolder(t.tender_id);
+      const bridge = window.bidmanagerDesktop;
+      if (!bridge?.openPath) throw new Error('Open Folder is available in the desktop app.');
+      const result = await bridge.openPath(folder);
+      if (!result?.ok) throw new Error(result?.message || 'Could not open the folder.');
+    },
+    onError: (err) => alert(err instanceof Error ? err.message : String(err)),
   });
 
   const renderTenderCell = (tender, column, index) => {
@@ -970,7 +1174,7 @@ function useTenderRowActions() {
     if (column.key === '_time') return <TimeBadge dateStr={tender.closing_date} />;
     if (column.key === '_download') {
       const hasDocs = tender.has_documents || Number(tender.document_count) > 0;
-      const isDownloaded = hasDocs && tender.client_downloaded;
+      const isDownloaded = downloadedTenderIds.has(Number(tender.id));
       const busy = downloadTenderDocuments.isPending && downloadTenderDocuments.variables?.id === tender.id;
       const requesting = pendingRequestIds.has(tender.id)
         || (requestTenderJob.isPending && requestTenderJob.variables?.id === tender.id);
@@ -1020,11 +1224,22 @@ function useTenderRowActions() {
       );
     }
     if (column.key === '_actions') {
+      const isDownloaded = downloadedTenderIds.has(Number(tender.id));
       return (
         <div className="flex items-center gap-1" onClick={(event) => event.stopPropagation()}>
           <button onClick={() => addToProject.mutate(tender)} disabled={addToProject.isPending} className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]" title="Add to Project">
-            <FolderOpen size={14} />
+            <Plus size={14} />
           </button>
+          {isDownloaded && (
+            <button
+              onClick={() => openTenderFolder.mutate(tender)}
+              disabled={openTenderFolder.isPending && openTenderFolder.variables?.id === tender.id}
+              className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]"
+              title="Open Folder"
+            >
+              <FolderOpen size={14} />
+            </button>
+          )}
           {tender.tender_url && (
             <a href={tender.tender_url} target="_blank" rel="noopener noreferrer" className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]" title="Open Tender">
               <ExternalLink size={14} />
@@ -1079,6 +1294,14 @@ function TendersPage({ onBackToOrganizations }) {
   const [sortCol, setSortCol] = useState('closing_date');
   const [sortDir, setSortDir] = useState('asc');
   const [selectedId, setSelectedId] = useState(null);
+  // One-shot: the Downloads panel sets this before navigating here so the
+  // clicked tender gets selected/highlighted once its data has loaded.
+  const [pendingSelectId, setPendingSelectId] = useState(() => {
+    const forced = sessionStorage.getItem(TENDERS_FORCE_SELECT_KEY);
+    if (forced) sessionStorage.removeItem(TENDERS_FORCE_SELECT_KEY);
+    const id = Number(forced);
+    return Number.isFinite(id) && id > 0 ? id : null;
+  });
   const [showFilters, setShowFilters] = useState(false);
   // `website`/`savedByWebsite` are permanent (localStorage); `org`/`location`/
   // `category` are the session-only active filter (sessionStorage) — see the
@@ -1145,6 +1368,12 @@ function TendersPage({ onBackToOrganizations }) {
     queryKey: ['client-tenders', tab],
     queryFn: () => api.listTenders(null, { archived: tab === 'archived', limit: 5000 }),
   });
+
+  useEffect(() => {
+    if (!pendingSelectId || !tenders) return;
+    if (tenders.some((t) => t.id === pendingSelectId)) setSelectedId(pendingSelectId);
+    setPendingSelectId(null);
+  }, [pendingSelectId, tenders]);
 
   // Same pull as Settings' "Sync Tenders" button (api.js:syncFromServer) —
   // just reachable without leaving the Online Tenders tab.
@@ -1358,7 +1587,7 @@ function TendersPage({ onBackToOrganizations }) {
    ═══════════════════════════════════════════════════════════════════════════ */
 function OrganizationsPage({ onOpenOrgTenders }) {
   const qc = useQueryClient();
-  const { organizationsTable, setOrganizationsColumnWidth } = useAppStore();
+  const { getOrgColWidth, startOrgColResize } = useOrganizationColumns();
   // Persisted across navigating away and back (e.g. via Tenders' "Back to
   // Organizations" button) — only changes when the user edits the box.
   const [search, setSearch] = useState(() => { try { return sessionStorage.getItem(ORGANIZATIONS_SEARCH_KEY) || ''; } catch { return ''; } });
@@ -1416,23 +1645,6 @@ function OrganizationsPage({ onOpenOrgTenders }) {
     else { setSortCol(key); setSortDir(key === 'tender_count' ? 'desc' : 'asc'); }
   };
 
-  const columns = [
-    { key: '_sr', label: 'Sr. No.', width: 64 },
-    { key: '_bookmark', label: 'Bookmark', width: 90 },
-    { key: 'name', label: 'Organization', width: 320 },
-    { key: 'website_name', label: 'Website', width: 200 },
-    { key: 'tender_count', label: 'Tenders', width: 110 },
-  ];
-  const NON_SORTABLE_ORG_COLS = new Set(['_sr', '_bookmark']);
-  const getOrgColWidth = (c) => { const v = organizationsTable.columnWidths?.[c.key]; return Number.isFinite(v) && v > 0 ? v : c.width; };
-  const startOrgColResize = (col, startX) => {
-    const min = col.key === '_sr' ? 48 : 70;
-    const sw = getOrgColWidth(col);
-    const onMove = (e) => setOrganizationsColumnWidth(col.key, Math.max(min, sw + (e.clientX - startX)));
-    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
-    window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp);
-  };
-
   return (
     <div className="flex h-full flex-col">
       <div className="space-y-2 border-b border-[var(--border)] bg-[var(--surface-0)] px-6 py-3">
@@ -1457,51 +1669,19 @@ function OrganizationsPage({ onOpenOrgTenders }) {
         </div>
       </div>
       <div className="flex-1 overflow-auto">
-        {isLoading ? (
-          <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>
-        ) : filtered.length === 0 ? (
-          <EmptyState icon={Building2} title="No organizations" description={search ? `No organizations match "${search}"` : 'Sync from the server to load organizations.'} />
-        ) : (
-          <table className="data-table" style={{ tableLayout: 'fixed', width: '100%' }}>
-            <thead>
-              <tr>
-                {columns.map((c) => (
-                  <th
-                    key={c.key}
-                    style={{ width: getOrgColWidth(c), textAlign: c.key === 'tender_count' || c.key === '_bookmark' || c.key === '_sr' ? 'center' : 'left' }}
-                    className={cn('relative', !NON_SORTABLE_ORG_COLS.has(c.key) && 'cursor-pointer')}
-                    onClick={() => !NON_SORTABLE_ORG_COLS.has(c.key) && toggleSort(c.key)}
-                  >
-                    {c.label}{sortCol === c.key && <span className="ml-1">{sortDir === 'asc' ? '▲' : '▼'}</span>}
-                    <div
-                      className="absolute right-0 top-0 h-full w-2 cursor-col-resize hover:bg-[var(--accent)]/20"
-                      onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); startOrgColResize(c, e.clientX); }}
-                    />
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {filtered.map((org, i) => (
-                <tr key={org.id} className="cursor-pointer" onClick={() => onOpenOrgTenders?.(org.name, org.website_name)}>
-                  <td className="text-center text-xs text-[var(--text-muted)]">{i + 1}</td>
-                  <td className="text-center">
-                    <button
-                      onClick={(event) => { event.stopPropagation(); toggleOrgBookmark.mutate(org.name); }}
-                      className={cn('inline-flex h-7 w-7 items-center justify-center rounded transition-colors', bookmarkedOrgsSet.has(org.name) ? 'text-amber-400' : 'text-[var(--text-muted)] hover:text-amber-400')}
-                      title={bookmarkedOrgsSet.has(org.name) ? 'Remove bookmark' : 'Bookmark organization'}
-                    >
-                      <Bookmark size={16} fill={bookmarkedOrgsSet.has(org.name) ? 'currentColor' : 'none'} />
-                    </button>
-                  </td>
-                  <td className="text-sm">{org.name}</td>
-                  <td className="text-xs text-[var(--text-muted)]">{org.website_name || '—'}</td>
-                  <td className="text-center text-xs">{org.tender_count}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+        <OrganizationTable
+          rows={filtered}
+          isLoading={isLoading}
+          emptyState={<EmptyState icon={Building2} title="No organizations" description={search ? `No organizations match "${search}"` : 'Sync from the server to load organizations.'} />}
+          sortCol={sortCol}
+          sortDir={sortDir}
+          onToggleSort={toggleSort}
+          getColWidth={getOrgColWidth}
+          onStartResize={startOrgColResize}
+          bookmarkedOrgsSet={bookmarkedOrgsSet}
+          onToggleBookmark={(org) => toggleOrgBookmark.mutate(org.name)}
+          onRowClick={(org) => onOpenOrgTenders?.(org.name, org.website_name)}
+        />
       </div>
     </div>
   );
@@ -1512,10 +1692,16 @@ function OrganizationsPage({ onOpenOrgTenders }) {
    Organizations page). Renders through the same TenderTable/column system as
    Online Tenders so a bookmarked tender looks and behaves identically there.
    ═══════════════════════════════════════════════════════════════════════════ */
-function BookmarksPage() {
+function BookmarksPage({ onOpenOrgTenders }) {
+  const qc = useQueryClient();
+  const [tab, setTab] = useState('tenders');
+
+  // ── Tenders sub-tab ────────────────────────────────────────────────────
   const [sortCol, setSortCol] = useState('closing_date');
   const [sortDir, setSortDir] = useState('asc');
   const [selectedId, setSelectedId] = useState(null);
+  const [showFilters, setShowFilters] = useState(false);
+  const [filters, setFilters] = useState({ org: '', location: '', category: '' });
   const columns = useTenderColumns('bookmarks');
   const { renderTenderCell } = useTenderRowActions();
 
@@ -1524,45 +1710,161 @@ function BookmarksPage() {
   const { data: tenders, isLoading } = useQuery({
     queryKey: ['client-tenders-bookmarked'],
     queryFn: () => api.listTenders(null, { limit: 5000 }),
+    enabled: tab === 'tenders',
   });
 
+  const allBookmarkedRows = useMemo(() => (tenders || []).filter((t) => t.is_bookmarked), [tenders]);
+  const uniqueOrgs = useMemo(() => [...new Set(allBookmarkedRows.map((t) => t.org_chain).filter(Boolean))].sort(), [allBookmarkedRows]);
+  const uniqueLocations = useMemo(() => [...new Set(allBookmarkedRows.map((t) => t.location).filter(Boolean))].sort(), [allBookmarkedRows]);
+  const uniqueCategories = useMemo(() => [...new Set(allBookmarkedRows.map((t) => t.tender_category).filter(Boolean))].sort(), [allBookmarkedRows]);
+
   const bookmarkedRows = useMemo(() => {
-    const list = (tenders || []).filter((t) => t.is_bookmarked);
+    let list = allBookmarkedRows;
+    if (filters.org) list = list.filter((t) => t.org_chain === filters.org);
+    if (filters.location) list = list.filter((t) => t.location === filters.location);
+    if (filters.category) list = list.filter((t) => t.tender_category === filters.category);
     return [...list].sort((a, b) => {
       const c = smartCmp(a[sortCol] ?? '', b[sortCol] ?? '');
       return sortDir === 'asc' ? c : -c;
     });
-  }, [tenders, sortCol, sortDir]);
+  }, [allBookmarkedRows, filters, sortCol, sortDir]);
 
   const toggleSort = (key) => {
     if (sortCol === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
     else { setSortCol(key); setSortDir('asc'); }
   };
 
+  const exportBookmarkedTenders = () => {
+    const exportColumns = columns.visibleTenderColumns.filter((column) => !TENDER_NON_SORTABLE.has(column.key));
+    exportCSV(
+      exportColumns.map((column) => column.label),
+      bookmarkedRows,
+      exportColumns.map((column) => column.key),
+      `bookmarked_tenders_${new Date().toISOString().slice(0, 10)}.csv`
+    );
+  };
+
+  // ── Organizations sub-tab ──────────────────────────────────────────────
+  const [orgSortCol, setOrgSortCol] = useState('tender_count');
+  const [orgSortDir, setOrgSortDir] = useState('desc');
+  const { getOrgColWidth, startOrgColResize } = useOrganizationColumns();
+  const { data: organizations, isLoading: orgsLoading } = useQuery({ queryKey: ['organizations'], queryFn: api.listOrganizations, enabled: tab === 'organizations' });
+  const { data: bookmarkedOrgs } = useQuery({ queryKey: ['bookmarked-orgs'], queryFn: api.listBookmarkedOrgs, enabled: tab === 'organizations' });
+  const bookmarkedOrgsSet = useMemo(() => new Set(bookmarkedOrgs || []), [bookmarkedOrgs]);
+  const toggleOrgBookmark = useMutation({
+    mutationFn: (org) => api.toggleOrgBookmark(org),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['bookmarked-orgs'] }),
+  });
+  const bookmarkedOrgRows = useMemo(() => {
+    const list = (organizations || []).filter((o) => bookmarkedOrgsSet.has(o.name));
+    return [...list].sort((a, b) => {
+      const c = smartCmp(a[orgSortCol] ?? '', b[orgSortCol] ?? '');
+      return orgSortDir === 'asc' ? c : -c;
+    });
+  }, [organizations, bookmarkedOrgsSet, orgSortCol, orgSortDir]);
+  const toggleOrgSort = (key) => {
+    if (orgSortCol === key) setOrgSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else { setOrgSortCol(key); setOrgSortDir(key === 'tender_count' ? 'desc' : 'asc'); }
+  };
+
+  const count = tab === 'organizations' ? bookmarkedOrgRows.length : bookmarkedRows.length;
+
   return (
     <div className="flex h-full flex-col">
       <div className="border-b border-[var(--border)] bg-[var(--surface-0)] px-6 py-3">
         <div className="flex items-center gap-2.5">
           <h1 className="text-lg font-bold text-[var(--text)]">Bookmarks</h1>
-          <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-xs font-medium text-[var(--text-muted)]">{bookmarkedRows.length}</span>
+          <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-xs font-medium text-[var(--text-muted)]">{count}</span>
+        </div>
+        {tab === 'tenders' && (
+          <div className="mt-2 flex flex-wrap items-center gap-3">
+            <button
+              onClick={() => setShowFilters((v) => !v)}
+              className={cn('btn-ghost gap-1.5 text-xs', (showFilters || filters.org || filters.location || filters.category) && 'bg-[var(--accent-bg)] text-[var(--accent)]')}
+              title="Organization / Location / Category filters"
+            >
+              <Filter size={13} />Filters
+            </button>
+            <div className="flex-1" />
+            <TenderColumnsMenuButton
+              orderedTenderColumns={columns.orderedTenderColumns}
+              tenderHidden={columns.tenderHidden}
+              toggleTenderCol={columns.toggleTenderCol}
+              reorderMovableColumn={columns.reorderMovableColumn}
+            />
+            <button onClick={exportBookmarkedTenders} className="btn-ghost gap-1.5 text-xs"><FileDown size={13} />Export CSV</button>
+          </div>
+        )}
+        {tab === 'tenders' && showFilters && (
+          <div className="mt-2 grid grid-cols-2 gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3 lg:grid-cols-4">
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Organization</label>
+              <select value={filters.org} onChange={(e) => setFilters((f) => ({ ...f, org: e.target.value }))} className="input-field h-8 w-full text-xs">
+                <option value="">All</option>
+                {uniqueOrgs.map((o) => <option key={o} value={o}>{o}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Location</label>
+              <select value={filters.location} onChange={(e) => setFilters((f) => ({ ...f, location: e.target.value }))} className="input-field h-8 w-full text-xs">
+                <option value="">All</option>
+                {uniqueLocations.map((l) => <option key={l} value={l}>{l}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Category</label>
+              <select value={filters.category} onChange={(e) => setFilters((f) => ({ ...f, category: e.target.value }))} className="input-field h-8 w-full text-xs">
+                <option value="">All</option>
+                {uniqueCategories.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <div className="flex items-end"><button onClick={() => setFilters({ org: '', location: '', category: '' })} className="btn-ghost text-xs">Clear</button></div>
+          </div>
+        )}
+        <div className="-mx-6 -mb-3 mt-2 flex border-t border-[var(--border)] px-6">
+          {[{ key: 'organizations', label: 'Organizations' }, { key: 'tenders', label: 'Tenders' }].map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              className={cn('border-b-2 px-4 py-2.5 text-sm font-medium transition-colors', tab === t.key ? 'border-[var(--accent)] text-[var(--accent)]' : 'border-transparent text-[var(--text-muted)] hover:text-[var(--text)]')}
+            >
+              {t.label}
+            </button>
+          ))}
         </div>
       </div>
       <div className="flex-1 overflow-auto">
-        <TenderTable
-          columns={columns.visibleTenderColumns}
-          getColWidth={columns.getTenderColWidth}
-          tableWidth={columns.tenderTableWidth}
-          sortCol={sortCol}
-          sortDir={sortDir}
-          onToggleSort={toggleSort}
-          onStartResize={columns.startTenderColResize}
-          rows={bookmarkedRows}
-          isLoading={isLoading}
-          emptyState={<EmptyState icon={Star} title="No bookmarked tenders" description="Star a tender in Online Tenders to see it here." />}
-          renderCell={renderTenderCell}
-          selectedId={selectedId}
-          onSelectRow={(t) => setSelectedId(t.id === selectedId ? null : t.id)}
-        />
+        {tab === 'organizations' ? (
+          <OrganizationTable
+            rows={bookmarkedOrgRows}
+            isLoading={orgsLoading}
+            emptyState={<EmptyState icon={Bookmark} title="No bookmarked organizations" description="Star an organization in Organizations to see it here." />}
+            sortCol={orgSortCol}
+            sortDir={orgSortDir}
+            onToggleSort={toggleOrgSort}
+            getColWidth={getOrgColWidth}
+            onStartResize={startOrgColResize}
+            bookmarkedOrgsSet={bookmarkedOrgsSet}
+            onToggleBookmark={(org) => toggleOrgBookmark.mutate(org.name)}
+            onRowClick={(org) => onOpenOrgTenders?.(org.name, org.website_name)}
+          />
+        ) : (
+          <TenderTable
+            columns={columns.visibleTenderColumns}
+            getColWidth={columns.getTenderColWidth}
+            tableWidth={columns.tenderTableWidth}
+            sortCol={sortCol}
+            sortDir={sortDir}
+            onToggleSort={toggleSort}
+            onStartResize={columns.startTenderColResize}
+            rows={bookmarkedRows}
+            isLoading={isLoading}
+            emptyState={<EmptyState icon={Star} title="No bookmarked tenders" description="Star a tender in Online Tenders to see it here." />}
+            renderCell={renderTenderCell}
+            selectedId={selectedId}
+            onSelectRow={(t) => setSelectedId(t.id === selectedId ? null : t.id)}
+          />
+        )}
       </div>
     </div>
   );
@@ -1724,7 +2026,11 @@ function ProjectsPage({ onOpenProjectWorkspace, archived = false }) {
   const selectedProject = useMemo(() => (projects || []).find((p) => p.id === selId) || null, [projects, selId]);
   const { data: checklist, isLoading: checklistLoading } = useQuery({ queryKey: ['project-checklist', selId], queryFn: () => api.listChecklist(selId), enabled: !!selId && showDetails });
 
-  const createProject = useMutation({ mutationFn: (d) => api.createProject(d), onSuccess: () => { qc.invalidateQueries({ queryKey: ['projects'] }); qc.invalidateQueries({ queryKey: ['dashboard'] }); resetForm(); } });
+  const createProject = useMutation({
+    mutationFn: (d) => api.createProject(d),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['projects'] }); qc.invalidateQueries({ queryKey: ['dashboard'] }); resetForm(); },
+    onError: (err) => alert(err instanceof Error ? err.message : String(err)),
+  });
   const updateProject = useMutation({ mutationFn: ({ id, data }) => api.updateProject(id, data), onSuccess: () => { qc.invalidateQueries({ queryKey: ['projects'] }); resetForm(); } });
   const deleteProject = useMutation({
     mutationFn: async (ids) => {
@@ -3729,6 +4035,12 @@ export default function App() {
     return allowed.includes(saved) ? saved : 'dashboard';
   });
   const [showNotifications, setShowNotifications] = useState(false);
+  const [showDownloads, setShowDownloads] = useState(false);
+  const { data: allDocuments } = useQuery({ queryKey: ['client-documents'], queryFn: api.listAllDocuments });
+  const downloadsInProgressCount = useMemo(
+    () => (allDocuments || []).filter((d) => d.client_status === 'requested' || d.client_status === 'downloading').length,
+    [allDocuments]
+  );
   const [workspaceProjectId, setWorkspaceProjectId] = useState(() => {
     const value = Number(new URLSearchParams(window.location.search).get('projectId'));
     return Number.isFinite(value) && value > 0 ? value : null;
@@ -3751,12 +4063,15 @@ export default function App() {
   }, []);
 
   // Keeps the offline cache current without relying on the user remembering
-  // to press "Sync Tenders" in Settings — same pull-only sync, just scheduled.
+  // to press "Sync Tenders" in Settings — same sync (flush the queued
+  // pushes, then pull), on a 15-minute schedule AND the moment the network
+  // comes back so an offline edit propagates immediately on reconnect.
   useEffect(() => {
     if (!authSettings?.auth_token) return undefined;
     const run = () => { api.syncFromServer().then(() => qc.invalidateQueries()).catch(() => {}); };
     const timer = setInterval(run, 15 * 60 * 1000);
-    return () => clearInterval(timer);
+    window.addEventListener('online', run);
+    return () => { clearInterval(timer); window.removeEventListener('online', run); };
   }, [authSettings?.auth_token, qc]);
 
   // A "Requested…" pill (TendersPage) is backed by a placeholder row in the
@@ -3768,6 +4083,24 @@ export default function App() {
     if (!authSettings?.auth_token) return;
     api.resumePendingDownloadJobs().catch(() => {});
   }, [authSettings?.auth_token]);
+
+  // An edit (bookmark, project, checklist, ...) that failed to push in a
+  // previous session — app closed before the retry succeeded — sits marked
+  // "pending" in local storage until something retries it. Do that now
+  // rather than waiting for the 15-minute periodic sync or a manual click.
+  useEffect(() => {
+    if (!authSettings?.auth_token) return;
+    api.flushPendingSyncPush().catch(() => {});
+  }, [authSettings?.auth_token]);
+
+  // A background download job completing (api.js, no React Query access of
+  // its own) can change a tender's has_documents/document_count outside of
+  // any mutation this component knows about — refresh the tender lists when
+  // it signals that, so "Request" flips to "Download" without a manual Sync.
+  useEffect(() => api.onTendersChanged(() => {
+    qc.invalidateQueries({ queryKey: ['client-tenders'] });
+    qc.invalidateQueries({ queryKey: ['client-tenders-bookmarked'] });
+  }), [qc]);
 
   if (!authLoading && !authSettings?.auth_token) return <SignInScreen />;
 
@@ -3799,6 +4132,13 @@ export default function App() {
     navigate('organizations');
   };
 
+  // Downloads panel row click — jump to Online Tenders with that tender
+  // selected/highlighted (tolerates the tender no longer being present).
+  const openTenderDetails = (tenderDbId) => {
+    try { sessionStorage.setItem(TENDERS_FORCE_SELECT_KEY, String(tenderDbId || '')); } catch { /* ignore storage failures */ }
+    navigate('tenders');
+  };
+
   // Dashboard stat cards navigate to a pre-filtered view — same cross-page
   // mechanism as openOrgTenders, minus the org filter. Deliberately leaves
   // `website` untouched (read-modify-write) since it's now a mandatory
@@ -3820,7 +4160,7 @@ export default function App() {
     dashboard: <DashboardPage onNavigate={goToDashboardTarget} onOpenProjectWorkspace={(projectId) => setWorkspaceProjectId(projectId)} onOpenWebsiteOrganizations={openWebsiteOrganizations} />,
     tenders: <TendersPage onBackToOrganizations={() => navigate('organizations')} />,
     organizations: <OrganizationsPage onOpenOrgTenders={openOrgTenders} />,
-    bookmarks: <BookmarksPage />,
+    bookmarks: <BookmarksPage onOpenOrgTenders={openOrgTenders} />,
     projects: <ProjectsPage key="projects-active" onOpenProjectWorkspace={(projectId) => setWorkspaceProjectId(projectId)} />,
     archived_projects: <ProjectsPage key="projects-archived" archived onOpenProjectWorkspace={(projectId) => setWorkspaceProjectId(projectId)} />,
     templates: <TemplatesPage />,
@@ -3843,6 +4183,12 @@ export default function App() {
           )}
         </div>
         <div className="flex items-center gap-1">
+          <button onClick={() => setShowDownloads(!showDownloads)} className="relative p-1.5 rounded-md hover:bg-[var(--surface-1)] text-[var(--text-muted)]">
+            <Download size={16} />
+            {downloadsInProgressCount > 0 && (
+              <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 bg-[var(--accent)] text-white text-[10px] font-bold rounded-full flex items-center justify-center px-1">{downloadsInProgressCount}</span>
+            )}
+          </button>
           <button onClick={() => setShowNotifications(!showNotifications)} className="relative p-1.5 rounded-md hover:bg-[var(--surface-1)] text-[var(--text-muted)]">
             <Bell size={16} />
             {unreadCount > 0 && (
@@ -3853,6 +4199,7 @@ export default function App() {
             {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
           </button>
         </div>
+        <DownloadsPanel open={showDownloads} onClose={() => setShowDownloads(false)} onOpenTender={(tenderDbId) => { setShowDownloads(false); openTenderDetails(tenderDbId); }} />
         <NotificationPanel open={showNotifications} onClose={() => setShowNotifications(false)} />
       </header>
 

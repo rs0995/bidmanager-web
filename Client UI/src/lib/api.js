@@ -174,27 +174,70 @@ const SYNC_PUSH_DELAY_MS = 150;
 const SYNC_PUSH_MAX_DELAY_MS = 30000;
 let _syncPushTimer = null;
 let _syncPushPending = false;
-// The last /client/sync blob the server handed us (set by pullUserData). Used
-// to compute the `removed` delta on push — items that were in the server's
-// copy but the user has since deleted locally — so the server's additive
-// merge can honour a real removal without letting a stale/partial push wipe
-// a whole collection.
+// The last /client/sync blob the server handed us, and its `updated_at`.
+// Used to compute the `removed` delta on push AND as `base_updated_at` for
+// the server's per-item concurrency check ("any online edit beats an offline
+// edit"). PERSISTED to settings so an offline delete made before an app
+// restart can still be expressed on the next push. If this is lost (fresh
+// install / cleared data), `base_updated_at` is 0 and the server's copy wins
+// outright on the next pull.
 let _lastServerBlob = {};
+let _baseUpdatedAt = 0;
+let _baselineLoaded = false;
+async function loadSyncBaseline() {
+  if (_baselineLoaded) return;
+  _baselineLoaded = true;
+  try {
+    const s = (await getState()).settings || {};
+    if (s.lastServerSyncBlob && typeof s.lastServerSyncBlob === 'object' && Object.keys(_lastServerBlob).length === 0) {
+      _lastServerBlob = s.lastServerSyncBlob;
+    }
+    if (!_baseUpdatedAt) _baseUpdatedAt = Number(s.lastServerSyncAt) || 0;
+  } catch { /* first run — no settings yet */ }
+}
+async function saveSyncBaseline(blob, updatedAt) {
+  _lastServerBlob = (blob && typeof blob === 'object') ? blob : {};
+  const ts = Number(updatedAt);
+  if (Number.isFinite(ts) && ts > 0) _baseUpdatedAt = ts;
+  _baselineLoaded = true;
+  await updateState((state) => {
+    state.settings = { ...state.settings, lastServerSyncBlob: _lastServerBlob, lastServerSyncAt: _baseUpdatedAt };
+    return state;
+  });
+}
 const _idSet = (values) => new Set((values || []).map(Number).filter(Number.isFinite));
 const _rowIdSet = (rows) => new Set((rows || []).map((r) => Number(r?.id)).filter(Number.isFinite));
+// `_syncPushPending` alone doesn't survive an app restart — it's just a JS
+// module variable, gone the instant the process exits. If a push fails and
+// the app is closed before a retry succeeds, that in-memory flag resets to
+// false on next launch even though the edit was never actually confirmed by
+// the server — nothing then knows to retry it until the user happens to
+// touch that same data again. `state.settings.pendingSyncPush` is the
+// durable twin of that flag: written to IndexedDB the moment an edit is
+// made, cleared only once a push actually succeeds, and checked on every
+// flush (including the very first one after a restart) so an unconfirmed
+// edit from a previous session gets retried automatically.
+async function markSyncPushConfirmed() {
+  await updateState((state) => { state.settings = { ...state.settings, pendingSyncPush: false }; return state; });
+}
 function armSyncPushTimer(delay) {
   clearTimeout(_syncPushTimer);
   _syncPushTimer = setTimeout(async () => {
     try {
       await api.pushUserData();
       _syncPushPending = false;
+      await markSyncPushConfirmed();
     } catch {
       armSyncPushTimer(Math.min(delay * 2, SYNC_PUSH_MAX_DELAY_MS));
     }
   }, delay);
 }
 function updateSyncedState(mutator) {
-  const result = updateState(mutator);
+  const result = updateState((state) => {
+    const next = mutator(state) || state;
+    next.settings = { ...next.settings, pendingSyncPush: true };
+    return next;
+  });
   _syncPushPending = true;
   armSyncPushTimer(SYNC_PUSH_DELAY_MS);
   return result;
@@ -202,20 +245,23 @@ function updateSyncedState(mutator) {
 
 // A pull (pullUserData) overwrites local state wholesale from the server —
 // if a push from updateSyncedState is still pending (scheduled OR failed and
-// awaiting retry) when that happens, the pull would resurrect whatever the
-// local edit just removed/added (e.g. a deleted checklist item, or a newly
-// bookmarked tender that never actually reached the server), then the stale
-// timer would push that resurrection right back. Flushing — and actually
-// confirming success — first closes that race. If the flush itself fails,
-// this throws so pullUserData can skip overwriting local state this round
-// entirely, rather than trust a server copy known to be missing this
-// device's still-unconfirmed edit.
+// awaiting retry — this session's or, via the persisted flag, a previous
+// one's) when that happens, the pull would resurrect whatever the local edit
+// just removed/added (e.g. a deleted checklist item, or a newly bookmarked
+// tender that never actually reached the server), then the stale timer would
+// push that resurrection right back. Flushing — and actually confirming
+// success — first closes that race. If the flush itself fails, this throws
+// so pullUserData can skip overwriting local state this round entirely,
+// rather than trust a server copy known to be missing this device's still-
+// unconfirmed edit.
 async function flushPendingSyncPush() {
-  if (!_syncPushPending) return;
+  const persisted = (await getQueuedState()).settings?.pendingSyncPush;
+  if (!_syncPushPending && !persisted) return;
   clearTimeout(_syncPushTimer);
   try {
     await api.pushUserData();
     _syncPushPending = false;
+    await markSyncPushConfirmed();
   } catch (error) {
     armSyncPushTimer(SYNC_PUSH_DELAY_MS);
     throw error;
@@ -242,6 +288,11 @@ export const api = {
     _tendersChangedListeners.add(fn);
     return () => _tendersChangedListeners.delete(fn);
   },
+
+  // Call once at app startup: retries any edit left unconfirmed by a
+  // previous session (see the pendingSyncPush comment above) instead of
+  // waiting for the next periodic sync or manual action to stumble onto it.
+  flushPendingSyncPush: () => flushPendingSyncPush(),
 
   // ── Auth ───────────────────────────────────────────────────────────
   registerAccount: (input, overrides = {}) => requestClient(
@@ -887,6 +938,7 @@ export const api = {
     };
     // Removal delta: what the server last gave us but is gone locally now. The
     // server unions the rest, so this is the only way a delete propagates.
+    await loadSyncBaseline();
     const localBookmarks = _idSet(data.bookmarks);
     const localOrgs = new Set(bookmarkedOrgs);
     const localProjectIds = _rowIdSet(data.projects);
@@ -897,7 +949,16 @@ export const api = {
       projects: [...(_lastServerBlob.projects || [])].map((r) => Number(r?.id)).filter((id) => Number.isFinite(id) && !localProjectIds.has(id)),
       checklist: [...(_lastServerBlob.checklist || [])].map((r) => Number(r?.id)).filter((id) => Number.isFinite(id) && !localChecklistIds.has(id)),
     };
-    return requestClient('/client/sync', { method: 'PUT', body: { data, removed } }, overrides);
+    const res = await requestClient(
+      '/client/sync',
+      { method: 'PUT', body: { data, removed, base_updated_at: _baseUpdatedAt } },
+      overrides,
+    );
+    // Our push is now the latest known state — re-baseline so the next push
+    // isn't treated as stale and the next `removed` diff is against what we
+    // just sent.
+    await saveSyncBaseline(data, res?.updated_at);
+    return res;
   },
   pullUserData: async (overrides = {}) => {
     // Send any not-yet-pushed local edit first — otherwise this pull could
@@ -913,46 +974,29 @@ export const api = {
     }
     const response = await requestClient('/client/sync', {}, overrides);
     const data = response?.data || {};
-    // Reconcile against the server as authoritative, but keep a local item the
-    // server lacks when it's a genuine unsynced local ADD (present locally,
-    // absent from BOTH the server copy and the last server copy we saw). That
-    // survives a pull that races ahead of this device's own not-yet-confirmed
-    // push; anything the server dropped (a remove from another device, or a
-    // phantom) is let go.
-    const prevServerBookmarks = _idSet(_lastServerBlob.bookmarks);
-    const prevServerOrgs = new Set(_lastServerBlob.bookmarkedOrgs || []);
-    const prevServerProjectIds = _rowIdSet(_lastServerBlob.projects);
-    const prevServerChecklistIds = _rowIdSet(_lastServerBlob.checklist);
+    // The server is authoritative and flushPendingSyncPush() above already sent
+    // this device's queued edits, so this is a straight REPLACE from the
+    // server copy. Device-local filesystem paths (folder_path /
+    // linked_file_path) are carried over by id.
     await updateState((state) => {
       if (Array.isArray(data.bookmarks)) {
         const serverIds = _idSet(data.bookmarks);
-        state.tenders = state.tenders.map((row) => {
-          const id = Number(row.id);
-          const localAdd = row.is_bookmarked && !serverIds.has(id) && !prevServerBookmarks.has(id);
-          return { ...row, is_bookmarked: serverIds.has(id) || localAdd };
-        });
+        state.tenders = state.tenders.map((row) => ({ ...row, is_bookmarked: serverIds.has(Number(row.id)) }));
       }
-      if (Array.isArray(data.bookmarkedOrgs)) {
-        const localAdds = (state.bookmarkedOrgs || []).filter((n) => !prevServerOrgs.has(n));
-        state.bookmarkedOrgs = [...new Set([...data.bookmarkedOrgs, ...localAdds])];
-      }
+      if (Array.isArray(data.bookmarkedOrgs)) state.bookmarkedOrgs = [...data.bookmarkedOrgs];
       if (Array.isArray(data.templates)) state.templates = data.templates;
       if (Array.isArray(data.templateItems)) state.templateItems = data.templateItems;
       if (Array.isArray(data.projects)) {
         const localFolders = new Map(state.projects.map((row) => [row.id, row.folder_path]));
-        const serverIds = _rowIdSet(data.projects);
-        const localAdds = state.projects.filter((r) => !serverIds.has(Number(r.id)) && !prevServerProjectIds.has(Number(r.id)));
-        state.projects = [...data.projects, ...localAdds].map((row) => ({ ...row, folder_path: localFolders.get(row.id) || row.folder_path || null }));
+        state.projects = data.projects.map((row) => ({ ...row, folder_path: localFolders.get(row.id) || row.folder_path || null }));
       }
       if (Array.isArray(data.checklist)) {
         const localPaths = new Map(state.checklist.map((row) => [row.id, row.linked_file_path]));
-        const serverIds = _rowIdSet(data.checklist);
-        const localAdds = state.checklist.filter((r) => !serverIds.has(Number(r.id)) && !prevServerChecklistIds.has(Number(r.id)));
-        state.checklist = [...data.checklist, ...localAdds].map((row) => ({ ...row, linked_file_path: localPaths.get(row.id) || row.linked_file_path || '' }));
+        state.checklist = data.checklist.map((row) => ({ ...row, linked_file_path: localPaths.get(row.id) || row.linked_file_path || '' }));
       }
       return state;
     });
-    _lastServerBlob = data;
+    await saveSyncBaseline(data, response?.updated_at);
     const columnPrefs = data.tenderColumnPrefs;
     if (columnPrefs) {
       const store = useAppStore.getState();

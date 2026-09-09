@@ -180,38 +180,23 @@ export function deleteChecklistItem(itemId) {
   persist();
 }
 
-// Called by sync.js when a /client/sync pull brings in projects/checklist
-// from another device. Local-only fields (attachment metadata refers to a
-// File that only exists on the device that attached it) are dropped on pull
-// from a foreign write, but preserved when the row is this device's own.
-export function mergeFromServer(serverProjects, serverChecklist, prevBlob = {}) {
-  // Server is authoritative, but a row created locally that hasn't round-
-  // tripped through a successful push yet must survive a pull that races
-  // ahead of it. "Hasn't synced yet" = the id is absent from BOTH the server
-  // copy and the LAST server copy we saw (prevBlob) — i.e. a genuine local
-  // add, not something the server deliberately deleted.
-  const prevProjIds = new Set((prevBlob.projects || []).map((r) => r && r.id));
-  const prevChkIds = new Set((prevBlob.checklist || []).map((r) => r && r.id));
+// Called by sync.js on a /client/sync PULL. The server is the source of
+// truth and sync.js already flushed this device's queue before pulling, so
+// this is a straight REPLACE from the server copy — only this device's own
+// attachment metadata (a File that lives in fileObjects here) is carried
+// over by id.
+export function mergeFromServer(serverProjects, serverChecklist) {
   if (Array.isArray(serverProjects)) {
-    const localById = new Map(projectsCache.map((row) => [row.id, row]));
-    const merged = serverProjects.map((row) => ({ ...localById.get(row.id), ...row }));
-    const serverIds = new Set(serverProjects.map((row) => row.id));
-    const localOnly = projectsCache.filter((row) => !serverIds.has(row.id) && !prevProjIds.has(row.id));
-    projectsCache = [...merged, ...localOnly];
-    nextProjectId = 1 + projectsCache.reduce((m, p) => Math.max(m, p.id), 0);
+    projectsCache = serverProjects.map((row) => ({ ...row }));
+    nextProjectId = 1 + projectsCache.reduce((m, p) => Math.max(m, Number(p.id) || 0), 0);
   }
   if (Array.isArray(serverChecklist)) {
     const localById = new Map(checklistCache.map((row) => [row.id, row]));
-    const merged = serverChecklist.map((row) => {
+    checklistCache = serverChecklist.map((row) => {
       const local = localById.get(row.id);
-      // Keep this device's own attachment metadata (the File itself only
-      // lives in fileObjects on the device that attached it).
       return { ...row, attachment: local?.attachment ?? row.attachment ?? null };
     });
-    const serverIds = new Set(serverChecklist.map((row) => row.id));
-    const localOnly = checklistCache.filter((row) => !serverIds.has(row.id) && !prevChkIds.has(row.id));
-    checklistCache = [...merged, ...localOnly];
-    nextItemId = 1 + checklistCache.reduce((m, c) => Math.max(m, c.id), 0);
+    nextItemId = 1 + checklistCache.reduce((m, c) => Math.max(m, Number(c.id) || 0), 0);
   }
   persist(false);
 }
