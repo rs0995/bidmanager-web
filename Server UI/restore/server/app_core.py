@@ -3369,13 +3369,42 @@ class ScraperBackend:
         return len(missing) == 0, missing
 
     @staticmethod
+    def _main_download_ledger_complete(tender_id):
+        # "update" mode trusts the notice + zip to already be on disk. A blob
+        # sitting in storage is not proof they were downloaded successfully -- a
+        # failed/partial job (or a false-positive storage.exists) leaves the
+        # blob check happy with no completed ledger row. Require the same
+        # "recorded success" signal should_skip_file() uses.
+        canonical = ScraperBackend.canonical_tender_id(tender_id)
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            rows = conn.execute(
+                "SELECT LOWER(TRIM(COALESCE(file_type,''))) FROM downloaded_files "
+                "WHERE UPPER(TRIM(COALESCE(tender_id,'')))=? "
+                "AND LOWER(TRIM(COALESCE(file_type,''))) IN ('notice','zip') "
+                "AND COALESCE(download_status,'complete')='complete' "
+                "AND (file_size_bytes IS NULL OR file_size_bytes > 0)",
+                (canonical,),
+            ).fetchall()
+            conn.close()
+        except Exception:
+            return False, ["ledger"]
+        have = {str(r[0] or "") for r in rows}
+        missing = [name for name in ("notice", "zip") if name not in have]
+        return len(missing) == 0, missing
+
+    @staticmethod
     def _resolve_download_mode(requested_mode, tender_id, folder_path):
         mode = str(requested_mode or "").strip().lower()
         if mode == "full":
             return "full"
         ok, missing = ScraperBackend._has_required_full_download_artifacts(tender_id, folder_path)
         if ok:
-            return "update"
+            ledger_ok, ledger_missing = ScraperBackend._main_download_ledger_complete(tender_id)
+            if ledger_ok:
+                return "update"
+            # Blob present but never recorded as a completed download.
+            ok, missing = False, ledger_missing
         if mode in {"", "auto"}:
             return "full"
         missing_txt = ", ".join(missing) if missing else "required files"
@@ -3818,9 +3847,7 @@ class ScraperBackend:
             f"SELECT id, tender_url FROM tenders WHERE website_id=? AND id IN ({placeholders})",
             (website_id, *ids),
         ).fetchall()
-        site_url_row = conn.execute("SELECT url FROM websites WHERE id=?", (website_id,)).fetchone()
         conn.close()
-        base_url = site_url_row[0] if site_url_row else "https://mahatenders.gov.in/nicgep/app?page=FrontEndTendersByOrganisation&service=page"
 
         targets = [(int(r[0]), str(r[1] or "").strip()) for r in rows if str(r[1] or "").strip()]
         if not targets:
