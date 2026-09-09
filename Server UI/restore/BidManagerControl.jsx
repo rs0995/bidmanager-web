@@ -2402,7 +2402,7 @@ function CaptchaPanel({ toast, captchas, setCaptchas, base, adminKey }) {
 // Expanded detail for one user row: their cloud-synced blob (bookmarks,
 // projects, templates, checklist, column prefs — from client_user_sync),
 // recent client activity, the raw JSON, and a reset action.
-function UserSyncDetail({ user, detail, onReset, onRefresh, resetBusy, toast }) {
+function UserSyncDetail({ user, detail, onReset, resetBusy, toast }) {
   const [rawOpen, setRawOpen] = useState(false);
   if (detail === 'loading' || detail == null) {
     return <div className="px-3 py-4"><Empty icon={Loader2} title="Loading user data…" /></div>;
@@ -2428,13 +2428,8 @@ function UserSyncDetail({ user, detail, onReset, onRefresh, resetBusy, toast }) 
         <span style={{ fontSize: 12, color: c.ink60 }}>
           {sync.synced_at ? <>Last synced <Mono style={{ fontSize: 11.5 }}>{fmtDateTime(sync.synced_at * 1000)}</Mono></> : 'Never synced'}
         </span>
-        <div className="flex items-center gap-2">
-          {onRefresh && (
-            <Btn size="sm" icon={RefreshCw} busy={detail === 'loading'} onClick={() => onRefresh(user)}>Refresh</Btn>
-          )}
-          <Btn size="sm" variant="danger" icon={Trash2} busy={resetBusy} disabled={!hasAnySync}
-            onClick={() => onReset(user)}>Reset synced data</Btn>
-        </div>
+        <Btn size="sm" variant="danger" icon={Trash2} busy={resetBusy} disabled={!hasAnySync}
+          onClick={() => onReset(user)}>Reset synced data</Btn>
       </div>
 
       {!hasAnySync ? (
@@ -2707,6 +2702,7 @@ function UsersPanel({ toast, base, adminKey }) {
                           user={u}
                           detail={details[u.id]}
                           onReset={resetSync}
+                          onRefresh={() => fetchDetail(u.id)}
                           resetBusy={resetBusyId === u.id}
                           toast={toast}
                         />
