@@ -989,40 +989,9 @@ export const api = {
     } catch {
       return {};
     }
-    let response = await requestClient('/client/sync', {}, overrides);
-    let data = response?.data || {};
+    const response = await requestClient('/client/sync', {}, overrides);
+    const data = response?.data || {};
 
-    // Self-heal: if this device holds synced content the server's blob lacks
-    // (bookmarks a push never delivered — the old HTTP 500, or from before
-    // the durable pending flag), push it up BEFORE the hard-mirror below
-    // erases it, then re-pull the merged result. The server's per-item
-    // base_updated_at check still lets a genuine online removal win, so this
-    // recovers stranded local edits without resurrecting deleted ones.
-    {
-      const local = await getQueuedState();
-      const sBk = _idSet(data.bookmarks || []);
-      const sOrg = new Set(data.bookmarkedOrgs || []);
-      const sProj = _rowIdSet(data.projects || []);
-      const sChk = _rowIdSet(data.checklist || []);
-      const localOnly =
-        (local.tenders || []).some((t) => t.is_bookmarked && !sBk.has(Number(t.id)))
-        || (local.bookmarkedOrgs || []).some((n) => !sOrg.has(n))
-        || (local.projects || []).some((p) => !sProj.has(Number(p.id)))
-        || (local.checklist || []).some((c) => !sChk.has(Number(c.id)));
-      if (localOnly) {
-        await updateState((s) => {
-          s.settings = { ...s.settings, pendingSyncPush: true, has_synced_once: true };
-          return s;
-        });
-        try {
-          await api.pushUserData();
-          _syncPushPending = false;
-          await markSyncPushConfirmed();
-        } catch { /* stays pending — a later flushPendingSyncPush retries it */ }
-        response = await requestClient('/client/sync', {}, overrides);
-        data = response?.data || {};
-      }
-    }
     // The server is the source of truth: a pull HARD-MIRRORS local user-data
     // to the server blob — every synced collection is set unconditionally,
     // defaulting to empty, so a key the server omits (or a "Reset synced
