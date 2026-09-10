@@ -3710,7 +3710,9 @@ function SettingsPage() {
       ...f,
       parent_dir: deriveParent(settings) || f.parent_dir,
       project_details_show_tender_info: settings.project_details_show_tender_info || f.project_details_show_tender_info,
-      server_url: settings.server_url || api.defaultServerUrl,
+      // Show the effective URL: the baked-in default unless the user has
+      // explicitly set one.
+      server_url: settings.server_url_user_set ? (settings.server_url || api.defaultServerUrl) : api.defaultServerUrl,
     }));
   }, [settings]);
 
@@ -3722,10 +3724,12 @@ function SettingsPage() {
     // back. Other settings still save; the URL just snaps back to the
     // known-good one.
     mutationFn: async (patch) => {
-      const storedUrl = normUrl(settings?.server_url || api.defaultServerUrl);
+      const effectiveStored = settings?.server_url_user_set ? (settings?.server_url || api.defaultServerUrl) : api.defaultServerUrl;
+      const storedUrl = normUrl(effectiveStored);
       const nextUrl = normUrl(patch.server_url);
+      const urlChanged = Boolean(nextUrl) && nextUrl !== storedUrl;
       let urlError = '';
-      if (nextUrl && nextUrl !== storedUrl) {
+      if (urlChanged) {
         try {
           await api.testConnection({ server_url: patch.server_url });
         } catch (error) {
@@ -3733,8 +3737,8 @@ function SettingsPage() {
         }
       }
       const toSave = urlError
-        ? { ...patch, server_url: settings?.server_url || api.defaultServerUrl }
-        : patch;
+        ? { ...patch, server_url: effectiveStored }
+        : (urlChanged ? { ...patch, server_url_user_set: true } : patch);
       await api.updateSettings(toSave);
       const folders = await api.ensureParentFolders(toSave.parent_dir);
       return { folders, urlError, savedUrl: toSave.server_url };
@@ -3756,7 +3760,7 @@ function SettingsPage() {
   });
   const handleSave = () => saveMut.mutate(form);
   const resetUrlMut = useMutation({
-    mutationFn: () => api.updateSettings({ server_url: api.defaultServerUrl }),
+    mutationFn: () => api.updateSettings({ server_url: api.defaultServerUrl, server_url_user_set: false }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['settings'] });
       qc.invalidateQueries({ queryKey: ['health'] });
@@ -4134,14 +4138,33 @@ export default function App() {
     api.resumePendingDownloadJobs().catch(() => {});
   }, [authSettings?.auth_token]);
 
+  // Heal a stale/dead Backend URL left in an old install's app data: while
+  // the user hasn't explicitly set one, the baked-in default is authoritative
+  // (connection() already ignores the stale value — this just keeps the
+  // persisted copy honest so Settings shows the real host).
+  useEffect(() => {
+    if (!authSettings?.auth_token || authSettings.server_url_user_set) return;
+    if (String(authSettings.server_url || '').replace(/\/+$/, '') !== String(api.defaultServerUrl).replace(/\/+$/, '')) {
+      api.updateSettings({ server_url: api.defaultServerUrl }).then(() => qc.invalidateQueries({ queryKey: ['settings'] })).catch(() => {});
+    }
+  }, [authSettings?.auth_token, authSettings?.server_url_user_set, authSettings?.server_url, qc]);
+
+  // First sync on any install is a PULL — a fresh (or stale) device adopts
+  // the server's data before it's ever allowed to push. pullUserData also
+  // flushes any pending edit first and re-pushes stranded local-only content.
+  useEffect(() => {
+    if (!authSettings?.auth_token || authSettings.has_synced_once) return;
+    api.pullUserData().catch(() => {});
+  }, [authSettings?.auth_token, authSettings?.has_synced_once]);
+
   // An edit (bookmark, project, checklist, ...) that failed to push in a
   // previous session — app closed before the retry succeeded — sits marked
   // "pending" in local storage until something retries it. Do that now
   // rather than waiting for the 15-minute periodic sync or a manual click.
   useEffect(() => {
-    if (!authSettings?.auth_token) return;
+    if (!authSettings?.auth_token || !authSettings.has_synced_once) return;
     api.flushPendingSyncPush().catch(() => {});
-  }, [authSettings?.auth_token]);
+  }, [authSettings?.auth_token, authSettings?.has_synced_once]);
 
   // A background download job completing (api.js, no React Query access of
   // its own) can change a tender's has_documents/document_count outside of

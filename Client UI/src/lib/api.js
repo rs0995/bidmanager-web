@@ -32,7 +32,12 @@ let sessionAuth = null;
 async function connection(overrides = {}) {
   const settings = await getState().then((state) => state.settings);
   return {
-    server_url: normalizeServerUrl(overrides.server_url ?? settings.server_url),
+    // The baked-in DEFAULT_SERVER_URL wins until the user has explicitly set
+    // a Backend URL in Settings — so a stale/dead server_url left in an old
+    // install's IndexedDB never gets honored on a fresh install.
+    server_url: normalizeServerUrl(
+      overrides.server_url ?? (settings.server_url_user_set ? settings.server_url : DEFAULT_SERVER_URL),
+    ),
     // Login issues a personal session token (Server UI/server/client_api.py
     // require_client_user) that travels in the x-client-key header — a
     // per-user token, not a shared app secret.
@@ -224,7 +229,8 @@ function armSyncPushTimer(delay) {
   clearTimeout(_syncPushTimer);
   _syncPushTimer = setTimeout(async () => {
     try {
-      await api.pushUserData();
+      const res = await api.pushUserData();
+      if (res?.skipped) return;  // first sync not done yet — pullUserData re-arms
       _syncPushPending = false;
       await markSyncPushConfirmed();
     } catch {
@@ -255,11 +261,15 @@ function updateSyncedState(mutator) {
 // rather than trust a server copy known to be missing this device's still-
 // unconfirmed edit.
 async function flushPendingSyncPush() {
-  const persisted = (await getQueuedState()).settings?.pendingSyncPush;
-  if (!_syncPushPending && !persisted) return;
+  const s = (await getQueuedState()).settings || {};
+  if (!_syncPushPending && !s.pendingSyncPush) return;
+  // First sync not done — don't push yet, leave the pending flag set so the
+  // first pull re-arms it.
+  if (!s.has_synced_once) return;
   clearTimeout(_syncPushTimer);
   try {
-    await api.pushUserData();
+    const res = await api.pushUserData();
+    if (res?.skipped) return;
     _syncPushPending = false;
     await markSyncPushConfirmed();
   } catch (error) {
@@ -918,6 +928,10 @@ export const api = {
     // ships an incomplete snapshot that then wipes the missing data on the
     // next pull. See Client UI/src/lib/db.js.
     const state = await getQueuedState();
+    // First sync must be a pull: a brand-new (or stale) device adopts the
+    // server's data before it is ever allowed to push its own blank/partial
+    // blob up. pullUserData sets has_synced_once and re-arms this push.
+    if (!state.settings?.has_synced_once) return { skipped: true };
     const orgIdByName = new Map((state.organizations || []).map((row) => [row.name, row.id]));
     const bookmarkedOrgs = state.bookmarkedOrgs || [];
     const { tendersTable, tendersView } = useAppStore.getState();
@@ -975,8 +989,40 @@ export const api = {
     } catch {
       return {};
     }
-    const response = await requestClient('/client/sync', {}, overrides);
-    const data = response?.data || {};
+    let response = await requestClient('/client/sync', {}, overrides);
+    let data = response?.data || {};
+
+    // Self-heal: if this device holds synced content the server's blob lacks
+    // (bookmarks a push never delivered — the old HTTP 500, or from before
+    // the durable pending flag), push it up BEFORE the hard-mirror below
+    // erases it, then re-pull the merged result. The server's per-item
+    // base_updated_at check still lets a genuine online removal win, so this
+    // recovers stranded local edits without resurrecting deleted ones.
+    {
+      const local = await getQueuedState();
+      const sBk = _idSet(data.bookmarks || []);
+      const sOrg = new Set(data.bookmarkedOrgs || []);
+      const sProj = _rowIdSet(data.projects || []);
+      const sChk = _rowIdSet(data.checklist || []);
+      const localOnly =
+        (local.tenders || []).some((t) => t.is_bookmarked && !sBk.has(Number(t.id)))
+        || (local.bookmarkedOrgs || []).some((n) => !sOrg.has(n))
+        || (local.projects || []).some((p) => !sProj.has(Number(p.id)))
+        || (local.checklist || []).some((c) => !sChk.has(Number(c.id)));
+      if (localOnly) {
+        await updateState((s) => {
+          s.settings = { ...s.settings, pendingSyncPush: true, has_synced_once: true };
+          return s;
+        });
+        try {
+          await api.pushUserData();
+          _syncPushPending = false;
+          await markSyncPushConfirmed();
+        } catch { /* stays pending — a later flushPendingSyncPush retries it */ }
+        response = await requestClient('/client/sync', {}, overrides);
+        data = response?.data || {};
+      }
+    }
     // The server is the source of truth: a pull HARD-MIRRORS local user-data
     // to the server blob — every synced collection is set unconditionally,
     // defaulting to empty, so a key the server omits (or a "Reset synced
@@ -996,6 +1042,8 @@ export const api = {
       state.checklist = (Array.isArray(data.checklist) ? data.checklist : []).map((row) => ({
         ...row, linked_file_path: localPaths.get(row.id) || row.linked_file_path || '',
       }));
+      // First successful pull done — pushes are now allowed.
+      state.settings = { ...state.settings, has_synced_once: true };
       return state;
     });
     await saveSyncBaseline(data, response?.updated_at);

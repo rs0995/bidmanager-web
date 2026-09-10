@@ -22,6 +22,15 @@ const initialState = () => ({
     project_details_show_tender_info: 'true',
     projects_entry_mode: 'inline',
     server_url: DEFAULT_SERVER_URL,
+    // The baked-in DEFAULT_SERVER_URL is authoritative until the user
+    // explicitly changes the Backend URL in Settings (flips this true).
+    // Until then connection() ignores a stale/dead saved server_url — a
+    // fresh install over old app data can't get stuck on a dead host.
+    server_url_user_set: false,
+    // Set true after the first successful pullUserData. Until then the
+    // client never pushes: a brand-new (or stale) device adopts the
+    // server's data first and can't clobber it with a blank/partial blob.
+    has_synced_once: false,
     client_api_key: '',
     auth_token: '',
     last_sync_at: '',
