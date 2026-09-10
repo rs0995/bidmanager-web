@@ -4097,6 +4097,10 @@ class ScraperBackend:
                             t_id, zip_filename, zip_path, file_type="zip"
                         ):
                             log_to_gui("  Checking Zip File...")
+                            # Re-open the tender page first (see the Tender Notice block) —
+                            # the shared section-0 CAPTCHA step can leave the driver off the
+                            # detail page, hiding the unlocked "DirectLink_N" / zip anchor.
+                            ScraperBackend.open_tender_page_with_recovery(driver, base_url, url)
                             zip_href = None
                             for by, locator in (
                                 (By.PARTIAL_LINK_TEXT, "Download as zip file"),

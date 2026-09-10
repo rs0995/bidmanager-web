@@ -1453,6 +1453,49 @@ def _init_db_schema(conn):
         FOREIGN KEY(user_id) REFERENCES client_users(id)
     )''')
 
+    # The client_* tables above were added after the Postgres repair block near
+    # the top of this function, so they never got the same treatment. On the
+    # live self-hosted Postgres a dump/restore left client_tokens.id (and
+    # client_activity_log.id) without a sequence/identity default, so
+    # _issue_token()'s id-less INSERT threw NotNullViolation -> bare HTTP 500
+    # on every client login/register. Repair is idempotent and guarded so a
+    # hiccup here can never brick startup.
+    if db_compat.using_postgres():
+        try:
+            for table in ("client_tokens", "client_activity_log"):
+                id_row = c.execute(
+                    "SELECT column_default, is_identity FROM information_schema.columns "
+                    "WHERE table_schema=current_schema() AND table_name=? AND column_name='id'",
+                    (table,),
+                ).fetchone()
+                if id_row and not id_row[0] and str(id_row[1] or "NO").upper() != "YES":
+                    seq = f"{table}_id_seq"
+                    c.execute(f'CREATE SEQUENCE IF NOT EXISTS "{seq}"')
+                    c.execute(
+                        f"SELECT setval('{seq}', COALESCE((SELECT MAX(id) FROM \"{table}\"), 0) + 1, false)"
+                    )
+                    c.execute(f'ALTER TABLE "{table}" ALTER COLUMN id SET DEFAULT nextval(\'{seq}\'::regclass)')
+                    c.execute(f'ALTER SEQUENCE "{seq}" OWNED BY "{table}".id')
+            for table, columns in {
+                "client_users": ("created_at", "last_login_at", "last_seen_at"),
+                "client_tokens": ("created_at", "revoked_at"),
+                "client_activity_log": ("created_at",),
+                "client_user_sync": ("updated_at",),
+            }.items():
+                for column in columns:
+                    type_row = c.execute(
+                        "SELECT data_type FROM information_schema.columns "
+                        "WHERE table_schema=current_schema() AND table_name=? AND column_name=?",
+                        (table, column),
+                    ).fetchone()
+                    if type_row and str(type_row[0]).lower() == "real":
+                        c.execute(
+                            f'ALTER TABLE "{table}" ALTER COLUMN "{column}" '
+                            f'TYPE DOUBLE PRECISION USING "{column}"::double precision'
+                        )
+        except Exception as exc:  # noqa: BLE001 - never let a repair failure block boot
+            print(f"[init_db] client_* Postgres schema repair skipped: {exc}")
+
     # Websites where an admin deleted the auto-managed "Bookmarks · <site>" job.
     # client_api._reconcile_bookmark_jobs won't recreate it while a row is here;
     # POST /admin/bookmark-scrape/resume clears it.

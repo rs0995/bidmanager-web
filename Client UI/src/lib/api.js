@@ -1,9 +1,9 @@
 import { getState, getQueuedState, nextId, updateState } from './db.js';
 import { useAppStore } from './store';
 import { timeRemaining } from './utils';
+import { DEFAULT_SERVER_URL } from './cloud-config';
 
 const desktop = () => window.bidmanagerDesktop;
-const DEFAULT_SERVER_URL = 'https://161.118.170.233.sslip.io';
 const leaf = (value) => String(value || 'Project').replace(/[<>:"/\\|?*]+/g, ' ').replace(/\s+/g, ' ').trim() || 'Project';
 const joinPath = (...parts) => parts.filter(Boolean).join('\\').replace(/[\\/]+/g, '\\');
 const valueNumber = (value) => Number(String(value || '').replace(/[^0-9.]/g, '')) || 0;
@@ -761,7 +761,10 @@ export const api = {
       active_projects: activeProjects.length,
       bookmarked_tenders: state.tenders.filter((row) => row.is_bookmarked).length,
       closing_soon: closingSoon,
-      total_pipeline_value: state.projects.reduce((sum, row) => sum + valueNumber(row.project_value), 0),
+      // Active only — an archived/removed project must stop counting instead
+      // of leaving the total permanently inflated (state.projects here never
+      // shrinks on archive, only on a hard delete from the Archived list).
+      total_pipeline_value: activeProjects.reduce((sum, row) => sum + valueNumber(row.project_value), 0),
       websites: state.websites.map((site) => {
         const siteTenders = active.filter((row) => Number(row.website_id) === Number(site.id));
         const derivedOrgs = new Set(siteTenders.map((row) => String(row.org_chain || '').trim()).filter(Boolean)).size;

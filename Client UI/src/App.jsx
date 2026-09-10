@@ -1076,7 +1076,7 @@ function useTenderRowActions() {
     mutationFn: async (t) => {
       if (!t.is_bookmarked) {
         const count = await api.countBookmarkedTenders();
-        if (count >= 10) throw new Error('You can bookmark at most 10 tenders. Remove one before adding another.');
+        if (count >= 30) throw new Error('You can bookmark at most 30 tenders. Remove one before adding another.');
       }
       return api.patchTender(t.id, { is_bookmarked: !t.is_bookmarked });
     },
@@ -3714,18 +3714,58 @@ function SettingsPage() {
     }));
   }, [settings]);
 
+  const normUrl = (u) => String(u || '').trim().replace(/\/+$/, '');
+
   const saveMut = useMutation({
-    mutationFn: async (patch) => { await api.updateSettings(patch); return api.ensureParentFolders(patch.parent_dir); },
+    // A changed Backend URL is only persisted if it actually connects —
+    // otherwise a typo would break every /client/* call with no easy way
+    // back. Other settings still save; the URL just snaps back to the
+    // known-good one.
+    mutationFn: async (patch) => {
+      const storedUrl = normUrl(settings?.server_url || api.defaultServerUrl);
+      const nextUrl = normUrl(patch.server_url);
+      let urlError = '';
+      if (nextUrl && nextUrl !== storedUrl) {
+        try {
+          await api.testConnection({ server_url: patch.server_url });
+        } catch (error) {
+          urlError = `Could not connect to ${patch.server_url} — Backend URL not changed. (${error instanceof Error ? error.message : String(error)})`;
+        }
+      }
+      const toSave = urlError
+        ? { ...patch, server_url: settings?.server_url || api.defaultServerUrl }
+        : patch;
+      await api.updateSettings(toSave);
+      const folders = await api.ensureParentFolders(toSave.parent_dir);
+      return { folders, urlError, savedUrl: toSave.server_url };
+    },
     onSuccess: (result) => {
       qc.invalidateQueries({ queryKey: ['settings'] });
+      qc.invalidateQueries({ queryKey: ['health'] });
       window.dispatchEvent(new Event('bm-settings-updated'));
-      setPathStatus(result?.ok === false ? `Saved settings, but could not create folders: ${result.message}` : 'Saved.');
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
+      setForm((f) => ({ ...f, server_url: result.savedUrl }));
+      if (result.urlError) {
+        setPathStatus(result.urlError);
+      } else {
+        setPathStatus(result.folders?.ok === false ? `Saved settings, but could not create folders: ${result.folders.message}` : 'Saved.');
+        setSaved(true);
+        setTimeout(() => setSaved(false), 2000);
+      }
     },
     onError: (error) => setPathStatus(`Save failed: ${error instanceof Error ? error.message : String(error)}`),
   });
   const handleSave = () => saveMut.mutate(form);
+  const resetUrlMut = useMutation({
+    mutationFn: () => api.updateSettings({ server_url: api.defaultServerUrl }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['settings'] });
+      qc.invalidateQueries({ queryKey: ['health'] });
+      window.dispatchEvent(new Event('bm-settings-updated'));
+      setForm((f) => ({ ...f, server_url: api.defaultServerUrl }));
+      setPathStatus('Backend URL reset to default.');
+    },
+    onError: (error) => setPathStatus(`Reset failed: ${error instanceof Error ? error.message : String(error)}`),
+  });
   const uf = (k, v) => setForm((f) => ({ ...f, [k]: v }));
   const folderPath = (name) => form.parent_dir ? `${form.parent_dir}${form.parent_dir.endsWith('\\') || form.parent_dir.endsWith('/') ? '' : '\\'}${name}` : '-';
 
@@ -3877,7 +3917,16 @@ function SettingsPage() {
                   <p className="mt-1 text-xs text-[var(--text-muted)]">The production URL is prefilled and remains editable. Only authenticated /client/* routes are used.</p>
                 </div>
                 <div>
-                  <label className="text-xs text-[var(--text-muted)] mb-1 block">Backend URL</label>
+                  <div className="mb-1 flex items-center justify-between">
+                    <label className="text-xs text-[var(--text-muted)]">Backend URL</label>
+                    <button
+                      onClick={() => resetUrlMut.mutate()}
+                      disabled={resetUrlMut.isPending}
+                      className="text-[11px] text-[var(--accent)] hover:underline disabled:opacity-50"
+                    >
+                      Reset to default
+                    </button>
+                  </div>
                   <input
                     value={form.server_url}
                     onChange={(event) => uf('server_url', event.target.value)}
@@ -3885,6 +3934,7 @@ function SettingsPage() {
                     placeholder={api.defaultServerUrl}
                     spellCheck={false}
                   />
+                  <p className="mt-1 text-[11px] text-[var(--text-muted)]">A changed URL is only saved if it connects successfully.</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <button onClick={() => connectionMut.mutate()} disabled={connectionMut.isPending || !settings?.auth_token} className="btn-secondary text-xs gap-1.5">

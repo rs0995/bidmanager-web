@@ -1,3 +1,5 @@
+import { DEFAULT_SERVER_URL } from './cloud-config';
+
 const DB_NAME = 'bidmanager-client';
 const DB_VERSION = 1;
 const STORE = 'state';
@@ -19,10 +21,16 @@ const initialState = () => ({
     parent_dir: '',
     project_details_show_tender_info: 'true',
     projects_entry_mode: 'inline',
-    server_url: 'https://161.118.170.233.sslip.io',
+    server_url: DEFAULT_SERVER_URL,
     client_api_key: '',
     auth_token: '',
     last_sync_at: '',
+    // Durable twin of api.js's in-memory _syncPushPending — true whenever a
+    // cloud-synced edit hasn't yet been confirmed pushed to the server.
+    // Survives an app restart so an edit that failed to push (backend 502,
+    // app closed before the retry landed) doesn't silently sit unconfirmed
+    // forever — see flushPendingSyncPush in Client UI/src/lib/api.js.
+    pendingSyncPush: false,
   },
 });
 
@@ -74,6 +82,19 @@ export function updateState(mutator) {
     const next = (await mutator(structuredClone(current))) || current;
     return writeRaw(next);
   };
+  writeQueue = writeQueue.then(run, run);
+  return writeQueue;
+}
+
+// Like getState(), but waits for every write already queued via updateState()
+// to actually commit first. Plain getState() reads IndexedDB directly and can
+// race an in-flight updateState() write (e.g. a bookmark toggle whose write
+// hasn't landed yet), reading a stale/incomplete snapshot. Anything that
+// pushes local state elsewhere (pushUserData) must use this instead, or it
+// can ship an incomplete payload that then wipes the missing data on the
+// next pull.
+export function getQueuedState() {
+  const run = () => getState();
   writeQueue = writeQueue.then(run, run);
   return writeQueue;
 }

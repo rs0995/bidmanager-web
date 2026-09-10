@@ -11,6 +11,9 @@ ID_TABLES = {
     "checklist_template_item_files",
     "checklist_template_items",
     "checklist_templates",
+    "client_activity_log",
+    "client_tokens",
+    "client_user_sync",
     "client_users",
     "downloaded_files",
     "organizations",
@@ -333,10 +336,12 @@ def _get_pool():
 
     Every ``sqlite3.connect(DB_FILE)`` in the codebase is monkey-patched to
     ``connect()`` below, so in Postgres mode the hot path (``get_setting`` on
-    every scrape step, per-request ``get_db``) was paying a full TCP+TLS+SCRAM
-    handshake to a remote Neon instance per call. The pool turns that into a
-    near-zero checkout. Returns ``None`` if ``psycopg_pool`` is unavailable so
-    ``connect()`` can fall back to a direct connection.
+    every scrape step, per-request ``get_db``) was paying a full connection
+    handshake per call (previously over the network to a remote Neon instance;
+    now to the local ``postgres`` container, but the pool still avoids the
+    per-call overhead). The pool turns that into a near-zero checkout. Returns
+    ``None`` if ``psycopg_pool`` is unavailable so ``connect()`` can fall back
+    to a direct connection.
     """
     global _pool
     if _pool is not None:
@@ -357,9 +362,20 @@ def _get_pool():
             _database_url(),
             min_size=1,
             max_size=max_size,
-            # Disable psycopg's implicit statement preparation: it is incompatible
-            # with a PgBouncer (Neon "-pooler") endpoint in transaction mode.
+            # Disable psycopg's implicit statement preparation: kept off so this
+            # also works unchanged against a PgBouncer-style pooler in transaction
+            # mode (e.g. if a managed Postgres is ever put back in front of this).
             kwargs={"prepare_threshold": None},
+            # A managed Postgres pooler / compute autosuspend can recycle
+            # server-side connections aggressively, so a long-lived idle
+            # connection in the pool can go dead without us knowing. check= runs
+            # a cheap liveness probe on every checkout and transparently replaces
+            # a dead connection; the lifetime / idle caps make the pool drop
+            # stale sockets before a query hits them. Harmless overhead against
+            # the local self-hosted Postgres, but keeps this file provider-agnostic.
+            check=ConnectionPool.check_connection,
+            max_lifetime=180,
+            max_idle=60,
             name="bidmanager",
             open=False,
         )
