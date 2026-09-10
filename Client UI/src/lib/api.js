@@ -935,8 +935,21 @@ export const api = {
     const orgIdByName = new Map((state.organizations || []).map((row) => [row.name, row.id]));
     const bookmarkedOrgs = state.bookmarkedOrgs || [];
     const { tendersTable, tendersView } = useAppStore.getState();
+    // Baseline must be loaded before the payload: bookmarks are only a flag on
+    // state.tenders rows, and that list loads lazily (syncFromServer / the
+    // ['client-tenders'] query). In the brief post-install window it's still
+    // empty, so a naive `state.tenders.filter(is_bookmarked)` yields [] and the
+    // removal delta below would tell the server to delete every prior bookmark.
+    // Carry through any baseline bookmark whose tender row hasn't loaded here
+    // yet — we can't see its real state, so we must not claim it was removed.
+    await loadSyncBaseline();
+    const loadedTenderIds = _idSet(state.tenders.map((row) => row.id));
+    const flaggedBookmarks = state.tenders.filter((row) => row.is_bookmarked).map((row) => Number(row.id));
+    const carriedBookmarks = (_lastServerBlob.bookmarks || [])
+      .map(Number)
+      .filter((id) => Number.isFinite(id) && !loadedTenderIds.has(id));
     const data = {
-      bookmarks: state.tenders.filter((row) => row.is_bookmarked).map((row) => row.id),
+      bookmarks: [...new Set([...flaggedBookmarks, ...carriedBookmarks])],
       bookmarkedOrgs,
       bookmarkedOrgIds: bookmarkedOrgs.map((name) => orgIdByName.get(name)).filter((id) => Number.isFinite(id)),
       templates: state.templates,
@@ -955,7 +968,10 @@ export const api = {
     };
     // Removal delta: what the server last gave us but is gone locally now. The
     // server unions the rest, so this is the only way a delete propagates.
-    await loadSyncBaseline();
+    // `localBookmarks` includes the carried ids above, so `removed.bookmarks`
+    // reduces to "tenders this device HAS loaded and are now unbookmarked" —
+    // the only safe removal claim. Once the full snapshot is in, carried is
+    // empty and a genuine un-bookmark still propagates.
     const localBookmarks = _idSet(data.bookmarks);
     const localOrgs = new Set(bookmarkedOrgs);
     const localProjectIds = _rowIdSet(data.projects);
