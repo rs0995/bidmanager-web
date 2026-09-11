@@ -1202,6 +1202,64 @@ def client_request_tender_download(tender_db_id: int) -> dict[str, Any]:
     return {"job_id": str(result["job_id"]), "status": str(result["status"])}
 
 
+def _find_organization(conn: Any, org_id: int) -> Any:
+    row = conn.execute(
+        "SELECT id,website_id FROM organizations WHERE id=?", (org_id,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Organization not found.")
+    return row
+
+
+@router.post(
+    "/organizations/{org_id}/request-tenders",
+    dependencies=[Depends(require_client_user)],
+    response_model=RequestDownloadResponse,
+)
+def client_request_org_tenders(org_id: int) -> dict[str, Any]:
+    # One-time manual scrape for an org not covered by any saved_custom_jobs
+    # row. Goes straight into background_jobs via _enqueue_job (action
+    # "fetch_tenders_selected", same as the admin console's one-off
+    # "fetch-selected" route) and never touches saved_custom_jobs, so it
+    # can't accidentally create a recurring schedule and the org stays
+    # requestable again later.
+    with _get_db() as conn:
+        org = dict(_find_organization(conn, org_id))
+        covered_org_ids, full_websites = _org_scrape_coverage(conn, [org["website_id"]])
+    if org["website_id"] in full_websites or org_id in covered_org_ids:
+        raise HTTPException(409, "This organization already has a saved scrape job covering it.")
+    import api_server  # deferred: api_server imports this module at load time
+
+    result = api_server._enqueue_job(
+        "fetch_tenders_selected",
+        {"website_id": org["website_id"], "org_ids": [org_id], "download_after": False, "source": "custom"},
+    )
+    return {"job_id": str(result["job_id"]), "status": str(result["status"])}
+
+
+@router.get("/organizations/{org_id}/request-tenders-status", dependencies=[Depends(require_client_user)])
+def client_org_request_status(org_id: int, job_id: str = Query(..., min_length=1)) -> dict[str, Any]:
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT status,error,payload_json FROM background_jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Request job not found.")
+    data = dict(row)
+    try:
+        payload = json.loads(data.get("payload_json") or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    if org_id not in (payload.get("org_ids") or []):
+        raise HTTPException(404, "Request job not found.")
+    status = str(data.get("status") or "")
+    return {
+        "job_id": job_id,
+        "status": status,
+        "error": str(data.get("error") or "") if status == "failed" else "",
+    }
+
+
 @router.get("/tenders/{tender_db_id}/download-status", dependencies=[Depends(require_client_user)])
 def client_tender_download_status(
     tender_db_id: int, job_id: str = Query(..., min_length=1)
