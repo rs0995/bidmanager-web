@@ -40,6 +40,11 @@ const initialState = () => ({
     // app closed before the retry landed) doesn't silently sit unconfirmed
     // forever — see flushPendingSyncPush in Client UI/src/lib/api.js.
     pendingSyncPush: false,
+    // Device-local only — never part of the cloud sync blob. Maps
+    // organization id -> job_id for an in-flight one-time "Request tenders"
+    // scrape (see api.js requestOrgTenders/pollOrgTendersJob), so the button
+    // still shows "Requesting…" and polling still resumes after a restart.
+    pendingOrgRequests: {},
   },
 });
 

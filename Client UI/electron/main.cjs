@@ -93,6 +93,54 @@ ipcMain.handle('desktop:open-project-window', (_event, projectId) => {
   return { ok: true };
 });
 
+// A raw deep link into a government tender portal often lands on that
+// portal's own "Stale Session" error page — these sites only hand out a
+// valid session when you arrive via their own search/listing flow. Opening
+// the tender in-app (instead of the OS default browser) lets us detect that
+// same signature the scraper backend already checks for
+// (ScraperBackend._download_page_is_stale in Server UI/server/app_core.py)
+// and recover by re-navigating through the org's listing page first — a
+// single retry, not a loop, since some portals just don't offer a working
+// listing URL either.
+function pageTitleLooksStale(win) {
+  try {
+    const title = String(win.webContents.getTitle() || '').trim().toLowerCase();
+    return title.includes('stale session') || title === 'error';
+  } catch {
+    return false;
+  }
+}
+
+ipcMain.handle('desktop:open-tender-url', async (_event, payload = {}) => {
+  const tenderUrl = String(payload.tenderUrl || '').trim();
+  const listingUrl = String(payload.listingUrl || '').trim();
+  if (!tenderUrl) return { ok: false, message: 'No tender URL to open.' };
+  const win = new BrowserWindow({
+    width: 1200,
+    height: 850,
+    show: false,
+    autoHideMenuBar: true,
+    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+  });
+  win.once('ready-to-show', () => win.show());
+  const waitForLoad = () => new Promise((resolve) => {
+    win.webContents.once('did-finish-load', resolve);
+    win.webContents.once('did-fail-load', resolve);
+  });
+  win.loadURL(tenderUrl);
+  await waitForLoad();
+  if (!win.isDestroyed() && listingUrl && pageTitleLooksStale(win)) {
+    win.loadURL(listingUrl);
+    await waitForLoad();
+    if (!win.isDestroyed()) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      win.loadURL(tenderUrl);
+      await waitForLoad();
+    }
+  }
+  return { ok: true };
+});
+
 ipcMain.handle('desktop:rename-path', (_event, payload = {}) => safeResult(() => {
   const source = path.resolve(String(payload.oldPath || ''));
   const destination = path.resolve(String(payload.newPath || ''));

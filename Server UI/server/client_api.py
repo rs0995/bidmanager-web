@@ -965,17 +965,55 @@ def client_search(
     )
 
 
-def _public_organization(row: Any) -> dict[str, Any]:
+def _public_organization(
+    row: Any, covered_org_ids: Optional[set[int]] = None, full_websites: Optional[set[int]] = None,
+) -> dict[str, Any]:
     data = dict(row)
+    org_id = int(data["id"])
+    website_id = int(data["website_id"])
+    has_saved_job = bool(
+        (full_websites and website_id in full_websites)
+        or (covered_org_ids and org_id in covered_org_ids)
+    )
     return {
-        "id": int(data["id"]),
-        "website_id": int(data["website_id"]),
+        "id": org_id,
+        "website_id": website_id,
         "website_name": str(data.get("website_name") or ""),
         "name": str(data.get("name") or ""),
         "tenders_url": str(data.get("tenders_url") or ""),
         "tender_count": int(data.get("tender_count") or 0),
         "scrape_enabled": bool(data.get("scrape_enabled")),
+        "has_saved_job": has_saved_job,
     }
+
+
+def _org_scrape_coverage(conn: Any, website_ids: list[int]) -> tuple[set[int], set[int]]:
+    """Which orgs (by id) and which whole websites (by id) already have a
+    saved_custom_jobs scrape job covering them — admin-configured or the
+    auto-managed 24h "Bookmarks · <site>" job (see _reconcile_bookmark_jobs);
+    both live in the same table, so one membership check covers either.
+    Used to hide "Request tenders" for orgs that are already scheduled."""
+    website_ids = sorted({int(w) for w in website_ids if w is not None})
+    if not website_ids:
+        return set(), set()
+    placeholders = ",".join("?" for _ in website_ids)
+    rows = conn.execute(
+        f"SELECT website_id,org_ids_json,all_organizations FROM saved_custom_jobs "
+        f"WHERE job_type='scrape' AND website_id IN ({placeholders})",
+        website_ids,
+    ).fetchall()
+    org_ids: set[int] = set()
+    full_websites: set[int] = set()
+    for row in rows:
+        data = dict(row)
+        if bool(data.get("all_organizations")):
+            full_websites.add(int(data["website_id"]))
+            continue
+        try:
+            org_ids.update(int(v) for v in json.loads(data.get("org_ids_json") or "[]"))
+        except (TypeError, ValueError):
+            pass
+    return org_ids, full_websites
 
 
 @router.get("/organizations", dependencies=[Depends(require_client_user)])
@@ -1007,7 +1045,11 @@ def client_organizations(
             f"{select_sql}{where_sql} ORDER BY o.name ASC,o.id ASC LIMIT ? OFFSET ?",
             [*params, page_size, offset],
         ).fetchall()
-    return {"items": [_public_organization(row) for row in rows], **_page_meta(page, page_size, total)}
+        covered_org_ids, full_websites = _org_scrape_coverage(conn, [dict(r)["website_id"] for r in rows])
+    return {
+        "items": [_public_organization(row, covered_org_ids, full_websites) for row in rows],
+        **_page_meta(page, page_size, total),
+    }
 
 
 def _find_tender(conn: Any, tender_db_id: int) -> Any:
@@ -1158,6 +1200,64 @@ def client_request_tender_download(tender_db_id: int) -> dict[str, Any]:
         {"tender_db_id": tender_db_id, "mode": "full", "source": "client"},
     )
     return {"job_id": str(result["job_id"]), "status": str(result["status"])}
+
+
+def _find_organization(conn: Any, org_id: int) -> Any:
+    row = conn.execute(
+        "SELECT id,website_id FROM organizations WHERE id=?", (org_id,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Organization not found.")
+    return row
+
+
+@router.post(
+    "/organizations/{org_id}/request-tenders",
+    dependencies=[Depends(require_client_user)],
+    response_model=RequestDownloadResponse,
+)
+def client_request_org_tenders(org_id: int) -> dict[str, Any]:
+    # One-time manual scrape for an org not covered by any saved_custom_jobs
+    # row. Goes straight into background_jobs via _enqueue_job (action
+    # "fetch_tenders_selected", same as the admin console's one-off
+    # "fetch-selected" route) and never touches saved_custom_jobs, so it
+    # can't accidentally create a recurring schedule and the org stays
+    # requestable again later.
+    with _get_db() as conn:
+        org = dict(_find_organization(conn, org_id))
+        covered_org_ids, full_websites = _org_scrape_coverage(conn, [org["website_id"]])
+    if org["website_id"] in full_websites or org_id in covered_org_ids:
+        raise HTTPException(409, "This organization already has a saved scrape job covering it.")
+    import api_server  # deferred: api_server imports this module at load time
+
+    result = api_server._enqueue_job(
+        "fetch_tenders_selected",
+        {"website_id": org["website_id"], "org_ids": [org_id], "download_after": False, "source": "custom"},
+    )
+    return {"job_id": str(result["job_id"]), "status": str(result["status"])}
+
+
+@router.get("/organizations/{org_id}/request-tenders-status", dependencies=[Depends(require_client_user)])
+def client_org_request_status(org_id: int, job_id: str = Query(..., min_length=1)) -> dict[str, Any]:
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT status,error,payload_json FROM background_jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Request job not found.")
+    data = dict(row)
+    try:
+        payload = json.loads(data.get("payload_json") or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    if org_id not in (payload.get("org_ids") or []):
+        raise HTTPException(404, "Request job not found.")
+    status = str(data.get("status") or "")
+    return {
+        "job_id": job_id,
+        "status": status,
+        "error": str(data.get("error") or "") if status == "failed" else "",
+    }
 
 
 @router.get("/tenders/{tender_db_id}/download-status", dependencies=[Depends(require_client_user)])

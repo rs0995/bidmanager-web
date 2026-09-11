@@ -120,6 +120,11 @@ async function downloadServerOrganizations(overrides = {}) {
       website_name: row.website_name || '',
       tender_count: Number(row.tender_count) || 0,
       scrape_enabled: Boolean(row.scrape_enabled),
+      // Listing-page URL for this org — used by openTenderUrl() to recover
+      // a stale-session deep link, and (once the server sends it) to hide
+      // "Request tenders" for orgs already covered by a saved custom job.
+      tenders_url: row.tenders_url || '',
+      has_saved_job: Boolean(row.has_saved_job),
     })));
     pages = Math.max(0, Number(payload.pages) || 0);
     page += 1;
@@ -529,6 +534,70 @@ export const api = {
       api.pollTenderDownloadJob(tender, placeholder.job_id, overrides, 0);
     }
   },
+
+  // ── "Request tenders" — one-time manual scrape for an org with no saved
+  // custom job covering it (see Server UI/server/client_api.py
+  // /organizations/{id}/request-tenders). Mirrors the tender download-request
+  // flow above, but the pending marker is a plain local settings field
+  // (never synced to the cloud — it's meaningless on another device).
+  requestOrgTenders: async (org) => {
+    const { job_id: jobId } = await requestClient(
+      `/client/organizations/${Number(org.id)}/request-tenders`,
+      { method: 'POST', body: {} },
+    );
+    await updateState((state) => {
+      state.settings = { ...state.settings, pendingOrgRequests: { ...(state.settings.pendingOrgRequests || {}), [org.id]: jobId } };
+      return state;
+    });
+    api.pollOrgTendersJob(org, jobId, 0);
+    return { job_id: jobId };
+  },
+  getOrgRequestStatus: (orgId, jobId, overrides = {}) => requestClient(
+    `/client/organizations/${Number(orgId)}/request-tenders-status?job_id=${encodeURIComponent(jobId)}`,
+    {}, overrides,
+  ),
+  // Same shape/resilience as pollTenderDownloadJob: poll every 15s, capped,
+  // tolerating a couple of transient errors before giving up.
+  pollOrgTendersJob: async (org, jobId, attempt = 0, consecutiveErrors = 0) => {
+    const MAX_ATTEMPTS = 80;
+    const MAX_CONSECUTIVE_ERRORS = 3;
+    const clearPending = () => updateState((state) => {
+      const next = { ...(state.settings.pendingOrgRequests || {}) };
+      delete next[org.id];
+      state.settings = { ...state.settings, pendingOrgRequests: next };
+      return state;
+    });
+    try {
+      const { status } = await api.getOrgRequestStatus(org.id, jobId);
+      if (status === 'completed') {
+        await clearPending();
+        await api.syncFromServer().catch(() => {});
+        notifyTendersChanged();
+        return;
+      }
+      if (status === 'failed' || attempt >= MAX_ATTEMPTS) {
+        await clearPending();
+        return;
+      }
+      setTimeout(() => api.pollOrgTendersJob(org, jobId, attempt + 1, 0), 15000);
+    } catch {
+      if (consecutiveErrors + 1 >= MAX_CONSECUTIVE_ERRORS) {
+        await clearPending();
+        return;
+      }
+      setTimeout(() => api.pollOrgTendersJob(org, jobId, attempt + 1, consecutiveErrors + 1), 15000);
+    }
+  },
+  // Call once at app startup — same rationale as resumePendingDownloadJobs.
+  resumePendingOrgRequests: async () => {
+    const settings = (await getState()).settings;
+    const pending = settings.pendingOrgRequests || {};
+    for (const [orgId, jobId] of Object.entries(pending)) {
+      api.pollOrgTendersJob({ id: Number(orgId) }, jobId, 0);
+    }
+  },
+  getPendingOrgRequestIds: async () => Object.keys((await getState()).settings.pendingOrgRequests || {}).map(Number),
+
   // "Download" — mint a signed URL for an already-available document, then
   // save it to disk via the Electron IPC bridge (or fall back to a plain
   // browser download when running outside Electron, where the destination
@@ -609,6 +678,27 @@ export const api = {
     if (params.bookmarked !== undefined) rows = rows.filter((row) => Boolean(row.is_bookmarked) === Boolean(params.bookmarked));
     rows = filterRows(rows, params.search, ['tender_id', 'title', 'org_chain', 'location', 'tender_category']);
     return rows.slice(0, Number(params.limit) || rows.length);
+  },
+  // "Open Tender" opens tender.tender_url directly — a raw deep link into a
+  // government portal, which often shows THAT portal's own "Stale Session"
+  // error unless you arrive via its own search/listing flow. Under Electron
+  // this is handled in-app (see electron/main.cjs desktop:open-tender-url):
+  // it opens tender_url in an embedded window and, if that stale-session
+  // page shows up, re-navigates through the org's listing URL and back.
+  // Outside Electron (dev/browser) there's no way to do that recovery, so
+  // it just opens the link like before.
+  openTenderUrl: async (tender) => {
+    const url = String(tender?.tender_url || '').trim();
+    if (!url) return;
+    const bridge = desktop();
+    if (bridge?.openTenderUrl) {
+      const orgs = (await getState()).organizations || [];
+      const org = orgs.find((o) => o.name === tender.org_chain && Number(o.website_id) === Number(tender.website_id))
+        || orgs.find((o) => o.name === tender.org_chain);
+      await bridge.openTenderUrl(url, org?.tenders_url || '');
+      return;
+    }
+    window.open(url, '_blank', 'noopener,noreferrer');
   },
   patchTender: async (id, patch) => {
     let result;

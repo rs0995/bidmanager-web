@@ -1241,9 +1241,14 @@ function useTenderRowActions() {
             </button>
           )}
           {tender.tender_url && (
-            <a href={tender.tender_url} target="_blank" rel="noopener noreferrer" className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]" title="Open Tender">
+            <button
+              type="button"
+              onClick={() => api.openTenderUrl(tender)}
+              className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]"
+              title="Open Tender"
+            >
               <ExternalLink size={14} />
-            </a>
+            </button>
           )}
         </div>
       );
@@ -1374,6 +1379,29 @@ function TendersPage({ onBackToOrganizations }) {
     if (tenders.some((t) => t.id === pendingSelectId)) setSelectedId(pendingSelectId);
     setPendingSelectId(null);
   }, [pendingSelectId, tenders]);
+
+  // "Request tenders" — a one-time manual scrape for the org this view is
+  // currently filtered to, when it isn't already covered by a saved custom
+  // job. `organizations` is the full server-side org list (not derived from
+  // loaded tenders), so this also works for an org with zero tenders.
+  const { data: organizations } = useQuery({ queryKey: ['organizations'], queryFn: api.listOrganizations });
+  const activeOrg = useMemo(
+    () => (filters.org ? (organizations || []).find((o) => o.name === filters.org && (!filters.website || o.website_name === filters.website)) : null),
+    [organizations, filters.org, filters.website]
+  );
+  const { data: pendingOrgRequestIds } = useQuery({
+    queryKey: ['pending-org-requests'],
+    queryFn: api.getPendingOrgRequestIds,
+    enabled: Boolean(activeOrg),
+    refetchInterval: 5000,
+  });
+  const isRequestingOrgTenders = Boolean(activeOrg) && (pendingOrgRequestIds || []).includes(activeOrg.id);
+  const requestOrgTenders = useMutation({
+    mutationFn: () => api.requestOrgTenders(activeOrg),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['pending-org-requests'] }),
+    onError: (err) => alert(`Could not request tenders: ${err?.message || String(err)}`),
+  });
+  const canRequestOrgTenders = Boolean(activeOrg) && !activeOrg.has_saved_job;
 
   // Same pull as Settings' "Sync Tenders" button (api.js:syncFromServer) —
   // just reachable without leaving the Online Tenders tab.
@@ -1556,6 +1584,17 @@ function TendersPage({ onBackToOrganizations }) {
               {t.label}
             </button>
           ))}
+          {canRequestOrgTenders && (
+            <button
+              onClick={() => requestOrgTenders.mutate()}
+              disabled={isRequestingOrgTenders || requestOrgTenders.isPending}
+              className="btn-ghost my-1 ml-auto gap-1.5 text-xs"
+              title="Send a one-time scrape request for this organization"
+            >
+              {isRequestingOrgTenders || requestOrgTenders.isPending ? <Spinner size={13} /> : <RefreshCw size={13} />}
+              {isRequestingOrgTenders || requestOrgTenders.isPending ? 'Requesting…' : 'Request tenders'}
+            </button>
+          )}
         </div>
       </div>
 
@@ -1571,7 +1610,22 @@ function TendersPage({ onBackToOrganizations }) {
           onStartResize={columns.startTenderColResize}
           rows={filtered}
           isLoading={isLoading}
-          emptyState={<EmptyState icon={Globe} title="No tenders" description={search ? `No tenders match "${search}"` : 'No tenders to show yet.'} />}
+          emptyState={
+            <EmptyState
+              icon={Globe}
+              title="No tenders"
+              description={search ? `No tenders match "${search}"` : 'No tenders to show yet.'}
+              action={tab === 'active' && !search && canRequestOrgTenders && (
+                <button
+                  onClick={() => requestOrgTenders.mutate()}
+                  disabled={isRequestingOrgTenders || requestOrgTenders.isPending}
+                  className="btn-secondary text-xs"
+                >
+                  {isRequestingOrgTenders || requestOrgTenders.isPending ? 'Requesting…' : 'Request now'}
+                </button>
+              )}
+            />
+          }
           renderCell={renderTenderCell}
           selectedId={selectedId}
           onSelectRow={(t) => setSelectedId(t.id === selectedId ? null : t.id)}
@@ -1702,6 +1756,7 @@ function BookmarksPage({ onOpenOrgTenders }) {
   const [selectedId, setSelectedId] = useState(null);
   const [showFilters, setShowFilters] = useState(false);
   const [filters, setFilters] = useState({ org: '', location: '', category: '' });
+  const [search, setSearch] = useState('');
   const columns = useTenderColumns('bookmarks');
   const { renderTenderCell } = useTenderRowActions();
 
@@ -1723,11 +1778,15 @@ function BookmarksPage({ onOpenOrgTenders }) {
     if (filters.org) list = list.filter((t) => t.org_chain === filters.org);
     if (filters.location) list = list.filter((t) => t.location === filters.location);
     if (filters.category) list = list.filter((t) => t.tender_category === filters.category);
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter((t) => [t.tender_id, t.title, t.org_chain, t.location, t.tender_category].some((v) => String(v ?? '').toLowerCase().includes(q)));
+    }
     return [...list].sort((a, b) => {
       const c = smartCmp(a[sortCol] ?? '', b[sortCol] ?? '');
       return sortDir === 'asc' ? c : -c;
     });
-  }, [allBookmarkedRows, filters, sortCol, sortDir]);
+  }, [allBookmarkedRows, filters, search, sortCol, sortDir]);
 
   const toggleSort = (key) => {
     if (sortCol === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
@@ -1747,6 +1806,7 @@ function BookmarksPage({ onOpenOrgTenders }) {
   // ── Organizations sub-tab ──────────────────────────────────────────────
   const [orgSortCol, setOrgSortCol] = useState('tender_count');
   const [orgSortDir, setOrgSortDir] = useState('desc');
+  const [orgSearch, setOrgSearch] = useState('');
   const { getOrgColWidth, startOrgColResize } = useOrganizationColumns();
   const { data: organizations, isLoading: orgsLoading } = useQuery({ queryKey: ['organizations'], queryFn: api.listOrganizations, enabled: tab === 'organizations' });
   const { data: bookmarkedOrgs } = useQuery({ queryKey: ['bookmarked-orgs'], queryFn: api.listBookmarkedOrgs, enabled: tab === 'organizations' });
@@ -1756,12 +1816,16 @@ function BookmarksPage({ onOpenOrgTenders }) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['bookmarked-orgs'] }),
   });
   const bookmarkedOrgRows = useMemo(() => {
-    const list = (organizations || []).filter((o) => bookmarkedOrgsSet.has(o.name));
+    let list = (organizations || []).filter((o) => bookmarkedOrgsSet.has(o.name));
+    if (orgSearch.trim()) {
+      const q = orgSearch.toLowerCase();
+      list = list.filter((o) => o.name.toLowerCase().includes(q) || (o.website_name || '').toLowerCase().includes(q));
+    }
     return [...list].sort((a, b) => {
       const c = smartCmp(a[orgSortCol] ?? '', b[orgSortCol] ?? '');
       return orgSortDir === 'asc' ? c : -c;
     });
-  }, [organizations, bookmarkedOrgsSet, orgSortCol, orgSortDir]);
+  }, [organizations, bookmarkedOrgsSet, orgSearch, orgSortCol, orgSortDir]);
   const toggleOrgSort = (key) => {
     if (orgSortCol === key) setOrgSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
     else { setOrgSortCol(key); setOrgSortDir(key === 'tender_count' ? 'desc' : 'asc'); }
@@ -1776,8 +1840,20 @@ function BookmarksPage({ onOpenOrgTenders }) {
           <h1 className="text-lg font-bold text-[var(--text)]">Bookmarks</h1>
           <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-xs font-medium text-[var(--text-muted)]">{count}</span>
         </div>
+        {tab === 'organizations' && (
+          <div className="mt-2 flex flex-wrap items-center gap-3">
+            <div className="relative min-w-[180px] max-w-sm flex-1">
+              <input value={orgSearch} onChange={(e) => setOrgSearch(e.target.value)} placeholder="Search organizations..." className="input-field h-8 w-full text-sm" />
+              {orgSearch && <button onClick={() => setOrgSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><X size={14} /></button>}
+            </div>
+          </div>
+        )}
         {tab === 'tenders' && (
           <div className="mt-2 flex flex-wrap items-center gap-3">
+            <div className="relative min-w-[180px] max-w-sm flex-1">
+              <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search..." className="input-field h-8 w-full text-sm" />
+              {search && <button onClick={() => setSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><X size={14} /></button>}
+            </div>
             <button
               onClick={() => setShowFilters((v) => !v)}
               className={cn('btn-ghost gap-1.5 text-xs', (showFilters || filters.org || filters.location || filters.category) && 'bg-[var(--accent-bg)] text-[var(--accent)]')}
@@ -4136,6 +4212,13 @@ export default function App() {
   useEffect(() => {
     if (!authSettings?.auth_token) return;
     api.resumePendingDownloadJobs().catch(() => {});
+  }, [authSettings?.auth_token]);
+
+  // Same reattachment, for an in-flight "Request tenders" org scrape — see
+  // api.resumePendingOrgRequests.
+  useEffect(() => {
+    if (!authSettings?.auth_token) return;
+    api.resumePendingOrgRequests().catch(() => {});
   }, [authSettings?.auth_token]);
 
   // Heal a stale/dead Backend URL left in an old install's app data: while

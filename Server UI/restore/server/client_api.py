@@ -684,7 +684,7 @@ def client_push_sync(body: SyncPushRequest, user_id: int = Depends(require_clien
         # sends `base_updated_at`, an incoming change to an item the server
         # changed after that timestamp is skipped (online beats offline).
         merged = _merge_sync_blob(
-            stored, incoming, body.removed or {}, conn, body.base_updated_at
+            stored, incoming, body.removed or {}, conn, body.base_updated_at, now
         )
         payload = json.dumps(merged, ensure_ascii=False)
         if len(payload.encode("utf-8")) > MAX_SYNC_PAYLOAD_BYTES:
@@ -965,17 +965,55 @@ def client_search(
     )
 
 
-def _public_organization(row: Any) -> dict[str, Any]:
+def _public_organization(
+    row: Any, covered_org_ids: Optional[set[int]] = None, full_websites: Optional[set[int]] = None,
+) -> dict[str, Any]:
     data = dict(row)
+    org_id = int(data["id"])
+    website_id = int(data["website_id"])
+    has_saved_job = bool(
+        (full_websites and website_id in full_websites)
+        or (covered_org_ids and org_id in covered_org_ids)
+    )
     return {
-        "id": int(data["id"]),
-        "website_id": int(data["website_id"]),
+        "id": org_id,
+        "website_id": website_id,
         "website_name": str(data.get("website_name") or ""),
         "name": str(data.get("name") or ""),
         "tenders_url": str(data.get("tenders_url") or ""),
         "tender_count": int(data.get("tender_count") or 0),
         "scrape_enabled": bool(data.get("scrape_enabled")),
+        "has_saved_job": has_saved_job,
     }
+
+
+def _org_scrape_coverage(conn: Any, website_ids: list[int]) -> tuple[set[int], set[int]]:
+    """Which orgs (by id) and which whole websites (by id) already have a
+    saved_custom_jobs scrape job covering them — admin-configured or the
+    auto-managed 24h "Bookmarks · <site>" job (see _reconcile_bookmark_jobs);
+    both live in the same table, so one membership check covers either.
+    Used to hide "Request tenders" for orgs that are already scheduled."""
+    website_ids = sorted({int(w) for w in website_ids if w is not None})
+    if not website_ids:
+        return set(), set()
+    placeholders = ",".join("?" for _ in website_ids)
+    rows = conn.execute(
+        f"SELECT website_id,org_ids_json,all_organizations FROM saved_custom_jobs "
+        f"WHERE job_type='scrape' AND website_id IN ({placeholders})",
+        website_ids,
+    ).fetchall()
+    org_ids: set[int] = set()
+    full_websites: set[int] = set()
+    for row in rows:
+        data = dict(row)
+        if bool(data.get("all_organizations")):
+            full_websites.add(int(data["website_id"]))
+            continue
+        try:
+            org_ids.update(int(v) for v in json.loads(data.get("org_ids_json") or "[]"))
+        except (TypeError, ValueError):
+            pass
+    return org_ids, full_websites
 
 
 @router.get("/organizations", dependencies=[Depends(require_client_user)])
@@ -1007,7 +1045,11 @@ def client_organizations(
             f"{select_sql}{where_sql} ORDER BY o.name ASC,o.id ASC LIMIT ? OFFSET ?",
             [*params, page_size, offset],
         ).fetchall()
-    return {"items": [_public_organization(row) for row in rows], **_page_meta(page, page_size, total)}
+        covered_org_ids, full_websites = _org_scrape_coverage(conn, [dict(r)["website_id"] for r in rows])
+    return {
+        "items": [_public_organization(row, covered_org_ids, full_websites) for row in rows],
+        **_page_meta(page, page_size, total),
+    }
 
 
 def _find_tender(conn: Any, tender_db_id: int) -> Any:
