@@ -39,11 +39,6 @@ if not errorlevel 1 (
     )
 )
 
-rem --- Record the current installer so we can prove a fresh one was produced.
-set "INSTALLER=installer\current\BidManagerControl-Setup-1.0.4.exe"
-set "OLD_STAMP="
-if exist "%INSTALLER%" for %%F in ("%INSTALLER%") do set "OLD_STAMP=%%~tF"
-
 echo [1/4] Building the console UI (Server UI\dist)...
 call npm run build
 if errorlevel 1 exit /b 1
@@ -99,15 +94,19 @@ if exist "%INSTALLER%" for %%F in ("%INSTALLER%") do set "NEW_STAMP=%%~tF"
 echo.
 if not exist "%INSTALLER%" (
     echo [ERROR] No installer at %INSTALLER%
+    endlocal
     exit /b 1
 )
-if "%OLD_STAMP%"=="%NEW_STAMP%" (
-    echo [ERROR] Installer timestamp did not change (%NEW_STAMP%) - build did NOT refresh it.
-    exit /b 1
-)
+if "%OLD_STAMP%"=="%NEW_STAMP%" goto :stale
 echo Done.  Fresh installer: %INSTALLER%
 echo   was: %OLD_STAMP%
 echo   now: %NEW_STAMP%
 echo.
-
 endlocal
+exit /b 0
+
+:stale
+echo [ERROR] Installer timestamp did not change - build did NOT refresh it.
+echo   stamp: %NEW_STAMP%
+endlocal
+exit /b 1

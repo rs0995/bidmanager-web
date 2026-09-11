@@ -39,11 +39,6 @@ if not errorlevel 1 (
     )
 )
 
-rem --- Record the current installer so we can prove a fresh one was produced.
-set "INSTALLER=installer\current\BidManagerControl-Setup-1.0.4.exe"
-set "OLD_STAMP="
-if exist "%INSTALLER%" for %%F in ("%INSTALLER%") do set "OLD_STAMP=%%~tF"
-
 echo [1/4] Building the console UI (Server UI\dist)...
 call npm run build
 if errorlevel 1 exit /b 1
@@ -70,6 +65,17 @@ if not exist "build\admin-backend\BidManagerControlBackend.exe" (
     exit /b 1
 )
 
+rem --- Bump the patch version (1.0.x -> 1.0.x+1) before packaging, so the
+rem     installer electron-builder produces is named for the new version.
+for /f "delims=" %%V in ('node -e "console.log(require('./electron/package.json').version)"') do set "OLD_VERSION=%%V"
+for /f "delims=" %%V in ('node -e "const p='%OLD_VERSION%'.split('.');p[2]=String(Number(p[2])+1);console.log(p.join('.'))"') do set "NEW_VERSION=%%V"
+if "%OLD_VERSION%"=="" (
+    echo [ERROR] Could not read the current version from electron\package.json
+    exit /b 1
+)
+node -e "const fs=require('fs');for(const f of ['electron/package.json','package.json']){const p=JSON.parse(fs.readFileSync(f));p.version='%NEW_VERSION%';fs.writeFileSync(f, JSON.stringify(p,null,2)+'\n');}"
+echo Bumping version: %OLD_VERSION% -^> %NEW_VERSION%
+
 echo [4/4] Building Electron installer (NSIS)...
 rem Clean stale packaging dir - electron-builder renames win-unpacked.tmp ->
 rem win-unpacked and fails with EPERM when the old one is locked.
@@ -88,30 +94,32 @@ if errorlevel 1 (
     if errorlevel 1 (
         cd ..
         echo [ERROR] electron-builder failed.
+        node -e "const fs=require('fs');for(const f of ['electron/package.json','package.json']){const p=JSON.parse(fs.readFileSync(f));p.version='%OLD_VERSION%';fs.writeFileSync(f, JSON.stringify(p,null,2)+'\n');}"
         exit /b 1
     )
 )
 cd ..
 
-set "NEW_STAMP="
-if exist "%INSTALLER%" for %%F in ("%INSTALLER%") do set "NEW_STAMP=%%~tF"
-
+set "INSTALLER=installer\current\BidManagerControl-Setup-%NEW_VERSION%.exe"
 echo.
 if not exist "%INSTALLER%" (
     echo [ERROR] No installer at %INSTALLER%
+    node -e "const fs=require('fs');for(const f of ['electron/package.json','package.json']){const p=JSON.parse(fs.readFileSync(f));p.version='%OLD_VERSION%';fs.writeFileSync(f, JSON.stringify(p,null,2)+'\n');}"
     endlocal
     exit /b 1
 )
-if "%OLD_STAMP%"=="%NEW_STAMP%" goto :stale
+
+rem --- Move the previous version's installer out of the way into the archive.
+if not exist "installer\archive\%OLD_VERSION%" mkdir "installer\archive\%OLD_VERSION%"
+for %%F in ("installer\current\*%OLD_VERSION%*") do move "%%F" "installer\archive\%OLD_VERSION%\" >nul
+
+rem --- Record what changed in this version, from the accumulated pending notes.
+if not exist "CHANGELOG_PENDING.txt" type nul > "CHANGELOG_PENDING.txt"
+node -e "const fs=require('fs');const pendPath='CHANGELOG_PENDING.txt';const clPath='installer/archive/CHANGELOG.txt';const pend=fs.readFileSync(pendPath,'utf8').split(/\r?\n/).map(l=>l.trim()).filter(Boolean);const lines=pend.length?pend.map(l=>'- '+l.replace(/^[-*]\s*/,'')):['- (no recorded changes)'];const date=new Date().toISOString().slice(0,10);const entry='## %NEW_VERSION% - '+date+'\n'+lines.join('\n')+'\n\n';const prev=fs.existsSync(clPath)?fs.readFileSync(clPath,'utf8'):'';fs.writeFileSync(clPath, entry+prev);fs.writeFileSync(pendPath,'');"
+
 echo Done.  Fresh installer: %INSTALLER%
-echo   was: %OLD_STAMP%
-echo   now: %NEW_STAMP%
+echo   version: %OLD_VERSION% -^> %NEW_VERSION%
+echo   archived previous build to installer\archive\%OLD_VERSION%\
 echo.
 endlocal
 exit /b 0
-
-:stale
-echo [ERROR] Installer timestamp did not change - build did NOT refresh it.
-echo   stamp: %NEW_STAMP%
-endlocal
-exit /b 1

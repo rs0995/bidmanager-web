@@ -1,6 +1,6 @@
 {
   "name": "bidmanager-control-shell",
-  "version": "1.0.8",
+  "version": "1.0.4",
   "private": true,
   "description": "Electron wrapper for the BidManager Control admin console",
   "main": "main.cjs",
@@ -21,19 +21,11 @@
       "package.json"
     ],
     "extraResources": [
-      {
-        "from": "../dist",
-        "to": "frontend/dist"
-      },
-      {
-        "from": "../build/admin-backend",
-        "to": "backend"
-      }
+      { "from": "../dist", "to": "frontend/dist" },
+      { "from": "../build/admin-backend", "to": "backend" }
     ],
     "win": {
-      "target": [
-        "nsis"
-      ],
+      "target": ["nsis"],
       "artifactName": "BidManagerControl-Setup-${version}.${ext}"
     },
     "nsis": {
