@@ -1061,6 +1061,24 @@ function ConfigPanel({ toast, env, base, adminKey, setBase, dbUrl, setDbUrl, sto
             </Field>
           </>)}
 
+          {group('Documents & storage', <>
+            <Field label="Maximum file size" dirty={isDirty('max_file_size_mb')}>
+              <NumIn value={draft.max_file_size_mb} onChange={(v) => set('max_file_size_mb', v)} suffix="MB" />
+            </Field>
+            <Field label="Accepted extensions" dirty={isDirty('allowed_extensions')}>
+              <TextIn value={draft.allowed_extensions} onChange={(v) => set('allowed_extensions', v)} w={230} />
+            </Field>
+            <Field label="Bucket" hint="The bucket name here should match the Storage / Drive URL set in Connection above" dirty={isDirty('gcs_bucket')}>
+              <TextIn value={draft.gcs_bucket} onChange={(v) => set('gcs_bucket', v)} w={230} />
+            </Field>
+            <Field label="Path prefix" hint="Folder inside that bucket where tender documents are organised" dirty={isDirty('storage_prefix')}>
+              <TextIn value={draft.storage_prefix} onChange={(v) => set('storage_prefix', v)} w={160} />
+            </Field>
+            <Field label="Download link lifetime" hint="How long a signed link stays valid after a client asks for it" dirty={isDirty('signed_url_ttl_min')}>
+              <NumIn value={draft.signed_url_ttl_min} onChange={(v) => set('signed_url_ttl_min', v)} suffix="min" />
+            </Field>
+          </>)}
+
           {group('Captcha solving', <>
             <Field label="AI provider" hint="Choose manual entry, a hosted AI provider, or any OpenAI-compatible vision API" dirty={isDirty('captcha_ai_provider')}>
               <Select value={draft.captcha_ai_provider} onChange={(v) => set('captcha_ai_provider', v)} w={190}
@@ -1131,24 +1149,6 @@ function ConfigPanel({ toast, env, base, adminKey, setBase, dbUrl, setDbUrl, sto
             </Field>
             <Field label="Require admin key" hint="Protects this console and every /admin route" dirty={isDirty('require_admin_key')}>
               <Toggle checked={draft.require_admin_key} onChange={(v) => set('require_admin_key', v)} />
-            </Field>
-          </>)}
-
-          {group('Documents & storage', <>
-            <Field label="Maximum file size" dirty={isDirty('max_file_size_mb')}>
-              <NumIn value={draft.max_file_size_mb} onChange={(v) => set('max_file_size_mb', v)} suffix="MB" />
-            </Field>
-            <Field label="Accepted extensions" dirty={isDirty('allowed_extensions')}>
-              <TextIn value={draft.allowed_extensions} onChange={(v) => set('allowed_extensions', v)} w={230} />
-            </Field>
-            <Field label="Bucket" hint="The bucket name here should match the Storage / Drive URL set in Connection above" dirty={isDirty('gcs_bucket')}>
-              <TextIn value={draft.gcs_bucket} onChange={(v) => set('gcs_bucket', v)} w={230} />
-            </Field>
-            <Field label="Path prefix" hint="Folder inside that bucket where tender documents are organised" dirty={isDirty('storage_prefix')}>
-              <TextIn value={draft.storage_prefix} onChange={(v) => set('storage_prefix', v)} w={160} />
-            </Field>
-            <Field label="Download link lifetime" hint="How long a signed link stays valid after a client asks for it" dirty={isDirty('signed_url_ttl_min')}>
-              <NumIn value={draft.signed_url_ttl_min} onChange={(v) => set('signed_url_ttl_min', v)} suffix="min" />
             </Field>
           </>)}
       </div>

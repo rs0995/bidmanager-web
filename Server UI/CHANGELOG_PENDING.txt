@@ -1,0 +1,1 @@
+- Moved the Documents & storage card to right below Browser sessions on the Settings page.
