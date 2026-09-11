@@ -1995,7 +1995,7 @@ class ScraperBackend:
             return None
 
     @staticmethod
-    def handle_captcha_interaction(driver, context, submit_id="Submit"):
+    def handle_captcha_interaction(driver, context, submit_id="Submit", is_download=False):
         if not ensure_scraper_dependencies():
             return False
         def _status_table_visible():
@@ -2069,7 +2069,10 @@ class ScraperBackend:
             return False
         # Manual fallback after configured automatic attempts.
         try:
-            manual_attempts = setting_int("captcha_max_attempts", 4, minimum=1, maximum=10)
+            if is_download:
+                manual_attempts = 5
+            else:
+                manual_attempts = setting_int("retry_attempts", 3, minimum=1, maximum=10)
             manual_wait = setting_int("captcha_manual_wait_s", 180, minimum=10, maximum=900)
             for manual_try in range(manual_attempts):
                 try:
@@ -2086,9 +2089,7 @@ class ScraperBackend:
                 )
                 solution = request_manual_captcha(img_data, context=context, timeout=manual_wait)
                 if solution is None:
-                    if str(ScraperBackend.get_setting("captcha_on_no_answer", "requeue")).strip().lower() == "requeue":
-                        raise JobRequeueError(f"Manual CAPTCHA timed out for {context}; queued to try again.")
-                    log_to_gui(f"Manual CAPTCHA timed out for {context}; failing the job as configured.")
+                    log_to_gui(f"Manual CAPTCHA timed out for {context}.")
                     return False
                 if not solution:
                     return False  # user cancelled
@@ -4068,7 +4069,7 @@ class ScraperBackend:
                                 continue
                         if unlock_trigger:
                             driver.execute_script("arguments[0].click();", unlock_trigger)
-                            if ScraperBackend.handle_captcha_interaction(driver, "Tender documents"):
+                            if ScraperBackend.handle_captcha_interaction(driver, "Tender documents", is_download=True):
                                 for by, locator in (
                                     (By.PARTIAL_LINK_TEXT, "Tendernotice"),
                                     (By.ID, "DirectLink_0"),

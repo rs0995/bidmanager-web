@@ -90,9 +90,9 @@ maintained implementation.
   downloads are deduplicated by tender ID when configured.
 - Request retries/backoff, page-load timeout, browser headless mode, user-agent rotation,
   allowed download extensions, and maximum file size are enforced by scraper code.
-- CAPTCHA automatic attempt counts and manual wait time are enforced; manual retries follow
-  `retry_attempts` (capped at 5 for download jobs). Any job failure — CAPTCHA included —
-  requeues within `retry_attempts` before it is marked failed.
+- CAPTCHA automatic/manual attempt counts and manual wait time are enforced. If no one
+  answers, the durable job either requeues within `retry_attempts` or fails, according to
+  `captcha_on_no_answer`.
 - Proxy rotation reads comma-separated proxy URLs from `BIDMANAGER_PROXY_URLS`; the
   configured proxy pool must be something other than `none` for it to be active.
 

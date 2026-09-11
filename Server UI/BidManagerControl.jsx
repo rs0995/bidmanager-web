@@ -77,14 +77,10 @@ const DEFAULT_CONFIG = {
   captcha_ai_api_key: '',
   captcha_ai_api_key_set: false,
   captcha_ai_endpoint: '',
-  captcha_max_attempts: 4,
-  captcha_confidence_min: 0.72,
   captcha_manual_fallback: true,
   captcha_handover_after_attempts: 2,
   captcha_manual_wait_s: 180,
   captcha_alert_channel: 'desktop',
-  captcha_on_no_answer: 'requeue',
-  auto_download_documents: true,
   max_file_size_mb: 80,
   allowed_extensions: 'pdf, zip, rar, xls, xlsx, doc, docx',
   gcs_bucket: '',
@@ -1047,7 +1043,7 @@ function ConfigPanel({ toast, env, base, adminKey, setBase, dbUrl, setDbUrl, sto
             <Field label="Download session idle timeout" hint="The download browser stays open this long between downloads so the CAPTCHA is solved once per website session; a longer gap rebuilds it and re-solves." dirty={isDirty('download_session_idle_min')}>
               <NumIn value={draft.download_session_idle_min} onChange={(v) => set('download_session_idle_min', v)} min={1} max={120} suffix="min" />
             </Field>
-            <Field label="Retry attempts" dirty={isDirty('retry_attempts')}>
+            <Field label="Retry attempts" hint="How many times a failed job (scrape, download, or CAPTCHA) is automatically retried before it's marked failed" dirty={isDirty('retry_attempts')}>
               <NumIn value={draft.retry_attempts} onChange={(v) => set('retry_attempts', v)} />
             </Field>
             <Field label="Backoff between retries" dirty={isDirty('retry_backoff_s')}>
@@ -1087,12 +1083,6 @@ function ConfigPanel({ toast, env, base, adminKey, setBase, dbUrl, setDbUrl, sto
                 <TextIn value={draft.captcha_ai_endpoint || ''} onChange={(v) => set('captcha_ai_endpoint', v)} w={300} placeholder="https://provider.example/v1/chat/completions" />
               </Field>
             </>}
-            <Field label="Attempts per captcha" dirty={isDirty('captcha_max_attempts')}>
-              <NumIn value={draft.captcha_max_attempts} onChange={(v) => set('captcha_max_attempts', v)} />
-            </Field>
-            <Field label="Minimum confidence" hint="Below this the answer is discarded and re-read" dirty={isDirty('captcha_confidence_min')}>
-              <NumIn value={draft.captcha_confidence_min} onChange={(v) => set('captcha_confidence_min', v)} step={0.01} />
-            </Field>
             <Field label="Ask me when the model fails" hint="Sends the image to the Captchas screen instead of failing the job" dirty={isDirty('captcha_manual_fallback')}>
               <Toggle checked={draft.captcha_manual_fallback} onChange={(v) => set('captcha_manual_fallback', v)} />
             </Field>
@@ -1105,31 +1095,6 @@ function ConfigPanel({ toast, env, base, adminKey, setBase, dbUrl, setDbUrl, sto
             <Field label="Alert me by" dirty={isDirty('captcha_alert_channel')}>
               <Select value={draft.captcha_alert_channel} onChange={(v) => set('captcha_alert_channel', v)} w={150}
                 options={[{ value: 'desktop', label: 'Desktop alert' }, { value: 'sound', label: 'Sound only' }, { value: 'email', label: 'Email' }, { value: 'none', label: 'No alert' }]} />
-            </Field>
-            <Field label="If nobody answers" dirty={isDirty('captcha_on_no_answer')}>
-              <Select value={draft.captcha_on_no_answer} onChange={(v) => set('captcha_on_no_answer', v)} w={150}
-                options={[{ value: 'requeue', label: 'Try again later' }, { value: 'abandon', label: 'Fail the job' }]} />
-            </Field>
-          </>)}
-
-          {group('Documents & storage', <>
-            <Field label="Download documents automatically" dirty={isDirty('auto_download_documents')}>
-              <Toggle checked={draft.auto_download_documents} onChange={(v) => set('auto_download_documents', v)} />
-            </Field>
-            <Field label="Maximum file size" dirty={isDirty('max_file_size_mb')}>
-              <NumIn value={draft.max_file_size_mb} onChange={(v) => set('max_file_size_mb', v)} suffix="MB" />
-            </Field>
-            <Field label="Accepted extensions" dirty={isDirty('allowed_extensions')}>
-              <TextIn value={draft.allowed_extensions} onChange={(v) => set('allowed_extensions', v)} w={230} />
-            </Field>
-            <Field label="Bucket" hint="The bucket name here should match the Storage / Drive URL set in Connection above" dirty={isDirty('gcs_bucket')}>
-              <TextIn value={draft.gcs_bucket} onChange={(v) => set('gcs_bucket', v)} w={230} />
-            </Field>
-            <Field label="Path prefix" hint="Folder inside that bucket where tender documents are organised" dirty={isDirty('storage_prefix')}>
-              <TextIn value={draft.storage_prefix} onChange={(v) => set('storage_prefix', v)} w={160} />
-            </Field>
-            <Field label="Download link lifetime" hint="How long a signed link stays valid after a client asks for it" dirty={isDirty('signed_url_ttl_min')}>
-              <NumIn value={draft.signed_url_ttl_min} onChange={(v) => set('signed_url_ttl_min', v)} suffix="min" />
             </Field>
           </>)}
 
@@ -1166,6 +1131,24 @@ function ConfigPanel({ toast, env, base, adminKey, setBase, dbUrl, setDbUrl, sto
             </Field>
             <Field label="Require admin key" hint="Protects this console and every /admin route" dirty={isDirty('require_admin_key')}>
               <Toggle checked={draft.require_admin_key} onChange={(v) => set('require_admin_key', v)} />
+            </Field>
+          </>)}
+
+          {group('Documents & storage', <>
+            <Field label="Maximum file size" dirty={isDirty('max_file_size_mb')}>
+              <NumIn value={draft.max_file_size_mb} onChange={(v) => set('max_file_size_mb', v)} suffix="MB" />
+            </Field>
+            <Field label="Accepted extensions" dirty={isDirty('allowed_extensions')}>
+              <TextIn value={draft.allowed_extensions} onChange={(v) => set('allowed_extensions', v)} w={230} />
+            </Field>
+            <Field label="Bucket" hint="The bucket name here should match the Storage / Drive URL set in Connection above" dirty={isDirty('gcs_bucket')}>
+              <TextIn value={draft.gcs_bucket} onChange={(v) => set('gcs_bucket', v)} w={230} />
+            </Field>
+            <Field label="Path prefix" hint="Folder inside that bucket where tender documents are organised" dirty={isDirty('storage_prefix')}>
+              <TextIn value={draft.storage_prefix} onChange={(v) => set('storage_prefix', v)} w={160} />
+            </Field>
+            <Field label="Download link lifetime" hint="How long a signed link stays valid after a client asks for it" dirty={isDirty('signed_url_ttl_min')}>
+              <NumIn value={draft.signed_url_ttl_min} onChange={(v) => set('signed_url_ttl_min', v)} suffix="min" />
             </Field>
           </>)}
       </div>

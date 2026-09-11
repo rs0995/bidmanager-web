@@ -2268,6 +2268,43 @@ def _release_execution_slot() -> None:
             _append_live_log("Drain completed; the scraper is accepting new jobs again.")
 
 
+def _requeue_or_fail_job(job_id: str, error_message: str, logs: list[str]) -> bool:
+    """On any job failure, requeue for another attempt (up to 'retry_attempts') or
+    mark it failed once the retry budget is exhausted. Returns True if requeued."""
+    try:
+        retry_limit = max(
+            1, min(10, int(core.ScraperBackend.get_setting("retry_attempts", "3")))
+        )
+    except Exception:
+        retry_limit = 3
+    with _job_lock:
+        attempt_count = int((_jobs.get(job_id) or {}).get("attempt_count") or 1)
+    if attempt_count < retry_limit:
+        _update_job(
+            job_id,
+            status="queued",
+            result=None,
+            error=error_message,
+            logs=logs,
+            progress=0,
+            started_at=None,
+            finished_at=None,
+            heartbeat_at=time.time(),
+            cancel_requested=False,
+            worker_id="",
+        )
+        return True
+    _update_job(
+        job_id,
+        status="failed",
+        error=f"{error_message} Retry limit ({retry_limit}) reached.",
+        logs=logs,
+        finished_at=time.time(),
+        heartbeat_at=time.time(),
+    )
+    return False
+
+
 def _run_job(job_id: str):
     logs: list[str] = []
     requeue_requested = False
@@ -2310,13 +2347,8 @@ def _run_job(job_id: str):
         explicit_failed = result is False
 
         if explicit_failed or org_fetch_failed:
-            _update_job(
-                job_id,
-                status="failed",
-                error=logs[-1] if logs else "Operation failed.",
-                logs=logs,
-                finished_at=time.time(),
-                heartbeat_at=time.time(),
+            requeue_requested = _requeue_or_fail_job(
+                job_id, logs[-1] if logs else "Operation failed.", logs
             )
         else:
             _update_job(
@@ -2366,47 +2398,9 @@ def _run_job(job_id: str):
             cancel_requested=True,
         )
     except core.JobRequeueError as exc:
-        try:
-            retry_limit = max(
-                1, min(10, int(core.ScraperBackend.get_setting("retry_attempts", "3")))
-            )
-        except Exception:
-            retry_limit = 3
-        with _job_lock:
-            attempt_count = int((_jobs.get(job_id) or {}).get("attempt_count") or 1)
-        if attempt_count < retry_limit:
-            _update_job(
-                job_id,
-                status="queued",
-                result=None,
-                error=str(exc),
-                logs=logs,
-                progress=0,
-                started_at=None,
-                finished_at=None,
-                heartbeat_at=time.time(),
-                cancel_requested=False,
-                worker_id="",
-            )
-            requeue_requested = True
-        else:
-            _update_job(
-                job_id,
-                status="failed",
-                error=f"{exc} Retry limit ({retry_limit}) reached.",
-                logs=logs,
-                finished_at=time.time(),
-                heartbeat_at=time.time(),
-            )
+        requeue_requested = _requeue_or_fail_job(job_id, str(exc), logs)
     except Exception as e:
-        _update_job(
-            job_id,
-            status="failed",
-            error=str(e),
-            logs=logs,
-            finished_at=time.time(),
-            heartbeat_at=time.time(),
-        )
+        requeue_requested = _requeue_or_fail_job(job_id, str(e), logs)
     finally:
         core.clear_job_runtime()
         _log_context.tag = ""
@@ -2471,8 +2465,7 @@ def _enqueue_job(action: str, payload: Optional[dict] = None) -> dict:
         raise HTTPException(423, "The scraper is in drain mode and is not accepting new jobs.")
     download_after = payload.get("download_after")
     if action in {"fetch_tenders", "fetch_tenders_selected"} and (
-        bool(download_after) if download_after is not None
-        else core.setting_bool("auto_download_documents", True)
+        bool(download_after) if download_after is not None else True
     ):
         payload.setdefault("followup_action", "download_tenders")
     dedupe_key = _job_dedupe_key(action, payload)
@@ -5240,14 +5233,10 @@ ADMIN_CONFIG_KEYS = {
     "captcha_ai_model": "gemini-3.7-flash",
     "captcha_ai_api_key": "",
     "captcha_ai_endpoint": "",
-    "captcha_max_attempts": "4",
-    "captcha_confidence_min": "0.72",
     "captcha_manual_fallback": "true",
     "captcha_handover_after_attempts": "2",
     "captcha_manual_wait_s": "180",
     "captcha_alert_channel": "desktop",
-    "captcha_on_no_answer": "requeue",
-    "auto_download_documents": "true",
     "max_file_size_mb": "80",
     "allowed_extensions": "pdf, zip, rar, xls, xlsx, doc, docx",
     "gcs_bucket": "",
