@@ -5527,6 +5527,59 @@ def run_saved_custom_job(saved_job_id: int, owner: str, _auth: None = Depends(re
     return _enqueue_saved_custom_job(saved_job_id)
 
 
+@app.get("/admin/custom-jobs/{saved_job_id}/scope")
+def get_saved_custom_job_scope(saved_job_id: int, _auth: None = Depends(require_admin_key)):
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT website_id,org_ids_json,tender_ids_json,all_organizations,all_tenders "
+            "FROM saved_custom_jobs WHERE id=?",
+            (int(saved_job_id),),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Saved custom job not found")
+        website_id = int(row[0])
+        org_ids = [int(v) for v in _json_load(row[1], [])]
+        tender_ids = [int(v) for v in _json_load(row[2], [])]
+        all_organizations = bool(row[3])
+        all_tenders = bool(row[4])
+
+        organizations = []
+        if org_ids:
+            placeholders = ",".join("?" for _ in org_ids)
+            organizations = [
+                {"id": int(r[0]), "name": str(r[1] or "")}
+                for r in conn.execute(
+                    f"SELECT id,name FROM organizations WHERE website_id=? AND id IN ({placeholders}) ORDER BY name",
+                    (website_id, *org_ids),
+                ).fetchall()
+            ]
+
+        tenders = []
+        if tender_ids:
+            placeholders = ",".join("?" for _ in tender_ids)
+            tenders = [
+                {
+                    "id": int(r[0]),
+                    "tender_id": str(r[1] or ""),
+                    "title": str(r[2] or ""),
+                    "org_chain": str(r[3] or ""),
+                    "closing_date": str(r[4] or ""),
+                }
+                for r in conn.execute(
+                    f"SELECT id,tender_id,title,org_chain,closing_date FROM tenders "
+                    f"WHERE website_id=? AND id IN ({placeholders}) ORDER BY org_chain,title",
+                    (website_id, *tender_ids),
+                ).fetchall()
+            ]
+
+    return {
+        "organizations": organizations,
+        "tenders": tenders,
+        "all_organizations": all_organizations,
+        "all_tenders": all_tenders,
+    }
+
+
 @app.delete("/admin/custom-jobs/{saved_job_id}")
 def delete_saved_custom_job(saved_job_id: int, owner: str, _auth: None = Depends(require_admin_key)):
     owner_name = " ".join(str(owner or "").split())

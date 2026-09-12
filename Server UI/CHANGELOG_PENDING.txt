@@ -1,1 +1,2 @@
-- Moved the Documents & storage card to right below Browser sessions on the Settings page.
+- Saved jobs table: click "N organizations" / "N tenders" to view the actual list; added a Run once button for user-created jobs.
+- /client/organizations now exposes last_scraped_at, so the mobile app can show it and enforce a 24h cooldown on "Request tenders".
