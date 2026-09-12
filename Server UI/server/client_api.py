@@ -985,6 +985,14 @@ def _public_organization(
         "scrape_enabled": bool(data.get("scrape_enabled")),
         "has_saved_job": has_saved_job,
         "last_scraped_at": float(data.get("last_scraped_at") or 0),
+        # Was this org found on the site's own organisation-list page during
+        # the most recent scrape of its website (fetch_organisations_logic)?
+        # Distinct from scrape_enabled (an admin's per-org auto-scrape
+        # toggle) — this reflects whether the org still exists on the site
+        # at all. Intentionally still returned when false: clients need the
+        # row present to grey it out / sink it to the bottom of a bookmarked
+        # list rather than have it silently vanish.
+        "is_available": bool(data.get("is_available", 1)),
     }
 
 
@@ -1040,7 +1048,8 @@ def client_organizations(
         "SELECT o.id,o.website_id,COALESCE(w.name,'') AS website_name,"
         "COALESCE(o.name,'') AS name,COALESCE(o.tenders_url,'') AS tenders_url,"
         "COALESCE(o.tender_count,0) AS tender_count,COALESCE(o.scrape_enabled,0) AS scrape_enabled,"
-        "COALESCE(o.last_scraped_at,0) AS last_scraped_at "
+        "COALESCE(o.last_scraped_at,0) AS last_scraped_at,"
+        "COALESCE(o.is_available,1) AS is_available "
         "FROM organizations o LEFT JOIN websites w ON w.id=o.website_id"
     )
     offset = (page - 1) * page_size

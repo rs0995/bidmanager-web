@@ -1134,6 +1134,13 @@ def _init_db_schema(conn):
         ("scrape_interval_minutes", "INTEGER DEFAULT 0"),
         ("next_scrape_at", "REAL DEFAULT 0"),
         ("last_scraped_at", "REAL"),
+        # Whether this org was found on the site's own organisation-list page
+        # during the most recent fetch_organisations_logic pass for its
+        # website — distinct from scrape_enabled (an admin's per-org
+        # auto-scrape toggle). Defaults to 1 so every pre-existing row reads
+        # as available until the next org-list scrape says otherwise.
+        ("is_available", "INTEGER DEFAULT 1"),
+        ("last_seen_at", "REAL"),
     ]
     for col, ddl in org_migrations:
         try:
@@ -2089,9 +2096,7 @@ class ScraperBackend:
                 )
                 solution = request_manual_captcha(img_data, context=context, timeout=manual_wait)
                 if solution is None:
-                    if str(ScraperBackend.get_setting("captcha_on_no_answer", "requeue")).strip().lower() == "requeue":
-                        raise JobRequeueError(f"Manual CAPTCHA timed out for {context}; queued to try again.")
-                    log_to_gui(f"Manual CAPTCHA timed out for {context}; failing the job as configured.")
+                    log_to_gui(f"Manual CAPTCHA timed out for {context}.")
                     return False
                 if not solution:
                     return False  # user cancelled

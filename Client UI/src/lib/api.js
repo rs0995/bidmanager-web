@@ -169,6 +169,12 @@ async function downloadServerOrganizations(overrides = {}) {
       // individual tenders were actually fetched (0 = never) — drives the
       // "Request tenders" cooldown and the "Last updated" org-table label.
       last_scraped_at: Number(row.last_scraped_at) || 0,
+      // Was this org found on the site's own organisation-list page during
+      // the most recent scrape of its website — distinct from
+      // scrape_enabled (an admin's per-org auto-scrape toggle). Hidden
+      // entirely from the plain Organizations tab; greyed out and
+      // non-clickable (but still shown) when bookmarked.
+      is_available: row.is_available !== false,
     })));
     pages = Math.max(0, Number(payload.pages) || 0);
     page += 1;

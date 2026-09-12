@@ -44,7 +44,8 @@ class ClientApiTests(unittest.TestCase):
                 id INTEGER PRIMARY KEY, website_id INTEGER, name TEXT, tenders_url TEXT,
                 tender_count INTEGER, is_selected INTEGER DEFAULT 0,
                 scrape_enabled INTEGER DEFAULT 0, scrape_interval_minutes INTEGER DEFAULT 0,
-                next_scrape_at REAL DEFAULT 0, last_scraped_at REAL
+                next_scrape_at REAL DEFAULT 0, last_scraped_at REAL,
+                is_available INTEGER DEFAULT 1, last_seen_at REAL
             );
             CREATE TABLE downloaded_files (
                 id INTEGER PRIMARY KEY, tender_id TEXT, tender_db_id INTEGER,
@@ -142,8 +143,8 @@ class ClientApiTests(unittest.TestCase):
                 (2,1,'Water Authority','T-200','Water works','Pipeline','2000','20',
                  '2026-10-10','2026-10-11','2026-08-02','','Mumbai','Services','Closed',1,'https://example.test/t/200',0,0,0,0,0,NULL,NULL,NULL);
             INSERT INTO organizations VALUES
-                (1,1,'Road Authority','https://example.test/org/1',1,1,0,0,0,NULL),
-                (2,1,'Water Authority','https://example.test/org/2',1,1,0,0,0,NULL);
+                (1,1,'Road Authority','https://example.test/org/1',1,1,0,0,0,NULL,1,NULL),
+                (2,1,'Water Authority','https://example.test/org/2',1,1,0,0,0,NULL,1,NULL);
             """
         )
         conn.execute(

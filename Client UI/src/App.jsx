@@ -1057,8 +1057,18 @@ function OrganizationTable({ rows, isLoading, emptyState, sortCol, sortDir, onTo
         </tr>
       </thead>
       <tbody>
-        {rows.map((org, i) => (
-          <tr key={org.id} className="cursor-pointer" onClick={() => onRowClick?.(org)}>
+        {rows.map((org, i) => {
+          // OrganizationsPage already filters these out — this only ever
+          // matters for BookmarksPage, which keeps a bookmarked-but-gone org
+          // visible (so the bookmark isn't silently lost) but inert.
+          const unavailable = org.is_available === false;
+          return (
+          <tr
+            key={org.id}
+            className={cn(unavailable ? 'cursor-default opacity-50' : 'cursor-pointer')}
+            onClick={() => !unavailable && onRowClick?.(org)}
+            title={unavailable ? 'No longer available on the source website' : undefined}
+          >
             <td className="text-center text-xs text-[var(--text-muted)]">{i + 1}</td>
             <td className="text-center">
               <button
@@ -1070,7 +1080,7 @@ function OrganizationTable({ rows, isLoading, emptyState, sortCol, sortDir, onTo
               </button>
             </td>
             <td className="text-sm">
-              <div>{org.name}</div>
+              <div>{org.name}{unavailable && <span className="ml-1.5 text-xs text-[var(--text-muted)]">(unavailable)</span>}</div>
               {org.last_scraped_at > 0 && (
                 <div className="text-xs text-[var(--text-muted)] mt-0.5">Last updated {api.formatISTTimestamp(org.last_scraped_at)}</div>
               )}
@@ -1078,7 +1088,8 @@ function OrganizationTable({ rows, isLoading, emptyState, sortCol, sortDir, onTo
             <td className="text-xs text-[var(--text-muted)]">{org.website_name || '—'}</td>
             <td className="text-center text-xs">{org.tender_count}</td>
           </tr>
-        ))}
+          );
+        })}
       </tbody>
     </table>
   );
@@ -1718,7 +1729,9 @@ function OrganizationsPage({ onOpenOrgTenders }) {
   }, [uniqueWebsites, website]);
 
   const filtered = useMemo(() => {
-    let list = organizations || [];
+    // Orgs no longer found on the site's own listing are hidden here
+    // entirely — they still show up (greyed out) in Bookmarks if bookmarked.
+    let list = (organizations || []).filter((o) => o.is_available !== false);
     if (website) list = list.filter((o) => o.website_name === website);
     if (search.trim()) {
       const q = search.toLowerCase();
@@ -1862,7 +1875,14 @@ function BookmarksPage({ onOpenOrgTenders }) {
       const q = orgSearch.toLowerCase();
       list = list.filter((o) => o.name.toLowerCase().includes(q) || (o.website_name || '').toLowerCase().includes(q));
     }
+    // Availability is the primary sort — a bookmarked org no longer on its
+    // site always sinks to the bottom — with the user's chosen column/
+    // direction as the tiebreak inside each group, so switching sort still
+    // fully re-orders "available" and "unavailable" independently.
     return [...list].sort((a, b) => {
+      const au = a.is_available === false ? 1 : 0;
+      const bu = b.is_available === false ? 1 : 0;
+      if (au !== bu) return au - bu;
       const c = smartCmp(a[orgSortCol] ?? '', b[orgSortCol] ?? '');
       return orgSortDir === 'asc' ? c : -c;
     });

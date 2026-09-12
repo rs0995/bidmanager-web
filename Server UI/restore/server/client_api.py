@@ -985,6 +985,14 @@ def _public_organization(
         "scrape_enabled": bool(data.get("scrape_enabled")),
         "has_saved_job": has_saved_job,
         "last_scraped_at": float(data.get("last_scraped_at") or 0),
+        # Was this org found on the site's own organisation-list page during
+        # the most recent scrape of its website (fetch_organisations_logic)?
+        # Distinct from scrape_enabled (an admin's per-org auto-scrape
+        # toggle) — this reflects whether the org still exists on the site
+        # at all. Intentionally still returned when false: clients need the
+        # row present to grey it out / sink it to the bottom of a bookmarked
+        # list rather than have it silently vanish.
+        "is_available": bool(data.get("is_available", 1)),
     }
 
 
@@ -1239,7 +1247,13 @@ def client_request_org_tenders(org_id: int) -> dict[str, Any]:
         org = dict(_find_organization(conn, org_id))
     last_scraped_at = float(org.get("last_scraped_at") or 0)
     if last_scraped_at and (time.time() - last_scraped_at) < 86400:
-        raise HTTPException(429, "This organization's tenders were fetched less than 24 hours ago.")
+        # Structured detail (not just a string) so a client whose own local
+        # cache was stale can rebuild its friendly cooldown message from this
+        # live timestamp instead of showing this raw text to the user.
+        raise HTTPException(429, detail={
+            "message": "This organization's tenders were fetched less than 24 hours ago.",
+            "last_scraped_at": last_scraped_at,
+        })
     import api_server  # deferred: api_server imports this module at load time
 
     result = api_server._enqueue_job(

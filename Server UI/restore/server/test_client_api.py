@@ -44,7 +44,8 @@ class ClientApiTests(unittest.TestCase):
                 id INTEGER PRIMARY KEY, website_id INTEGER, name TEXT, tenders_url TEXT,
                 tender_count INTEGER, is_selected INTEGER DEFAULT 0,
                 scrape_enabled INTEGER DEFAULT 0, scrape_interval_minutes INTEGER DEFAULT 0,
-                next_scrape_at REAL DEFAULT 0, last_scraped_at REAL
+                next_scrape_at REAL DEFAULT 0, last_scraped_at REAL,
+                is_available INTEGER DEFAULT 1, last_seen_at REAL
             );
             CREATE TABLE downloaded_files (
                 id INTEGER PRIMARY KEY, tender_id TEXT, tender_db_id INTEGER,
@@ -527,10 +528,13 @@ class ClientApiTests(unittest.TestCase):
         self.assertEqual(self._blob()["bookmarks"], [1])
 
     def test_fresh_push_matching_current_updated_at_always_applies(self):
-        t1 = self._push({"bookmarks": [1]}, base=1.0)
-        t2 = self._push({"bookmarks": [1, 2]}, base=t1)
-        self._push({"bookmarks": [1, 2, 3]}, base=t2)
-        self.assertEqual(self._blob()["bookmarks"], [1, 2, 3])
+        t1 = self._push({"projects": [{"id": 1, "title": "A"}]}, base=1.0)
+        t2 = self._push({"projects": [{"id": 1, "title": "A"}, {"id": 2, "title": "B"}]}, base=t1)
+        self._push(
+            {"projects": [{"id": 1, "title": "A"}, {"id": 2, "title": "B"}, {"id": 3, "title": "C"}]},
+            base=t2,
+        )
+        self.assertEqual({p["id"] for p in self._blob()["projects"]}, {1, 2, 3})
 
     def test_stale_version_entries_are_pruned(self):
         t1 = self._push({"projects": [{"id": 5, "title": "A"}]}, base=1.0)

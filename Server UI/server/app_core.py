@@ -1134,6 +1134,13 @@ def _init_db_schema(conn):
         ("scrape_interval_minutes", "INTEGER DEFAULT 0"),
         ("next_scrape_at", "REAL DEFAULT 0"),
         ("last_scraped_at", "REAL"),
+        # Whether this org was found on the site's own organisation-list page
+        # during the most recent fetch_organisations_logic pass for its
+        # website — distinct from scrape_enabled (an admin's per-org
+        # auto-scrape toggle). Defaults to 1 so every pre-existing row reads
+        # as available until the next org-list scrape says otherwise.
+        ("is_available", "INTEGER DEFAULT 1"),
+        ("last_seen_at", "REAL"),
     ]
     for col, ddl in org_migrations:
         try:
@@ -2415,8 +2422,10 @@ class ScraperBackend:
             
             conn = sqlite3.connect(DB_FILE)
             c = conn.cursor()
-            
+
             count = 0
+            seen_names = set()
+            now = time.time()
             for row in rows:
                 cols = row.find_all('td')
                 if len(cols) > 2 and cols[0].text.strip().isdigit():
@@ -2424,19 +2433,39 @@ class ScraperBackend:
                     tender_count = cols[2].text.strip()
                     link = cols[2].find('a')['href'] if cols[2].find('a') else ""
                     full_link = urljoin(url, link)
-                    
+                    seen_names.add(org_name)
+
                     # Insert or Ignore (to preserve selection status if exists)
                     # We use INSERT OR IGNORE then UPDATE to update details but keep selection
                     c.execute("SELECT id FROM organizations WHERE website_id=? AND name=?", (website_id, org_name))
                     exists = c.fetchone()
-                    
+
                     if exists:
-                        c.execute("UPDATE organizations SET tender_count=?, tenders_url=? WHERE id=?", (tender_count, full_link, exists[0]))
+                        c.execute(
+                            "UPDATE organizations SET tender_count=?, tenders_url=?, is_available=1, last_seen_at=? WHERE id=?",
+                            (tender_count, full_link, now, exists[0]),
+                        )
                     else:
-                        c.execute("INSERT INTO organizations (website_id, name, tender_count, tenders_url) VALUES (?, ?, ?, ?)", 
-                                  (website_id, org_name, tender_count, full_link))
+                        c.execute(
+                            "INSERT INTO organizations (website_id, name, tender_count, tenders_url, is_available, last_seen_at) "
+                            "VALUES (?, ?, ?, ?, 1, ?)",
+                            (website_id, org_name, tender_count, full_link, now),
+                        )
                     count += 1
-            
+
+            # Anything previously known for this website but absent from this
+            # fresh scrape has disappeared from the site's own organisation
+            # listing — flag it rather than deleting the row (preserves
+            # bookmarks/history), mirroring archive_missing_tenders_for_org's
+            # seen-set diff for tenders. Guarded on a non-empty pass so a
+            # parse/site error can't wipe every org for this website.
+            if seen_names:
+                placeholders = ",".join("?" for _ in seen_names)
+                c.execute(
+                    f"UPDATE organizations SET is_available=0 WHERE website_id=? AND name NOT IN ({placeholders})",
+                    (website_id, *seen_names),
+                )
+
             conn.commit()
             conn.close()
             log_to_gui(f"Updated {count} organizations for {site_data['name']}")
