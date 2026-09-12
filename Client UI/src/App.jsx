@@ -329,6 +329,29 @@ function NotificationPanel({ open, onClose }) {
   );
 }
 
+// Small floating auto-dismissing cards — direct feedback for a user-
+// initiated action (e.g. the "Request tenders" cooldown message), distinct
+// from the notifications bell above (passive background events the user
+// opens a dropdown to see). Mounted once near the root; state lives in the
+// zustand store so non-React code (api.js) can push one too.
+function ToastHost() {
+  const { toasts, dismissToast } = useAppStore();
+  if (!toasts.length) return null;
+  return (
+    <div className="fixed bottom-4 right-4 z-[80] flex flex-col gap-2 w-80">
+      {toasts.map((t) => (
+        <div key={t.id} className="card shadow-xl border border-[var(--border)] flex items-start gap-3 px-4 py-3">
+          <NotificationIcon type={t.type} />
+          <p className="flex-1 min-w-0 text-sm text-[var(--text)]">{t.message}</p>
+          <button onClick={() => dismissToast(t.id)} className="text-[var(--text-muted)] hover:text-[var(--text)] shrink-0">
+            <X size={14} />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    DASHBOARD
    ═══════════════════════════════════════════════════════════════════════════ */
@@ -4375,6 +4398,7 @@ export default function App() {
         </div>
         <DownloadsPanel open={showDownloads} onClose={() => setShowDownloads(false)} onOpenTender={(tenderDbId) => { setShowDownloads(false); openTenderDetails(tenderDbId); }} />
         <NotificationPanel open={showNotifications} onClose={() => setShowNotifications(false)} />
+        <ToastHost />
       </header>
 
       <div className="flex flex-1 overflow-hidden">

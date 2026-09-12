@@ -9,10 +9,17 @@ export interface Notification {
   read: boolean;
 }
 
+export interface Toast {
+  id: string;
+  type: 'info' | 'success' | 'error';
+  message: string;
+}
+
 interface AppState {
   theme: 'dark' | 'light';
   sidebarCollapsed: boolean;
   notifications: Notification[];
+  toasts: Toast[];
   tendersTable: {
     hiddenColumns: string[];
     columnOrder: string[];
@@ -49,6 +56,14 @@ interface AppState {
   addNotification: (n: Omit<Notification, 'id'>) => void;
   markRead: (id: string) => void;
   markAllRead: () => void;
+  // Small floating auto-dismissing card (ToastHost in App.jsx) — for direct
+  // feedback on a user-initiated action, distinct from the notifications
+  // bell (addNotification), which is for passive background events the
+  // user opens the dropdown to see. Callable from non-React code (api.js)
+  // since the auto-dismiss timer lives in the action itself, not a
+  // component's lifecycle.
+  pushToast: (t: Omit<Toast, 'id'> & { duration?: number }) => void;
+  dismissToast: (id: string) => void;
   setTendersHiddenColumns: (hiddenColumns: string[]) => void;
   setTendersColumnOrder: (columnOrder: string[]) => void;
   setProjectsHiddenColumns: (hiddenColumns: string[]) => void;
@@ -72,6 +87,7 @@ export const useAppStore = create<AppState>()(
       theme: 'dark',
       sidebarCollapsed: false,
       notifications: [],
+      toasts: [],
       tendersTable: {
         hiddenColumns: [],
         columnOrder: [],
@@ -117,6 +133,13 @@ export const useAppStore = create<AppState>()(
         set((s) => ({
           notifications: s.notifications.map((n) => ({ ...n, read: true })),
         })),
+      pushToast: ({ type = 'info', message, duration = 8000 }) => {
+        const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        set((s) => ({ toasts: [...s.toasts, { id, type, message }] }));
+        setTimeout(() => useAppStore.getState().dismissToast(id), duration);
+      },
+      dismissToast: (id) =>
+        set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
       setTendersHiddenColumns: (hiddenColumns) =>
         set((s) => ({ tendersTable: { ...s.tendersTable, hiddenColumns } })),
       setTendersColumnOrder: (columnOrder) =>

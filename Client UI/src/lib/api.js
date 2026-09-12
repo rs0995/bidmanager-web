@@ -105,7 +105,10 @@ async function requestClient(route, options = {}, overrides = {}, { requireAuth 
     });
     if (!result?.ok) {
       if (result?.status === 401 || result?.status === 403) throw new AuthError(result?.message || 'Sign in again.', result?.reason);
-      throw new Error(result?.message || 'Could not reach the client API.');
+      const error = new Error(result?.message || 'Could not reach the client API.');
+      error.status = result?.status;
+      error.detail = result?.detail;
+      throw error;
     }
     return result.data;
   }
@@ -125,7 +128,10 @@ async function requestClient(route, options = {}, overrides = {}, { requireAuth 
       : (detail && typeof detail === 'object' ? detail.message : detail)
         || `Client API returned HTTP ${response.status}.`;
     if (response.status === 401 || response.status === 403) throw new AuthError(message, detail?.reason);
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    error.detail = detail;
+    throw error;
   }
   return payload;
 }
@@ -584,14 +590,38 @@ export const api = {
   requestOrgTenders: async (org) => {
     const cooldownMessage = getScrapeCooldownMessage(org.last_scraped_at);
     if (cooldownMessage) {
-      const { addNotification } = useAppStore.getState();
-      addNotification({ type: 'info', message: cooldownMessage, time: new Date().toLocaleString() });
+      useAppStore.getState().pushToast({ type: 'info', message: cooldownMessage });
       return { skipped: true };
     }
-    const { job_id: jobId } = await requestClient(
-      `/client/organizations/${Number(org.id)}/request-tenders`,
-      { method: 'POST', body: {} },
-    );
+    let jobId;
+    try {
+      ({ job_id: jobId } = await requestClient(
+        `/client/organizations/${Number(org.id)}/request-tenders`,
+        { method: 'POST', body: {} },
+      ));
+    } catch (error) {
+      // Local last_scraped_at was stale (this device hasn't synced since
+      // another device/job refreshed this org) and the pre-check above
+      // passed when it shouldn't have — the server's own defense-in-depth
+      // 429 caught it. Rebuild the same friendly message from the server's
+      // live timestamp (not a generic error dialog) and correct the local
+      // cache so this device doesn't repeat the round-trip immediately.
+      if (error?.status === 429) {
+        const liveLastScrapedAt = Number(error.detail?.last_scraped_at) || 0;
+        const message = getScrapeCooldownMessage(liveLastScrapedAt) || getScrapeCooldownMessage(Date.now() / 1000 - 1);
+        useAppStore.getState().pushToast({ type: 'info', message });
+        if (liveLastScrapedAt) {
+          await updateState((state) => {
+            state.organizations = state.organizations.map((row) => (
+              Number(row.id) === Number(org.id) ? { ...row, last_scraped_at: liveLastScrapedAt } : row
+            ));
+            return state;
+          });
+        }
+        return { skipped: true };
+      }
+      throw error;
+    }
     await updateState((state) => {
       state.settings = { ...state.settings, pendingOrgRequests: { ...(state.settings.pendingOrgRequests || {}), [org.id]: jobId } };
       return state;

@@ -1239,7 +1239,13 @@ def client_request_org_tenders(org_id: int) -> dict[str, Any]:
         org = dict(_find_organization(conn, org_id))
     last_scraped_at = float(org.get("last_scraped_at") or 0)
     if last_scraped_at and (time.time() - last_scraped_at) < 86400:
-        raise HTTPException(429, "This organization's tenders were fetched less than 24 hours ago.")
+        # Structured detail (not just a string) so a client whose own local
+        # cache was stale can rebuild its friendly cooldown message from this
+        # live timestamp instead of showing this raw text to the user.
+        raise HTTPException(429, detail={
+            "message": "This organization's tenders were fetched less than 24 hours ago.",
+            "last_scraped_at": last_scraped_at,
+        })
     import api_server  # deferred: api_server imports this module at load time
 
     result = api_server._enqueue_job(

@@ -1209,7 +1209,8 @@ def client_request_tender_download(tender_db_id: int) -> dict[str, Any]:
 
 def _find_organization(conn: Any, org_id: int) -> Any:
     row = conn.execute(
-        "SELECT id,website_id FROM organizations WHERE id=?", (org_id,)
+        "SELECT id,website_id,COALESCE(last_scraped_at,0) AS last_scraped_at FROM organizations WHERE id=?",
+        (org_id,),
     ).fetchone()
     if not row:
         raise HTTPException(404, "Organization not found.")
@@ -1222,17 +1223,23 @@ def _find_organization(conn: Any, org_id: int) -> Any:
     response_model=RequestDownloadResponse,
 )
 def client_request_org_tenders(org_id: int) -> dict[str, Any]:
-    # One-time manual scrape for an org not covered by any saved_custom_jobs
-    # row. Goes straight into background_jobs via _enqueue_job (action
-    # "fetch_tenders_selected", same as the admin console's one-off
+    # One-time manual scrape for an org whose tenders haven't been fetched
+    # in the last 24h. Goes straight into background_jobs via _enqueue_job
+    # (action "fetch_tenders_selected", same as the admin console's one-off
     # "fetch-selected" route) and never touches saved_custom_jobs, so it
-    # can't accidentally create a recurring schedule and the org stays
-    # requestable again later.
+    # can't accidentally create a recurring schedule. Coverage by a saved
+    # job no longer blocks this — organizations.last_scraped_at is stamped
+    # by the scraper itself only when an org's individual tenders were
+    # actually fetched (app_core.py, never by a bare org-list/count refresh),
+    # so a still-due org stays requestable even if a job already covers it.
+    # This is a defense-in-depth backstop — the desktop client is expected
+    # to decide this itself from the same field and not call this endpoint
+    # at all while within the cooldown.
     with _get_db() as conn:
         org = dict(_find_organization(conn, org_id))
-        covered_org_ids, full_websites = _org_scrape_coverage(conn, [org["website_id"]])
-    if org["website_id"] in full_websites or org_id in covered_org_ids:
-        raise HTTPException(409, "This organization already has a saved scrape job covering it.")
+    last_scraped_at = float(org.get("last_scraped_at") or 0)
+    if last_scraped_at and (time.time() - last_scraped_at) < 86400:
+        raise HTTPException(429, "This organization's tenders were fetched less than 24 hours ago.")
     import api_server  # deferred: api_server imports this module at load time
 
     result = api_server._enqueue_job(

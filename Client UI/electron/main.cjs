@@ -221,7 +221,7 @@ ipcMain.handle('desktop:client-api-request', async (_event, payload = {}) => {
         ? detail.map((d) => d.msg || d.type).join('; ')
         : (detail && typeof detail === 'object' ? detail.message : detail)
           || `Client API returned HTTP ${response.status}.`;
-      return { ok: false, status: response.status, message };
+      return { ok: false, status: response.status, message, detail };
     }
     return { ok: true, data, status: response.status };
   } catch (error) {
