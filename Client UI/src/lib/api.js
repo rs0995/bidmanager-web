@@ -14,6 +14,40 @@ function filterRows(rows, search, fields) {
   return rows.filter((row) => fields.some((key) => String(row[key] ?? '').toLowerCase().includes(q)));
 }
 
+const IST_TIME_ZONE = 'Asia/Kolkata';
+const IST_DATE_FMT = new Intl.DateTimeFormat('en-IN', { timeZone: IST_TIME_ZONE, day: 'numeric', month: 'short', year: 'numeric' });
+const IST_TIME_FMT = new Intl.DateTimeFormat('en-IN', { timeZone: IST_TIME_ZONE, hour: 'numeric', minute: '2-digit', hour12: true });
+const IST_HOUR_FMT = new Intl.DateTimeFormat('en-GB', { timeZone: IST_TIME_ZONE, hour: '2-digit', hour12: false });
+
+// "{date}, {time}" in IST, e.g. "11 Sep 2026, 3:45 PM" — used both for the
+// "Request tenders" cooldown message and the Organizations table's "Last
+// updated" label. Intl's timeZone option avoids hand-rolled UTC+5:30 math
+// (India has no DST, but this also sidesteps ever getting that wrong).
+function formatISTTimestamp(epochSeconds) {
+  const date = new Date(Number(epochSeconds) * 1000);
+  return `${IST_DATE_FMT.format(date)}, ${IST_TIME_FMT.format(date)}`;
+}
+
+// Org tenders were last individually fetched at `lastScrapedAtEpoch` (epoch
+// seconds, 0/falsy = never) — see organizations.last_scraped_at, stamped by
+// the scraper only on an actual per-org tender fetch. Returns null when a
+// "Request tenders" press should go through (never scraped, or ≥24h ago);
+// otherwise the message to show instead of calling the endpoint at all.
+function getScrapeCooldownMessage(lastScrapedAtEpoch) {
+  const last = Number(lastScrapedAtEpoch) || 0;
+  if (!last) return null;
+  const nowSeconds = Date.now() / 1000;
+  if (nowSeconds - last >= 86400) return null;
+  const now = new Date();
+  const istHour = Number(IST_HOUR_FMT.format(now));
+  const lastUpdated = `Last updated on ${formatISTTimestamp(last)}.`;
+  if (istHour < 20) {
+    return `${lastUpdated} Next update will be available today at 8:00 PM IST.`;
+  }
+  const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  return `${lastUpdated} Next update will be available tomorrow, ${IST_DATE_FMT.format(tomorrow)}, at 8:00 PM IST.`;
+}
+
 function normalizeServerUrl(value) {
   const raw = String(value || DEFAULT_SERVER_URL).trim().replace(/\/+$/, '');
   let parsed;
@@ -125,6 +159,10 @@ async function downloadServerOrganizations(overrides = {}) {
       // "Request tenders" for orgs already covered by a saved custom job.
       tenders_url: row.tenders_url || '',
       has_saved_job: Boolean(row.has_saved_job),
+      // Epoch seconds, stamped by the scraper only when this org's
+      // individual tenders were actually fetched (0 = never) — drives the
+      // "Request tenders" cooldown and the "Last updated" org-table label.
+      last_scraped_at: Number(row.last_scraped_at) || 0,
     })));
     pages = Math.max(0, Number(payload.pages) || 0);
     page += 1;
@@ -535,12 +573,21 @@ export const api = {
     }
   },
 
-  // ── "Request tenders" — one-time manual scrape for an org with no saved
-  // custom job covering it (see Server UI/server/client_api.py
-  // /organizations/{id}/request-tenders). Mirrors the tender download-request
+  // ── "Request tenders" — one-time manual scrape, allowed for any org as
+  // long as its tenders haven't been individually fetched in the last 24h
+  // (see Server UI/server/client_api.py /organizations/{id}/request-tenders
+  // and organizations.last_scraped_at). Mirrors the tender download-request
   // flow above, but the pending marker is a plain local settings field
   // (never synced to the cloud — it's meaningless on another device).
+  formatISTTimestamp,
+  getScrapeCooldownMessage,
   requestOrgTenders: async (org) => {
+    const cooldownMessage = getScrapeCooldownMessage(org.last_scraped_at);
+    if (cooldownMessage) {
+      const { addNotification } = useAppStore.getState();
+      addNotification({ type: 'info', message: cooldownMessage, time: new Date().toLocaleString() });
+      return { skipped: true };
+    }
     const { job_id: jobId } = await requestClient(
       `/client/organizations/${Number(org.id)}/request-tenders`,
       { method: 'POST', body: {} },

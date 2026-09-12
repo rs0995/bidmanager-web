@@ -775,6 +775,10 @@ const ORGANIZATIONS_SEARCH_KEY = 'bm-client:organizations:search';
 // One-shot flag: a Dashboard Website Coverage card sets this immediately
 // before navigating here so that website is preselected/filtered.
 const ORGANIZATIONS_FORCE_WEBSITE_KEY = 'bm-client:organizations:force-website';
+// Session-only: which Bookmarks sub-tab (Organisations/Tenders) was last
+// open — remembered for in-session navigation, but resets to Organisations
+// on a fresh app launch since sessionStorage doesn't survive that.
+const BOOKMARKS_LAST_TAB_KEY = 'bm-client:bookmarks:last-tab';
 
 // Permanent memory only — last website + each website's remembered
 // Organization/Location/Category selection. Never includes whether a
@@ -1042,7 +1046,12 @@ function OrganizationTable({ rows, isLoading, emptyState, sortCol, sortDir, onTo
                 <Bookmark size={16} fill={bookmarkedOrgsSet.has(org.name) ? 'currentColor' : 'none'} />
               </button>
             </td>
-            <td className="text-sm">{org.name}</td>
+            <td className="text-sm">
+              <div>{org.name}</div>
+              {org.last_scraped_at > 0 && (
+                <div className="text-xs text-[var(--text-muted)] mt-0.5">Last updated {api.formatISTTimestamp(org.last_scraped_at)}</div>
+              )}
+            </td>
             <td className="text-xs text-[var(--text-muted)]">{org.website_name || '—'}</td>
             <td className="text-center text-xs">{org.tender_count}</td>
           </tr>
@@ -1401,7 +1410,11 @@ function TendersPage({ onBackToOrganizations }) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['pending-org-requests'] }),
     onError: (err) => alert(`Could not request tenders: ${err?.message || String(err)}`),
   });
-  const canRequestOrgTenders = Boolean(activeOrg) && !activeOrg.has_saved_job;
+  // Shown for every org now — a saved job covering it no longer hides the
+  // button. requestOrgTenders itself decides whether to actually fire based
+  // on org.last_scraped_at (a 24h cooldown), never touching the network when
+  // it's still within the window (see api.getScrapeCooldownMessage).
+  const canRequestOrgTenders = Boolean(activeOrg);
 
   // Same pull as Settings' "Sync Tenders" button (api.js:syncFromServer) —
   // just reachable without leaving the Online Tenders tab.
@@ -1748,7 +1761,12 @@ function OrganizationsPage({ onOpenOrgTenders }) {
    ═══════════════════════════════════════════════════════════════════════════ */
 function BookmarksPage({ onOpenOrgTenders }) {
   const qc = useQueryClient();
-  const [tab, setTab] = useState('tenders');
+  const [tab, setTab] = useState(() => {
+    try { return sessionStorage.getItem(BOOKMARKS_LAST_TAB_KEY) || 'organizations'; } catch { return 'organizations'; }
+  });
+  useEffect(() => {
+    try { sessionStorage.setItem(BOOKMARKS_LAST_TAB_KEY, tab); } catch { /* ignore storage failures */ }
+  }, [tab]);
 
   // ── Tenders sub-tab ────────────────────────────────────────────────────
   const [sortCol, setSortCol] = useState('closing_date');

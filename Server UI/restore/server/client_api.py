@@ -984,15 +984,21 @@ def _public_organization(
         "tender_count": int(data.get("tender_count") or 0),
         "scrape_enabled": bool(data.get("scrape_enabled")),
         "has_saved_job": has_saved_job,
+        "last_scraped_at": float(data.get("last_scraped_at") or 0),
     }
 
 
 def _org_scrape_coverage(conn: Any, website_ids: list[int]) -> tuple[set[int], set[int]]:
-    """Which orgs (by id) and which whole websites (by id) already have a
-    saved_custom_jobs scrape job covering them — admin-configured or the
-    auto-managed 24h "Bookmarks · <site>" job (see _reconcile_bookmark_jobs);
-    both live in the same table, so one membership check covers either.
-    Used to hide "Request tenders" for orgs that are already scheduled."""
+    """(org ids specifically targeted, website ids where every org is
+    covered) by an active saved_custom_jobs scrape row — admin-configured or
+    the auto-managed 24h "Bookmarks · <site>" job (see
+    _reconcile_bookmark_jobs), either counts. Mirrors _saved_job_coverage's
+    rule (same file): an all_organizations=1 job only actually fetches each
+    org's individual tenders (for every org on the site) when it ALSO has
+    explicit org_ids selected — see _enqueue_saved_custom_job in
+    api_server.py; without org_ids it just refreshes the org list/counts, so
+    it doesn't count as coverage for anyone. Used to hide "Request tenders"
+    for orgs that are already kept fresh."""
     website_ids = sorted({int(w) for w in website_ids if w is not None})
     if not website_ids:
         return set(), set()
@@ -1006,13 +1012,11 @@ def _org_scrape_coverage(conn: Any, website_ids: list[int]) -> tuple[set[int], s
     full_websites: set[int] = set()
     for row in rows:
         data = dict(row)
-        if bool(data.get("all_organizations")):
-            full_websites.add(int(data["website_id"]))
-            continue
-        try:
-            org_ids.update(int(v) for v in json.loads(data.get("org_ids_json") or "[]"))
-        except (TypeError, ValueError):
-            pass
+        website_id = int(data["website_id"])
+        row_org_ids = _json_id_list(data.get("org_ids_json"))
+        if bool(data.get("all_organizations")) and row_org_ids:
+            full_websites.add(website_id)
+        org_ids.update(row_org_ids)
     return org_ids, full_websites
 
 
@@ -1035,7 +1039,8 @@ def client_organizations(
     select_sql = (
         "SELECT o.id,o.website_id,COALESCE(w.name,'') AS website_name,"
         "COALESCE(o.name,'') AS name,COALESCE(o.tenders_url,'') AS tenders_url,"
-        "COALESCE(o.tender_count,0) AS tender_count,COALESCE(o.scrape_enabled,0) AS scrape_enabled "
+        "COALESCE(o.tender_count,0) AS tender_count,COALESCE(o.scrape_enabled,0) AS scrape_enabled,"
+        "COALESCE(o.last_scraped_at,0) AS last_scraped_at "
         "FROM organizations o LEFT JOIN websites w ON w.id=o.website_id"
     )
     offset = (page - 1) * page_size
