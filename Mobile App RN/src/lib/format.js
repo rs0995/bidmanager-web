@@ -11,23 +11,47 @@ export function fmtINR(n) {
 
 export const formatCrores = fmtINR;
 
+const MONTH_INDEX = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+};
+
+// Parses the date formats the backend actually returns (mostly ISO-8601,
+// occasionally "dd-MMM-yyyy hh:mm AM/PM" style tender-portal text) into a
+// real Date, or null if unparseable/blank.
+//
+// The month-name fallback below is spelled out as a lookup table rather than
+// `new Date(monthName + " 1, 2000").getMonth()` (as this used to be
+// written) because that inner parse is itself engine-dependent: V8
+// (the web app, running in a browser) accepts "Oct 1, 2000", but Hermes
+// (React Native's JS engine) does not, silently producing NaN and poisoning
+// every closing_date derived from this fallback -- which is exactly why
+// deadlines rendered fine on the web app and came up empty on RN.
+function parseFlexibleDate(dateLike) {
+  if (!dateLike) return null;
+  const direct = new Date(dateLike);
+  if (!Number.isNaN(direct.getTime())) return direct;
+
+  const match = String(dateLike).match(
+    /(\d{1,2})[-\s](\w{3,})[-\s](\d{4})(?:[,\s]+(\d{1,2}):(\d{2})\s*(AM|PM)?)?/i,
+  );
+  if (!match) return null;
+
+  const [, day, mon, year, hour = "0", min = "0", ampm] = match;
+  const monthIndex = MONTH_INDEX[mon.slice(0, 3).toLowerCase()];
+  if (monthIndex === undefined) return null;
+
+  let h = Number(hour);
+  if (ampm && /pm/i.test(ampm) && h < 12) h += 12;
+  if (ampm && /am/i.test(ampm) && h === 12) h = 0;
+
+  const parsed = new Date(Number(year), monthIndex, Number(day), h, Number(min));
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
 export function timeRemaining(dateLike) {
-  if (!dateLike) return { totalDays: null, expired: false, label: "—" };
-  let date = new Date(dateLike);
-  if (Number.isNaN(date.getTime())) {
-    const match = String(dateLike).match(
-      /(\d{1,2})[-\s](\w{3,})[-\s](\d{4})(?:[,\s]+(\d{1,2}):(\d{2})\s*(AM|PM)?)?/i,
-    );
-    if (match) {
-      const [, day, mon, year, hour = "0", min = "0", ampm] = match;
-      const monthIndex = new Date(`${mon} 1, 2000`).getMonth();
-      let h = Number(hour);
-      if (ampm && /pm/i.test(ampm) && h < 12) h += 12;
-      if (ampm && /am/i.test(ampm) && h === 12) h = 0;
-      date = new Date(Number(year), monthIndex, Number(day), h, Number(min));
-    }
-  }
-  if (Number.isNaN(date.getTime())) return { totalDays: null, expired: false, label: "—" };
+  const date = parseFlexibleDate(dateLike);
+  if (!date) return { totalDays: null, expired: false, label: "—" };
   const diffMs = date.getTime() - Date.now();
   const totalDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
   const expired = diffMs < 0;
@@ -51,8 +75,8 @@ export function formatBytes(bytes) {
 
 export function formatDate(dateLike) {
   if (!dateLike) return "—";
-  const date = new Date(dateLike);
-  if (Number.isNaN(date.getTime())) return String(dateLike);
+  const date = parseFlexibleDate(dateLike);
+  if (!date) return String(dateLike);
   return date.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
 }
 
@@ -68,8 +92,8 @@ function istNowParts() {
 
 export function formatDateTimeIST(dateLike) {
   if (!dateLike) return "—";
-  const date = new Date(dateLike);
-  if (Number.isNaN(date.getTime())) return String(dateLike);
+  const date = parseFlexibleDate(dateLike);
+  if (!date) return String(dateLike);
   return date.toLocaleString("en-IN", { timeZone: IST_TZ, day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 

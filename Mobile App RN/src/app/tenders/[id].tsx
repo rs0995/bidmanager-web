@@ -88,9 +88,11 @@ export default function TenderDetailScreen() {
               {expired ? "Closed" : `Closes ${label}`}
             </Text>
           </View>
-          <View className="px-2.5 py-1 rounded-full bg-surface-2">
-            <Text className="text-xs font-medium text-text-muted">{tender.website_name}</Text>
-          </View>
+          {tender.pre_bid_meeting_date && (
+            <View className="px-2.5 py-1 rounded-full bg-surface-2">
+              <Text className="text-xs font-medium text-text-muted">Pre-bid {formatDate(tender.pre_bid_meeting_date)}</Text>
+            </View>
+          )}
         </View>
 
         <View className="bg-surface-0 border border-border rounded-[14px] p-3 mb-4 flex-row flex-wrap">
