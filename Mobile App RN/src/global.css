@@ -1,3 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 :root {
   --font-display:
     Spline Sans, Inter, ui-sans-serif, system-ui, sans-serif, Apple Color Emoji, Segoe UI Emoji,
@@ -6,4 +10,40 @@
     ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, Courier New, monospace;
   --font-rounded: 'SF Pro Rounded', 'Hiragino Maru Gothic ProN', Meiryo, 'MS PGothic', sans-serif;
   --font-serif: Georgia, 'Times New Roman', serif;
+
+  --bg: #f5f6fa;
+  --surface-0: #ffffff;
+  --surface-1: #f0f2f7;
+  --surface-2: #e6e9f0;
+  --surface-3: #d8dce6;
+  --border: #dfe2ea;
+  --text: #1a1f2e;
+  --text-muted: #6b7a96;
+  --accent: #3b6ce7;
+  --accent-bg: rgba(59, 108, 231, 0.08);
+  --accent-hover: #2b5cd4;
+  --row-selected-bg: rgba(59, 108, 231, 0.06);
+  --danger: #dc2626;
+  --danger-bg: rgba(220, 38, 38, 0.08);
+  --ok: #059669;
+  --warn: #d97706;
+}
+
+.dark {
+  --bg: #0c0e14;
+  --surface-0: #11141c;
+  --surface-1: #181c28;
+  --surface-2: #222838;
+  --surface-3: #2c3448;
+  --border: #252d40;
+  --text: #e4e8f1;
+  --text-muted: #6b7a96;
+  --accent: #5b8af5;
+  --accent-bg: rgba(91, 138, 245, 0.12);
+  --accent-hover: #7aa3ff;
+  --row-selected-bg: rgba(91, 138, 245, 0.08);
+  --danger: #ef5350;
+  --danger-bg: rgba(239, 83, 80, 0.12);
+  --ok: #34d399;
+  --warn: #fbbf24;
 }
