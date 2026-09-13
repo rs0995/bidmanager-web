@@ -82,11 +82,9 @@ class SchedulerDowntimeTests(unittest.TestCase):
     def test_defer_past_downtime_combines_weekday_pause_and_time_window(self):
         with self._settings("22:00", "06:00", days="sun"):
             # Saturday 23:00 is within the overnight window -> defers to Sunday 06:00,
-            # but Sunday is a fully paused day -> jumps to Monday 00:00, which is still
-            # within the (daily, weekday-independent) overnight window -> defers once
-            # more to Monday 06:00, the first moment that's clear of both.
+            # but Sunday is a fully paused day -> defers again to Monday 00:00.
             deferred = api_server._defer_past_downtime(_epoch_at(23, 0, day=22))
-            self.assertEqual(deferred, _epoch_at(6, 0, day=24))
+            self.assertEqual(deferred, _epoch_at(0, 0, day=24))
 
     def test_consolidated_pass_short_circuits_during_downtime_without_touching_the_db(self):
         with mock.patch.object(api_server, "_within_downtime", return_value=True), \

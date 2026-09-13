@@ -1,2 +1,2 @@
-- Saved jobs table: click "N organizations" / "N tenders" to view the actual list; added a Run once button for user-created jobs.
-- /client/organizations now exposes last_scraped_at, so the mobile app can show it and enforce a 24h cooldown on "Request tenders".
+- Saved jobs scope links now show a chevron icon instead of an underline, matching the Users panel.
+- Added a day-of-week picker to pause the scheduler entirely on selected days (e.g. weekends), separate from the daily time window.

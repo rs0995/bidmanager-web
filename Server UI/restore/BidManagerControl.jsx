@@ -96,7 +96,14 @@ const DEFAULT_CONFIG = {
   archive_daily_hour: 20,
   scheduler_downtime_from: '',
   scheduler_downtime_to: '',
+  scheduler_downtime_days: '',
 };
+
+const WEEKDAY_OPTIONS = [
+  { key: 'sun', label: 'Sun' }, { key: 'mon', label: 'Mon' }, { key: 'tue', label: 'Tue' },
+  { key: 'wed', label: 'Wed' }, { key: 'thu', label: 'Thu' }, { key: 'fri', label: 'Fri' },
+  { key: 'sat', label: 'Sat' },
+];
 
 const LOG_SOURCES = ['api', 'scraper', 'worker', 'storage', 'db'];
 const LOG_FILTERS_KEY = 'bidmanager.admin.log-filters.v1';
@@ -1728,13 +1735,15 @@ function ScraperPanel({ toast, base, adminKey }) {
                 <td className="px-3 py-2" style={{ fontSize: 11.5, color: c.ink60 }}>
                   <div className="flex items-center gap-1 flex-wrap">
                     {job.job_type !== 'download' && (
-                      <button onClick={() => toggleJobScope(job, 'orgs')} style={{ background: 'none', border: 'none', padding: 0, font: 'inherit', color: expandedJobId === job.id && expandedJobView === 'orgs' ? c.ink : c.indigo, textDecoration: 'underline', cursor: 'pointer' }}>
+                      <button onClick={() => toggleJobScope(job, 'orgs')} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: 'none', border: 'none', padding: 0, font: 'inherit', color: expandedJobId === job.id && expandedJobView === 'orgs' ? c.ink : c.ink60, cursor: 'pointer' }}>
+                        {expandedJobId === job.id && expandedJobView === 'orgs' ? <ChevronDown size={13} style={{ color: c.ink40 }} /> : <ChevronRight size={13} style={{ color: c.ink40 }} />}
                         {job.all_organizations ? (job.org_ids.length ? 'Website · refresh + scrape all' : 'Website · refresh orgs') : `${job.org_ids.length} organizations`}
                       </button>
                     )}
                     {job.job_type !== 'download' && job.job_type !== 'scrape' && <span>·</span>}
                     {job.job_type !== 'scrape' && (
-                      <button onClick={() => toggleJobScope(job, 'tenders')} style={{ background: 'none', border: 'none', padding: 0, font: 'inherit', color: expandedJobId === job.id && expandedJobView === 'tenders' ? c.ink : c.indigo, textDecoration: 'underline', cursor: 'pointer' }}>
+                      <button onClick={() => toggleJobScope(job, 'tenders')} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: 'none', border: 'none', padding: 0, font: 'inherit', color: expandedJobId === job.id && expandedJobView === 'tenders' ? c.ink : c.ink60, cursor: 'pointer' }}>
+                        {expandedJobId === job.id && expandedJobView === 'tenders' ? <ChevronDown size={13} style={{ color: c.ink40 }} /> : <ChevronRight size={13} style={{ color: c.ink40 }} />}
                         {`${job.tender_ids.length} tenders`}
                       </button>
                     )}
@@ -1757,6 +1766,44 @@ function ScraperPanel({ toast, base, adminKey }) {
                   <Btn size="sm" variant="danger" icon={Trash2} busy={busy === `delete-${job.id}`} onClick={() => deleteSavedJob(job)}>Delete</Btn>
                 </div></td>
               </tr>
+              {expandedJobId === job.id && (
+                <tr style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
+                  <td colSpan={7} className="px-3 py-3" style={{ background: c.paper }}>
+                    {jobScopeLoading === job.id ? (
+                      <span style={{ fontSize: 12, color: c.ink40 }}>Loading…</span>
+                    ) : !scope ? (
+                      <span style={{ fontSize: 12, color: c.ink40 }}>Could not load scope.</span>
+                    ) : expandedJobView === 'orgs' ? (
+                      scope.all_organizations && scope.organizations.length === 0 ? (
+                        <span style={{ fontSize: 12, color: c.ink60 }}>All organizations on this website.</span>
+                      ) : scope.organizations.length === 0 ? (
+                        <span style={{ fontSize: 12, color: c.ink40 }}>No organizations.</span>
+                      ) : (
+                        <div className="flex flex-wrap gap-1">
+                          {scope.organizations.map((o) => <Pill key={o.id} state="neutral">{o.name}</Pill>)}
+                        </div>
+                      )
+                    ) : (
+                      scope.all_tenders && scope.tenders.length === 0 ? (
+                        <span style={{ fontSize: 12, color: c.ink60 }}>All tenders on this website.</span>
+                      ) : scope.tenders.length === 0 ? (
+                        <span style={{ fontSize: 12, color: c.ink40 }}>No tenders.</span>
+                      ) : (
+                        <div>
+                          {scope.tenders.map((t) => (
+                            <div key={t.id} className="py-1" style={{ borderBottom: `1px solid ${c.ruleSoft}`, fontSize: 12 }}>
+                              <Mono style={{ fontSize: 10.5, color: c.ink40 }}>#{t.tender_id || t.id}</Mono>{' '}
+                              <span style={{ color: c.ink }}>{t.title || '—'}</span>
+                              <span style={{ color: c.ink40 }}> · {t.org_chain || '—'}{t.closing_date ? ` · closes ${t.closing_date}` : ''}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )
+                    )}
+                  </td>
+                </tr>
+              )}
+              </React.Fragment>
               ); })}</tbody>
             </table>
           </div>

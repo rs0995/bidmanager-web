@@ -96,7 +96,14 @@ const DEFAULT_CONFIG = {
   archive_daily_hour: 20,
   scheduler_downtime_from: '',
   scheduler_downtime_to: '',
+  scheduler_downtime_days: '',
 };
+
+const WEEKDAY_OPTIONS = [
+  { key: 'sun', label: 'Sun' }, { key: 'mon', label: 'Mon' }, { key: 'tue', label: 'Tue' },
+  { key: 'wed', label: 'Wed' }, { key: 'thu', label: 'Thu' }, { key: 'fri', label: 'Fri' },
+  { key: 'sat', label: 'Sat' },
+];
 
 const LOG_SOURCES = ['api', 'scraper', 'worker', 'storage', 'db'];
 const LOG_FILTERS_KEY = 'bidmanager.admin.log-filters.v1';
@@ -1138,11 +1145,30 @@ function ConfigPanel({ toast, env, base, adminKey, setBase, dbUrl, setDbUrl, sto
             <Field label="Archive run time" hint="Hour of day (IST, 0–23) to run the daily archive sweep" dirty={isDirty('archive_daily_hour')}>
               <NumIn value={draft.archive_daily_hour} onChange={(v) => set('archive_daily_hour', v)} min={0} max={23} suffix=":00 IST" />
             </Field>
-            <Field label="Scheduler downtime — From" hint="IST. The only window in which automatic scraping is paused. Between From and To no jobs run; a job due in that window runs at the To time. Leave blank to run 24/7." dirty={isDirty('scheduler_downtime_from')}>
+            <Field label="Scheduler downtime — From" hint="IST. Daily window in which automatic scraping is paused. Between From and To no jobs run; a job due in that window runs at the To time. Leave blank to run 24/7. The days below are a separate, additional full-day pause." dirty={isDirty('scheduler_downtime_from')}>
               <TextIn type="time" w={110} value={draft.scheduler_downtime_from} onChange={(v) => set('scheduler_downtime_from', v)} />
             </Field>
             <Field label="Scheduler downtime — To" dirty={isDirty('scheduler_downtime_to')}>
               <TextIn type="time" w={110} value={draft.scheduler_downtime_to} onChange={(v) => set('scheduler_downtime_to', v)} />
+            </Field>
+            <Field label="Pause on these days" hint="IST. The scheduler is paused all day on any day picked here, regardless of the time window above." dirty={isDirty('scheduler_downtime_days')}>
+              <div className="flex flex-wrap gap-1">
+                {WEEKDAY_OPTIONS.map(({ key, label }) => {
+                  const days = new Set((draft.scheduler_downtime_days || '').split(',').map((d) => d.trim()).filter(Boolean));
+                  const active = days.has(key);
+                  return (
+                    <button key={key} type="button" onClick={() => {
+                      const next = new Set(days);
+                      if (active) next.delete(key); else next.add(key);
+                      set('scheduler_downtime_days', WEEKDAY_OPTIONS.map((w) => w.key).filter((k) => next.has(k)).join(','));
+                    }} style={{
+                      fontFamily: mono, fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', padding: '4px 10px',
+                      background: active ? c.ink : c.card, color: active ? '#fff' : c.ink40,
+                      border: `1px solid ${active ? c.ink : c.rule}`, cursor: 'pointer',
+                    }}>{label}</button>
+                  );
+                })}
+              </div>
             </Field>
           </>)}
 
@@ -1728,13 +1754,15 @@ function ScraperPanel({ toast, base, adminKey }) {
                 <td className="px-3 py-2" style={{ fontSize: 11.5, color: c.ink60 }}>
                   <div className="flex items-center gap-1 flex-wrap">
                     {job.job_type !== 'download' && (
-                      <button onClick={() => toggleJobScope(job, 'orgs')} style={{ background: 'none', border: 'none', padding: 0, font: 'inherit', color: expandedJobId === job.id && expandedJobView === 'orgs' ? c.ink : c.indigo, textDecoration: 'underline', cursor: 'pointer' }}>
+                      <button onClick={() => toggleJobScope(job, 'orgs')} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: 'none', border: 'none', padding: 0, font: 'inherit', color: expandedJobId === job.id && expandedJobView === 'orgs' ? c.ink : c.ink60, cursor: 'pointer' }}>
+                        {expandedJobId === job.id && expandedJobView === 'orgs' ? <ChevronDown size={13} style={{ color: c.ink40 }} /> : <ChevronRight size={13} style={{ color: c.ink40 }} />}
                         {job.all_organizations ? (job.org_ids.length ? 'Website · refresh + scrape all' : 'Website · refresh orgs') : `${job.org_ids.length} organizations`}
                       </button>
                     )}
                     {job.job_type !== 'download' && job.job_type !== 'scrape' && <span>·</span>}
                     {job.job_type !== 'scrape' && (
-                      <button onClick={() => toggleJobScope(job, 'tenders')} style={{ background: 'none', border: 'none', padding: 0, font: 'inherit', color: expandedJobId === job.id && expandedJobView === 'tenders' ? c.ink : c.indigo, textDecoration: 'underline', cursor: 'pointer' }}>
+                      <button onClick={() => toggleJobScope(job, 'tenders')} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: 'none', border: 'none', padding: 0, font: 'inherit', color: expandedJobId === job.id && expandedJobView === 'tenders' ? c.ink : c.ink60, cursor: 'pointer' }}>
+                        {expandedJobId === job.id && expandedJobView === 'tenders' ? <ChevronDown size={13} style={{ color: c.ink40 }} /> : <ChevronRight size={13} style={{ color: c.ink40 }} />}
                         {`${job.tender_ids.length} tenders`}
                       </button>
                     )}

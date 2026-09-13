@@ -2693,12 +2693,28 @@ def _downtime_window() -> Optional[tuple[int, int]]:
     return (start, end)
 
 
+_WEEKDAY_KEYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _downtime_days() -> set[str]:
+    """Weekdays (IST) the scheduler is paused all day, independent of the
+    From/To time window."""
+    raw = str(core.ScraperBackend.get_setting("scheduler_downtime_days", "") or "")
+    return {
+        part.strip().lower()[:3]
+        for part in raw.split(",")
+        if part.strip().lower()[:3] in _WEEKDAY_KEYS
+    }
+
+
 def _within_downtime(now_epoch: Optional[float] = None) -> bool:
+    moment = datetime.fromtimestamp(now_epoch if now_epoch is not None else time.time(), _IST)
+    if _WEEKDAY_KEYS[moment.weekday()] in _downtime_days():
+        return True
     window = _downtime_window()
     if not window:
         return False
     start, end = window
-    moment = datetime.fromtimestamp(now_epoch if now_epoch is not None else time.time(), _IST)
     minute = moment.hour * 60 + moment.minute
     if end < start:  # spans midnight
         return minute >= start or minute < end
@@ -2706,19 +2722,27 @@ def _within_downtime(now_epoch: Optional[float] = None) -> bool:
 
 
 def _defer_past_downtime(next_epoch: float) -> float:
-    """If next_epoch (IST) lands inside the downtime window, push it to that
-    occurrence's 'to' boundary so the run happens right after downtime ends."""
-    window = _downtime_window()
-    if not window or not _within_downtime(next_epoch):
-        return next_epoch
-    _, end = window
-    moment = datetime.fromtimestamp(next_epoch, _IST)
-    minute = moment.hour * 60 + moment.minute
-    target = moment.replace(hour=end // 60, minute=end % 60, second=0, microsecond=0)
-    # Overnight window and the target is in the pre-midnight half -> 'to' is next day.
-    if end < (window[0]) and minute >= window[0]:
-        target += timedelta(days=1)
-    return target.timestamp()
+    """If next_epoch (IST) lands during scheduler downtime - a fully paused
+    weekday and/or the From/To time window - push it forward to when downtime
+    ends. Loops to handle consecutive paused days (e.g. Sat+Sun both paused)."""
+    epoch = next_epoch
+    for _ in range(8):  # a week has 7 days; this always terminates unless every day is paused
+        if not _within_downtime(epoch):
+            return epoch
+        window = _downtime_window()
+        moment = datetime.fromtimestamp(epoch, _IST)
+        if _WEEKDAY_KEYS[moment.weekday()] in _downtime_days():
+            next_day = (moment + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            epoch = next_day.timestamp()
+            continue
+        _, end = window
+        minute = moment.hour * 60 + moment.minute
+        target = moment.replace(hour=end // 60, minute=end % 60, second=0, microsecond=0)
+        # Overnight window and the target is in the pre-midnight half -> 'to' is next day.
+        if end < window[0] and minute >= window[0]:
+            target += timedelta(days=1)
+        epoch = target.timestamp()
+    return epoch
 
 
 def _claim_scheduler_lease(now: float, interval_seconds: int, name: str = "default") -> bool:
@@ -5525,6 +5549,59 @@ def run_saved_custom_job(saved_job_id: int, owner: str, _auth: None = Depends(re
     if not row:
         raise HTTPException(404, "Saved custom job not found for this user")
     return _enqueue_saved_custom_job(saved_job_id)
+
+
+@app.get("/admin/custom-jobs/{saved_job_id}/scope")
+def get_saved_custom_job_scope(saved_job_id: int, _auth: None = Depends(require_admin_key)):
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT website_id,org_ids_json,tender_ids_json,all_organizations,all_tenders "
+            "FROM saved_custom_jobs WHERE id=?",
+            (int(saved_job_id),),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Saved custom job not found")
+        website_id = int(row[0])
+        org_ids = [int(v) for v in _json_load(row[1], [])]
+        tender_ids = [int(v) for v in _json_load(row[2], [])]
+        all_organizations = bool(row[3])
+        all_tenders = bool(row[4])
+
+        organizations = []
+        if org_ids:
+            placeholders = ",".join("?" for _ in org_ids)
+            organizations = [
+                {"id": int(r[0]), "name": str(r[1] or "")}
+                for r in conn.execute(
+                    f"SELECT id,name FROM organizations WHERE website_id=? AND id IN ({placeholders}) ORDER BY name",
+                    (website_id, *org_ids),
+                ).fetchall()
+            ]
+
+        tenders = []
+        if tender_ids:
+            placeholders = ",".join("?" for _ in tender_ids)
+            tenders = [
+                {
+                    "id": int(r[0]),
+                    "tender_id": str(r[1] or ""),
+                    "title": str(r[2] or ""),
+                    "org_chain": str(r[3] or ""),
+                    "closing_date": str(r[4] or ""),
+                }
+                for r in conn.execute(
+                    f"SELECT id,tender_id,title,org_chain,closing_date FROM tenders "
+                    f"WHERE website_id=? AND id IN ({placeholders}) ORDER BY org_chain,title",
+                    (website_id, *tender_ids),
+                ).fetchall()
+            ]
+
+    return {
+        "organizations": organizations,
+        "tenders": tenders,
+        "all_organizations": all_organizations,
+        "all_tenders": all_tenders,
+    }
 
 
 @app.delete("/admin/custom-jobs/{saved_job_id}")
