@@ -8,12 +8,13 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { bootstrapApp } from "@/lib/bootstrap";
 import { queryClient, setAuthErrorHandler } from "@/lib/queryClient";
-import { isSignedIn } from "@/lib/auth";
+import { useSignedIn } from "@/lib/auth";
 import { pullBookmarks } from "@/lib/sync";
 import { resumePendingDownloadJobs } from "@/lib/documents";
 import { resumePendingOrgRequests } from "@/lib/orgRequests";
 import { isAppLockEnabled, verifyAppLock } from "@/lib/appLock";
 import { interopIcon } from "@/lib/nativeIcons";
+import { ToastProvider } from "@/components/feedback/ToastProvider";
 
 const FingerprintIcon = interopIcon(Fingerprint);
 
@@ -38,18 +39,23 @@ export default function RootLayout() {
   return (
     <SafeAreaProvider>
       <QueryClientProvider client={queryClient}>
-        <AuthGate />
+        <ToastProvider>
+          <AuthGate />
+        </ToastProvider>
       </QueryClientProvider>
     </SafeAreaProvider>
   );
 }
 
 function AuthGate() {
-  const [signedIn, setSignedIn] = useState(isSignedIn());
+  // useSignedIn() is the observable form of isSignedIn() (see lib/auth.js) --
+  // it re-renders this gate when setSession()/clearSession() runs anywhere
+  // (SignInScreen on success, queryClient.js on a 401/403), which a plain
+  // isSignedIn() read at mount time would miss entirely.
+  const signedIn = useSignedIn();
 
   useEffect(() => {
     setAuthErrorHandler(() => {
-      setSignedIn(false);
       router.replace("/sign-in");
     });
   }, []);
