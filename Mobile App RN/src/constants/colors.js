@@ -30,3 +30,10 @@ export function useThemeColors() {
   const scheme = useColorScheme();
   return COLORS[scheme === "dark" ? "dark" : "light"];
 }
+
+export function urgencyColor(key, colors) {
+  if (key === "crit") return colors.danger;
+  if (key === "soon") return colors.warn;
+  if (key === "ok") return colors.ok;
+  return colors.textMuted;
+}

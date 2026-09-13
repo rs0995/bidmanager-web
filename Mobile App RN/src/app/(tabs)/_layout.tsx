@@ -16,7 +16,7 @@ const MoreIcon = interopIcon(Menu);
 // mostly just wiring icons + the unread-alerts badge.
 export default function TabsLayout() {
   const alerts = useAlerts();
-  const unread = alerts.filter((a) => !a.read).length;
+  const unread = alerts.filter((a: any) => !a.read).length;
   const colors = useThemeColors();
 
   return (
