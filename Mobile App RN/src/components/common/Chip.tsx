@@ -1,4 +1,5 @@
-import { Pressable, Text } from "react-native";
+import { Children, isValidElement } from "react";
+import { Pressable, Text, View } from "react-native";
 import { cn } from "@/lib/cn";
 
 type ChipProps = {
@@ -7,7 +8,22 @@ type ChipProps = {
   onPress?: () => void;
 };
 
+// Callers pass a mix of icon elements and raw text as siblings (e.g.
+// <Star .../> Bookmarked), the way the web app did inside a flex <button>.
+// RN cannot render a bare string as a child of View, so any string/number
+// child is wrapped in <Text> here; icon elements pass through unchanged.
 export function Chip({ active, children, onPress }: ChipProps) {
+  const content = Children.map(children, (child) => {
+    if (typeof child === "string" || typeof child === "number") {
+      return (
+        <Text className={cn("text-[13px] font-medium text-text-muted", active && "text-accent")}>
+          {child}
+        </Text>
+      );
+    }
+    return isValidElement(child) ? child : null;
+  });
+
   return (
     <Pressable
       onPress={onPress}
@@ -16,9 +32,7 @@ export function Chip({ active, children, onPress }: ChipProps) {
         active && "bg-accent-bg border-accent",
       )}
     >
-      <Text className={cn("text-[13px] font-medium text-text-muted", active && "text-accent")}>
-        {children}
-      </Text>
+      {content}
     </Pressable>
   );
 }

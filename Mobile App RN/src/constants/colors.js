@@ -1,4 +1,4 @@
-import { useColorScheme } from "react-native";
+import { useColorScheme } from "nativewind";
 
 // Plain-JS mirror of the CSS variables in src/global.css, for the handful of
 // places that need an actual resolved color value rather than a NativeWind
@@ -27,7 +27,7 @@ export const COLORS = {
 };
 
 export function useThemeColors() {
-  const scheme = useColorScheme();
+  const { colorScheme: scheme } = useColorScheme();
   return COLORS[scheme === "dark" ? "dark" : "light"];
 }
 
@@ -36,4 +36,18 @@ export function urgencyColor(key, colors) {
   if (key === "soon") return colors.warn;
   if (key === "ok") return colors.ok;
   return colors.textMuted;
+}
+
+// Approximates the web app color-mix(in srgb, X 16%, transparent) usage
+// (e.g. tinted status pills) — RN has no color-mix, but blending a color at
+// a fixed opacity against a fully transparent backdrop is just that color
+// at that alpha, so this only needs to handle a "#rrggbb" input.
+export function hexToRgba(hex, alpha) {
+  const m = /^#([0-9a-f]{6})$/i.exec(hex);
+  if (!m) return hex;
+  const int = parseInt(m[1], 16);
+  const r = (int >> 16) & 255;
+  const g = (int >> 8) & 255;
+  const b = int & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
