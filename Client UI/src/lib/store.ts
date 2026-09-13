@@ -7,6 +7,11 @@ export interface Notification {
   message: string;
   time: string;
   read: boolean;
+  // Optional navigation target — clicking the notification jumps to this
+  // tender (preferred) or, failing that, this org's tender list. Mirrors
+  // Mobile App's alert shape (lib/alerts.js: tenderId/orgName).
+  tenderId?: number;
+  orgName?: string;
 }
 
 export interface Toast {

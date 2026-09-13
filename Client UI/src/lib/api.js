@@ -1017,10 +1017,10 @@ export const api = {
           // local diff owns status + pre-bid/corrigendum, which the server's
           // tender_history snapshot doesn't track.
           if (previous.status !== row.status) {
-            notificationsToEmit.push({ type: 'status', message: `"${row.title || row.tender_id}" status changed to ${row.status || 'unknown'}.` });
+            notificationsToEmit.push({ type: 'status', message: `"${row.title || row.tender_id}" status changed to ${row.status || 'unknown'}.`, tenderId: row.id });
           }
           if ((Number(previous.prebid_count) || 0) !== (Number(row.prebid_count) || 0) || (Number(previous.corrigendum_count) || 0) !== (Number(row.corrigendum_count) || 0)) {
-            notificationsToEmit.push({ type: 'prebid', message: `"${row.title || row.tender_id}" has a new pre-bid or corrigendum.` });
+            notificationsToEmit.push({ type: 'prebid', message: `"${row.title || row.tender_id}" has a new pre-bid or corrigendum.`, tenderId: row.id });
           }
         } else if (!previous && row.org_chain && bookmarkedOrgsSet.has(row.org_chain)) {
           const bucket = newTendersByOrg.get(row.org_chain) || [];
@@ -1039,9 +1039,9 @@ export const api = {
     });
     for (const [org, rows] of newTendersByOrg) {
       if (rows.length > 10) {
-        notificationsToEmit.push({ type: 'new', message: `${rows.length} new tenders added under ${org}.` });
+        notificationsToEmit.push({ type: 'new', message: `${rows.length} new tenders added under ${org}.`, orgName: org });
       } else {
-        rows.forEach((row) => notificationsToEmit.push({ type: 'new', message: `"${row.title || row.tender_id}" added under ${org}.` }));
+        rows.forEach((row) => notificationsToEmit.push({ type: 'new', message: `"${row.title || row.tender_id}" added under ${org}.`, tenderId: row.id, orgName: org }));
       }
     }
     // Server-recorded changes for this account's bookmarks (closing-date
@@ -1052,15 +1052,15 @@ export const api = {
       if (changesSince > 0) {
         (changes?.tenders || []).forEach((t) => {
           if ((t.changed_fields || []).includes('closing_date')) {
-            notificationsToEmit.push({ type: 'status', message: `"${t.title || `Tender #${t.id}`}" — closing date changed.` });
+            notificationsToEmit.push({ type: 'status', message: `"${t.title || `Tender #${t.id}`}" — closing date changed.`, tenderId: t.id });
           }
         });
         for (const [org, items] of Object.entries(changes?.new_by_org || {})) {
           const list = items || [];
           if (list.length > 10) {
-            notificationsToEmit.push({ type: 'new', message: `${list.length} new tenders added under ${org}.` });
+            notificationsToEmit.push({ type: 'new', message: `${list.length} new tenders added under ${org}.`, orgName: org });
           } else {
-            list.forEach((t) => notificationsToEmit.push({ type: 'new', message: `"${t.title || t.tender_id}" added under ${org}.` }));
+            list.forEach((t) => notificationsToEmit.push({ type: 'new', message: `"${t.title || t.tender_id}" added under ${org}.`, tenderId: t.id, orgName: org }));
           }
         }
       }
@@ -1074,7 +1074,7 @@ export const api = {
     if (notificationsToEmit.length) {
       const { addNotification } = useAppStore.getState();
       const time = new Date().toLocaleString();
-      notificationsToEmit.forEach((n) => addNotification({ type: n.type, message: n.message, time }));
+      notificationsToEmit.forEach((n) => addNotification({ type: n.type, message: n.message, time, tenderId: n.tenderId, orgName: n.orgName }));
     }
     // Reconcile with whatever another device may have pushed since this
     // device's last sync. Runs after the notification diff above (which

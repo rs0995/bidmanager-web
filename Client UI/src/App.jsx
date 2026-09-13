@@ -288,7 +288,7 @@ function Sidebar({ active, onNavigate, collapsed, onToggle }) {
 }
 
 // ── Notification Panel ────────────────────────────────────────────────────
-function NotificationPanel({ open, onClose }) {
+function NotificationPanel({ open, onClose, onOpenTender, onOpenOrg }) {
   const { notifications, markRead, markAllRead } = useAppStore();
   if (!open) return null;
   return (
@@ -306,10 +306,16 @@ function NotificationPanel({ open, onClose }) {
           {notifications.length === 0 && (
             <p className="text-sm text-[var(--text-muted)] text-center py-8">No notifications</p>
           )}
-          {notifications.map(n => (
+          {notifications.map(n => {
+            const navigable = Boolean(n.tenderId || n.orgName);
+            return (
             <div
               key={n.id}
-              onClick={() => markRead(n.id)}
+              onClick={() => {
+                markRead(n.id);
+                if (n.tenderId) { onClose(); onOpenTender?.(n.tenderId); }
+                else if (n.orgName) { onClose(); onOpenOrg?.(n.orgName); }
+              }}
               className={cn(
                 'flex items-start gap-3 px-4 py-3 border-b border-[var(--border)] last:border-0 transition-colors cursor-pointer hover:bg-[var(--surface-1)]',
                 !n.read && 'bg-[var(--accent-bg)]/20'
@@ -321,8 +327,10 @@ function NotificationPanel({ open, onClose }) {
                 <p className="text-xs text-[var(--text-muted)] mt-0.5">{n.time}</p>
               </div>
               {!n.read && <div className="w-2 h-2 rounded-full bg-[var(--accent)] mt-1.5 shrink-0" />}
+              {navigable && <ChevronRight size={14} className="text-[var(--text-muted)] shrink-0 mt-0.5" />}
             </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     </>
@@ -4417,7 +4425,12 @@ export default function App() {
           </button>
         </div>
         <DownloadsPanel open={showDownloads} onClose={() => setShowDownloads(false)} onOpenTender={(tenderDbId) => { setShowDownloads(false); openTenderDetails(tenderDbId); }} />
-        <NotificationPanel open={showNotifications} onClose={() => setShowNotifications(false)} />
+        <NotificationPanel
+          open={showNotifications}
+          onClose={() => setShowNotifications(false)}
+          onOpenTender={openTenderDetails}
+          onOpenOrg={(orgName) => openOrgTenders(orgName)}
+        />
         <ToastHost />
       </header>
 
