@@ -3831,6 +3831,7 @@ function SettingsPage() {
     parent_dir: '',
     project_details_show_tender_info: 'true',
     server_url: api.defaultServerUrl,
+    sync_interval_minutes: 15,
   });
   const [saved, setSaved] = useState(false);
   const [pathStatus, setPathStatus] = useState('');
@@ -3858,6 +3859,7 @@ function SettingsPage() {
       // Show the effective URL: the baked-in default unless the user has
       // explicitly set one.
       server_url: settings.server_url_user_set ? (settings.server_url || api.defaultServerUrl) : api.defaultServerUrl,
+      sync_interval_minutes: Number(settings.sync_interval_minutes) || 15,
     }));
   }, [settings]);
 
@@ -4085,6 +4087,20 @@ function SettingsPage() {
                   />
                   <p className="mt-1 text-[11px] text-[var(--text-muted)]">A changed URL is only saved if it connects successfully.</p>
                 </div>
+                <div>
+                  <label className="mb-1 block text-xs text-[var(--text-muted)]">Sync interval</label>
+                  <select
+                    value={form.sync_interval_minutes}
+                    onChange={(event) => uf('sync_interval_minutes', Number(event.target.value))}
+                    className="input-field h-9 w-auto max-w-[180px] text-xs"
+                  >
+                    <option value={5}>Every 5 minutes</option>
+                    <option value={15}>Every 15 minutes</option>
+                    <option value={30}>Every 30 minutes</option>
+                    <option value={60}>Every hour</option>
+                  </select>
+                  <p className="mt-1 text-[11px] text-[var(--text-muted)]">The app also always syncs once on every launch, and immediately when the network reconnects.</p>
+                </div>
                 <div className="flex flex-wrap gap-2">
                   <button onClick={() => connectionMut.mutate()} disabled={connectionMut.isPending || !settings?.auth_token} className="btn-secondary text-xs gap-1.5">
                     {connectionMut.isPending ? <Spinner size={13} /> : <Wifi size={13} />}Test Connection
@@ -4263,15 +4279,19 @@ export default function App() {
 
   // Keeps the offline cache current without relying on the user remembering
   // to press "Sync Tenders" in Settings — same sync (flush the queued
-  // pushes, then pull), on a 15-minute schedule AND the moment the network
-  // comes back so an offline edit propagates immediately on reconnect.
+  // pushes, then pull) fires once immediately on every launch, then again
+  // on a configurable schedule (Settings' "Sync interval", default 15 min)
+  // AND the moment the network comes back so an offline edit propagates
+  // immediately on reconnect.
   useEffect(() => {
     if (!authSettings?.auth_token) return undefined;
     const run = () => { api.syncFromServer().then(() => qc.invalidateQueries()).catch(() => {}); };
-    const timer = setInterval(run, 15 * 60 * 1000);
+    run();
+    const intervalMinutes = Math.max(1, Number(authSettings.sync_interval_minutes) || 15);
+    const timer = setInterval(run, intervalMinutes * 60 * 1000);
     window.addEventListener('online', run);
     return () => { clearInterval(timer); window.removeEventListener('online', run); };
-  }, [authSettings?.auth_token, qc]);
+  }, [authSettings?.auth_token, authSettings?.sync_interval_minutes, qc]);
 
   // A "Requested…" pill (TendersPage) is backed by a placeholder row in the
   // local `documents` store with the job id attached, but the setTimeout

@@ -34,6 +34,10 @@ const initialState = () => ({
     client_api_key: '',
     auth_token: '',
     last_sync_at: '',
+    // How often the background sync (App.jsx's periodic syncFromServer
+    // effect) re-runs, in minutes. Editable in Settings; the app also
+    // always syncs once immediately on every launch regardless of this.
+    sync_interval_minutes: 15,
     // Durable twin of api.js's in-memory _syncPushPending — true whenever a
     // cloud-synced edit hasn't yet been confirmed pushed to the server.
     // Survives an app restart so an edit that failed to push (backend 502,
