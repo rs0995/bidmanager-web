@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback, Fragment } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef, Fragment } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   LayoutDashboard, Globe, FolderOpen, FileText, Server, Settings,
@@ -810,6 +810,24 @@ const ORGANIZATIONS_FORCE_WEBSITE_KEY = 'bm-client:organizations:force-website';
 // open — remembered for in-session navigation, but resets to Organisations
 // on a fresh app launch since sessionStorage doesn't survive that.
 const BOOKMARKS_LAST_TAB_KEY = 'bm-client:bookmarks:last-tab';
+// Permanent memory — the last selected website (portal) and sort column/
+// direction on the Organizations tab, until manually changed.
+const ORGANIZATIONS_STATE_KEY = 'bm-client:organizations:state:v1';
+
+function loadOrganizationsState() {
+  try {
+    const raw = localStorage.getItem(ORGANIZATIONS_STATE_KEY);
+    if (!raw) return { website: '', sortCol: 'tender_count', sortDir: 'desc' };
+    const parsed = JSON.parse(raw);
+    return {
+      website: String(parsed?.website || ''),
+      sortCol: String(parsed?.sortCol || 'tender_count'),
+      sortDir: parsed?.sortDir === 'asc' ? 'asc' : 'desc',
+    };
+  } catch {
+    return { website: '', sortCol: 'tender_count', sortDir: 'desc' };
+  }
+}
 
 // Permanent memory only — last website + each website's remembered
 // Organization/Location/Category selection. Never includes whether a
@@ -1366,6 +1384,11 @@ function TendersPage({ onBackToOrganizations }) {
   // switch behavior below).
   const [filters, setFilters] = useState(() => ({ ...loadTenderFilterState(), ...loadActiveTenderFilterState() }));
   const [filtersActivated, setFiltersActivated] = useState(() => sessionStorage.getItem(TENDERS_FILTERS_ACTIVATED_KEY) === '1');
+  // Remembers each tab's scroll offset separately so switching Active <->
+  // Archived restores where you were instead of both sharing one clamped
+  // scrollTop on the same (never-unmounted) scroll container.
+  const scrollRef = useRef(null);
+  const scrollPositions = useRef({ active: { top: 0, left: 0 }, archived: { top: 0, left: 0 } });
   const columns = useTenderColumns(tab);
   const { renderTenderCell } = useTenderRowActions();
 
@@ -1430,6 +1453,16 @@ function TendersPage({ onBackToOrganizations }) {
     if (tenders.some((t) => t.id === pendingSelectId)) setSelectedId(pendingSelectId);
     setPendingSelectId(null);
   }, [pendingSelectId, tenders]);
+
+  // Restore this tab's remembered scroll offset once its rows are actually
+  // in the DOM (accurate scrollHeight/scrollWidth to clamp against) — not
+  // before, or it'd restore against the previous tab's still-rendered rows.
+  useEffect(() => {
+    if (isLoading || !scrollRef.current) return;
+    const pos = scrollPositions.current[tab] || { top: 0, left: 0 };
+    scrollRef.current.scrollTop = pos.top;
+    scrollRef.current.scrollLeft = pos.left;
+  }, [tab, isLoading]);
 
   // "Request tenders" — a one-time manual scrape for the org this view is
   // currently filtered to, when it isn't already covered by a saved custom
@@ -1654,7 +1687,11 @@ function TendersPage({ onBackToOrganizations }) {
       </div>
 
       {/* Table */}
-      <div className="flex-1 overflow-auto">
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-auto"
+        onScroll={(e) => { scrollPositions.current[tab] = { top: e.currentTarget.scrollTop, left: e.currentTarget.scrollLeft }; }}
+      >
         <TenderTable
           columns={columns.visibleTenderColumns}
           getColWidth={columns.getTenderColWidth}
@@ -1702,19 +1739,26 @@ function OrganizationsPage({ onOpenOrgTenders }) {
   const [search, setSearch] = useState(() => { try { return sessionStorage.getItem(ORGANIZATIONS_SEARCH_KEY) || ''; } catch { return ''; } });
   // One-shot: a Website Coverage card on the Dashboard sets this immediately
   // before navigating here so that website is preselected/filtered.
+  // Otherwise falls back to the last website/sort the user picked here,
+  // which survives an app restart (see ORGANIZATIONS_STATE_KEY) — until
+  // manually changed.
   const [website, setWebsite] = useState(() => {
     try {
       const forced = sessionStorage.getItem(ORGANIZATIONS_FORCE_WEBSITE_KEY);
       if (forced !== null) { sessionStorage.removeItem(ORGANIZATIONS_FORCE_WEBSITE_KEY); return forced; }
     } catch { /* ignore storage failures */ }
-    return '';
+    return loadOrganizationsState().website;
   });
-  const [sortCol, setSortCol] = useState('tender_count');
-  const [sortDir, setSortDir] = useState('desc');
+  const [sortCol, setSortCol] = useState(() => loadOrganizationsState().sortCol);
+  const [sortDir, setSortDir] = useState(() => loadOrganizationsState().sortDir);
 
   useEffect(() => {
     try { sessionStorage.setItem(ORGANIZATIONS_SEARCH_KEY, search); } catch { /* ignore storage failures */ }
   }, [search]);
+
+  useEffect(() => {
+    try { localStorage.setItem(ORGANIZATIONS_STATE_KEY, JSON.stringify({ website, sortCol, sortDir })); } catch { /* ignore storage failures */ }
+  }, [website, sortCol, sortDir]);
 
   const { data: organizations, isLoading } = useQuery({ queryKey: ['organizations'], queryFn: api.listOrganizations });
   const { data: bookmarkedOrgs } = useQuery({ queryKey: ['bookmarked-orgs'], queryFn: api.listBookmarkedOrgs });
