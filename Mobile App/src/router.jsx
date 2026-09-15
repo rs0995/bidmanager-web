@@ -12,6 +12,8 @@ import { ProjectsScreen } from './screens/ProjectsScreen.jsx';
 import { ProjectDetailScreen } from './screens/ProjectDetailScreen.jsx';
 import { AlertsScreen } from './screens/AlertsScreen.jsx';
 import { MoreScreen } from './screens/MoreScreen.jsx';
+import { DownloadsScreen } from './screens/DownloadsScreen.jsx';
+import { BookmarksScreen } from './screens/BookmarksScreen.jsx';
 
 export const router = createBrowserRouter([
   { path: '/signin', element: <SignInScreen /> },
@@ -28,6 +30,8 @@ export const router = createBrowserRouter([
       { path: 'projects/:id', element: <ProjectDetailScreen /> },
       { path: 'alerts', element: <AlertsScreen /> },
       { path: 'more', element: <MoreScreen /> },
+      { path: 'downloads', element: <DownloadsScreen /> },
+      { path: 'bookmarks', element: <BookmarksScreen /> },
       { path: '*', element: <Navigate to="/overview" replace /> },
     ],
   },

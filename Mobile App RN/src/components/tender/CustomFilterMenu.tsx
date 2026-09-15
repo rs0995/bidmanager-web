@@ -1,5 +1,5 @@
 import { Fragment, useMemo } from "react";
-import { View, Text, Pressable } from "react-native";
+import { View, Text, Pressable, ScrollView } from "react-native";
 import { parseINR } from "@/lib/format";
 
 const VALUE_OPTIONS: [string, string][] = [
@@ -30,23 +30,25 @@ export function CustomFilterMenu({ open, rows, active, onAdd }: CustomFilterMenu
   if (!open) return null;
 
   return (
-    <View className="bg-surface-0 border border-border rounded-[14px] p-1.5 mb-3 gap-0.5">
-      {groups.map((group) => {
-        const available = group.options.filter(([key]) => !active.includes(key));
-        if (available.length === 0) return null;
-        return (
-          <Fragment key={group.heading}>
-            <Text className="px-2 pt-2 pb-1 text-[10px] font-bold uppercase tracking-wide text-text-muted">
-              {group.heading}
-            </Text>
-            {available.map(([key, label]) => (
-              <Pressable key={key} className="px-2.5 py-2 rounded-lg" onPress={() => onAdd(key)}>
-                <Text className="text-sm text-text">{label}</Text>
-              </Pressable>
-            ))}
-          </Fragment>
-        );
-      })}
+    <View className="bg-surface-0 border border-border rounded-[14px] mb-3 max-h-[280px]">
+      <ScrollView className="p-1.5" contentContainerClassName="gap-0.5" nestedScrollEnabled>
+        {groups.map((group) => {
+          const available = group.options.filter(([key]) => !active.includes(key));
+          if (available.length === 0) return null;
+          return (
+            <Fragment key={group.heading}>
+              <Text className="px-2 pt-2 pb-1 text-[10px] font-bold uppercase tracking-wide text-text-muted">
+                {group.heading}
+              </Text>
+              {available.map(([key, label]) => (
+                <Pressable key={key} className="px-2.5 py-2 rounded-lg" onPress={() => onAdd(key)}>
+                  <Text className="text-sm text-text">{label}</Text>
+                </Pressable>
+              ))}
+            </Fragment>
+          );
+        })}
+      </ScrollView>
     </View>
   );
 }

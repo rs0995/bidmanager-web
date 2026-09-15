@@ -1890,10 +1890,13 @@ class ScraperBackend:
             ScraperBackend.captcha_ai_client = genai.GenerativeModel(config["model"])
             ScraperBackend.captcha_ai_signature = signature
         image = Image.open(io.BytesIO(image_data))
-        response = ScraperBackend.captcha_ai_client.generate_content([
-            "Extract the 6 alphanumeric characters from this CAPTCHA image. Return only the characters.",
-            image,
-        ])
+        response = ScraperBackend.captcha_ai_client.generate_content(
+            [
+                "Extract the 6 alphanumeric characters from this CAPTCHA image. Return only the characters.",
+                image,
+            ],
+            request_options={"timeout": 60},
+        )
         return ScraperBackend._extract_captcha_text(getattr(response, "text", ""))
 
     @staticmethod
@@ -2422,8 +2425,10 @@ class ScraperBackend:
             
             conn = sqlite3.connect(DB_FILE)
             c = conn.cursor()
-            
+
             count = 0
+            seen_names = set()
+            now = time.time()
             for row in rows:
                 cols = row.find_all('td')
                 if len(cols) > 2 and cols[0].text.strip().isdigit():
@@ -2431,19 +2436,39 @@ class ScraperBackend:
                     tender_count = cols[2].text.strip()
                     link = cols[2].find('a')['href'] if cols[2].find('a') else ""
                     full_link = urljoin(url, link)
-                    
+                    seen_names.add(org_name)
+
                     # Insert or Ignore (to preserve selection status if exists)
                     # We use INSERT OR IGNORE then UPDATE to update details but keep selection
                     c.execute("SELECT id FROM organizations WHERE website_id=? AND name=?", (website_id, org_name))
                     exists = c.fetchone()
-                    
+
                     if exists:
-                        c.execute("UPDATE organizations SET tender_count=?, tenders_url=? WHERE id=?", (tender_count, full_link, exists[0]))
+                        c.execute(
+                            "UPDATE organizations SET tender_count=?, tenders_url=?, is_available=1, last_seen_at=? WHERE id=?",
+                            (tender_count, full_link, now, exists[0]),
+                        )
                     else:
-                        c.execute("INSERT INTO organizations (website_id, name, tender_count, tenders_url) VALUES (?, ?, ?, ?)", 
-                                  (website_id, org_name, tender_count, full_link))
+                        c.execute(
+                            "INSERT INTO organizations (website_id, name, tender_count, tenders_url, is_available, last_seen_at) "
+                            "VALUES (?, ?, ?, ?, 1, ?)",
+                            (website_id, org_name, tender_count, full_link, now),
+                        )
                     count += 1
-            
+
+            # Anything previously known for this website but absent from this
+            # fresh scrape has disappeared from the site's own organisation
+            # listing — flag it rather than deleting the row (preserves
+            # bookmarks/history), mirroring archive_missing_tenders_for_org's
+            # seen-set diff for tenders. Guarded on a non-empty pass so a
+            # parse/site error can't wipe every org for this website.
+            if seen_names:
+                placeholders = ",".join("?" for _ in seen_names)
+                c.execute(
+                    f"UPDATE organizations SET is_available=0 WHERE website_id=? AND name NOT IN ({placeholders})",
+                    (website_id, *seen_names),
+                )
+
             conn.commit()
             conn.close()
             log_to_gui(f"Updated {count} organizations for {site_data['name']}")
@@ -3643,14 +3668,14 @@ class ScraperBackend:
         return cells[idx].text.strip(), first_row
 
     @staticmethod
-    def _download_result_docs_from_popup(driver, tender_id, base_folder):
+    def _download_result_docs_from_popup(driver, tender_id, base_folder, folder_name="Financial Result"):
         if not ensure_scraper_dependencies():
             return False
         wait = WebDriverWait(driver, 20)
         main_window = driver.current_window_handle
         downloaded_any = False
-        result_folder = os.path.join(base_folder, "Financial Result")
-        os.makedirs(result_folder, exist_ok=True)
+        result_folder = os.path.join(base_folder, folder_name)
+        folder_created = False
         try:
             summary_link = wait.until(EC.element_to_be_clickable((By.PARTIAL_LINK_TEXT, "summary details")))
             driver.execute_script("arguments[0].click();", summary_link)
@@ -3679,6 +3704,9 @@ class ScraperBackend:
                 fpath = os.path.join(result_folder, safe_name)
                 if ScraperBackend.should_skip_file(tender_id, safe_name, fpath):
                     continue
+                if not folder_created:
+                    os.makedirs(result_folder, exist_ok=True)
+                    folder_created = True
                 if ScraperBackend.download_file_with_requests(href, fpath, driver.get_cookies(), tender_id=tender_id, file_type="result"):
                     downloaded_any = True
                     log_to_gui(f"    Downloaded Result File: {safe_name}")
@@ -3876,6 +3904,117 @@ class ScraperBackend:
             if driver is not None:
                 driver.quit()
         log_to_gui("Result file check complete.")
+
+    @staticmethod
+    def fetch_tender_status_single_logic(tender_db_id):
+        try:
+            target_id = int(tender_db_id)
+        except Exception:
+            log_to_gui("Fetch status: invalid tender selection.")
+            return False
+        if not ensure_scraper_dependencies():
+            log_to_gui(scraper_dependency_message())
+            return False
+        storage_runtime.require_durable_cloud_storage()
+        conn = sqlite3.connect(DB_FILE)
+        row = conn.execute(
+            "SELECT website_id, tender_id, folder_path FROM tenders WHERE id=?",
+            (target_id,)
+        ).fetchone()
+        conn.close()
+        if not row:
+            log_to_gui("Fetch status: selected tender not found.")
+            return False
+        website_id, tender_id, folder_path = row
+        tender_id = str(tender_id or "").strip()
+        if not tender_id:
+            log_to_gui("Fetch status: selected tender has no tender ID.")
+            return False
+
+        conn = sqlite3.connect(DB_FILE)
+        site_row = conn.execute("SELECT status_url FROM websites WHERE id=?", (website_id,)).fetchone()
+        conn.close()
+        if not site_row or not str(site_row[0] or "").strip():
+            log_to_gui("Fetch status: status URL not configured for this website.")
+            return False
+        status_url = site_row[0]
+
+        target_statuses = {"Financial Bid Opening", "Financial Evaluation", "AOC", "Concluded"}
+        driver = None
+        tender_folder = ""
+        got = False
+        try:
+            driver = create_browser_driver()
+            ScraperBackend.captcha_solved_in_session = False
+            log_to_gui(f"Checking status: {tender_id}")
+            driver.get(status_url)
+            inp = WebDriverWait(driver, 12).until(EC.presence_of_element_located((By.ID, "tenderId")))
+            inp.clear()
+            inp.send_keys(tender_id)
+            if not ScraperBackend.handle_captcha_interaction(driver, f"Status {tender_id}", submit_id="Search"):
+                log_to_gui(f"  CAPTCHA failed for {tender_id}.")
+                return False
+            status, row_el = ScraperBackend._extract_status_and_row(driver)
+            if status:
+                conn = sqlite3.connect(DB_FILE)
+                conn.execute("UPDATE tenders SET status=? WHERE id=?", (status, target_id))
+                conn.commit()
+                conn.close()
+                log_to_gui(f"Updated status for {tender_id}: {status}")
+            else:
+                log_to_gui(f"No Tender Stage found for {tender_id}")
+                return False
+            if status not in target_statuses:
+                log_to_gui(f"  Status '{status}' not eligible for result docs yet.")
+                return False
+
+            view_links = row_el.find_elements(By.XPATH, ".//a[img[contains(@src, 'view.png')]]") if row_el else []
+            if not view_links and row_el:
+                view_links = row_el.find_elements(By.TAG_NAME, "a")
+            if not view_links:
+                log_to_gui("  Result view link not found.")
+                return False
+            driver.execute_script("arguments[0].click();", view_links[0])
+            time.sleep(2)
+
+            safe_id = re.sub(r'[\\/*?:"<>|]', "", str(tender_id))
+            storage = storage_runtime.active_document_storage()
+            existing_folder = (folder_path or "").strip()
+            if not storage.remote and existing_folder and os.path.isdir(existing_folder):
+                tender_folder = existing_folder
+            else:
+                tender_folder = os.path.join(BASE_DOWNLOAD_DIRECTORY, safe_id)
+                os.makedirs(tender_folder, exist_ok=True)
+
+            got = ScraperBackend._download_result_docs_from_popup(
+                driver, tender_id, tender_folder, folder_name="Results"
+            )
+            if got:
+                durable_folder = storage.folder_reference(
+                    tender_folder,
+                    str(tender_id or ""),
+                    ScraperBackend.get_setting("storage_prefix", "tenders/"),
+                )
+                now_iso = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                conn = sqlite3.connect(DB_FILE)
+                conn.execute(
+                    "UPDATE tenders SET folder_path=?, last_downloaded_at=? WHERE id=?",
+                    (durable_folder, now_iso, target_id),
+                )
+                conn.commit()
+                conn.close()
+                log_to_gui(f"Downloaded status document(s) for {tender_id} into 'Results'.")
+            else:
+                log_to_gui(f"  No result document available yet for {tender_id}.")
+            return got
+        except Exception as e:
+            log_to_gui(f"Fetch status error for {tender_id}: {e}")
+            return False
+        finally:
+            if driver is not None:
+                driver.quit()
+            if tender_folder:
+                storage_runtime.cleanup_scratch_folder(tender_folder)
 
     @staticmethod
     def refresh_tender_details_logic(website_id, target_db_ids):

@@ -39,7 +39,7 @@ export default function OrganizationTendersScreen() {
     } catch (e: any) {
       const message = e?.message || "";
       if (/already/i.test(message)) {
-        toast?.push({ title: "Already covered", body: "This organisation already has a scrape job covering it.", type: "info" });
+        toast?.push({ title: "Already covered", body: "This organisation is already being updated.", type: "info" });
       } else if (/less than 24 hours/i.test(message)) {
         toast?.push({ title: "Update not due yet", body: scrapeCooldownMessage(lastScrapedAt), type: "info" });
       } else {
@@ -65,7 +65,6 @@ export default function OrganizationTendersScreen() {
           <EmptyState
             icon={Globe}
             title="No tenders yet"
-            body="Nothing scraped for this organisation yet."
             action={orgId ? (
               <Button variant="secondary" className="mt-2" onPress={handleRequest} disabled={pending}>
                 {pending ? "Requesting…" : "Request tenders"}

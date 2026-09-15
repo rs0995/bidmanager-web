@@ -1,11 +1,10 @@
 import { useMemo, useState } from "react";
-import { View, FlatList } from "react-native";
+import { View, FlatList, Pressable } from "react-native";
 import { Bookmark, Search, Building2 } from "lucide-react-native";
 import { OrganizationCard } from "./OrganizationCard";
 import { SkeletonList } from "@/components/feedback/Skeleton";
 import { EmptyState } from "@/components/feedback/EmptyState";
 import { ErrorState } from "@/components/feedback/ErrorState";
-import { Chip } from "@/components/common/Chip";
 import { Input } from "@/components/common/Field";
 import { useOrgBookmarkToggle } from "@/hooks/useBookmarks";
 import { useThemeColors } from "@/constants/colors";
@@ -42,19 +41,24 @@ export function OrganizationList({ query, bookmarkedOnly, onToggleBookmarked }: 
 
   const header = (
     <View className="px-4 pt-3 pb-2 bg-bg">
-      <View className="relative mb-2 justify-center">
-        <Search size={15} color={colors.textMuted} style={{ position: "absolute", left: 12, zIndex: 1 }} />
-        <Input
-          style={{ paddingLeft: 34 }}
-          placeholder="Search organisations"
-          value={search}
-          onChangeText={setSearch}
-        />
-      </View>
-      <View className="flex-row gap-2">
-        <Chip active={bookmarkedOnly} onPress={() => onToggleBookmarked(!bookmarkedOnly)}>
-          <Bookmark size={12} color={bookmarkedOnly ? colors.accent : colors.textMuted} /> Bookmarked
-        </Chip>
+      <View className="flex-row items-center gap-2">
+        <Pressable
+          onPress={() => onToggleBookmarked(!bookmarkedOnly)}
+          className="w-[41px] h-[41px] items-center justify-center rounded-[10px] border"
+          style={bookmarkedOnly ? { borderColor: colors.accent, backgroundColor: colors.accentBg } : { borderColor: colors.border, backgroundColor: colors.surface1 }}
+          accessibilityLabel="Bookmarked only"
+        >
+          <Bookmark size={16} color={bookmarkedOnly ? colors.accent : colors.textMuted} fill={bookmarkedOnly ? colors.accent : "none"} />
+        </Pressable>
+        <View className="relative flex-1 justify-center">
+          <Search size={15} color={colors.textMuted} style={{ position: "absolute", left: 12, zIndex: 1 }} />
+          <Input
+            style={{ paddingLeft: 34 }}
+            placeholder="Search organisations"
+            value={search}
+            onChangeText={setSearch}
+          />
+        </View>
       </View>
     </View>
   );

@@ -19,11 +19,13 @@ export function DeadlineGroups() {
 
   const withUrgency = tenders
     .map((t: any) => ({ t, r: timeRemaining(t.closing_date) }))
-    .filter(({ r }: any) => !r.expired);
+    .filter(({ r }: any) => !r.expired)
+    .sort((a: any, b: any) => (a.r.totalDays ?? Infinity) - (b.r.totalDays ?? Infinity))
+    .slice(0, 10);
 
   return (
-    <View className="bg-surface-0 border border-border rounded-[14px] p-4">
-      <Text className="mb-3 text-sm font-bold text-text">Upcoming deadlines</Text>
+    <View className="bg-surface-0 border border-border rounded-[19px] p-4">
+      <Text className="mb-3 text-base text-text" style={{ fontFamily: "BricolageGrotesque_700Bold" }}>Upcoming deadlines</Text>
       {BANDS.map((band) => {
         const rows = withUrgency.filter(({ r }: any) => urgency(r.totalDays).label === band);
         if (rows.length === 0) return null;
@@ -31,7 +33,7 @@ export function DeadlineGroups() {
         const color = urgencyColor(key, colors);
         return (
           <View key={band} className="mb-3">
-            <Text className="mb-1.5 text-[11px] font-bold uppercase tracking-wide" style={{ color }}>{band}</Text>
+            <Text className="mb-1.5 text-xs font-bold uppercase tracking-wide" style={{ color }}>{band}</Text>
             {rows.map(({ t, r }: any) => (
               <Pressable
                 key={t.id}
@@ -40,10 +42,15 @@ export function DeadlineGroups() {
               >
                 <View className="w-1 self-stretch rounded-full" style={{ backgroundColor: color }} />
                 <View className="flex-1">
-                  <Text className="font-mono text-[10px] text-accent">{t.tender_id}</Text>
-                  <Text className="text-sm text-text" numberOfLines={1}>{t.title}</Text>
+                  <Text
+                    className="text-xs uppercase text-text-muted"
+                    style={{ fontFamily: "IBMPlexMono_400Regular", letterSpacing: 0.5 }}
+                  >
+                    {t.tender_id}
+                  </Text>
+                  <Text className="text-base text-text" numberOfLines={1}>{t.title}</Text>
                 </View>
-                <Text className="text-xs font-semibold" style={{ color }}>{r.label}</Text>
+                <Text className="text-sm font-bold" style={{ color }}>{r.label}</Text>
               </Pressable>
             ))}
           </View>

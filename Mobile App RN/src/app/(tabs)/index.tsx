@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { View, Text, ScrollView } from "react-native";
-import { Globe, FolderOpen, Clock, IndianRupee, RefreshCw } from "lucide-react-native";
-import { ScreenHeader } from "@/components/shell/ScreenHeader";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { Globe, FolderOpen, Clock, RefreshCw } from "lucide-react-native";
 import { StatCard } from "@/components/dashboard/StatCard";
 import { BookmarksStatCard } from "@/components/dashboard/BookmarksStatCard";
 import { NeedsAttentionCard } from "@/components/dashboard/NeedsAttentionCard";
@@ -30,10 +30,12 @@ export default function OverviewScreen() {
   const { lastSyncAt } = useSettings();
   const toast = useToast();
   const colors = useThemeColors();
+  const insets = useSafeAreaInsets();
   const [syncing, setSyncing] = useState(false);
 
   const activeProjects = projects.filter((p: any) => p.status !== "Archived");
   const pipelineValue = activeProjects.reduce((sum: number, p: any) => sum + parseINR(p.project_value), 0);
+  const [pipelineAmount, pipelineUnit] = fmtINR(pipelineValue).split(" ");
   const closingThisWeek = trackedTenders.filter((t: any) => {
     const { totalDays, expired } = timeRemaining(t.closing_date);
     return !expired && totalDays != null && totalDays <= 7;
@@ -56,8 +58,8 @@ export default function OverviewScreen() {
 
   return (
     <View className="flex-1 bg-bg">
-      <ScreenHeader title="Overview" />
-      <ScrollView contentContainerClassName="p-4">
+      <ScrollView contentContainerClassName="p-4" contentContainerStyle={{ paddingTop: insets.top + 16 }}>
+        <Text className="text-2xl text-text mb-4" style={{ fontFamily: "BricolageGrotesque_700Bold" }}>Overview</Text>
         {isLoading && <SkeletonList count={2} />}
         {isError && <ErrorState message={error?.message} onRetry={refetch} />}
         {stats && (
@@ -66,10 +68,10 @@ export default function OverviewScreen() {
 
             <View className="flex-row flex-wrap gap-3 mb-4">
               <View className="flex-1 basis-[47%]">
-                <StatCard icon={Globe} label="Tenders synced" value={stats.active_tenders} to="/tenders" />
+                <StatCard icon={Globe} label="Tenders synced" value={stats.active_tenders} to="/tenders" variant="accent" />
               </View>
               <View className="flex-1 basis-[47%]">
-                <StatCard icon={FolderOpen} label="Active projects" value={activeProjects.length} to="/projects" />
+                <StatCard icon={FolderOpen} label="Active projects" value={activeProjects.length} to="/projects" variant="ok" />
               </View>
               <View className="flex-1 basis-[47%]">
                 <BookmarksStatCard orgCount={bookmarkedOrgNames.size} tenderCount={bookmarkedIds.size} to="/bookmarks" />
@@ -80,24 +82,28 @@ export default function OverviewScreen() {
                   label="Closing this week"
                   value={closingThisWeek}
                   to="/tenders?closing5=1"
-                  alert={closingThisWeek > 0}
+                  variant="danger"
                 />
               </View>
             </View>
 
-            <View className="bg-surface-0 border border-border rounded-[14px] p-4 mb-4">
-              <View className="flex-row items-center gap-2 mb-1">
-                <IndianRupee size={14} color={colors.accent} />
-                <Text className="text-xs font-bold uppercase tracking-wide text-text-muted">Pipeline value</Text>
+            <View className="bg-surface-0 border border-border rounded-[19px] p-4 mb-4">
+              <View className="flex-row items-center justify-between gap-2 mb-2">
+                <Text className="flex-1 text-sm font-semibold text-text" numberOfLines={1}>
+                  Pipeline value — bids in preparation
+                </Text>
+                <View className="rounded-full bg-surface-2 px-3 py-1.5">
+                  <Text className="text-sm text-text-muted">{activeProjects.length} projects</Text>
+                </View>
               </View>
-              <Text className="text-2xl font-bold text-text">{fmtINR(pipelineValue)}</Text>
-              <Text className="mt-1 text-xs text-text-muted">
-                Sum of your local project values ({activeProjects.length} active)
+              <Text className="text-[29px] text-text" style={{ letterSpacing: -0.5, fontFamily: "BricolageGrotesque_700Bold" }}>
+                {pipelineAmount}
+                {pipelineUnit ? <Text className="text-sm font-medium text-text-muted"> {pipelineUnit}</Text> : null}
               </Text>
             </View>
 
             <View
-              className="rounded-2xl p-4 mb-4 flex-row items-center gap-3"
+              className="rounded-[19px] p-4 mb-4 flex-row items-center gap-3"
               style={{
                 backgroundColor: isStale ? colors.accentBg : colors.surface1,
                 borderWidth: 1,

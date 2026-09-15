@@ -4,7 +4,7 @@ import {
   Globe, Key, Search, X, Check, AlertTriangle, RefreshCw, Play, Pause, Trash2,
   Download, Upload, Plus, RotateCcw, Loader2, ChevronRight, ChevronDown, ArrowLeft,
   Copy, ExternalLink, Filter, ShieldCheck, Zap, FileText,
-  Eye, Bell, SkipForward, Timer, Send, Users, Ban
+  Eye, Bell, SkipForward, Timer, Send, Users, Ban, Archive
 } from 'lucide-react';
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -309,6 +309,14 @@ function createApi(base, adminKey) {
       const params = new URLSearchParams({ archived: 'false', limit: '1000', sort: 'closing_date', order: 'asc' });
       if (search) params.set('search', search);
       return apiFetch(base, `/v1/websites/${Number(websiteId)}/tenders?${params.toString()}`, { adminKey });
+    },
+    async archivedTenders(websiteId, search = '') {
+      const params = new URLSearchParams({ archived: 'true', limit: '1000', sort: 'closing_date', order: 'desc' });
+      if (search) params.set('search', search);
+      return apiFetch(base, `/v1/websites/${Number(websiteId)}/tenders?${params.toString()}`, { adminKey });
+    },
+    async fetchTenderStatus(tenderDbId) {
+      return apiFetch(base, `/v1/tenders/${Number(tenderDbId)}/fetch-status`, { method: 'POST', adminKey });
     },
     async scrapeOrganizations(websiteId, orgIds, all = false) {
       if (all) {
@@ -1914,6 +1922,133 @@ function ScraperPanel({ toast, base, adminKey }) {
   );
 }
 
+function ArchivePanel({ toast, base, adminKey }) {
+  const api = useMemo(() => createApi(base, adminKey), [base, adminKey]);
+  const [websites, setWebsites] = useState([]);
+  const [websiteId, setWebsiteId] = useState('');
+  const [tenders, setTenders] = useState([]);
+  const [search, setSearch] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [busyId, setBusyId] = useState(null);
+  // { [tenderDbId]: jobId } — tenders with a fetch-status job still queued/running.
+  const [pendingJobs, setPendingJobs] = useState({});
+
+  useEffect(() => {
+    api.websites().then((rows) => {
+      const next = Array.isArray(rows) ? rows : [];
+      setWebsites(next);
+      setWebsiteId((current) => current || String(next[0]?.id || ''));
+    }).catch((err) => toast(err.message || 'Could not load websites'));
+  }, [api, toast]);
+
+  const loadData = useCallback(async () => {
+    if (!websiteId) return;
+    setLoading(true);
+    try {
+      const rows = await api.archivedTenders(websiteId, search);
+      setTenders(Array.isArray(rows) ? rows : []);
+    } catch (err) {
+      toast(err.message || 'Could not load archived tenders');
+    } finally {
+      setLoading(false);
+    }
+  }, [api, toast, websiteId, search]);
+
+  useEffect(() => { loadData(); }, [loadData]);
+
+  const fetchStatus = async (tender) => {
+    setBusyId(tender.id);
+    try {
+      const job = await api.fetchTenderStatus(tender.id);
+      const jobId = job.job_id || job.id;
+      setPendingJobs((current) => ({ ...current, [tender.id]: jobId }));
+      toast(`Fetch status job ${jobId || ''} queued for ${tender.tender_id || tender.id}`);
+    } catch (err) {
+      toast(err.message || 'Could not queue status fetch');
+    }
+    setBusyId(null);
+  };
+
+  // Poll the shared jobs queue for any tenders we're waiting on, and pull
+  // a fresh tender list as soon as one finishes so status/Results show up
+  // without the user having to click Refresh themselves.
+  useEffect(() => {
+    const pendingEntries = Object.entries(pendingJobs);
+    if (pendingEntries.length === 0) return undefined;
+    let cancelled = false;
+    const t = setInterval(async () => {
+      let jobs;
+      try {
+        jobs = await api.jobs();
+      } catch {
+        return;
+      }
+      if (cancelled) return;
+      let anyResolved = false;
+      setPendingJobs((current) => {
+        const next = { ...current };
+        for (const [tenderId, jobId] of Object.entries(current)) {
+          const job = jobs.find((j) => String(j.id) === String(jobId));
+          if (!job || job.status === 'done' || job.status === 'failed') {
+            if (job?.status === 'failed') toast(job.error || `Fetch status failed for tender #${tenderId}`);
+            delete next[tenderId];
+            anyResolved = true;
+          }
+        }
+        return next;
+      });
+      if (anyResolved) loadData();
+    }, 3000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [pendingJobs, api, toast, loadData]);
+
+  return (
+    <Panel
+      code="ARC" title="Archive" note="Archived tenders — check status and pull the result document"
+      right={<Btn size="sm" icon={RefreshCw} busy={loading} disabled={!websiteId} onClick={loadData}>Refresh</Btn>}
+    >
+      <Card pad={false}>
+        <div className="flex flex-wrap items-center justify-between gap-3 px-3 py-3" style={{ borderBottom: `1px solid ${c.rule}` }}>
+          <div>
+            <SubHead>Archived tenders</SubHead>
+            <div style={{ fontSize: 12, color: c.ink60 }}>Fetch Status checks the tender's current stage and, once a result is available, downloads it into a "Results" folder inside the tender's own folder.</div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Select value={websiteId} onChange={setWebsiteId} w={210} options={websites.map((website) => ({ value: String(website.id), label: website.name }))} />
+            <TextIn value={search} onChange={setSearch} w={210} placeholder="Search tenders" />
+          </div>
+        </div>
+        <div className="overflow-auto" style={{ maxHeight: 520 }}>
+          <table className="w-full" style={{ borderCollapse: 'collapse' }}>
+            <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}><tr style={{ background: c.paper }}>
+              {['Tender ID', 'Organization / title', 'Status', 'Last scrape', ''].map((th) => <th key={th} className="text-left px-3 py-2" style={{ fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60, borderBottom: `1px solid ${c.rule}`, fontWeight: 500 }}>{th}</th>)}
+            </tr></thead>
+            <tbody>{tenders.map((tender) => {
+              const isPending = Object.prototype.hasOwnProperty.call(pendingJobs, tender.id);
+              return (
+              <tr key={tender.id} style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
+                <td className="px-3 py-2"><Mono style={{ fontSize: 11.5, color: c.ink }}>{tender.tender_id || '—'}</Mono></td>
+                <td className="px-3 py-2" style={{ minWidth: 260 }}><div style={{ fontSize: 12, color: c.ink }}>{tender.org_chain || '—'}</div><div style={{ fontSize: 11.5, color: c.ink60, marginTop: 2 }}>{tender.title || '—'}</div></td>
+                <td className="px-3 py-2">
+                  {isPending
+                    ? <Pill state="info"><Loader2 size={11} className="animate-spin" style={{ marginRight: 4, verticalAlign: -2 }} />Checking…</Pill>
+                    : <Pill state={tender.status ? 'info' : 'neutral'}>{tender.status || 'Not Fetched'}</Pill>}
+                </td>
+                <td className="px-3 py-2"><Mono style={{ fontSize: 11, color: c.ink60 }}>{tender.last_scraped_at ? fmtDateTime(tender.last_scraped_at * 1000) : '—'}</Mono></td>
+                <td className="px-3 py-2 text-right whitespace-nowrap">
+                  <Btn size="sm" variant="primary" icon={Search} busy={busyId === tender.id} disabled={!tender.tender_id || isPending} onClick={() => fetchStatus(tender)}>{isPending ? 'Checking…' : 'Fetch Status'}</Btn>
+                </td>
+              </tr>
+              );
+            })}</tbody>
+          </table>
+          {!loading && tenders.length === 0 && <Empty icon={Archive} title="No archived tenders for this website." />}
+        </div>
+      </Card>
+    </Panel>
+  );
+}
+
 function StoragePanel({ toast, env, base, adminKey, storageUrl, localScope }) {
   const api = useMemo(() => createApi(base, adminKey), [base, adminKey]);
   const [prefix, setPrefix] = useState('');
@@ -2907,6 +3042,7 @@ const NAV = [
   { code: 'SRV', key: 'server',  label: 'Server',   icon: Server },
   { code: 'CFG', key: 'config',  label: 'Settings', icon: Sliders },
   { code: 'SCR', key: 'scraper', label: 'Scraper',  icon: Globe },
+  { code: 'ARC', key: 'archive', label: 'Archive',  icon: Archive },
   { code: 'JOB', key: 'jobs',    label: 'Jobs',     icon: Layers },
   { code: 'CAP', key: 'captcha', label: 'Captchas', icon: Eye, badge: true },
   { code: 'USR', key: 'users',   label: 'Users',    icon: Users },
@@ -3018,7 +3154,7 @@ export default function BidManagerControl() {
   }, [bases, env, keyVal]);
   const toast = useCallback((m) => { setToastMsg(m); setTimeout(() => setToastMsg(null), 2600); }, []);
 
-  const Body = { server: ServerPanel, config: ConfigPanel, scraper: ScraperPanel, jobs: JobsPanel, captcha: CaptchaPanel, users: UsersPanel, storage: StoragePanel, logs: LogsPanel, db: DbPanel }[tab];
+  const Body = { server: ServerPanel, config: ConfigPanel, scraper: ScraperPanel, archive: ArchivePanel, jobs: JobsPanel, captcha: CaptchaPanel, users: UsersPanel, storage: StoragePanel, logs: LogsPanel, db: DbPanel }[tab];
 
   return (
     <div style={{ background: c.paper, minHeight: '100vh', fontFamily: sans, color: c.ink }}>

@@ -14,17 +14,21 @@ export function ScreenHeader({ title, back = false, actions }: ScreenHeaderProps
   const insets = useSafeAreaInsets();
   const colors = useThemeColors();
   return (
-    <View
-      className="flex-row items-center gap-2 px-3 bg-surface-0 border-b border-border"
-      style={{ minHeight: 52, paddingTop: insets.top }}
-    >
-      {back && (
-        <Pressable onPress={() => router.back()} className="p-1.5" accessibilityLabel="Back">
-          <ChevronLeft size={20} color={colors.text} />
-        </Pressable>
-      )}
-      <Text className="flex-1 text-[15px] font-semibold text-text" numberOfLines={1}>{title}</Text>
-      {actions}
+    <View className="bg-surface-0 border-b border-border">
+      {/* Blank strip covering the status bar area, in the app's page
+          background color (not the header bar's white surface-0) — this is
+          the themed backdrop the status bar icons sit on, not part of the
+          white title bar below it. */}
+      <View style={{ height: insets.top, backgroundColor: colors.bg }} />
+      <View className="flex-row items-center gap-2 px-3 py-3" style={{ minHeight: 52 }}>
+        {back && (
+          <Pressable onPress={() => router.back()} className="p-1.5" accessibilityLabel="Back">
+            <ChevronLeft size={20} color={colors.text} />
+          </Pressable>
+        )}
+        <Text className="flex-1 text-[15px] text-text" numberOfLines={1} style={{ fontFamily: "BricolageGrotesque_600SemiBold" }}>{title}</Text>
+        {actions}
+      </View>
     </View>
   );
 }

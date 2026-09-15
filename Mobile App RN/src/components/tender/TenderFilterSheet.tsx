@@ -54,6 +54,7 @@ export function TenderFilterSheet({ open, onClose, filters, onApply }: TenderFil
         </Field>
         <Field label="Status">
           <Select
+            title="Status"
             value={local.archived ?? ""}
             onValueChange={(v) => set({ archived: v })}
             options={[{ value: "", label: "Active" }, { value: "true", label: "Archived" }]}
@@ -61,6 +62,7 @@ export function TenderFilterSheet({ open, onClose, filters, onApply }: TenderFil
         </Field>
         <Field label="Only tenders with documents">
           <Select
+            title="Only tenders with documents"
             value={local.has_documents ?? ""}
             onValueChange={(v) => set({ has_documents: v })}
             options={[
@@ -72,6 +74,7 @@ export function TenderFilterSheet({ open, onClose, filters, onApply }: TenderFil
         </Field>
         <Field label="Sort by">
           <Select
+            title="Sort by"
             value={local.sort_by || "closing_date"}
             onValueChange={(v) => set({ sort_by: v })}
             options={SORT_OPTIONS.map(([value, label]) => ({ value, label }))}
@@ -79,6 +82,7 @@ export function TenderFilterSheet({ open, onClose, filters, onApply }: TenderFil
         </Field>
         <Field label="Sort order">
           <Select
+            title="Sort order"
             value={local.sort_order || "asc"}
             onValueChange={(v) => set({ sort_order: v })}
             options={[{ value: "asc", label: "Ascending" }, { value: "desc", label: "Descending" }]}

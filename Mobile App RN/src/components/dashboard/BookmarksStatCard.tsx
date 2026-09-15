@@ -17,18 +17,20 @@ export function BookmarksStatCard({ orgCount, tenderCount, to }: BookmarksStatCa
   return (
     <Pressable
       onPress={() => to && router.push(to as any)}
-      className="bg-surface-0 border border-border rounded-[14px] p-3"
+      className="bg-surface-0 border border-border rounded-2xl px-3.5 pt-[14px] pb-[14px]"
     >
-      <Bookmark size={16} color={colors.accent} />
-      <View className="flex-row items-stretch mt-2 gap-2">
-        <View className="items-start">
-          <Text className="text-xl font-bold text-text">{orgCount}</Text>
-          <Text className="text-[11px] text-text-muted">Orgs</Text>
+      <View className="w-[39px] h-[39px] rounded-[11px] items-center justify-center mb-2 bg-warn-bg">
+        <Bookmark size={18} color={colors.warn} />
+      </View>
+      <View className="flex-row items-stretch gap-3">
+        <View className="items-center">
+          <Text className="text-[23px] text-text" style={{ letterSpacing: -0.4, fontFamily: "BricolageGrotesque_700Bold" }}>{orgCount}</Text>
+          <Text className="mt-0.5 text-xs text-text-muted">Orgs</Text>
         </View>
-        <View style={{ width: 1, backgroundColor: colors.border }} />
-        <View className="items-start">
-          <Text className="text-xl font-bold text-text">{tenderCount}</Text>
-          <Text className="text-[11px] text-text-muted">Tenders</Text>
+        <View style={{ width: 1.5, backgroundColor: colors.border }} />
+        <View className="items-center">
+          <Text className="text-[23px] text-text" style={{ letterSpacing: -0.4, fontFamily: "BricolageGrotesque_700Bold" }}>{tenderCount}</Text>
+          <Text className="mt-0.5 text-xs text-text-muted">Tenders</Text>
         </View>
       </View>
     </Pressable>

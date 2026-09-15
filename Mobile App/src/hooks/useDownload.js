@@ -1,60 +1,51 @@
 import { useState, useCallback } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { api } from '../lib/api.js';
+import {
+  downloadDocument as doDownloadDocument,
+  requestTenderDownload as doRequestTenderDownload,
+  useDocumentsForTender,
+} from '../lib/documents.js';
 
-// Mints a fresh signed URL on every tap — never cache it, it expires in
-// ~15 minutes. window.location.assign (not an <a download>) because a
-// cross-origin download attribute is unreliable in mobile Safari.
-export function useDocumentDownload() {
+// Per-file download. Status/history is tracked in the local documents cache
+// (lib/documents.js), so a failed download surfaces its error and stays
+// visible; the caller passes a toast pusher to show failures.
+export function useDocumentDownload(onError) {
   const [pendingId, setPendingId] = useState(null);
   const download = useCallback(async (tenderId, doc) => {
     setPendingId(doc.id);
     try {
-      const { url } = await api.downloadRequest(tenderId, doc.id);
-      window.location.assign(url);
+      await doDownloadDocument({
+        id: doc.id, tender_db_id: tenderId, tender_id: doc.tender_id, file_name: doc.name,
+      });
+    } catch (e) {
+      onError?.(e);
     } finally {
       setPendingId(null);
     }
-  }, []);
+  }, [onError]);
   return { download, pendingId };
 }
 
-const MAX_ATTEMPTS = 40; // ~40 * 15s ≈ 10 minutes
-
-// Drives the "Request Download" flow for a tender with no documents yet:
-// start the server-side scrape job, then poll its status until it resolves.
-export function useRequestDownload(tenderId) {
-  const queryClient = useQueryClient();
-  const [jobId, setJobId] = useState(null);
-  const [attempt, setAttempt] = useState(0);
+// Whole-tender "Request download". The placeholder row (id = -tenderId) is
+// persisted in the documents cache, so its state survives navigation and
+// reload (resumePendingDownloadJobs re-attaches the poll on startup).
+export function useRequestDownload(tender) {
+  const rows = useDocumentsForTender(tender.id);
+  const placeholder = rows.find((r) => r.id === -Number(tender.id)) || null;
+  const [starting, setStarting] = useState(false);
 
   const start = useCallback(async () => {
-    const { job_id } = await api.requestDownloadJob(tenderId);
-    setJobId(job_id);
-    setAttempt(0);
-  }, [tenderId]);
-
-  const statusQuery = useQuery({
-    queryKey: ['downloadStatus', tenderId, jobId],
-    queryFn: () => api.downloadStatus(tenderId, jobId),
-    enabled: Boolean(jobId),
-    refetchInterval: (query) => {
-      const status = query.state.data?.status;
-      if (status === 'completed' || status === 'failed' || attempt >= MAX_ATTEMPTS) return false;
-      return 12_000;
-    },
-  });
-
-  const status = statusQuery.data?.status;
-  if (status === 'completed' && jobId) {
-    queryClient.invalidateQueries({ queryKey: ['tenderDocuments', Number(tenderId)] });
-  }
+    setStarting(true);
+    try {
+      await doRequestTenderDownload(tender);
+    } finally {
+      setStarting(false);
+    }
+  }, [tender]);
 
   return {
     start,
-    jobId,
-    status,
-    error: statusQuery.data?.error,
-    timedOut: attempt >= MAX_ATTEMPTS && status !== 'completed' && status !== 'failed',
+    starting,
+    status: placeholder?.client_status || null, // 'requested' | 'failed' | null
+    error: placeholder?.error || null,
   };
 }

@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { View, ScrollView } from "react-native";
+import { View, ScrollView, Pressable } from "react-native";
 import { Search, Plus, Star, X } from "lucide-react-native";
 import { Chip } from "@/components/common/Chip";
 import { Input } from "@/components/common/Field";
@@ -37,22 +37,34 @@ export function TenderFilterBar({
   }, [text]);
 
   return (
-    <View className="px-4 pt-3 pb-2 bg-surface-0 border-b border-border">
-      <View className="relative mb-2 justify-center">
-        <Search size={15} color={colors.textMuted} style={{ position: "absolute", left: 12, zIndex: 1 }} />
-        <Input
-          style={{ paddingLeft: 34 }}
-          placeholder="Search title, org, tender ID"
-          value={text}
-          onChangeText={setText}
-        />
+    <View className="pt-3 pb-2 bg-surface-0 border-b border-border">
+      <View className="px-4">
+        <View className="flex-row items-center gap-2 mb-2">
+          <Pressable
+            onPress={() => onToggleBookmarked(!bookmarkedOnly)}
+            className="w-[41px] h-[41px] items-center justify-center rounded-[10px] border"
+            style={bookmarkedOnly ? { borderColor: colors.accent, backgroundColor: colors.accentBg } : { borderColor: colors.border, backgroundColor: colors.surface1 }}
+            accessibilityLabel="Bookmarked only"
+          >
+            <Star size={16} color={bookmarkedOnly ? colors.accent : colors.textMuted} fill={bookmarkedOnly ? colors.accent : "none"} />
+          </Pressable>
+          <View className="relative flex-1 justify-center">
+            <Search size={15} color={colors.textMuted} style={{ position: "absolute", left: 12, zIndex: 1 }} />
+            <Input
+              style={{ paddingLeft: 34 }}
+              placeholder="Search title, org, tender ID"
+              value={text}
+              onChangeText={setText}
+            />
+          </View>
+        </View>
       </View>
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 pb-1">
+      {/* Padding lives in the scroll content (not the outer row) so the chip
+          row scrolls flush to the screen edges instead of stopping short of
+          them. */}
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 pb-1 px-4">
         <Chip active={!bookmarkedOnly && !closingSoon} onPress={() => { onToggleBookmarked(false); onToggleClosingSoon(false); }}>
           All
-        </Chip>
-        <Chip active={bookmarkedOnly} onPress={() => onToggleBookmarked(!bookmarkedOnly)}>
-          <Star size={12} color={bookmarkedOnly ? colors.accent : colors.textMuted} /> Bookmarked
         </Chip>
         <Chip active={closingSoon} onPress={() => onToggleClosingSoon(!closingSoon)}>
           Closing &lt; 5 days
@@ -69,12 +81,14 @@ export function TenderFilterBar({
         )}
         <Chip onPress={onOpenAdvanced}>More</Chip>
       </ScrollView>
-      <CustomFilterMenu
-        open={menuOpen}
-        rows={rows}
-        active={customFilters}
-        onAdd={(key) => { onAddCustom(key); setMenuOpen(false); }}
-      />
+      <View className="px-4">
+        <CustomFilterMenu
+          open={menuOpen}
+          rows={rows}
+          active={customFilters}
+          onAdd={(key) => { onAddCustom(key); setMenuOpen(false); }}
+        />
+      </View>
     </View>
   );
 }

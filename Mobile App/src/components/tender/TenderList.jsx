@@ -9,7 +9,7 @@ import { Globe } from 'lucide-react';
 // window, ad-hoc custom filters) over whatever pages have been fetched from
 // the server so far — the backend has no endpoint for these specific facets,
 // same approach the reference artifact takes over its fixed dataset.
-export function TenderList({ query, filterFn, onRowsChange }) {
+export function TenderList({ query, filterFn, onRowsChange, renderEmpty }) {
   const { data, isLoading, isError, error, fetchNextPage, hasNextPage, isFetchingNextPage, refetch } = query;
   const sentinelRef = useRef(null);
 
@@ -34,6 +34,7 @@ export function TenderList({ query, filterFn, onRowsChange }) {
   if (isError) return <ErrorState message={error?.message} onRetry={refetch} />;
 
   if (rows.length === 0) {
+    if (renderEmpty) return renderEmpty();
     return <EmptyState icon={Globe} title="No tenders found" body="Try adjusting your search or filters." />;
   }
 

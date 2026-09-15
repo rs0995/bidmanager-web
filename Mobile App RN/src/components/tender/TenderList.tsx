@@ -1,5 +1,5 @@
 import { useMemo, useEffect } from "react";
-import { FlatList, View } from "react-native";
+import { FlatList, View, ActivityIndicator } from "react-native";
 import { Globe } from "lucide-react-native";
 import { TenderCard } from "./TenderCard";
 import { SkeletonList } from "@/components/feedback/Skeleton";
@@ -42,7 +42,11 @@ export function TenderList({ query, filterFn, onRowsChange, renderEmpty, ListHea
       ListHeaderComponent={ListHeaderComponent}
       onEndReachedThreshold={0.5}
       onEndReached={() => { if (hasNextPage && !isFetchingNextPage) fetchNextPage(); }}
-      ListFooterComponent={isFetchingNextPage ? <SkeletonList count={2} /> : <View className="h-4" />}
+      ListFooterComponent={
+        isFetchingNextPage
+          ? <View className="py-6 items-center justify-center"><ActivityIndicator /></View>
+          : <View className="h-4" />
+      }
     />
   );
 }

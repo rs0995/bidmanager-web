@@ -1,6 +1,6 @@
 import React from 'react';
 
-export function ProgressRing({ pct = 0, size = 40, indeterminate = false }) {
+export function ProgressRing({ pct = 0, size = 40, indeterminate = false, showLabel = false }) {
   const r = (size - 6) / 2;
   const c = 2 * Math.PI * r;
   const color = indeterminate ? 'var(--accent)' : pct >= 1 ? 'var(--ok)' : pct >= 0.6 ? 'var(--accent)' : 'var(--warn)';
@@ -12,6 +12,14 @@ export function ProgressRing({ pct = 0, size = 40, indeterminate = false }) {
         strokeDasharray={c} strokeDashoffset={indeterminate ? c * 0.75 : c * (1 - pct)}
         transform={`rotate(-90 ${size / 2} ${size / 2})`}
       />
+      {showLabel && !indeterminate && (
+        <text
+          x="50%" y="50%" textAnchor="middle" dominantBaseline="central"
+          style={{ fontSize: size * 0.32, fontWeight: 700, fontFamily: '"IBM Plex Mono", monospace', fill: 'var(--text)' }}
+        >
+          {Math.round(pct * 100)}
+        </text>
+      )}
     </svg>
   );
 }

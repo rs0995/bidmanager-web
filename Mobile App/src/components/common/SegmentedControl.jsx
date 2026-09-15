@@ -3,11 +3,11 @@ import { cn } from '../../lib/cn.js';
 
 export function SegmentedControl({ options, value, onChange }) {
   return (
-    <div className="segmented">
+    <div className="seg">
       {options.map((opt) => (
         <button
           key={opt.value}
-          className={cn('segmented-item', value === opt.value && 'segmented-item-active')}
+          className={cn(value === opt.value && 'on')}
           onClick={() => onChange(opt.value)}
           type="button"
         >

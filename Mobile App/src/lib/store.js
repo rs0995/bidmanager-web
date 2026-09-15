@@ -14,6 +14,7 @@ import { useSyncExternalStore } from 'react';
 // module scope and only replaced (a new Set/object) when a write happens.
 const BOOKMARKS_KEY = 'bm.bookmarks';
 const BOOKMARKED_ORGS_KEY = 'bm.bookmarkedOrgs';
+const ORG_ID_BY_NAME_KEY = 'bm.orgIdByName';
 const SETTINGS_KEY = 'bm.settings';
 
 const listeners = new Set();
@@ -88,6 +89,29 @@ export function toggleOrgBookmark(name) {
   writeJSON(BOOKMARKED_ORGS_KEY, [...bookmarkedOrgsCache]);
   emit();
   return bookmarkedOrgsCache.has(name);
+}
+
+// Org name -> numeric id, learned as organisation rows are seen (list or
+// bookmark toggle). lib/sync.js uses it to fill the desktop-compatible
+// `bookmarkedOrgIds` field in the /client/sync blob — desktop derives that
+// the same way from its cached org snapshot (Client UI/src/lib/api.js).
+let orgIdByNameCache = readJSON(ORG_ID_BY_NAME_KEY, {});
+
+export function recordOrgIds(orgs) {
+  let changed = false;
+  for (const org of orgs || []) {
+    const id = Number(org?.id);
+    const name = org?.name;
+    if (name && Number.isFinite(id) && orgIdByNameCache[name] !== id) {
+      orgIdByNameCache[name] = id;
+      changed = true;
+    }
+  }
+  if (changed) writeJSON(ORG_ID_BY_NAME_KEY, orgIdByNameCache);
+}
+
+export function getOrgIdByName() {
+  return orgIdByNameCache;
 }
 
 export function getSettings() {

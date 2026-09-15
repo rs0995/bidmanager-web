@@ -29,6 +29,7 @@ export function AddChecklistItemForm({ folders, onAdd, onCancel }: AddChecklistI
       <View className="flex-row gap-2">
         <View className="flex-1">
           <Select
+            title="Folder"
             value={subfolder}
             onValueChange={setSubfolder}
             options={folders.map((f) => ({ value: f, label: f }))}

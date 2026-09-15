@@ -8,8 +8,12 @@ import { addAlert } from './alerts.js';
 // a mismatched field name here silently renders as "-" on the other app
 // rather than erroring, so this is not just a style choice.
 //   Project:        { id, title, client_name, source_tender_id,
-//                      project_value, emd, deadline, prebid, status,
-//                      description }
+//                      source_tender_db_id, project_value, emd, deadline,
+//                      prebid, status, description }
+//                      (source_tender_db_id is the numeric tender DB id, used
+//                      to look up documents/live status for the source
+//                      tender; older projects created before this field
+//                      existed may not have it)
 //   Checklist item: { id, project_id, sr_no, req_file_name, description,
 //                      subfolder, status: 'Pending' | 'Completed',
 //                      attachment }   (attachment is mobile-only metadata;
@@ -87,6 +91,7 @@ export function createProjectFromTender(tender) {
     title: tender.title || tender.tender_id || 'Untitled project',
     client_name: tender.organization || tender.website_name || '',
     source_tender_id: tender.tender_id || '',
+    source_tender_db_id: tender.id ?? null,
     project_value: tender.tender_value || 0,
     emd: tender.emd || 0,
     deadline: tender.closing_date || null,

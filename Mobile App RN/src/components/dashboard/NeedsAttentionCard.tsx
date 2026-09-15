@@ -1,6 +1,6 @@
 import { View, Text, Pressable } from "react-native";
 import { router } from "expo-router";
-import { TriangleAlert, CircleAlert, ArrowRight } from "lucide-react-native";
+import { TriangleAlert, ArrowRight } from "lucide-react-native";
 import { timeRemaining, urgency } from "@/lib/format";
 import { useBookmarkedTenders } from "@/hooks/useBookmarks";
 import { useThemeColors } from "@/constants/colors";
@@ -17,15 +17,17 @@ export function NeedsAttentionCard() {
   if (urgent.length === 0) return null;
 
   return (
-    <View className="bg-surface-0 border rounded-[14px] p-4 mb-4" style={{ borderColor: colors.warn }}>
+    <View className="bg-surface-0 border border-border rounded-[19px] p-4 mb-4">
       <View className="flex-row items-center gap-2 mb-3">
         <TriangleAlert size={16} color={colors.warn} />
         <Text className="text-sm font-bold text-text">Needs attention</Text>
       </View>
       <View className="flex flex-col gap-2">
         {urgent.slice(0, 3).map((t: any) => (
-          <View key={t.id} className="flex-row items-center gap-3 p-2.5 rounded-lg bg-surface-1">
-            <CircleAlert size={16} color={colors.danger} />
+          <View key={t.id} className="flex-row items-center gap-3 p-[11px] rounded-lg bg-surface-1">
+            <View className="rounded-full bg-danger-bg px-2 py-1">
+              <Text className="text-sm font-medium text-danger">Critical</Text>
+            </View>
             <Text className="flex-1 text-sm text-text" numberOfLines={2}>
               {t.title} closes soon with no documents yet
             </Text>

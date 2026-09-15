@@ -1,2 +1,0 @@
-- Saved jobs scope links now show a chevron icon instead of an underline, matching the Users panel.
-- Added a day-of-week picker to pause the scheduler entirely on selected days (e.g. weekends), separate from the daily time window.

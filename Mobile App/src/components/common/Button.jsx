@@ -6,6 +6,9 @@ const VARIANTS = {
   secondary: 'btn-secondary',
   ghost: 'btn-ghost',
   danger: 'btn-danger',
+  fbtnGhost: 'fbtn-ghost',
+  fbtnAdd: 'fbtn-add',
+  mini: 'mini-btn',
 };
 
 export function Button({ variant = 'primary', className, children, ...props }) {

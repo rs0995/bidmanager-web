@@ -51,10 +51,16 @@ export default function TendersScreen() {
   const tendersQuery = useTenders(apiFilters);
   const orgsQuery = useOrganizations({ website_id: apiFilters.website_id, q: apiFilters.q });
 
+  // router.setParams() merges/patches the given keys into the current route
+  // params rather than replacing the whole set — omitting a key (the old
+  // `delete next[key]` approach) leaves its previous value in place instead
+  // of clearing it, so toggling a filter off silently did nothing. Passing
+  // an explicit "" keeps the key present with a value setParams actually
+  // applies, and every reader here already treats "" as falsy/unset.
   const onChange = useCallback((patch: Record<string, string>) => {
     const next: Record<string, string> = { ...filters };
     Object.entries(patch).forEach(([key, value]) => {
-      if (value) next[key] = value; else delete next[key];
+      next[key] = value || "";
     });
     router.setParams(next);
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -3,12 +3,13 @@ import { View, Text, Pressable } from "react-native";
 import { ChevronDown, Check } from "lucide-react-native";
 import { useWebsites } from "@/hooks/useWebsites";
 import { Sheet } from "@/components/common/Sheet";
+import { Skeleton } from "@/components/feedback/Skeleton";
 import { useThemeColors } from "@/constants/colors";
 
 type SiteScopeProps = { websiteId: string; onChange: (id: string) => void };
 
 export function SiteScope({ websiteId, onChange }: SiteScopeProps) {
-  const { data: websites = [] } = useWebsites();
+  const { data: websites = [], isLoading } = useWebsites();
   const [open, setOpen] = useState(false);
   const colors = useThemeColors();
 
@@ -16,18 +17,28 @@ export function SiteScope({ websiteId, onChange }: SiteScopeProps) {
     if (!websiteId && websites.length > 0) onChange(String(websites[0].id));
   }, [websiteId, websites, onChange]);
 
+  // Reserve the same footprint as the real picker while loading -- returning
+  // null here (as this used to) left nothing on screen, so the picker
+  // popped in abruptly ~1s later instead of the space just being ready.
+  if (isLoading) {
+    return (
+      <View className="px-4 pt-3 pb-2">
+        <Skeleton className="w-full h-[46px] rounded-xl" />
+      </View>
+    );
+  }
   if (websites.length === 0) return null;
 
   const current = websites.find((s: any) => String(s.id) === String(websiteId));
 
   return (
-    <View className="px-4 pb-2">
+    <View className="px-4 pt-3 pb-2">
       <Pressable
-        className="w-full flex-row items-center justify-between gap-2 px-3 py-2.5 rounded-xl bg-surface-0 border border-border"
+        className="w-full flex-row items-center justify-between gap-2 px-3.5 py-[11px] rounded-xl bg-surface-0 border border-border"
         onPress={() => setOpen(true)}
       >
-        <Text className="text-sm font-medium text-text" numberOfLines={1}>{current?.name || "Choose portal"}</Text>
-        <ChevronDown size={16} color={colors.textMuted} />
+        <Text className="text-base font-medium text-text" numberOfLines={1}>{current?.name || "Choose portal"}</Text>
+        <ChevronDown size={18} color={colors.textMuted} />
       </Pressable>
 
       <Sheet open={open} onClose={() => setOpen(false)} title="Choose portal">

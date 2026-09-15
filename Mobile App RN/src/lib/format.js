@@ -52,9 +52,15 @@ function parseFlexibleDate(dateLike) {
 export function timeRemaining(dateLike) {
   const date = parseFlexibleDate(dateLike);
   if (!date) return { totalDays: null, expired: false, label: "—" };
-  const diffMs = date.getTime() - Date.now();
-  const totalDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
-  const expired = diffMs < 0;
+  // Calendar-date difference (midnight to midnight), not a raw millisecond
+  // diff — a closing date should read the same "Xd left" all day regardless
+  // of what time it currently is, and only become "Closed" once its calendar
+  // date has actually passed. Matches Mobile App's web timeRemaining().
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startOfClosing = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const totalDays = Math.round((startOfClosing.getTime() - startOfToday.getTime()) / (1000 * 60 * 60 * 24));
+  const expired = totalDays < 0;
   const label = expired ? "Closed" : totalDays <= 0 ? "Today" : `${totalDays}d left`;
   return { totalDays, expired, label, date };
 }

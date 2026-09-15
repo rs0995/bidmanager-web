@@ -1264,6 +1264,7 @@ export default function TendersPage() {
               </button>
               <button disabled={bookmarkedActiveTenders.length === 0 || addTendersToProjects.isPending} onClick={() => addTendersToProjects.mutate(bookmarkedActiveTenders)} className="btn-ghost gap-1 text-xs"><FolderPlus size={12} />Add To Projects ({bookmarkedActiveTenders.length})</button>
               <button onClick={() => (allActiveSelected ? deselectAll.mutate() : selectAll.mutate())} className="btn-ghost gap-1 text-xs">{allActiveSelected ? <CheckSquare size={12} /> : <Square size={12} />}{allActiveSelected ? 'Deselect All' : 'Select All'}</button>
+              <button disabled={jobRunning} onClick={() => runJob((id) => api.checkTenderStatus(id), siteIds)} className="btn-ghost gap-1 text-xs"><RefreshCw size={12} />Status</button>
             </>
           )}
           {tab === 'archived' && (

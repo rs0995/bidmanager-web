@@ -1,4 +1,5 @@
 import React, { useMemo } from 'react';
+import { parseINR } from '../../lib/format.js';
 
 const VALUE_OPTIONS = [
   ['val:gt25', 'Above ₹25 Cr'],
@@ -8,7 +9,7 @@ const OTHER_OPTIONS = [['prebid', 'Has pre-bid meeting']];
 
 // Inline ad-hoc filter builder — up to 2 active custom filters at once,
 // options derived from the currently-loaded tender rows (category/location),
-// matching the reference artifact's "+ Filter" menu exactly.
+// matching the reference artifact's "+ Filter" menu (.fmenu/.fmh/.fmo).
 export function CustomFilterMenu({ open, rows, active, onAdd }) {
   const groups = useMemo(() => {
     const cats = [...new Set(rows.map((t) => t.category).filter(Boolean))].sort();
@@ -24,19 +25,17 @@ export function CustomFilterMenu({ open, rows, active, onAdd }) {
   if (!open) return null;
 
   return (
-    <div className="card p-1.5 mb-3 grid gap-0.5">
+    <div className="fmenu">
       {groups.map((group) => {
         const available = group.options.filter(([key]) => !active.includes(key));
         if (available.length === 0) return null;
         return (
           <React.Fragment key={group.heading}>
-            <p className="m-0 px-2 pt-2 pb-1 text-[10px] font-bold uppercase tracking-wide" style={{ color: 'var(--text-muted)' }}>
-              {group.heading}
-            </p>
+            <p className="fmh m-0">{group.heading}</p>
             {available.map(([key, label]) => (
               <button
                 key={key}
-                className="text-left text-sm px-2.5 py-2 rounded-lg"
+                className="fmo"
                 onClick={() => onAdd(key)}
               >
                 {label}
@@ -60,7 +59,7 @@ export function customFilterLabel(key) {
 export function customFilterPass(tender, key) {
   if (key.startsWith('cat:')) return tender.category === key.slice(4);
   if (key.startsWith('loc:')) return tender.location === key.slice(4);
-  const value = Number(tender.tender_value) || 0; // stored in rupees; 1 Cr = 1e7
+  const value = parseINR(tender.tender_value); // rupees; 1 Cr = 1e7
   if (key === 'val:gt25') return value > 25 * 1e7;
   if (key === 'val:lt10') return value < 10 * 1e7;
   if (key === 'prebid') return Boolean(tender.pre_bid_meeting_date);

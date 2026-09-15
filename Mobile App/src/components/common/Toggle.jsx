@@ -8,10 +8,10 @@ export function Toggle({ checked, onChange, disabled }) {
       role="switch"
       aria-checked={checked}
       disabled={disabled}
-      className={cn('toggle-switch', checked && 'toggle-switch-on')}
+      className={cn('sw', checked && 'on')}
       onClick={() => onChange?.(!checked)}
     >
-      <span className="toggle-thumb" />
+      <span className="sw-thumb" />
     </button>
   );
 }

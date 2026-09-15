@@ -42,8 +42,16 @@ export const api = {
     `/client/tenders/${Number(tenderId)}/download-status?job_id=${encodeURIComponent(jobId)}`,
   ),
 
-  // ── Organizations (phase 2 — not wired into any screen yet) ────────
+  // ── Organizations ────────────────────────────────────────────────
   organizations: (params) => request(`/client/organizations?${new URLSearchParams(clean(params))}`),
+  // One-time scrape request for an org with no saved job covering it yet
+  // (ported from Client UI's "Request tenders"). Never creates a recurring
+  // schedule, so the org stays requestable again later; the server 409s if
+  // it's already covered.
+  requestOrgTenders: (orgId) => request(`/client/organizations/${Number(orgId)}/request-tenders`, { method: 'POST', body: {} }),
+  orgRequestStatus: (orgId, jobId) => request(
+    `/client/organizations/${Number(orgId)}/request-tenders-status?job_id=${encodeURIComponent(jobId)}`,
+  ),
 
   // ── Cross-device sync blob (see lib/sync.js for the merge-preserving
   // read-modify-write this app performs against it) ───────────────────

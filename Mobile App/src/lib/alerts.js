@@ -33,12 +33,28 @@ export function getAlerts() {
   return alertsCache;
 }
 
-export function addAlert({ kind, message }) {
-  const entry = { id: nextId++, kind, message, at: new Date().toISOString(), read: false };
+// tenderId (numeric /client/tenders id) / orgName (org_chain string) are
+// optional navigation targets — AlertsScreen uses them to route a tap to the
+// right screen. Neither is required; an alert with neither is just markable-read.
+export function addAlert({ kind, message, tenderId, orgName }) {
+  const entry = {
+    id: nextId++, kind, message, at: new Date().toISOString(), read: false,
+    tenderId: tenderId ?? null, orgName: orgName ?? null,
+  };
   alertsCache = [entry, ...alertsCache].slice(0, MAX_ALERTS);
   writeJSON(ALERTS_KEY, alertsCache);
   emit();
   return entry;
+}
+
+export function markRead(id) {
+  let changed = false;
+  alertsCache = alertsCache.map((a) => {
+    if (a.id !== id || a.read) return a;
+    changed = true;
+    return { ...a, read: true };
+  });
+  if (changed) { writeJSON(ALERTS_KEY, alertsCache); emit(); }
 }
 
 export function markAllRead() {

@@ -839,6 +839,11 @@ def download_single_tender(
     return _enqueue_job("download_single_tender", {"tender_db_id": tender_db_id, "mode": mode})
 
 
+@app.api_route("/v1/tenders/{tender_db_id}/fetch-status", methods=["POST", "GET"], response_model=JobStartResponse)
+def fetch_tender_status_single(tender_db_id: int):
+    return _enqueue_job("fetch_tender_status_single", {"tender_db_id": tender_db_id})
+
+
 def _find_tender_with_files(conn: sqlite3.Connection, raw_tender_id: str):
     tender_id = str(raw_tender_id or "").strip()
     if not tender_id:
@@ -2225,6 +2230,8 @@ def _job_callable(action: str, payload: dict):
         return core.ScraperBackend.push_local_data_to_cloud(website_id)
     if action == "download_single_tender":
         return core.ScraperBackend.download_single_tender_logic(payload.get("tender_db_id"), payload.get("mode", "full"))
+    if action == "fetch_tender_status_single":
+        return core.ScraperBackend.fetch_tender_status_single_logic(payload.get("tender_db_id"))
     raise RuntimeError(f"Unsupported durable job action: {action}")
 
 
@@ -5732,6 +5739,7 @@ _JOB_KIND_BY_ACTION = {
     "refresh_and_download_tenders": "download",
     "download_tender_results": "download",
     "download_single_tender": "download",
+    "fetch_tender_status_single": "fetch",
 }
 
 

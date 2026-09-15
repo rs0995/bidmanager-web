@@ -59,7 +59,7 @@ export async function runDeadlineCheck(fetchTenderById) {
         fired.add(key);
         changed = true;
         const message = `"${tender.title}" closes in about ${threshold}h.`;
-        addAlert({ kind: 'deadline', message });
+        addAlert({ kind: 'deadline', message, tenderId: tender.id });
         notify('Deadline approaching', message);
       }
     }

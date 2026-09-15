@@ -19,27 +19,27 @@ export function TenderCard({ tender }: { tender: any }) {
       onPress={() => router.push(`/tenders/${tender.id}` as any)}
     >
       <View className="flex-row items-center justify-between gap-2">
-        <Text className="font-mono text-[11px] text-accent">{tender.tender_id}</Text>
+        <Text className="text-[12px] font-bold text-accent" style={{ fontFamily: "IBMPlexMono_600SemiBold" }}>{tender.tender_id}</Text>
         <View className="flex-row items-center gap-2">
           <View
             className="px-2 py-0.5 rounded-full"
             style={{ backgroundColor: expired ? colors.surface2 : hexToRgba(color, 0.16) }}
           >
-            <Text className="font-mono text-[11px] font-semibold" style={{ color: expired ? colors.textMuted : color }}>
+            <Text className="font-mono text-xs font-semibold" style={{ color: expired ? colors.textMuted : color }}>
               {expired ? "Closed" : label}
             </Text>
           </View>
           <Pressable onPress={() => toggle(tender.id)} accessibilityLabel="Toggle bookmark" className="p-0.5">
-            <Star size={17} fill={bookmarked ? colors.warn : "none"} color={bookmarked ? colors.warn : colors.textMuted} />
+            <Star size={19} fill={bookmarked ? colors.warn : "none"} color={bookmarked ? colors.warn : colors.textMuted} />
           </Pressable>
         </View>
       </View>
-      <Text className="text-sm font-semibold text-text" numberOfLines={2}>{tender.title}</Text>
-      <Text className="text-xs">
+      <Text className="text-base font-semibold text-text" numberOfLines={2}>{tender.title}</Text>
+      <Text className="text-sm">
         <Text className="text-text font-semibold">{fmtINR(tender.tender_value)}</Text>
       </Text>
       {tender.organization && (
-        <Text className="text-xs text-text-muted" numberOfLines={1}>{tender.organization}</Text>
+        <Text className="text-sm text-text-muted" numberOfLines={1}>{tender.organization}</Text>
       )}
     </Pressable>
   );

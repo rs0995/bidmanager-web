@@ -139,7 +139,7 @@ export const flushPush = doPush;
 export async function syncNow() {
   await syncUserData();
 
-  const projectTenderIds = getProjects().map((p) => p.source_tender_id).filter(Boolean);
+  const projectTenderIds = getProjects().map((p) => p.source_tender_db_id).filter(Boolean);
   const ids = new Set([...getBookmarks(), ...projectTenderIds]);
 
   const snapshot = readJSON(SNAPSHOT_KEY, {});
@@ -161,11 +161,11 @@ export async function syncNow() {
 
     if (prev.status !== cur.status) {
       changedCount += 1;
-      addAlert({ kind: 'status', message: `"${tender.title}" status changed to ${cur.status || 'unknown'}.` });
+      addAlert({ kind: 'status', message: `"${tender.title}" status changed to ${cur.status || 'unknown'}.`, tenderId: tender.id });
     }
     if (prev.prebid_count !== cur.prebid_count || prev.corrigendum_count !== cur.corrigendum_count) {
       changedCount += 1;
-      addAlert({ kind: 'prebid', message: `"${tender.title}" has a new pre-bid or corrigendum.` });
+      addAlert({ kind: 'prebid', message: `"${tender.title}" has a new pre-bid or corrigendum.`, tenderId: tender.id });
     }
   }
   writeJSON(SNAPSHOT_KEY, nextSnapshot);
@@ -190,18 +190,20 @@ async function fetchServerChanges() {
     for (const t of resp.tenders || []) {
       if ((t.changed_fields || []).includes('closing_date')) {
         count += 1;
-        addAlert({ kind: 'status', message: `"${t.title || `Tender #${t.id}`}" — closing date changed.` });
+        addAlert({ kind: 'status', message: `"${t.title || `Tender #${t.id}`}" — closing date changed.`, tenderId: t.id });
       }
     }
     for (const [org, items] of Object.entries(resp.new_by_org || {})) {
       const list = items || [];
       if (list.length > 10) {
         count += 1;
-        addAlert({ kind: 'new', message: `${list.length} new tenders added under ${org}.` });
+        // A count, not one tender — tapping opens the org's tender list instead.
+        addAlert({ kind: 'new', message: `${list.length} new tenders added under ${org}.`, orgName: org });
       } else {
         list.forEach((t) => {
           count += 1;
-          addAlert({ kind: 'new', message: `"${t.title || t.tender_id}" added under ${org}.` });
+          // Names one specific tender — tapping goes straight to it.
+          addAlert({ kind: 'new', message: `"${t.title || t.tender_id}" added under ${org}.`, tenderId: t.id });
         });
       }
     }

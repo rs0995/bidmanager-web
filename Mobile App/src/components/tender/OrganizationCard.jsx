@@ -2,43 +2,61 @@ import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ChevronRight, Bookmark } from 'lucide-react';
 import { useOrgBookmarkToggle } from '../../hooks/useBookmarks.js';
-import { useToast } from '../feedback/ToastProvider.jsx';
+import { recordOrgIds } from '../../lib/store.js';
+import { formatDateTimeIST } from '../../lib/format.js';
 
-export function OrganizationCard({ org }) {
+// showWebsite: the Tenders tab's Organisations sub-tab is already scoped to
+// one portal via SiteScope, so the website name there is redundant — the
+// Bookmarks screen mixes portals by design, so it opts back in.
+export function OrganizationCard({ org, showWebsite = false }) {
   const navigate = useNavigate();
   const { isOrgBookmarked, toggle } = useOrgBookmarkToggle();
-  const toast = useToast();
   const bookmarked = isOrgBookmarked(org.name);
+  // No longer found on the site's own organisation-list page — the card
+  // still renders (a bookmark on it isn't silently lost) but is inert.
+  const unavailable = org.is_available === false;
 
   const handleBookmark = (e) => {
     e.stopPropagation();
-    const nowOn = toggle(org.name);
-    if (nowOn) {
-      toast?.push({
-        title: 'Organisation bookmarked',
-        body: 'This also keeps its tenders updated automatically (a recurring background check every few hours).',
-      });
-    }
+    recordOrgIds([org]); // so bookmarkedOrgIds can be filled on the next sync push
+    toggle(org.name);
+  };
+
+  const openOrg = () => {
+    if (unavailable) return;
+    navigate(`/tenders/org/${encodeURIComponent(org.name)}?website_id=${org.website_id}&org_id=${org.id}&last_scraped_at=${org.last_scraped_at || 0}`);
   };
 
   return (
-    <button
-      className="card p-3 flex items-center justify-between gap-3 text-left w-full"
-      onClick={() => navigate(`/tenders/org/${encodeURIComponent(org.name)}?website_id=${org.website_id}`)}
+    // A <div role="button">, not a <button> — the bookmark toggle below is
+    // itself an interactive <button> (and nested <button>s are invalid HTML
+    // and behave unreliably on mobile touch).
+    <div
+      className={`ocard ${unavailable ? 'cursor-default' : 'cursor-pointer'}`}
+      style={unavailable ? { opacity: 0.5 } : undefined}
+      role="button"
+      tabIndex={unavailable ? -1 : 0}
+      aria-disabled={unavailable}
+      onClick={openOrg}
+      onKeyDown={(e) => { if (!unavailable && (e.key === 'Enter' || e.key === ' ')) openOrg(); }}
     >
       <div className="min-w-0">
-        <p className="m-0 text-sm font-medium truncate">{org.name}</p>
-        <div className="flex gap-2 mt-1 text-xs" style={{ color: 'var(--text-muted)' }}>
-          <span>{org.website_name}</span>
+        <h4 className="m-0 truncate">
+          {org.name}
+          {unavailable && <span className="ml-1.5 text-xs" style={{ color: 'var(--text-muted)' }}>(unavailable)</span>}
+        </h4>
+        <div className="ometa">
+          {showWebsite && <span>{org.website_name}</span>}
+          {org.last_scraped_at ? <span>Last updated {formatDateTimeIST(org.last_scraped_at * 1000)}</span> : null}
         </div>
       </div>
-      <div className="flex items-center gap-3 flex-shrink-0">
-        <span className="font-mono text-sm font-semibold">{org.tender_count}</span>
-        <button onClick={handleBookmark} aria-label="Toggle organisation bookmark">
-          <Bookmark size={17} fill={bookmarked ? 'var(--warn)' : 'none'} color={bookmarked ? 'var(--warn)' : 'var(--text-muted)'} />
+      <div className="oright">
+        <span className="ocount">{org.tender_count}</span>
+        <button onClick={handleBookmark} aria-label="Toggle organisation bookmark" className={bookmarked ? 'star on' : 'star'}>
+          <Bookmark size={17} fill={bookmarked ? 'currentColor' : 'none'} />
         </button>
-        <ChevronRight size={16} style={{ color: 'var(--text-muted)' }} />
+        {!unavailable && <ChevronRight className="oarr" size={16} />}
       </div>
-    </button>
+    </div>
   );
 }

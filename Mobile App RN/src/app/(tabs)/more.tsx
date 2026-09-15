@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { View, Text, Pressable, ScrollView } from "react-native";
 import { router } from "expo-router";
 import { useMutation, useQueryClient, useQuery } from "@tanstack/react-query";
-import { Sun, Moon, Monitor, LogOut, RefreshCw, Wifi, WifiOff, Download, FileSpreadsheet, ClipboardList, Fingerprint, Trash2 } from "lucide-react-native";
+import { Sun, Moon, Monitor, LogOut, RefreshCw, Wifi, WifiOff, Download, FileSpreadsheet, ClipboardList, Fingerprint, Bell, Trash2 } from "lucide-react-native";
 import { ScreenHeader } from "@/components/shell/ScreenHeader";
 import { Field, Input } from "@/components/common/Field";
 import { Button } from "@/components/common/Button";
@@ -14,7 +14,8 @@ import { useToast } from "@/components/feedback/ToastProvider";
 import { useTheme } from "@/hooks/useTheme";
 import { api } from "@/lib/api";
 import { getUser, clearSession } from "@/lib/auth";
-import { useSettings, rehydrateStore } from "@/lib/store";
+import { useSettings, setSettings, rehydrateStore } from "@/lib/store";
+import { requestNotificationPermission, startDeadlineChecks, stopDeadlineChecks } from "@/lib/deadlineCheck";
 import { syncNow, pullBookmarks, rehydrateSync } from "@/lib/sync";
 import { exportTendersCsv } from "@/lib/exportCsv";
 import { isAppLockAvailable, isAppLockEnabled, enableAppLock, disableAppLock } from "@/lib/appLock";
@@ -60,7 +61,7 @@ export default function MoreScreen() {
   const queryClient = useQueryClient();
   const { theme, setTheme } = useTheme();
   const user = getUser();
-  const { lastSyncAt } = useSettings();
+  const { lastSyncAt, deadlineRemindersOn } = useSettings();
   const colors = useThemeColors();
   const [pwOpen, setPwOpen] = useState(false);
   const [pwForm, setPwForm] = useState({ current_password: "", new_password: "" });
@@ -70,6 +71,15 @@ export default function MoreScreen() {
   const [confirmClearCache, setConfirmClearCache] = useState(false);
 
   useEffect(() => { isAppLockAvailable().then(setLockAvailable); }, []);
+
+  useEffect(() => {
+    if (deadlineRemindersOn) {
+      startDeadlineChecks((id: any) => api.tender(id));
+    } else {
+      stopDeadlineChecks();
+    }
+    return stopDeadlineChecks;
+  }, [deadlineRemindersOn]);
 
   const health = useQuery({ queryKey: ["health-check"], queryFn: api.health, enabled: false, retry: 0 });
 
@@ -113,6 +123,18 @@ export default function MoreScreen() {
     toast?.push({ title: "Cache cleared" });
   };
 
+  const toggleReminders = async (next: boolean) => {
+    if (next) {
+      const granted = await requestNotificationPermission();
+      setSettings({ deadlineRemindersOn: true });
+      if (!granted) {
+        toast?.push({ title: "Reminders on", body: "Notifications permission was not granted — you will still see alerts in this list while the app is open.", type: "info" });
+      }
+    } else {
+      setSettings({ deadlineRemindersOn: false });
+    }
+  };
+
   const toggleAppLock = async (next: boolean) => {
     try {
       if (next) { await enableAppLock(); setLockEnabled(true); toast?.push({ title: "App lock enabled" }); }
@@ -143,7 +165,7 @@ export default function MoreScreen() {
           <MoreRow icon={FileSpreadsheet} label="Export tenders (CSV)" value={exportCsv.isPending ? "Exporting…" : "›"} onPress={() => exportCsv.mutate()} disabled={exportCsv.isPending} spin={exportCsv.isPending} />
           <MoreRow icon={ClipboardList} label="Checklist templates" value="Coming soon" onPress={() => toast?.push({ title: "Coming soon", body: "Checklist templates are managed on the desktop app for now." })} disabled />
           {lockAvailable && (
-            <View className="flex-row items-center gap-3 py-3 px-3">
+            <View className="flex-row items-center gap-3 py-3 px-3 border-b border-border">
               <View className="w-[26px] h-[26px] rounded-lg items-center justify-center bg-accent-bg">
                 <Fingerprint size={15} color={colors.accent} />
               </View>
@@ -151,6 +173,18 @@ export default function MoreScreen() {
               <Toggle checked={lockEnabled} onChange={toggleAppLock} />
             </View>
           )}
+          <View className="flex-row items-center gap-3 py-3 px-3">
+            <View className="w-[26px] h-[26px] rounded-lg items-center justify-center bg-accent-bg">
+              <Bell size={15} color={colors.accent} />
+            </View>
+            <View className="flex-1">
+              <Text className="text-sm text-text">Deadline reminders</Text>
+              <Text className="mt-0.5 text-xs text-text-muted">
+                On-device notifications at 72h, 24h & 3h before close (while the app is open)
+              </Text>
+            </View>
+            <Toggle checked={Boolean(deadlineRemindersOn)} onChange={toggleReminders} />
+          </View>
         </View>
 
         <View className="bg-surface-0 border border-border rounded-[14px] p-3 mb-3">

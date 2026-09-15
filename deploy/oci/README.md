@@ -3,8 +3,12 @@
 Runs the maintained `Server UI/server` backend on one OCI Compute VM with Chromium/Selenium
 and automatic HTTPS via Caddy. This is a **compute-only move off Google Cloud Run**:
 
-- **Database:** the existing external **Neon Postgres** is kept as-is. No Postgres runs on
-  the VM. Set `DATABASE_URL` in `.env` to the same value Cloud Run used.
+- **Database:** **self-hosted Postgres**, running as the `postgres` container in this compose
+  stack, on the same VM as the backend. (Originally kept the external Neon Postgres from the
+  Cloud Run days; moved to self-hosted 2026-09-07 after Neon's free-tier data-transfer cap was
+  exhausted, worsened by the VM/DB region mismatch.) Not published to the host — reachable only
+  from `backend` over the internal Docker network. Set `POSTGRES_USER`/`POSTGRES_PASSWORD`/
+  `POSTGRES_DB` in `.env`; `DATABASE_URL` is built from those automatically.
 - **Documents:** **Google Drive** is kept as-is. Cloud Run authenticated to Drive with its
   attached service account (ADC); a VM cannot, so a **JSON key for that same service
   account** is mounted at `./drive-sa.json`. No document migration, all `gdrive://`
@@ -26,10 +30,10 @@ and automatic HTTPS via Caddy. This is a **compute-only move off Google Cloud Ru
 4. `deploy/oci/drive-sa.json` — a JSON key for the Drive service account already shared as
    Editor on the Drive root folder. `chmod 600`.
 5. Values for `.env` (see `.env.example`): `BIDMANAGER_DOMAIN`, `OCI_REGION`,
-   `OCI_INSTANCE_ID`, `DATABASE_URL` (Neon), `GOOGLE_DRIVE_FOLDER_ID`, and the three
-   carried-over secrets.
+   `OCI_INSTANCE_ID`, `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`,
+   `GOOGLE_DRIVE_FOLDER_ID`, and the three carried-over secrets.
 6. A cutover time. Pause the Cloud Run scheduler (or scale both services to 0) during the
-   switch so two schedulers do not race on the shared Neon lease.
+   switch so two schedulers do not race on the shared database lease.
 
 ## VM preparation
 
@@ -53,12 +57,15 @@ Caddy obtains and renews the TLS certificate automatically once DNS resolves and
 
 ## Database
 
-Nothing to migrate — the backend connects to the same Neon database Cloud Run used. Verify
-with `GET /admin/health` → `providers.database.engine == "postgres"` and the host shown is
-Neon.
+Postgres runs as the `postgres` container in this compose stack, with its data in the
+`pgdata` named volume — no external DB, no network egress between app and DB. Verify with
+`GET /admin/health` → `providers.database.engine == "postgres"` and the provider shown is
+`postgres-local`.
 
-Neon keeps its own backups; additionally schedule an off-VM `pg_dump` (e.g. to OCI Object
-Storage) before production cutover.
+Unlike Neon, self-hosted Postgres has **no managed backups or PITR** — this is a known gap,
+not yet implemented. Until a backup job exists, `docker volume rm pgdata` or a lost VM means
+losing the database. Schedule an off-VM `pg_dump` (e.g. to OCI Object Storage or Google Drive)
+before relying on this in production.
 
 ## Documents
 

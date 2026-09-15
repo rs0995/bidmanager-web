@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useCallback } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams, useLocation } from 'react-router-dom';
 import { ScreenHeader } from '../components/shell/ScreenHeader.jsx';
 import { SiteScope } from '../components/tender/SiteScope.jsx';
 import { SegmentedControl } from '../components/common/SegmentedControl.jsx';
@@ -15,12 +15,22 @@ import { customFilterPass } from '../components/tender/CustomFilterMenu.jsx';
 
 export function TendersScreen() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const location = useLocation();
   const [sheetOpen, setSheetOpen] = useState(false);
   const [rows, setRows] = useState([]);
   const { isBookmarked } = useBookmarkToggle();
 
   const filters = useMemo(() => Object.fromEntries(searchParams.entries()), [searchParams]);
-  const view = filters.view === 'orgs' ? 'orgs' : 'tenders';
+  // Remember whichever sub-tab was last used, instead of always reopening on
+  // Tenders — the URL param wins when present (e.g. a deep link), otherwise
+  // fall back to the last choice persisted in localStorage.
+  const view = filters.view
+    ? (filters.view === 'orgs' ? 'orgs' : 'tenders')
+    : (localStorage.getItem('bm.tendersLastView') === 'orgs' ? 'orgs' : 'tenders');
+  // Same pattern as `view` above: remember the last portal picked so leaving
+  // and returning to this tab (or a reload) doesn't reset SiteScope back to
+  // the first portal.
+  const websiteId = filters.website_id || localStorage.getItem('bm.tendersLastWebsiteId') || '';
   const customFilters = filters.custom ? filters.custom.split(',').filter(Boolean) : [];
   const bookmarkedOnly = filters.bookmarked_only === '1';
   const closingSoon = filters.closing5 === '1';
@@ -28,8 +38,15 @@ export function TendersScreen() {
 
   const apiFilters = useMemo(() => {
     const { view: _v, custom: _c, bookmarked_only: _b, closing5: _c5, org_bookmarked: _o, ...rest } = filters;
+    // Default to live tenders only — the backend returns both active and
+    // archived when `archived` is omitted. A tender past its closing date
+    // but not yet flipped to archived server-side still counts as "live"
+    // here; only rows the backend has actually marked is_archived are hidden.
+    if (rest.archived === undefined || rest.archived === '') rest.archived = 'false';
+    rest.website_id = websiteId;
     return rest;
-  }, [filters]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters, websiteId]);
 
   const tendersQuery = useTenders(apiFilters);
   const orgsQuery = useOrganizations({ website_id: apiFilters.website_id, q: apiFilters.q });
@@ -57,12 +74,21 @@ export function TendersScreen() {
 
   return (
     <div>
-      <ScreenHeader title="Tenders" />
-      <SiteScope websiteId={apiFilters.website_id} onChange={(id) => onChange({ website_id: id })} />
+      <ScreenHeader title="Tenders" back={Boolean(location.state?.fromCard)} />
+      <SiteScope
+        websiteId={apiFilters.website_id}
+        onChange={(id) => {
+          localStorage.setItem('bm.tendersLastWebsiteId', id);
+          onChange({ website_id: id });
+        }}
+      />
       <div className="px-4 pb-1">
         <SegmentedControl
           value={view}
-          onChange={(v) => onChange({ view: v === 'tenders' ? '' : v })}
+          onChange={(v) => {
+            localStorage.setItem('bm.tendersLastView', v);
+            onChange({ view: v === 'tenders' ? '' : v });
+          }}
           options={[{ value: 'orgs', label: 'Organisations' }, { value: 'tenders', label: 'Tenders' }]}
         />
       </div>

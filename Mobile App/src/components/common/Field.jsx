@@ -1,4 +1,5 @@
 import React from 'react';
+import { cn } from '../../lib/cn.js';
 
 export function Field({ label, error, children }) {
   return (
@@ -10,10 +11,10 @@ export function Field({ label, error, children }) {
   );
 }
 
-export function Input(props) {
-  return <input className="input-field" {...props} />;
+export function Input({ className, ...props }) {
+  return <input className={cn('input-field', className)} {...props} />;
 }
 
-export function Select(props) {
-  return <select className="input-field" {...props} />;
+export function Select({ className, ...props }) {
+  return <select className={cn('input-field', className)} {...props} />;
 }

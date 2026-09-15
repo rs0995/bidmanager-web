@@ -1,19 +1,23 @@
-import React, { useEffect } from 'react';
-import { Clock, TriangleAlert, CheckCircle2, Info } from 'lucide-react';
+import React from 'react';
+import { useNavigate } from 'react-router-dom';
+import { Clock, TriangleAlert, CheckCircle2, Info, Activity, Calendar, Zap, ChevronRight } from 'lucide-react';
 import { ScreenHeader } from '../components/shell/ScreenHeader.jsx';
-import { Toggle } from '../components/common/Toggle.jsx';
 import { EmptyState } from '../components/feedback/EmptyState.jsx';
-import { useAlerts, markAllRead } from '../lib/alerts.js';
-import { useSettings, setSettings } from '../lib/store.js';
-import { requestNotificationPermission, canNotify, startDeadlineChecks, stopDeadlineChecks } from '../lib/deadlineCheck.js';
-import { api } from '../lib/api.js';
-import { useToast } from '../components/feedback/ToastProvider.jsx';
+import { useAlerts, markRead, markAllRead } from '../lib/alerts.js';
+import { cn } from '../lib/cn.js';
 
+// Kinds align with the desktop Client UI's notification `type` set
+// (status / prebid / new) plus this app's extra local sources
+// (deadline / success). See Client UI/src/components/ui/shared.tsx.
+// nicon variant (d/i/s/w) matches the reference artifact's icon-tint set.
 const ICONS = {
-  deadline: { icon: Clock, bg: 'var(--danger-bg)', color: 'var(--danger)' },
-  warning: { icon: TriangleAlert, bg: 'var(--warn-wash, var(--accent-bg))', color: 'var(--warn)' },
-  success: { icon: CheckCircle2, bg: 'var(--accent-bg)', color: 'var(--ok)' },
-  sync: { icon: Info, bg: 'var(--accent-bg)', color: 'var(--accent)' },
+  status: { icon: Activity, variant: 'i' },
+  prebid: { icon: Calendar, variant: 'i' },
+  new: { icon: Zap, variant: 'i' },
+  deadline: { icon: Clock, variant: 'd' },
+  warning: { icon: TriangleAlert, variant: 'w' },
+  success: { icon: CheckCircle2, variant: 's' },
+  sync: { icon: Info, variant: 'i' },
 };
 
 function relativeTime(iso) {
@@ -28,66 +32,53 @@ function relativeTime(iso) {
 
 export function AlertsScreen() {
   const alerts = useAlerts();
-  const { deadlineRemindersOn } = useSettings();
-  const toast = useToast();
+  const navigate = useNavigate();
+  const hasUnread = alerts.some((a) => !a.read);
 
-  useEffect(() => { markAllRead(); }, []);
-
-  useEffect(() => {
-    if (deadlineRemindersOn) {
-      startDeadlineChecks((id) => api.tender(id));
-    } else {
-      stopDeadlineChecks();
-    }
-    return stopDeadlineChecks;
-  }, [deadlineRemindersOn]);
-
-  const toggleReminders = async (next) => {
-    if (next) {
-      const granted = canNotify() ? await requestNotificationPermission() : false;
-      setSettings({ deadlineRemindersOn: true });
-      if (!granted) {
-        toast?.push({ title: 'Reminders on', body: 'Notifications aren’t available here — you’ll still see alerts in this list while the app is open.', type: 'info' });
-      }
-    } else {
-      setSettings({ deadlineRemindersOn: false });
-    }
+  const openAlert = (a) => {
+    markRead(a.id);
+    if (a.tenderId) navigate(`/tenders/${a.tenderId}`);
+    else if (a.orgName) navigate(`/tenders/org/${encodeURIComponent(a.orgName)}?sort_by=published_date&sort_order=desc`);
   };
 
   return (
     <div>
-      <ScreenHeader title="Alerts" />
+      <ScreenHeader
+        title="Alerts"
+        actions={hasUnread && (
+          <button className="text-xs font-semibold" style={{ color: 'var(--accent)', padding: 6, background: 'none', border: 'none', cursor: 'pointer' }} onClick={markAllRead}>
+            Mark all read
+          </button>
+        )}
+      />
       <div className="p-4">
-        <p className="m-0 mb-3 text-xs" style={{ color: 'var(--text-muted)' }}>
-          Local deadline reminders &amp; what changed on the last sync
-        </p>
-        <div className="card p-3.5 flex items-center justify-between gap-3 mb-4">
-          <div>
-            <p className="m-0 text-sm font-semibold">Deadline reminders</p>
-            <p className="m-0 mt-0.5 text-xs" style={{ color: 'var(--text-muted)' }}>
-              On-device notifications at 72h, 24h &amp; 3h before close (while the app is open)
-            </p>
-          </div>
-          <Toggle checked={Boolean(deadlineRemindersOn)} onChange={toggleReminders} />
-        </div>
-
         {alerts.length === 0 ? (
           <EmptyState icon={Info} title="No alerts yet" body="Sync, bookmark deadlines, and checklist progress will show up here." />
         ) : (
-          <div className="card p-1">
+          <div className="panel" style={{ padding: 0 }}>
             {alerts.map((a) => {
               const meta = ICONS[a.kind] || ICONS.sync;
               const Icon = meta.icon;
+              const navigable = Boolean(a.tenderId || a.orgName);
               return (
-                <div key={a.id} className="flex gap-3 p-3" style={{ borderBottom: '1px solid var(--border)' }}>
-                  <span className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0" style={{ background: meta.bg }}>
-                    <Icon size={15} style={{ color: meta.color }} />
+                <button
+                  key={a.id}
+                  className="nitem w-full text-left"
+                  style={{ background: a.read ? undefined : 'var(--row-selected-bg)' }}
+                  onClick={() => openAlert(a)}
+                >
+                  <span className={cn('nicon', meta.variant)}>
+                    <Icon size={15} />
                   </span>
-                  <div className="min-w-0">
-                    <p className="m-0 text-sm leading-snug">{a.message}</p>
-                    <p className="m-0 mt-0.5 text-xs" style={{ color: 'var(--text-muted)' }}>{relativeTime(a.at)}</p>
+                  <div className="min-w-0 flex-1 flex items-center gap-2">
+                    <div className="min-w-0 flex-1">
+                      <p className="nmsg m-0">{a.message}</p>
+                      <p className="ntime m-0">{relativeTime(a.at)}</p>
+                    </div>
+                    {navigable && <ChevronRight size={16} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />}
                   </div>
-                </div>
+                  {!a.read && <span className="unread" />}
+                </button>
               );
             })}
           </div>

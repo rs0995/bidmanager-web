@@ -3,35 +3,31 @@ import { Field, Input, Select } from '../common/Field.jsx';
 import { Button } from '../common/Button.jsx';
 
 export function AddChecklistItemForm({ folders, onAdd, onCancel }) {
-  const [name, setName] = useState('');
-  const [folder, setFolder] = useState(folders[0]);
-  const [note, setNote] = useState('');
+  const [reqFileName, setReqFileName] = useState('');
+  const [subfolder, setSubfolder] = useState(folders[0]);
+  const [description, setDescription] = useState('');
 
   const submit = () => {
-    if (!name.trim()) return;
-    onAdd({ name: name.trim(), folder, note: note.trim() });
-    setName('');
-    setNote('');
+    if (!reqFileName.trim()) return;
+    onAdd({ req_file_name: reqFileName.trim(), subfolder, description: description.trim() });
+    setReqFileName('');
+    setDescription('');
   };
 
   return (
-    <div className="card p-3 mb-3 flex flex-col gap-2">
+    <div className="addbox">
       <Field label="Document name">
-        <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. EMD — DD / BG" autoFocus />
+        <Input className="fin" value={reqFileName} onChange={(e) => setReqFileName(e.target.value)} placeholder="e.g. EMD — DD / BG" autoFocus />
       </Field>
-      <div className="flex gap-2">
-        <div className="flex-1">
-          <Select value={folder} onChange={(e) => setFolder(e.target.value)} aria-label="Section">
-            {folders.map((f) => <option key={f} value={f}>{f}</option>)}
-          </Select>
-        </div>
-        <div className="flex-1">
-          <Input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note (optional)" />
-        </div>
+      <div className="frow">
+        <Select className="fin" value={subfolder} onChange={(e) => setSubfolder(e.target.value)} aria-label="Section">
+          {folders.map((f) => <option key={f} value={f}>{f}</option>)}
+        </Select>
+        <Input className="fin" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Note (optional)" />
       </div>
-      <div className="flex gap-2">
-        <Button variant="ghost" className="flex-1" onClick={onCancel}>Cancel</Button>
-        <Button className="flex-1" onClick={submit}>Add to checklist</Button>
+      <div className="frow">
+        <Button variant="fbtnGhost" onClick={onCancel}>Cancel</Button>
+        <Button variant="fbtnAdd" onClick={submit}>Add to checklist</Button>
       </div>
     </div>
   );

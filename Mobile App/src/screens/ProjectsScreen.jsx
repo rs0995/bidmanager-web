@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from 'react';
+import { useLocation } from 'react-router-dom';
 import { FolderOpen } from 'lucide-react';
 import { ScreenHeader } from '../components/shell/ScreenHeader.jsx';
 import { SegmentedControl } from '../components/common/SegmentedControl.jsx';
@@ -7,6 +8,7 @@ import { EmptyState } from '../components/feedback/EmptyState.jsx';
 import { useProjects } from '../lib/projects.js';
 
 export function ProjectsScreen() {
+  const location = useLocation();
   const [seg, setSeg] = useState('active');
   const projects = useProjects();
 
@@ -19,7 +21,7 @@ export function ProjectsScreen() {
 
   return (
     <div>
-      <ScreenHeader title="Projects" />
+      <ScreenHeader title="Projects" back={Boolean(location.state?.fromCard)} />
       <div className="p-4">
         <p className="m-0 mb-3 text-xs" style={{ color: 'var(--text-muted)' }}>
           Track bids in preparation — add checklist items &amp; attach documents. Stored on this device, synced to your account.

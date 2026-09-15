@@ -33,7 +33,7 @@ function writeJSON(key, value) {
   setRaw(key, JSON.stringify(value));
 }
 
-const SETTINGS_DEFAULTS = { theme: "dark", lastSyncAt: null, appLockEnabled: false, deadlineRemindersOn: false };
+const SETTINGS_DEFAULTS = { theme: "light", lastSyncAt: null, appLockEnabled: false, deadlineRemindersOn: false };
 
 let bookmarksCache = new Set(readJSON(BOOKMARKS_KEY, []).map(Number));
 let bookmarkedOrgsCache = new Set(readJSON(BOOKMARKED_ORGS_KEY, []));

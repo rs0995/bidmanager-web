@@ -11,18 +11,26 @@ export function useWebsites() {
     queryKey: ['websites'],
     queryFn: async () => {
       const map = new Map();
-      let page = 1;
-      let pages = 1;
-      do {
-        const payload = await api.organizations({ page, page_size: 100 });
-        (payload.items || []).forEach((row) => {
+      const addRows = (items) => {
+        (items || []).forEach((row) => {
           if (row.website_id != null && !map.has(row.website_id)) {
             map.set(row.website_id, { id: row.website_id, name: row.website_name });
           }
         });
-        pages = Math.max(1, Number(payload.pages) || 1);
-        page += 1;
-      } while (page <= pages && page <= 20);
+      };
+
+      const first = await api.organizations({ page: 1, page_size: 100 });
+      addRows(first.items);
+      const pages = Math.min(Math.max(1, Number(first.pages) || 1), 20);
+      if (pages > 1) {
+        // Page 1 is already in hand — fetch the rest concurrently instead of
+        // one-at-a-time, since each round trip otherwise adds to the visible
+        // delay before the portal picker has data to show.
+        const rest = await Promise.all(
+          Array.from({ length: pages - 1 }, (_, i) => api.organizations({ page: i + 2, page_size: 100 })),
+        );
+        rest.forEach((payload) => addRows(payload.items));
+      }
       return [...map.values()];
     },
     staleTime: 5 * 60_000,

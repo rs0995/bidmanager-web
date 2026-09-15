@@ -1,0 +1,58 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * "New theme" — ported value-for-value from Mobile App/src/globals.css
+ * (the "BidManager Field" warm-paper / indigo theme already live on the web
+ * client). Lives in its own folder so the original src/global.css (the
+ * theme still active by default) is never edited — see
+ * src/theme-new/README.md for how to switch to this theme and back.
+ *
+ * Same CSS variable names as src/global.css, so tailwind.config.js's
+ * `theme.extend.colors` token map (bg, surface-0..3, accent, ...) needs no
+ * changes to pick these up. Two extra vars (--ok-bg, --warn-bg) exist here
+ * that the old theme doesn't define — see tailwind.config.js for the
+ * additive-only token entries that expose them as `bg-ok-bg` / `bg-warn-bg`.
+ */
+:root {
+  --bg: #f2f1ec;
+  --surface-0: #ffffff;
+  --surface-1: #f6f5f1;
+  --surface-2: #ecebe4;
+  --surface-3: #d3d0c4;
+  --border: #e2e0d7;
+  --text: #1b1d24;
+  --text-muted: #797d8c;
+  --accent: #3a3fd4;
+  --accent-bg: #ececfb;
+  --accent-hover: #2b2fae;
+  --row-selected-bg: rgba(58, 63, 212, 0.06);
+  --danger: #c8324b;
+  --danger-bg: #f8e3e6;
+  --ok: #12805c;
+  --ok-bg: #dcefe4;
+  --warn: #b46a06;
+  --warn-bg: #f2e3ce;
+}
+
+.dark {
+  --bg: #0e0f13;
+  --surface-0: #191b22;
+  --surface-1: #1f222b;
+  --surface-2: #14161c;
+  --surface-3: #363a46;
+  --border: #2b2e38;
+  --text: #f0eff4;
+  --text-muted: #878a98;
+  --accent: #8a8dfb;
+  --accent-bg: #23253a;
+  --accent-hover: #a7a9ff;
+  --row-selected-bg: rgba(138, 141, 251, 0.10);
+  --danger: #e8697f;
+  --danger-bg: #2c1720;
+  --ok: #4bbf95;
+  --ok-bg: rgba(75, 191, 149, 0.14);
+  --warn: #d99a4a;
+  --warn-bg: rgba(217, 154, 74, 0.14);
+}

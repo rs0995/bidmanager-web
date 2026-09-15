@@ -6,6 +6,7 @@ import { useBookmarkedTenders } from '../../hooks/useBookmarks.js';
 import { EmptyState } from '../feedback/EmptyState.jsx';
 
 const BANDS = ['Critical', 'Soon', 'Comfortable'];
+const CHIP_CLASS = { Critical: 'crit', Soon: 'soon', Comfortable: 'ok' };
 
 export function DeadlineGroups() {
   const navigate = useNavigate();
@@ -18,29 +19,30 @@ export function DeadlineGroups() {
 
   const withUrgency = tenders
     .map((t) => ({ t, r: timeRemaining(t.closing_date) }))
-    .filter(({ r }) => !r.expired);
+    .filter(({ r }) => !r.expired)
+    .sort((a, b) => (a.r.totalDays ?? Infinity) - (b.r.totalDays ?? Infinity))
+    .slice(0, 10);
 
   return (
-    <div className="card p-4">
+    <div className="panel">
       <h3 className="m-0 mb-3 text-sm font-bold">Upcoming deadlines</h3>
       {BANDS.map((band) => {
         const rows = withUrgency.filter(({ r }) => urgency(r.totalDays).label === band);
         if (rows.length === 0) return null;
-        const color = urgency(rows[0].r.totalDays).color;
+        const variant = CHIP_CLASS[band];
         return (
-          <div key={band} className="mb-3 last:mb-0">
-            <p className="m-0 mb-1.5 text-[11px] font-bold uppercase tracking-wide" style={{ color }}>{band}</p>
+          <React.Fragment key={band}>
+            <p className={`dband ${variant}`}>{band.toUpperCase()}</p>
             {rows.map(({ t, r }) => (
-              <div key={t.id} className="flex items-center gap-3 py-2 cursor-pointer" onClick={() => navigate(`/tenders/${t.id}`)}>
-                <div className="w-1 self-stretch rounded-full flex-shrink-0" style={{ background: color }} />
-                <div className="min-w-0 flex-1">
-                  <p className="m-0 font-mono text-[10px]" style={{ color: 'var(--accent)' }}>{t.tender_id}</p>
-                  <p className="m-0 text-sm truncate">{t.title}</p>
+              <button key={t.id} className={`drow ${variant}`} onClick={() => navigate(`/tenders/${t.id}`)}>
+                <div className="min-w-0">
+                  <p className="who m-0">{t.tender_id}</p>
+                  <p className="what m-0">{t.title}</p>
                 </div>
-                <span className="text-xs font-semibold flex-shrink-0" style={{ color }}>{r.label}</span>
-              </div>
+                <span className={`dline ${variant}`}>{r.label}</span>
+              </button>
             ))}
-          </div>
+          </React.Fragment>
         );
       })}
     </div>

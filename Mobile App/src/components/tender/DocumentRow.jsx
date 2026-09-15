@@ -1,29 +1,45 @@
 import React from 'react';
-import { FileText, Download, Loader2 } from 'lucide-react';
+import { FileText, Download, Loader2, CheckCircle2, TriangleAlert } from 'lucide-react';
 import { formatBytes, formatDate } from '../../lib/format.js';
 import { useDocumentDownload } from '../../hooks/useDownload.js';
+import { useDocumentsForTender } from '../../lib/documents.js';
+import { useToast } from '../feedback/ToastProvider.jsx';
 
 export function DocumentRow({ tenderId, doc }) {
-  const { download, pendingId } = useDocumentDownload();
-  const pending = pendingId === doc.id;
+  const toast = useToast();
+  const { download, pendingId } = useDocumentDownload(
+    (e) => toast?.push({ title: 'Download failed', body: e?.message, type: 'error' }),
+  );
+  const cacheRows = useDocumentsForTender(tenderId);
+  const cached = cacheRows.find((r) => r.id === doc.id);
+  const status = pendingId === doc.id ? 'downloading' : (cached?.client_status || 'synced');
+
+  const disabled = doc.downloadable === false || status === 'downloading';
+
+  let icon = <Download size={16} />;
+  let iconColor;
+  if (status === 'downloading') icon = <Loader2 size={16} className="animate-spin" />;
+  else if (status === 'downloaded') { icon = <CheckCircle2 size={16} />; iconColor = 'var(--ok)'; }
+  else if (status === 'failed') { icon = <TriangleAlert size={16} />; iconColor = 'var(--danger)'; }
 
   return (
-    <div className="flex items-center gap-3 py-2.5" style={{ borderBottom: '1px solid var(--border)' }}>
-      <FileText size={18} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
-      <div className="min-w-0 flex-1">
-        <p className="m-0 text-sm truncate">{doc.name}</p>
-        <p className="m-0 text-xs" style={{ color: 'var(--text-muted)' }}>
-          {doc.type} · {formatBytes(doc.size_bytes)} · {formatDate(doc.downloaded_at)}
+    <div className="doc">
+      <span className="di"><FileText size={13} style={{ color: 'var(--accent)' }} /></span>
+      <div className="min-w-0">
+        <p className="dn m-0">{doc.name}</p>
+        <p className="dm m-0" style={{ color: status === 'failed' ? 'var(--danger)' : undefined }}>
+          {status === 'failed' && cached?.error
+            ? cached.error
+            : `${doc.type} · ${formatBytes(doc.size_bytes)} · ${formatDate(doc.downloaded_at)}`}
         </p>
       </div>
       <button
-        className="btn-ghost"
-        style={{ minHeight: 0, padding: 8 }}
-        disabled={!doc.downloadable || pending}
+        style={{ color: iconColor, background: 'none', border: 'none', cursor: disabled ? 'not-allowed' : 'pointer', padding: 4 }}
+        disabled={disabled}
         onClick={() => download(tenderId, doc)}
-        aria-label="Download"
+        aria-label={status === 'failed' ? 'Retry download' : status === 'downloaded' ? 'Download again' : 'Download'}
       >
-        {pending ? <Loader2 size={18} className="animate-spin" /> : <Download size={18} />}
+        {icon}
       </button>
     </div>
   );

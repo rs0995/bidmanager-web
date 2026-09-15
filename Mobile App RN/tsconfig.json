@@ -3,6 +3,9 @@
   "compilerOptions": {
     "strict": true,
     "paths": {
+      "@/constants/colors": [
+        "./src/theme-new/colors"
+      ],
       "@/*": [
         "./src/*"
       ],

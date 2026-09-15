@@ -111,12 +111,14 @@ export default function TenderDetailScreen() {
 
         <View className="gap-2 mb-4">
           <Pressable
-            className="rounded-[11px] min-h-11 flex-row items-center justify-center gap-1.5"
-            style={{ backgroundColor: bookmarked ? colors.warn : colors.accent }}
+            className="rounded-[11px] min-h-11 flex-row items-center justify-center gap-1.5 bg-surface-0"
+            style={{ borderWidth: 1.5, borderColor: bookmarked ? colors.warn : colors.accent }}
             onPress={handleToggle}
           >
-            <Star size={15} color="#fff" />
-            <Text className="text-white text-sm font-semibold">{bookmarked ? "Bookmarked" : "Bookmark"}</Text>
+            <Star size={15} color={bookmarked ? colors.warn : colors.accent} fill={bookmarked ? colors.warn : "none"} />
+            <Text className="text-sm font-semibold" style={{ color: bookmarked ? colors.warn : colors.accent }}>
+              {bookmarked ? "Bookmarked" : "Bookmark"}
+            </Text>
           </Pressable>
           <View className="flex-row gap-2">
             <Pressable
