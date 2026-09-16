@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "bidmanager-mobile",
+    "name": "Bid Manager",
     "slug": "bidmanager-mobile",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -10,7 +10,7 @@
     "ios": {
       "icon": "./assets/images/icon.png",
       "bundleIdentifier": "com.raku.s0995.bidmanager-mobile",
-      "buildNumber": "3"
+      "buildNumber": "4"
     },
     "android": {
       "adaptiveIcon": {
