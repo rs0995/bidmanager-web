@@ -9,7 +9,8 @@
     "userInterfaceStyle": "automatic",
     "ios": {
       "icon": "./assets/expo.icon",
-      "bundleIdentifier": "com.raku.s0995.bidmanager-mobile"
+      "bundleIdentifier": "com.raku.s0995.bidmanager-mobile",
+      "buildNumber": "2"
     },
     "android": {
       "adaptiveIcon": {
