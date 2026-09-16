@@ -5,6 +5,7 @@ import { ScreenHeader } from "@/components/shell/ScreenHeader";
 import { EmptyState } from "@/components/feedback/EmptyState";
 import { useAlerts, markRead, markAllRead } from "@/lib/alerts";
 import { useThemeColors, hexToRgba } from "@/constants/colors";
+import { cn } from "@/lib/cn";
 
 const ICON_KEYS: Record<string, { icon: any; bg: "accentBg" | "dangerBg"; color: "ok" | "accent" | "danger" | "warn" }> = {
   status: { icon: Activity, bg: "accentBg", color: "ok" },
@@ -52,16 +53,17 @@ export default function AlertsScreen() {
           <EmptyState icon={Info} title="No alerts yet" body="Sync, bookmark deadlines, and checklist progress will show up here." />
         ) : (
           <View className="bg-surface-0 border border-border rounded-[14px] p-1">
-            {alerts.map((a: any) => {
+            {alerts.map((a: any, i: number) => {
               const meta = ICON_KEYS[a.kind] || ICON_KEYS.sync;
               const Icon = meta.icon;
               const navigable = Boolean(a.tenderId || a.orgName);
               const bgColor = meta.bg === "dangerBg" ? colors.dangerBg : colors.accentBg;
               const iconColor = colors[meta.color];
+              const isLast = i === alerts.length - 1;
               return (
                 <Pressable
                   key={a.id}
-                  className="flex-row items-center gap-3 p-3 border-b border-border"
+                  className={cn("flex-row items-center gap-3 p-3", !isLast && "border-b border-border")}
                   style={!a.read ? { backgroundColor: hexToRgba(colors.accent, 0.07) } : undefined}
                   onPress={() => openAlert(a)}
                 >

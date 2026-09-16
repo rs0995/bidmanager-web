@@ -81,7 +81,7 @@ export default function OverviewScreen() {
                   icon={Clock}
                   label="Closing this week"
                   value={closingThisWeek}
-                  to="/tenders?closing5=1"
+                  to="/tenders/closing-this-week"
                   variant="danger"
                 />
               </View>

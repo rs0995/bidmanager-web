@@ -6,6 +6,7 @@ import { EmptyState } from "@/components/feedback/EmptyState";
 import { SpinningIcon } from "@/components/common/SpinningIcon";
 import { useAllDownloads, isPdfDoc, isZipDoc } from "@/lib/documents";
 import { useThemeColors } from "@/constants/colors";
+import { cn } from "@/lib/cn";
 
 const META: Record<string, { icon: any; spin?: boolean; label: string; color: "accent" | "ok" | "danger" }> = {
   requested: { icon: Loader2, spin: true, label: "Requested…", color: "accent" },
@@ -36,11 +37,12 @@ export default function DownloadsScreen() {
           <EmptyState icon={DownloadCloud} title="No downloads yet" body="Request or download tender documents and they will show up here." />
         ) : (
           <View className="bg-surface-0 border border-border rounded-[14px] p-1">
-            {rows.map((d: any) => {
+            {rows.map((d: any, i: number) => {
               const meta = META[d.client_status] || META.requested;
               const Icon = meta.icon;
               const color = colors[meta.color];
               const isOpenable = d.client_status === "downloaded" && (isPdfDoc(d) || isZipDoc(d));
+              const isLast = i === rows.length - 1;
               const openDocument = () => {
                 if (isPdfDoc(d)) {
                   router.push({ pathname: "/documents/[id]/view", params: { id: String(d.id) } });
@@ -51,7 +53,7 @@ export default function DownloadsScreen() {
               return (
                 <Pressable
                   key={d.id}
-                  className="flex-row items-start gap-3 p-3 border-b border-border"
+                  className={cn("flex-row items-start gap-3 p-3", !isLast && "border-b border-border")}
                   onPress={openDocument}
                   disabled={!isOpenable}
                 >

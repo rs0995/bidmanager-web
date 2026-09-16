@@ -44,13 +44,7 @@ export default function TenderDetailScreen() {
   const color = urgencyColor(u.key, colors);
 
   const handleToggle = () => {
-    const nowOn = toggle(tender.id);
-    if (nowOn) {
-      toast?.push({
-        title: "Bookmarked",
-        body: "This also keeps its documents updated automatically (a recurring background check every few hours).",
-      });
-    }
+    toggle(tender.id);
   };
 
   const handleAddToProject = () => {

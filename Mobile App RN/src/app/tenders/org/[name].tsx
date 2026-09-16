@@ -24,6 +24,13 @@ export default function OrganizationTendersScreen() {
   const colors = useThemeColors();
 
   const query = useTenders({ organization: orgName, website_id: websiteId, sort_by: sortBy, sort_order: sortOrder });
+  // Client-side safety net for the sort the server was already asked for —
+  // guarantees correct order even if the server doesn't apply sort_by/sort_order.
+  const sortFn = useCallback((a: any, b: any) => {
+    if (sortBy !== "published_date") return 0;
+    const cmp = String(a.published_date || "").localeCompare(String(b.published_date || ""));
+    return sortOrder === "asc" ? cmp : -cmp;
+  }, [sortBy, sortOrder]);
   const pending = useOrgRequestPending(orgId);
   const cooldownActive = lastScrapedAt > 0 && (Date.now() - lastScrapedAt * 1000) < COOLDOWN_MS;
 
@@ -61,6 +68,7 @@ export default function OrganizationTendersScreen() {
       <ScreenHeader title={orgName} back actions={headerRequestButton} />
       <TenderList
         query={query}
+        sortFn={sortFn}
         renderEmpty={() => (
           <EmptyState
             icon={Globe}

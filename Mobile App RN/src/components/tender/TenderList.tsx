@@ -9,6 +9,7 @@ import { ErrorState } from "@/components/feedback/ErrorState";
 type TenderListProps = {
   query: any;
   filterFn?: (t: any) => boolean;
+  sortFn?: (a: any, b: any) => number;
   onRowsChange?: (rows: any[]) => void;
   renderEmpty?: () => React.ReactNode;
   ListHeaderComponent?: React.ComponentType<any> | React.ReactElement | null;
@@ -17,11 +18,16 @@ type TenderListProps = {
 // RN has no IntersectionObserver — FlatList's onEndReached is the native
 // equivalent for infinite scroll, and also gives virtualization for free
 // (the web version rendered every fetched row into the DOM).
-export function TenderList({ query, filterFn, onRowsChange, renderEmpty, ListHeaderComponent }: TenderListProps) {
+export function TenderList({ query, filterFn, sortFn, onRowsChange, renderEmpty, ListHeaderComponent }: TenderListProps) {
   const { data, isLoading, isError, error, fetchNextPage, hasNextPage, isFetchingNextPage, refetch } = query;
 
   const allRows = useMemo(() => (data ? data.pages.flatMap((p: any) => p.items) : []), [data]);
-  const rows = useMemo(() => (filterFn ? allRows.filter(filterFn) : allRows), [allRows, filterFn]);
+  // Sorted client-side as a safety net: the server is asked to sort (via
+  // sort_by/sort_order query params where callers pass them), but pages are
+  // fetched independently, and if the server doesn't honor the params this
+  // still guarantees the union of loaded rows renders in the right order.
+  const sortedRows = useMemo(() => (sortFn ? allRows.slice().sort(sortFn) : allRows), [allRows, sortFn]);
+  const rows = useMemo(() => (filterFn ? sortedRows.filter(filterFn) : sortedRows), [sortedRows, filterFn]);
 
   useEffect(() => { onRowsChange?.(allRows); }, [allRows, onRowsChange]);
 
