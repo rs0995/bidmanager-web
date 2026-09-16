@@ -1,10 +1,11 @@
 import { useEffect } from "react";
 import { View, Text, Pressable } from "react-native";
+import { router } from "expo-router";
 import Animated, { useAnimatedStyle, useSharedValue, withRepeat, withTiming, Easing } from "react-native-reanimated";
 import { FileText, Download, Loader2, CheckCircle2, TriangleAlert } from "lucide-react-native";
 import { formatBytes, formatDate } from "@/lib/format";
 import { useDocumentDownload } from "@/hooks/useDownload";
-import { useDocumentsForTender } from "@/lib/documents";
+import { useDocumentsForTender, isPdfDoc, isZipDoc } from "@/lib/documents";
 import { useToast } from "@/components/feedback/ToastProvider";
 import { useThemeColors } from "@/constants/colors";
 
@@ -32,13 +33,27 @@ export function DocumentRow({ tenderId, doc }: { tenderId: number; doc: any }) {
   const status = pendingId === doc.id ? "downloading" : (cached?.client_status || "synced");
 
   const disabled = doc.downloadable === false || status === "downloading";
+  const fileLike = { file_name: doc.name };
+  const isOpenable = status === "downloaded" && (isPdfDoc(fileLike) || isZipDoc(fileLike));
 
   let iconColor = colors.textMuted;
   if (status === "downloaded") iconColor = colors.ok;
   else if (status === "failed") iconColor = colors.danger;
 
+  const openDocument = () => {
+    if (isPdfDoc(fileLike)) {
+      router.push({ pathname: "/documents/[id]/view", params: { id: String(doc.id) } });
+    } else if (isZipDoc(fileLike)) {
+      router.push({ pathname: "/documents/[id]/archive", params: { id: String(doc.id) } });
+    }
+  };
+
   return (
-    <View className="flex-row items-center gap-3 py-2.5 border-b border-border">
+    <Pressable
+      className="flex-row items-center gap-3 py-2.5 border-b border-border"
+      onPress={openDocument}
+      disabled={!isOpenable}
+    >
       <FileText size={18} color={colors.textMuted} />
       <View className="flex-1">
         <Text className="text-sm text-text" numberOfLines={1}>{doc.name}</Text>
@@ -64,6 +79,6 @@ export function DocumentRow({ tenderId, doc }: { tenderId: number; doc: any }) {
           <Download size={18} color={iconColor} />
         )}
       </Pressable>
-    </View>
+    </Pressable>
   );
 }

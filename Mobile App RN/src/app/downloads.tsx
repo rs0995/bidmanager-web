@@ -1,9 +1,10 @@
-import { View, Text, ScrollView } from "react-native";
+import { View, Text, ScrollView, Pressable } from "react-native";
+import { router } from "expo-router";
 import { Loader2, CheckCircle2, TriangleAlert, DownloadCloud } from "lucide-react-native";
 import { ScreenHeader } from "@/components/shell/ScreenHeader";
 import { EmptyState } from "@/components/feedback/EmptyState";
 import { SpinningIcon } from "@/components/common/SpinningIcon";
-import { useAllDownloads } from "@/lib/documents";
+import { useAllDownloads, isPdfDoc, isZipDoc } from "@/lib/documents";
 import { useThemeColors } from "@/constants/colors";
 
 const META: Record<string, { icon: any; spin?: boolean; label: string; color: "accent" | "ok" | "danger" }> = {
@@ -39,8 +40,21 @@ export default function DownloadsScreen() {
               const meta = META[d.client_status] || META.requested;
               const Icon = meta.icon;
               const color = colors[meta.color];
+              const isOpenable = d.client_status === "downloaded" && (isPdfDoc(d) || isZipDoc(d));
+              const openDocument = () => {
+                if (isPdfDoc(d)) {
+                  router.push({ pathname: "/documents/[id]/view", params: { id: String(d.id) } });
+                } else if (isZipDoc(d)) {
+                  router.push({ pathname: "/documents/[id]/archive", params: { id: String(d.id) } });
+                }
+              };
               return (
-                <View key={d.id} className="flex-row items-start gap-3 p-3 border-b border-border">
+                <Pressable
+                  key={d.id}
+                  className="flex-row items-start gap-3 p-3 border-b border-border"
+                  onPress={openDocument}
+                  disabled={!isOpenable}
+                >
                   <SpinningIcon spinning={Boolean(meta.spin)}>
                     <Icon size={16} color={color} style={{ marginTop: 2 }} />
                   </SpinningIcon>
@@ -57,7 +71,7 @@ export default function DownloadsScreen() {
                       {relativeTime(d.downloaded_at || d.requested_at || d.updated_at)}
                     </Text>
                   </View>
-                </View>
+                </Pressable>
               );
             })}
           </View>

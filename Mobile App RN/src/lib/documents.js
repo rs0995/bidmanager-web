@@ -1,8 +1,19 @@
 import { useSyncExternalStore } from "react";
-import { File, Paths } from "expo-file-system";
+import { File, Directory, Paths } from "expo-file-system";
+import { unzipSync } from "fflate";
 import * as Sharing from "expo-sharing";
 import { getRaw, setRaw } from "./kv.js";
 import { api } from "./api.js";
+
+const DOCUMENTS_DIR_NAME = "documents";
+const ZIP_EXTRACTED_DIR_NAME = "zip-extracted";
+
+export function isPdfDoc(doc) {
+  return /\.pdf$/i.test(doc?.file_name || "");
+}
+export function isZipDoc(doc) {
+  return /\.zip$/i.test(doc?.file_name || "");
+}
 
 // Local-first document + download cache, backed by the shared kv.js
 // AsyncStorage mirror with the same cached-snapshot + useSyncExternalStore
@@ -194,24 +205,106 @@ export function resumePendingDownloadJobs() {
   }
 }
 
-// Per-file download: RN has no browser download mechanism, so this pulls
-// the file into the app cache directory via expo-file-system and hands it
-// to the OS share sheet (expo-sharing), letting the person save it to
-// Files, send it elsewhere, or open it in another app.
+// Per-file download: RN has no browser download mechanism, so this pulls the
+// file into persistent app storage (Paths.document, not the OS-purgeable
+// cache dir) via expo-file-system. PDFs and ZIPs are viewable/browsable right
+// in the app (see documents/[id]/view.tsx and archive.tsx), so those are just
+// saved. Everything else (Word/Excel/etc.) still gets handed to the OS share
+// sheet (expo-sharing) immediately, same as before.
 // doc: { id, tender_db_id, tender_id, file_name }
 export async function downloadDocument(doc) {
   upsertDocument({ id: doc.id, client_status: "downloading", error: null });
   try {
     const { url } = await api.downloadRequest(doc.tender_db_id, doc.id);
-    const dest = new File(Paths.cache, doc.file_name || `document-${doc.id}`);
+    const destDir = new Directory(Paths.document, DOCUMENTS_DIR_NAME, String(doc.id));
+    destDir.create({ intermediates: true, idempotent: true });
+    const dest = new File(destDir, doc.file_name || `document-${doc.id}`);
     const file = await File.downloadFileAsync(url, dest, { idempotent: true });
-    if (await Sharing.isAvailableAsync()) {
+    if (!isPdfDoc(doc) && !isZipDoc(doc) && (await Sharing.isAvailableAsync())) {
       await Sharing.shareAsync(file.uri);
     }
-    return upsertDocument({ id: doc.id, client_status: "downloaded", downloaded_at: new Date().toISOString(), error: null });
+    return upsertDocument({
+      id: doc.id,
+      client_status: "downloaded",
+      local_uri: file.uri,
+      downloaded_at: new Date().toISOString(),
+      error: null,
+    });
   } catch (e) {
     upsertDocument({ id: doc.id, client_status: "failed", error: e?.message || String(e) });
     throw e;
+  }
+}
+
+// Returns a `File` for a downloaded document's persisted copy, or null if it
+// hasn't been downloaded (or was removed by Clear Cache).
+export function getLocalFile(doc) {
+  const row = getDocument(doc?.id) ?? doc;
+  if (!row?.local_uri) return null;
+  const file = new File(row.local_uri);
+  return file.exists ? file : null;
+}
+
+// Extracts a downloaded ZIP into its own folder (once — subsequent calls
+// reuse the existing extraction) and returns the destination `Directory`.
+// Entries are read with fflate (pure JS, no native unzip dependency) since
+// expo-file-system has no unzip of its own.
+export async function ensureZipExtracted(doc) {
+  const row = getDocument(doc?.id) ?? doc;
+  const zipFile = getLocalFile(row);
+  if (!zipFile) throw new Error("This document has not been downloaded yet.");
+
+  const destDir = new Directory(Paths.document, ZIP_EXTRACTED_DIR_NAME, String(row.id));
+  if (destDir.exists && destDir.list().length > 0) {
+    return destDir;
+  }
+  destDir.create({ intermediates: true, idempotent: true });
+
+  const bytes = zipFile.bytesSync();
+  const entries = unzipSync(bytes);
+  for (const [entryPath, data] of Object.entries(entries)) {
+    if (!data || entryPath.endsWith("/")) continue; // directory entries have no bytes
+    const parts = entryPath.split("/").filter(Boolean);
+    const name = parts.pop();
+    let dir = destDir;
+    for (const part of parts) {
+      dir = new Directory(dir, part);
+      dir.create({ intermediates: true, idempotent: true });
+    }
+    new File(dir, name).write(data);
+  }
+  return destDir;
+}
+
+// Flattens an extracted ZIP's directory tree into a list of file entries
+// (nested folders are represented by "/" in `name`, not returned separately).
+function walkFiles(dir, prefix = "") {
+  const out = [];
+  for (const entry of dir.list()) {
+    const label = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (typeof entry.list === "function") {
+      out.push(...walkFiles(entry, label));
+    } else {
+      out.push({ name: label, uri: entry.uri, size: entry.size ?? null });
+    }
+  }
+  return out;
+}
+
+// Extracts a ZIP (if not already extracted) and returns its contents as a
+// flat list of { name, uri, size } file entries, sorted by name.
+export async function listZipEntries(doc) {
+  const destDir = await ensureZipExtracted(doc);
+  return walkFiles(destDir).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// Deletes every persisted document file and extracted ZIP folder. Called
+// from Clear Cache (lib/localCache.js) so it reclaims real device storage,
+// not just the bm.documents KV index.
+export function deleteAllLocalDocumentFiles() {
+  for (const name of [DOCUMENTS_DIR_NAME, ZIP_EXTRACTED_DIR_NAME]) {
+    const dir = new Directory(Paths.document, name);
+    if (dir.exists) dir.delete();
   }
 }
 
