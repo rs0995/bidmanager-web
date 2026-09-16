@@ -16,7 +16,7 @@ export function Chip({ active, children, onPress }: ChipProps) {
   const content = Children.map(children, (child) => {
     if (typeof child === "string" || typeof child === "number") {
       return (
-        <Text className={cn("text-[15px] font-medium text-text-muted", active && "text-accent")}>
+        <Text className={cn("text-[14px] font-medium text-text-muted", active && "text-accent")}>
           {child}
         </Text>
       );

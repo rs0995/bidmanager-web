@@ -39,7 +39,7 @@ export function TenderCard({ tender }: { tender: any }) {
         <Text className="text-text font-semibold">{fmtINR(tender.tender_value)}</Text>
       </Text>
       {tender.organization && (
-        <Text className="text-sm text-text-muted" numberOfLines={1}>{tender.organization}</Text>
+        <Text className="text-[14px] text-text-muted" numberOfLines={1}>{tender.organization}</Text>
       )}
     </Pressable>
   );

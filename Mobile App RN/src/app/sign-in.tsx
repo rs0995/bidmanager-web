@@ -39,7 +39,7 @@ export default function SignInScreen() {
       <ScrollView contentContainerClassName="flex-grow justify-center px-6 py-8">
         <View className="mb-8 items-center">
           <Text className="text-2xl font-bold text-accent">BID MANAGER</Text>
-          <Text className="mt-1 text-sm text-text-muted">
+          <Text className="mt-1 text-[14px] text-text-muted">
             {mode === "register" ? "Create your account" : "Sign in to continue"}
           </Text>
         </View>

@@ -1,6 +1,7 @@
 import { Pressable, View, Text } from "react-native";
 import { router } from "expo-router";
 import { Clock } from "lucide-react-native";
+import { ProgressRing } from "@/components/common/ProgressRing";
 import { fmtINR, timeRemaining, urgency } from "@/lib/format";
 import { getChecklist } from "@/lib/projects";
 import { useThemeColors, urgencyColor, hexToRgba } from "@/constants/colors";
@@ -19,12 +20,22 @@ export function ProjectCard({ project }: { project: any }) {
       className="bg-surface-0 border border-border rounded-2xl p-4 flex-row items-center gap-3"
       onPress={() => router.push(`/projects/${project.id}` as any)}
     >
+      <View className="items-center">
+        <ProgressRing pct={total ? done / total : 0} size={44}>
+          <Text className="text-xs font-bold text-text">{done}/{total}</Text>
+        </ProgressRing>
+        <Text className="mt-1 text-[14px] text-text-muted">Docs Ready</Text>
+      </View>
       <View className="flex-1">
-        <Text className="text-lg font-semibold text-text" numberOfLines={2}>{project.title}</Text>
-        <Text className="mt-1 text-base text-text-muted" numberOfLines={1}>
+        {project.source_tender_id && (
+          <Text className="text-[12px] font-bold text-accent" style={{ fontFamily: "IBMPlexMono_600SemiBold" }}>
+            {project.source_tender_id}
+          </Text>
+        )}
+        <Text className="mt-0.5 text-lg font-semibold text-text" numberOfLines={3}>{project.title}</Text>
+        <Text className="mt-1 text-[14px] text-text-muted" numberOfLines={1}>
           {project.client_name} · {fmtINR(project.project_value)}
         </Text>
-        <Text className="mt-0.5 font-mono text-base text-text-muted">{done}/{total} docs ready</Text>
       </View>
       <View
         className="flex-row items-center gap-1.5 px-3 py-1.5 rounded-full"

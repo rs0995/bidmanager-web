@@ -122,7 +122,7 @@ export default function ProjectDetailScreen() {
           </View>
           {project.prebid && (
             <View className="px-2.5 py-1 rounded-full bg-surface-2">
-              <Text className="text-xs font-medium text-text-muted">Pre-bid {formatDate(project.prebid)}</Text>
+              <Text className="text-[14px] font-medium text-text-muted">Pre-bid {formatDate(project.prebid)}</Text>
             </View>
           )}
         </View>
@@ -137,7 +137,7 @@ export default function ProjectDetailScreen() {
         </View>
         {project.description && (
           <View className="bg-surface-0 border border-border rounded-[14px] p-3 mb-4">
-            <Text className="mb-1.5 text-xs font-semibold text-text-muted">Work description</Text>
+            <Text className="mb-1.5 text-[14px] font-semibold text-text-muted">Work description</Text>
             <Text className="text-sm text-text">{project.description}</Text>
           </View>
         )}
@@ -170,10 +170,10 @@ export default function ProjectDetailScreen() {
         )}
 
         <View className="flex-row items-center justify-between mb-2">
-          <Text className="text-sm font-semibold text-text">Document checklist</Text>
+          <Text className="text-[17px] font-semibold text-text">Document checklist</Text>
           <Pressable className="px-2.5 py-1.5 rounded-lg bg-accent-bg flex-row items-center gap-1" onPress={() => setShowAdd((v) => !v)}>
-            <Plus size={12} color={colors.accent} />
-            <Text className="text-xs font-semibold text-accent">Add item</Text>
+            <Plus size={14} color={colors.accent} />
+            <Text className="text-[14px] font-semibold text-accent">Add item</Text>
           </Pressable>
         </View>
         {showAdd && (
@@ -187,12 +187,12 @@ export default function ProjectDetailScreen() {
         {grouped.map(([folder, items]) => (
           <View key={folder} className="mb-4">
             <View className="flex-row items-center gap-2 mb-2">
-              <Text className="text-xs font-semibold text-text-muted">
+              <Text className="text-[14px] font-semibold text-text-muted">
                 🗂️ {folder} <Text className="font-medium">{items.filter((i: any) => i.status === "Completed").length}/{items.length}</Text>
               </Text>
             </View>
             {items.length === 0 ? (
-              <Text className="text-xs italic text-text-muted">No items in this section yet</Text>
+              <Text className="text-[14px] italic text-text-muted">No items in this section yet</Text>
             ) : items.map((item: any) => (
               <ChecklistItem key={item.id} item={item} onPreview={() => setPreviewItem(item)} />
             ))}
@@ -215,7 +215,7 @@ export default function ProjectDetailScreen() {
           </>
         )}
       >
-        <Text className="text-sm text-text-muted">
+        <Text className="text-[14px] text-text-muted">
           "{project.title}" will move to the Archived tab in Projects. You can restore it from there at any time.
         </Text>
       </Sheet>

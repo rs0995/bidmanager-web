@@ -93,12 +93,12 @@ export default function OverviewScreen() {
                   Pipeline value — bids in preparation
                 </Text>
                 <View className="rounded-full bg-surface-2 px-3 py-1.5">
-                  <Text className="text-sm text-text-muted">{activeProjects.length} projects</Text>
+                  <Text className="text-[14px] text-text-muted">{activeProjects.length} projects</Text>
                 </View>
               </View>
               <Text className="text-[29px] text-text" style={{ letterSpacing: -0.5, fontFamily: "BricolageGrotesque_700Bold" }}>
                 {pipelineAmount}
-                {pipelineUnit ? <Text className="text-sm font-medium text-text-muted"> {pipelineUnit}</Text> : null}
+                {pipelineUnit ? <Text className="text-[14px] font-medium text-text-muted"> {pipelineUnit}</Text> : null}
               </Text>
             </View>
 
@@ -114,7 +114,7 @@ export default function OverviewScreen() {
                 <Text className="text-sm font-semibold" style={{ color: isStale ? colors.accent : colors.text }}>
                   {isStale ? "Sync tenders" : "Up to date"}
                 </Text>
-                <Text className="mt-0.5 text-xs text-text-muted">
+                <Text className="mt-0.5 text-[14px] text-text-muted">
                   {lastSyncAt
                     ? `Last synced ${new Date(lastSyncAt).toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}`
                     : "Never synced yet"}

@@ -13,7 +13,7 @@ export function ErrorState({ message, onRetry }: ErrorStateProps) {
   return (
     <View className="flex flex-col items-center justify-center gap-3 px-8 py-16">
       <TriangleAlert size={32} color={colors.danger} />
-      <Text className="text-sm text-text-muted text-center">
+      <Text className="text-[14px] text-text-muted text-center">
         {message || "Something went wrong."}
       </Text>
       {onRetry && <Button variant="secondary" onPress={onRetry}>Retry</Button>}

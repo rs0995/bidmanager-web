@@ -46,14 +46,14 @@ export default function DownloadsScreen() {
                   </SpinningIcon>
                   <View className="flex-1">
                     <Text className="text-sm text-text" numberOfLines={1}>{d.tender_title || d.tender_id || "Untitled tender"}</Text>
-                    <Text className="text-xs text-text-muted" numberOfLines={1}>{d.file_name || "All documents"}</Text>
+                    <Text className="text-[14px] text-text-muted" numberOfLines={1}>{d.file_name || "All documents"}</Text>
                     {d.client_status === "failed" && d.error && (
                       <Text className="text-xs text-danger" numberOfLines={1}>{d.error}</Text>
                     )}
                   </View>
                   <View className="items-end">
                     <Text className="text-xs font-medium" style={{ color }}>{meta.label}</Text>
-                    <Text className="text-[10px] text-text-muted">
+                    <Text className="text-[14px] text-text-muted">
                       {relativeTime(d.downloaded_at || d.requested_at || d.updated_at)}
                     </Text>
                   </View>

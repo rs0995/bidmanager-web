@@ -22,7 +22,7 @@ export default function ProjectsScreen() {
     <View className="flex-1 bg-bg">
       <ScreenHeader title="Projects" />
       <ScrollView contentContainerClassName="p-4">
-        <Text className="mb-3 text-xs text-text-muted">
+        <Text className="mb-3 text-[14px] text-text-muted">
           Track bids in preparation — add checklist items & attach documents. Stored on this device, synced to your account.
         </Text>
         <SegmentedControl

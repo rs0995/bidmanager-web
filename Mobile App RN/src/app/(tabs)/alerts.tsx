@@ -70,7 +70,7 @@ export default function AlertsScreen() {
                   </View>
                   <View className="flex-1">
                     <Text className="text-sm text-text leading-snug">{a.message}</Text>
-                    <Text className="mt-0.5 text-xs text-text-muted">{relativeTime(a.at)}</Text>
+                    <Text className="mt-0.5 text-[14px] text-text-muted">{relativeTime(a.at)}</Text>
                   </View>
                   {!a.read && <View className="w-2 h-2 rounded-full bg-accent" />}
                   {navigable && <ChevronRight size={16} color={colors.textMuted} />}

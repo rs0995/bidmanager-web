@@ -13,7 +13,7 @@ type FieldProps = {
 export function Field({ label, error, children }: FieldProps) {
   return (
     <View className="flex flex-col gap-1.5">
-      {label && <Text className="text-xs font-medium text-text-muted">{label}</Text>}
+      {label && <Text className="text-[14px] font-medium text-text-muted">{label}</Text>}
       {children}
       {error && <Text className="text-xs text-danger">{error}</Text>}
     </View>

@@ -24,13 +24,13 @@ export function BookmarksStatCard({ orgCount, tenderCount, to }: BookmarksStatCa
       </View>
       <View className="flex-row items-stretch gap-3">
         <View className="items-center">
-          <Text className="text-[23px] text-text" style={{ letterSpacing: -0.4, fontFamily: "BricolageGrotesque_700Bold" }}>{orgCount}</Text>
-          <Text className="mt-0.5 text-xs text-text-muted">Orgs</Text>
+          <Text className="text-[25px] text-text" style={{ letterSpacing: -0.4, fontFamily: "BricolageGrotesque_700Bold" }}>{orgCount}</Text>
+          <Text className="mt-0.5 text-[14px] text-text-muted">Orgs</Text>
         </View>
         <View style={{ width: 1.5, backgroundColor: colors.border }} />
         <View className="items-center">
-          <Text className="text-[23px] text-text" style={{ letterSpacing: -0.4, fontFamily: "BricolageGrotesque_700Bold" }}>{tenderCount}</Text>
-          <Text className="mt-0.5 text-xs text-text-muted">Tenders</Text>
+          <Text className="text-[25px] text-text" style={{ letterSpacing: -0.4, fontFamily: "BricolageGrotesque_700Bold" }}>{tenderCount}</Text>
+          <Text className="mt-0.5 text-[14px] text-text-muted">Tenders</Text>
         </View>
       </View>
     </Pressable>

@@ -26,7 +26,7 @@ export function SegmentedControl({ options, value, onChange }: SegmentedControlP
             )}
           >
             {opt.icon && <opt.icon size={14} color={active ? colors.text : colors.textMuted} />}
-            <Text className={cn("text-[13px] text-text-muted", active && "text-text font-semibold")}>
+            <Text className={cn("text-[14px] text-text-muted", active && "text-text font-semibold")}>
               {opt.label}
             </Text>
           </Pressable>

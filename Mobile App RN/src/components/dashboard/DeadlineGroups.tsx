@@ -43,7 +43,7 @@ export function DeadlineGroups() {
                 <View className="w-1 self-stretch rounded-full" style={{ backgroundColor: color }} />
                 <View className="flex-1">
                   <Text
-                    className="text-xs uppercase text-text-muted"
+                    className="text-[14px] uppercase text-text-muted"
                     style={{ fontFamily: "IBMPlexMono_400Regular", letterSpacing: 0.5 }}
                   >
                     {t.tender_id}

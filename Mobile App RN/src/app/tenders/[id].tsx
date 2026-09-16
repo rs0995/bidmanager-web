@@ -11,7 +11,7 @@ import { ErrorState } from "@/components/feedback/ErrorState";
 import { useTender } from "@/hooks/useTender";
 import { useTenderDocuments } from "@/hooks/useTenderDocuments";
 import { useBookmarkToggle } from "@/hooks/useBookmarks";
-import { fmtINR, formatDate, timeRemaining, urgency } from "@/lib/format";
+import { fmtINR, formatDate, formatDateTimeIST, timeRemaining, urgency } from "@/lib/format";
 import { useToast } from "@/components/feedback/ToastProvider";
 import { createProjectFromTender } from "@/lib/projects";
 import { syncTenderDocuments, downloadAllForTender } from "@/lib/documents";
@@ -80,43 +80,42 @@ export default function TenderDetailScreen() {
     <View className="flex-1 bg-bg">
       <ScreenHeader title="Tender detail" back />
       <ScrollView contentContainerClassName="p-4">
-        <Text className="font-mono text-xs text-accent">{tender.tender_id}</Text>
-        <Text className="mt-1.5 mb-2 text-lg font-bold leading-snug text-text">{tender.title}</Text>
+        <Text className="font-mono text-[13px] font-bold" style={{ color: colors.accentHover }}>{tender.tender_id}</Text>
+        <Text className="mt-1 mb-2 text-lg font-bold leading-snug text-text">{tender.title}</Text>
         <View className="flex-row gap-2 mb-4">
           <View className="px-2.5 py-1 rounded-full" style={{ backgroundColor: expired ? colors.surface2 : hexToRgba(color, 0.16) }}>
             <Text className="text-xs font-semibold" style={{ color: expired ? colors.textMuted : color }}>
-              {expired ? "Closed" : `Closes ${label}`}
+              {expired ? "Closed" : label}
             </Text>
           </View>
-          {tender.pre_bid_meeting_date && (
-            <View className="px-2.5 py-1 rounded-full bg-surface-2">
-              <Text className="text-xs font-medium text-text-muted">Pre-bid {formatDate(tender.pre_bid_meeting_date)}</Text>
-            </View>
-          )}
         </View>
 
-        <View className="bg-surface-0 border border-border rounded-[14px] p-3 mb-4 flex-row flex-wrap">
-          <View className="w-1/2 pr-2"><FieldRow stacked label="Tender value" value={fmtINR(tender.tender_value)} /></View>
-          <View className="w-1/2 pl-2"><FieldRow stacked label="EMD" value={fmtINR(tender.emd)} /></View>
-          <View className="w-1/2 pr-2"><FieldRow stacked label="Category" value={tender.category} /></View>
-          <View className="w-1/2 pl-2"><FieldRow stacked label="Location" value={tender.location} /></View>
-          <View className="w-1/2 pr-2"><FieldRow stacked label="Published date" value={formatDate(tender.published_date)} /></View>
-          <View className="w-1/2 pl-2"><FieldRow stacked label="Bid opening date" value={formatDate(tender.opening_date)} /></View>
-        </View>
         <View className="bg-surface-0 border border-border rounded-[14px] p-3 mb-4">
-          <FieldRow label="Closing" value={formatDate(tender.closing_date)} />
-          <FieldRow label="Pre-bid meeting" value={tender.pre_bid_meeting_date} />
+          <View className="flex-row flex-wrap">
+            <View className="w-1/2 pr-2"><FieldRow stacked label="Tender value" value={fmtINR(tender.tender_value)} /></View>
+            <View className="w-1/2 pl-2"><FieldRow stacked label="EMD" value={fmtINR(tender.emd)} /></View>
+            <View className="w-1/2 pr-2"><FieldRow stacked label="Category" value={tender.category} /></View>
+            <View className="w-1/2 pl-2"><FieldRow stacked label="Location" value={tender.location} /></View>
+            <View className="w-1/2 pr-2"><FieldRow stacked label="Published date" value={formatDate(tender.published_date)} /></View>
+            <View className="w-1/2 pl-2"><FieldRow stacked label="Bid opening date" value={formatDate(tender.opening_date)} /></View>
+          </View>
+          <FieldRow label="Closing" value={formatDateTimeIST(tender.closing_date)} />
+          <FieldRow label="Pre-bid meeting" value={formatDate(tender.pre_bid_meeting_date)} />
           <FieldRow label="Organisation chain" value={tender.organization} />
         </View>
 
         <View className="gap-2 mb-4">
           <Pressable
-            className="rounded-[11px] min-h-11 flex-row items-center justify-center gap-1.5 bg-surface-0"
-            style={{ borderWidth: 1.5, borderColor: bookmarked ? colors.warn : colors.accent }}
+            className="rounded-[11px] min-h-11 flex-row items-center justify-center gap-1.5"
+            style={{
+              borderWidth: 1.5,
+              borderColor: bookmarked ? colors.warn : colors.accent,
+              backgroundColor: bookmarked ? colors.warn : colors.surface0,
+            }}
             onPress={handleToggle}
           >
-            <Star size={15} color={bookmarked ? colors.warn : colors.accent} fill={bookmarked ? colors.warn : "none"} />
-            <Text className="text-sm font-semibold" style={{ color: bookmarked ? colors.warn : colors.accent }}>
+            <Star size={15} color={bookmarked ? "#fff" : colors.accent} fill={bookmarked ? "#fff" : "none"} />
+            <Text className="text-sm font-semibold" style={{ color: bookmarked ? "#fff" : colors.accent }}>
               {bookmarked ? "Bookmarked" : "Bookmark"}
             </Text>
           </Pressable>

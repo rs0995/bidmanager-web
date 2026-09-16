@@ -51,7 +51,7 @@ function MoreRow({ icon: Icon, label, value, onPress, disabled, spin }: {
         </SpinningIcon>
       </View>
       <Text className="flex-1 text-sm text-text">{label}</Text>
-      {value && <Text className="font-mono text-xs text-text-muted">{value}</Text>}
+      {value && <Text className="font-mono text-[14px] text-text-muted">{value}</Text>}
     </Pressable>
   );
 }
@@ -148,7 +148,7 @@ export default function MoreScreen() {
     <View className="flex-1 bg-bg">
       <ScreenHeader title="More" />
       <ScrollView contentContainerClassName="p-4">
-        <Text className="mb-3 text-xs text-text-muted">Sync, connection & workspace</Text>
+        <Text className="mb-3 text-[14px] text-text-muted">Sync, connection & workspace</Text>
 
         <View className="bg-surface-0 border border-border rounded-[14px] mb-3">
           <MoreRow icon={RefreshCw} label="Sync tenders" value={sync.isPending ? "Syncing…" : relativeTime(lastSyncAt)} onPress={() => sync.mutate()} disabled={sync.isPending} spin={sync.isPending} />
@@ -179,7 +179,7 @@ export default function MoreScreen() {
             </View>
             <View className="flex-1">
               <Text className="text-sm text-text">Deadline reminders</Text>
-              <Text className="mt-0.5 text-xs text-text-muted">
+              <Text className="mt-0.5 text-[14px] text-text-muted">
                 On-device notifications at 72h, 24h & 3h before close (while the app is open)
               </Text>
             </View>
@@ -189,7 +189,7 @@ export default function MoreScreen() {
 
         <View className="bg-surface-0 border border-border rounded-[14px] p-3 mb-3">
           <Text className="text-sm font-medium text-text">{user?.display_name || user?.email || "Signed in"}</Text>
-          {user?.email && <Text className="text-xs mt-0.5 text-text-muted">{user.email}</Text>}
+          {user?.email && <Text className="text-[14px] mt-0.5 text-text-muted">{user.email}</Text>}
           <View className="flex-row gap-2 mt-2">
             <Button variant="secondary" className="flex-1" onPress={() => setPwOpen(true)}>Change password</Button>
             <Button variant="danger" className="flex-1" onPress={() => signOut.mutate()} disabled={signOut.isPending}>
@@ -206,7 +206,7 @@ export default function MoreScreen() {
         </View>
 
         <View className="mb-2">
-          <Text className="mb-2 text-xs font-semibold uppercase tracking-wide text-text-muted">Appearance</Text>
+          <Text className="mb-2 text-[14px] font-semibold uppercase tracking-wide text-text-muted">Appearance</Text>
           <SegmentedControl
             value={theme}
             onChange={setTheme}
@@ -218,7 +218,7 @@ export default function MoreScreen() {
           />
         </View>
 
-        <Text className="text-xs mt-4 text-text-muted">
+        <Text className="text-[14px] mt-4 text-text-muted">
           Bookmarks and projects sync to your account. Attached documents and app-lock stay on this device only.
         </Text>
       </ScrollView>
@@ -250,7 +250,7 @@ export default function MoreScreen() {
           </>
         )}
       >
-        <Text className="text-sm text-text-muted">
+        <Text className="text-[14px] text-text-muted">
           Removes downloaded document info, alerts, and other data cached on this device. Nothing is deleted from your account — bookmarks and projects are re-synced from the cloud right after.
         </Text>
       </Sheet>

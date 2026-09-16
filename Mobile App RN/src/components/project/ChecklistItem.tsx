@@ -29,25 +29,25 @@ export function ChecklistItem({ item, onPreview }: { item: any; onPreview: (item
       onPress={() => { if (attachedThisSession) onPreview(item); }}
     >
       <View
-        className="w-[18px] h-[18px] rounded-md border items-center justify-center mt-0.5"
+        className="w-[22px] h-[22px] rounded-md border items-center justify-center mt-0.5"
         style={{ backgroundColor: done ? colors.ok : "transparent", borderColor: done ? colors.ok : colors.border }}
       >
-        {done && <Check size={12} color="#fff" />}
+        {done && <Check size={14} color="#fff" />}
       </View>
       <View className="flex-1">
-        <Text className="text-sm font-medium text-text">{item.req_file_name}</Text>
-        {item.description && <Text className="mt-0.5 text-xs text-text-muted">{item.description}</Text>}
+        <Text className="text-[17px] font-medium text-text">{item.req_file_name}</Text>
+        {item.description && <Text className="mt-0.5 text-[14px] text-text-muted">{item.description}</Text>}
         {hasFile && (
           <View className="flex-row items-center gap-2 mt-1 flex-wrap">
-            <Paperclip size={11} color={colors.accent} />
-            <Text className="text-xs font-medium text-accent" numberOfLines={1} style={{ maxWidth: 150 }}>
+            <Paperclip size={13} color={colors.accent} />
+            <Text className="text-[14px] font-medium text-accent" numberOfLines={1} style={{ maxWidth: 150 }}>
               {item.attachment.name}
             </Text>
-            <Text className="text-xs text-text-muted">
+            <Text className="text-[14px] text-text-muted">
               {attachedThisSession ? "tap to preview" : "attached on another session/device"}
             </Text>
             <Pressable onPress={() => removeAttachment(item.id)}>
-              <Text className="text-xs font-semibold text-danger">Remove</Text>
+              <Text className="text-[14px] font-semibold text-danger">Remove</Text>
             </Pressable>
           </View>
         )}
@@ -57,12 +57,12 @@ export function ChecklistItem({ item, onPreview }: { item: any; onPreview: (item
         style={{ backgroundColor: hasFile ? colors.accentBg : colors.accentBg }}
         onPress={pick}
       >
-        <Text className="text-xs font-semibold" style={{ color: hasFile ? colors.ok : colors.accent }}>
+        <Text className="text-[14px] font-semibold" style={{ color: hasFile ? colors.ok : colors.accent }}>
           {hasFile ? "Attached" : "Attach"}
         </Text>
       </Pressable>
       <Pressable className="p-1" onPress={() => setConfirmDelete(true)} accessibilityLabel="Delete item">
-        <X size={16} color={colors.danger} />
+        <X size={19} color={colors.danger} />
       </Pressable>
 
       <Sheet
@@ -76,7 +76,7 @@ export function ChecklistItem({ item, onPreview }: { item: any; onPreview: (item
           </>
         )}
       >
-        <Text className="text-sm text-text-muted">
+        <Text className="text-[14px] text-text-muted">
           "{item.req_file_name}" and its attachment (if any) will be removed from this device and the next sync. This cannot be undone.
         </Text>
       </Sheet>

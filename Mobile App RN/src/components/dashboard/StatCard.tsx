@@ -31,8 +31,8 @@ export function StatCard({ icon: Icon, label, value, to, variant = "accent", ale
       <View className={cn("w-[39px] h-[39px] rounded-[11px] items-center justify-center mb-2", VARIANT_BG[variant])}>
         <Icon size={18} color={colors[variant]} />
       </View>
-      <Text className="text-[23px] text-text" style={{ letterSpacing: -0.4, fontFamily: "BricolageGrotesque_700Bold" }}>{value}</Text>
-      <Text className="mt-0.5 text-xs text-text-muted">{label}</Text>
+      <Text className="text-[25px] text-text" style={{ letterSpacing: -0.4, fontFamily: "BricolageGrotesque_700Bold" }}>{value}</Text>
+      <Text className="mt-0.5 text-[14px] text-text-muted">{label}</Text>
     </Pressable>
   );
 }

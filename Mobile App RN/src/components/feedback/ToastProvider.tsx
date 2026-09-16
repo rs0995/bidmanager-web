@@ -54,7 +54,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
               <Icon size={18} color={color} style={{ marginTop: 1 }} />
               <View className="flex-1">
                 <Text className="text-sm font-semibold text-text">{t.title}</Text>
-                {t.body && <Text className="text-xs text-text-muted mt-0.5">{t.body}</Text>}
+                {t.body && <Text className="text-[14px] text-text-muted mt-0.5">{t.body}</Text>}
                 {t.action && (
                   <Pressable
                     className="mt-1.5"

@@ -38,7 +38,7 @@ export function FilePreview({ file, onClose }: { file: FileAsset | null; onClose
         ) : (
           <View className="bg-surface-0 border border-border rounded-[14px] p-6 items-center max-w-xs gap-3">
             <Text className="text-sm font-medium text-text text-center mb-1">{file.name}</Text>
-            <Text className="text-xs text-text-muted text-center">
+            <Text className="text-[14px] text-text-muted text-center">
               No inline preview for this file type.
             </Text>
             <Button variant="secondary" onPress={() => Sharing.shareAsync(file.uri)}>

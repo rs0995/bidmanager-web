@@ -35,12 +35,12 @@ export function OrganizationCard({ org, showWebsite = false }: OrganizationCardP
       <View className="flex-1">
         <Text className="text-sm font-medium text-text" numberOfLines={1}>
           {org.name}
-          {unavailable && <Text className="text-xs text-text-muted"> (unavailable)</Text>}
+          {unavailable && <Text className="text-[14px] text-text-muted"> (unavailable)</Text>}
         </Text>
         <View className="flex-row gap-2 mt-1">
-          {showWebsite && <Text className="text-xs text-text-muted">{org.website_name}</Text>}
+          {showWebsite && <Text className="text-[14px] text-text-muted">{org.website_name}</Text>}
           {org.last_scraped_at ? (
-            <Text className="text-xs text-text-muted">Last updated {formatDateTimeIST(org.last_scraped_at * 1000)}</Text>
+            <Text className="text-[14px] text-text-muted">Last updated {formatDateTimeIST(org.last_scraped_at * 1000)}</Text>
           ) : null}
         </View>
       </View>

@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { View } from "react-native";
 import Svg, { Circle } from "react-native-svg";
 import Animated, {
   useAnimatedStyle, useSharedValue, withRepeat, withTiming, Easing,
@@ -9,9 +10,10 @@ type ProgressRingProps = {
   pct?: number;
   size?: number;
   indeterminate?: boolean;
+  children?: React.ReactNode;
 };
 
-export function ProgressRing({ pct = 0, size = 40, indeterminate = false }: ProgressRingProps) {
+export function ProgressRing({ pct = 0, size = 40, indeterminate = false, children }: ProgressRingProps) {
   const colors = useThemeColors();
   const r = (size - 6) / 2;
   const c = 2 * Math.PI * r;
@@ -39,6 +41,21 @@ export function ProgressRing({ pct = 0, size = 40, indeterminate = false }: Prog
     </Svg>
   );
 
-  if (!indeterminate) return ring;
-  return <Animated.View style={animatedStyle}>{ring}</Animated.View>;
+  if (!children) {
+    return indeterminate ? <Animated.View style={animatedStyle}>{ring}</Animated.View> : ring;
+  }
+
+  return (
+    <View style={{ width: size, height: size }}>
+      {indeterminate ? <Animated.View style={animatedStyle}>{ring}</Animated.View> : ring}
+      <View
+        style={{
+          position: "absolute", left: 0, right: 0, top: 0, bottom: 0,
+          alignItems: "center", justifyContent: "center",
+        }}
+      >
+        {children}
+      </View>
+    </View>
+  );
 }

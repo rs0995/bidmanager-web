@@ -37,7 +37,7 @@ export function CustomFilterMenu({ open, rows, active, onAdd }: CustomFilterMenu
           if (available.length === 0) return null;
           return (
             <Fragment key={group.heading}>
-              <Text className="px-2 pt-2 pb-1 text-[10px] font-bold uppercase tracking-wide text-text-muted">
+              <Text className="px-2 pt-2 pb-1 text-[14px] font-bold uppercase tracking-wide text-text-muted">
                 {group.heading}
               </Text>
               {available.map(([key, label]) => (

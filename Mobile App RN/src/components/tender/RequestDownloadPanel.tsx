@@ -29,7 +29,7 @@ export function RequestDownloadPanel({ tender }: { tender: any }) {
     return (
       <View className="bg-surface-0 border border-border rounded-[14px] p-4 flex-row items-center gap-3">
         <ProgressRing indeterminate size={32} />
-        <Text className="flex-1 text-sm text-text-muted">
+        <Text className="flex-1 text-[14px] text-text-muted">
           Fetching documents from the source portal… this can take a few minutes. You can leave this screen.
         </Text>
       </View>
@@ -38,7 +38,7 @@ export function RequestDownloadPanel({ tender }: { tender: any }) {
 
   return (
     <View className="bg-surface-0 border border-border rounded-[14px] p-4 items-center gap-2">
-      <Text className="text-sm text-text-muted text-center">
+      <Text className="text-[14px] text-text-muted text-center">
         No documents downloaded yet for this tender.
       </Text>
       <Button onPress={handleStart} disabled={starting}>{starting ? "Starting…" : "Request download"}</Button>
