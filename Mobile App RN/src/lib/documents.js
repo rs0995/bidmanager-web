@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import * as FileSystem from "expo-file-system";
+import { File, Paths } from "expo-file-system";
 import * as Sharing from "expo-sharing";
 import { getRaw, setRaw } from "./kv.js";
 import { api } from "./api.js";
@@ -203,10 +203,10 @@ export async function downloadDocument(doc) {
   upsertDocument({ id: doc.id, client_status: "downloading", error: null });
   try {
     const { url } = await api.downloadRequest(doc.tender_db_id, doc.id);
-    const dest = FileSystem.cacheDirectory + (doc.file_name || `document-${doc.id}`);
-    const { uri } = await FileSystem.downloadAsync(url, dest);
+    const dest = new File(Paths.cache, doc.file_name || `document-${doc.id}`);
+    const file = await File.downloadFileAsync(url, dest, { idempotent: true });
     if (await Sharing.isAvailableAsync()) {
-      await Sharing.shareAsync(uri);
+      await Sharing.shareAsync(file.uri);
     }
     return upsertDocument({ id: doc.id, client_status: "downloaded", downloaded_at: new Date().toISOString(), error: null });
   } catch (e) {

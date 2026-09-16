@@ -1,4 +1,4 @@
-import * as FileSystem from "expo-file-system";
+import { File, Paths } from "expo-file-system";
 import * as Sharing from "expo-sharing";
 import { api } from "./api.js";
 
@@ -32,10 +32,10 @@ export async function exportTendersCsv(filters = {}, { maxPages = 200 } = {}) {
   const csv = [header, ...lines].join("\n");
 
   const fileName = `tenders-${new Date().toISOString().slice(0, 10)}.csv`;
-  const uri = FileSystem.cacheDirectory + fileName;
-  await FileSystem.writeAsStringAsync(uri, csv, { encoding: FileSystem.EncodingType.UTF8 });
+  const file = new File(Paths.cache, fileName);
+  file.write(csv);
   if (await Sharing.isAvailableAsync()) {
-    await Sharing.shareAsync(uri, { mimeType: "text/csv", dialogTitle: fileName });
+    await Sharing.shareAsync(file.uri, { mimeType: "text/csv", dialogTitle: fileName });
   }
   return rows.length;
 }

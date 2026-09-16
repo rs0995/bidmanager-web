@@ -10,7 +10,7 @@
     "ios": {
       "icon": "./assets/images/icon.png",
       "bundleIdentifier": "com.raku.s0995.bidmanager-mobile",
-      "buildNumber": "4",
+      "buildNumber": "5",
       "infoPlist": {
         "CFBundleDisplayName": "BM Pro"
       }
