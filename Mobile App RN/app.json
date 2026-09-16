@@ -36,7 +36,8 @@
         }
       ],
       "expo-secure-store",
-      "expo-sharing"
+      "expo-sharing",
+      "./plugins/withoutPushEntitlement.js"
     ],
     "experiments": {
       "typedRoutes": true,
