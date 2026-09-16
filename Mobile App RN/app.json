@@ -12,7 +12,7 @@
       "bundleIdentifier": "com.raku.s0995.bidmanager-mobile",
       "buildNumber": "4",
       "infoPlist": {
-        "CFBundleDisplayName": "Bid Manager"
+        "CFBundleDisplayName": "BM Pro"
       }
     },
     "android": {
