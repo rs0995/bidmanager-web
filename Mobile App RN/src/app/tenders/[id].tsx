@@ -90,18 +90,42 @@ export default function TenderDetailScreen() {
           </View>
         </View>
 
-        <View className="bg-surface-0 border border-border rounded-[14px] p-3 mb-4">
-          <View className="flex-row flex-wrap">
-            <View className="w-1/2 pr-2"><FieldRow stacked label="Tender value" value={fmtINR(tender.tender_value)} /></View>
-            <View className="w-1/2 pl-2"><FieldRow stacked label="EMD" value={fmtINR(tender.emd)} /></View>
-            <View className="w-1/2 pr-2"><FieldRow stacked label="Category" value={tender.category} /></View>
-            <View className="w-1/2 pl-2"><FieldRow stacked label="Location" value={tender.location} /></View>
-            <View className="w-1/2 pr-2"><FieldRow stacked label="Published date" value={formatDate(tender.published_date)} /></View>
-            <View className="w-1/2 pl-2"><FieldRow stacked label="Bid opening date" value={formatDate(tender.opening_date)} /></View>
+        <View className="bg-surface-0 border border-border rounded-[14px] mb-4 overflow-hidden">
+          <View className="flex-row border-b border-border">
+            <View className="w-1/2 py-2.5 px-3 border-r border-border">
+              <Text className="text-[14px] text-text-muted">Tender value</Text>
+              <Text className="mt-1 text-sm font-medium text-text">{fmtINR(tender.tender_value)}</Text>
+            </View>
+            <View className="w-1/2 py-2.5 px-3">
+              <Text className="text-[14px] text-text-muted">EMD</Text>
+              <Text className="mt-1 text-sm font-medium text-text">{fmtINR(tender.emd)}</Text>
+            </View>
           </View>
-          <FieldRow label="Closing" value={formatDateTimeIST(tender.closing_date)} />
-          <FieldRow label="Pre-bid meeting" value={formatDate(tender.pre_bid_meeting_date)} />
-          <FieldRow label="Organisation chain" value={tender.organization} />
+          <View className="flex-row border-b border-border">
+            <View className="w-1/2 py-2.5 px-3 border-r border-border">
+              <Text className="text-[14px] text-text-muted">Category</Text>
+              <Text className="mt-1 text-sm font-medium text-text">{tender.category || "—"}</Text>
+            </View>
+            <View className="w-1/2 py-2.5 px-3">
+              <Text className="text-[14px] text-text-muted">Location</Text>
+              <Text className="mt-1 text-sm font-medium text-text">{tender.location || "—"}</Text>
+            </View>
+          </View>
+          <View className="flex-row border-b border-border">
+            <View className="w-1/2 py-2.5 px-3 border-r border-border">
+              <Text className="text-[14px] text-text-muted">Published date</Text>
+              <Text className="mt-1 text-sm font-medium text-text">{formatDate(tender.published_date)}</Text>
+            </View>
+            <View className="w-1/2 py-2.5 px-3">
+              <Text className="text-[14px] text-text-muted">Bid opening date</Text>
+              <Text className="mt-1 text-sm font-medium text-text">{formatDate(tender.opening_date)}</Text>
+            </View>
+          </View>
+          <View className="px-3">
+            <FieldRow stacked label="Closing" value={formatDateTimeIST(tender.closing_date)} />
+            <FieldRow stacked label="Pre-bid meeting" value={formatDate(tender.pre_bid_meeting_date)} />
+            <FieldRow stacked label="Organisation chain" value={tender.organization} />
+          </View>
         </View>
 
         <View className="gap-2 mb-4">
