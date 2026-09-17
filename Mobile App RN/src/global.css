@@ -29,7 +29,8 @@
   --warn: #d97706;
 }
 
-.dark {
+/* `.dark:root`, not `.dark` — see the note in theme-new/global.css. */
+.dark:root {
   --bg: #0c0e14;
   --surface-0: #11141c;
   --surface-1: #181c28;

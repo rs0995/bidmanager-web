@@ -36,7 +36,16 @@
   --warn-bg: #f2e3ce;
 }
 
-.dark {
+/*
+ * NativeWind v4 resolves dark-mode CSS variables from `.dark:root`, not a
+ * bare `.dark` — the latter is read as "an element whose className contains
+ * dark", which nothing in an RN tree ever has, so every override below was
+ * silently ignored and only the JS palette (theme-new/colors.js, read via
+ * useThemeColors) ever switched. That mismatch is what left dark mode
+ * applying to a handful of inline-styled spots while every `bg-bg` /
+ * `bg-surface-0` / `text-text` className stayed on the light values.
+ */
+.dark:root {
   --bg: #0e0f13;
   --surface-0: #191b22;
   --surface-1: #1f222b;

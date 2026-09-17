@@ -1,0 +1,37 @@
+{
+  "name": "bidmanager-control-shell",
+  "version": "1.0.4",
+  "private": true,
+  "description": "Electron wrapper for the BidManager Control admin console",
+  "main": "main.cjs",
+  "scripts": {
+    "electron:dev": "node ../../node_modules/concurrently/dist/bin/concurrently.js -k \"npm --prefix .. run dev\" \"node ../../node_modules/wait-on/bin/wait-on http-get://127.0.0.1:5174 && node ../../node_modules/cross-env/src/bin/cross-env.js ELECTRON_DEV=1 ELECTRON_RENDERER_URL=http://127.0.0.1:5174 BIDMANAGER_PORT=8090 node ../../node_modules/electron/cli.js .\"",
+    "electron:dist": "node ../../node_modules/electron-builder/cli.js --win nsis"
+  },
+  "build": {
+    "appId": "com.bidmanager.control",
+    "productName": "BidManager Control",
+    "electronVersion": "33.4.11",
+    "directories": {
+      "output": "../installer/current"
+    },
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "package.json"
+    ],
+    "extraResources": [
+      { "from": "../dist", "to": "frontend/dist" },
+      { "from": "../build/admin-backend", "to": "backend" }
+    ],
+    "win": {
+      "target": ["nsis"],
+      "artifactName": "BidManagerControl-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": true
+    }
+  }
+}
