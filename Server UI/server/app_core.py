@@ -3131,7 +3131,6 @@ class ScraperBackend:
                                 loc = "N/A"
                                 cat = "N/A"
                                 prebid = "N/A"
-                                published = "N/A"
                                 work_desc = "N/A"
                                 d_soup = None
                                 
@@ -3165,34 +3164,13 @@ class ScraperBackend:
                                             d_soup,
                                             ["Pre Bid Meeting Date", "Pre-Bid Meeting Date"]
                                         ) or "N/A"
-                                        published = ScraperBackend.get_detail_by_label(
-                                            d_soup,
-                                            ["Published Date", "e-Published Date"]
-                                        ) or "N/A"
                                         work_desc = ScraperBackend.get_detail_by_label(
                                             d_soup,
                                             ["Work Description", "Description of Work", "Work Desc"]
                                         ) or "N/A"
-                                        # Prefer the tender's own detail page for critical dates over the
-                                        # listing table — it's the authoritative source and stays correct
-                                        # even if the listing columns shift.
-                                        detail_closing = ScraperBackend.get_detail_by_label(
-                                            d_soup,
-                                            ["Bid Submission End Date", "Bid Submission Closing Date", "Closing Date"]
-                                        )
-                                        if detail_closing:
-                                            closing_date = detail_closing
-                                        detail_opening = ScraperBackend.get_detail_by_label(
-                                            d_soup,
-                                            ["Bid Opening Date", "Technical Bid Opening Date"]
-                                        )
-                                        if detail_opening:
-                                            opening_date = detail_opening
                                     page_parse += time.perf_counter() - _ts
                                 except:
                                     page_parse += time.perf_counter() - _ts
-                                if not published or str(published).strip().upper() in {"N/A", "NA", "-"}:
-                                    published = published_date or "N/A"
                                 prebid_count, corrigendum_count = ScraperBackend.extract_prebid_corrigendum_counts(d_soup)
 
                                 title_text = ScraperBackend.derive_tender_title(listing_title_text, d_soup)
@@ -3202,9 +3180,17 @@ class ScraperBackend:
                                 if t_id_norm and t_id_norm.upper() != "N/A":
                                     org_seen_ids.add(t_id_norm)
                                 
+                                # closing_date/opening_date/published_date all come from the listing
+                                # table only (never re-derived from the detail page): get_detail_by_label
+                                # searches the WHOLE detail page with fuzzy "contains" matching and
+                                # returns the first hit, which can land on a corrigendum/amendment
+                                # section's own date instead of the tender's real one — that mismatch
+                                # was producing wrong closing/published dates (and identical bogus
+                                # times on both) for tenders with corrigenda. See backend/app_core.py,
+                                # which never overrides closing_date/opening_date this way either.
                                 tenders_to_save.append((
                                     website_id, org_name, t_id, title_text, val, emd, closing_date, opening_date,
-                                    full_link, loc, cat, prebid, published, work_desc, prebid_count, corrigendum_count
+                                    full_link, loc, cat, prebid, published_date, work_desc, prebid_count, corrigendum_count
                                 ))
 
                     # Save batch
@@ -4045,17 +4031,19 @@ class ScraperBackend:
 
         # (column, label variations, allow_contains) — mirrors fetch_tenders_logic's
         # detail-page extraction so a tender-scoped refresh and the org-wide scrape
-        # source the same fields the same way.
+        # source the same fields the same way. closing_date/opening_date/
+        # published_date are deliberately NOT refreshed here: get_detail_by_label
+        # fuzzy-matches against the whole page and can land on a corrigendum
+        # section's own date instead of the tender's real one, which was
+        # corrupting already-correct dates on refresh — those three columns are
+        # only ever set from the listing table in fetch_tenders_logic now.
         detail_fields = (
             ("emd", ["EMD Amount In â‚¹", "EMD Amount (in Rs.)", "EMD Amount In", "EMD Amount", "EMD"], True),
             ("tender_value", ["Tender Value In â‚¹", "Tender Value In Rs.", "Tender Value In", "Tender Value"], True),
             ("location", ["Location", "Work Location", "Place of Work"], True),
             ("tender_category", ["Tender Category"], False),
             ("pre_bid_meeting_date", ["Pre Bid Meeting Date", "Pre-Bid Meeting Date"], True),
-            ("published_date", ["Published Date", "e-Published Date"], True),
             ("work_description", ["Work Description", "Description of Work", "Work Desc"], True),
-            ("closing_date", ["Bid Submission End Date", "Bid Submission Closing Date", "Closing Date"], True),
-            ("opening_date", ["Bid Opening Date", "Technical Bid Opening Date"], True),
         )
 
         log_to_gui(f"Refreshing details for {len(targets)} tender(s)...")
