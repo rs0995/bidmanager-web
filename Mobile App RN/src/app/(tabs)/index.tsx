@@ -71,7 +71,7 @@ export default function OverviewScreen() {
                 <StatCard icon={Globe} label="Tenders synced" value={stats.active_tenders} to="/tenders" variant="accent" />
               </View>
               <View className="flex-1 basis-[47%]">
-                <StatCard icon={FolderOpen} label="Active projects" value={activeProjects.length} to="/projects" variant="ok" />
+                <StatCard icon={FolderOpen} label="Active projects" value={activeProjects.length} to="/projects" variant="ok" indentValue />
               </View>
               <View className="flex-1 basis-[47%]">
                 <BookmarksStatCard orgCount={bookmarkedOrgNames.size} tenderCount={bookmarkedIds.size} to="/bookmarks" />
@@ -83,6 +83,7 @@ export default function OverviewScreen() {
                   value={closingThisWeek}
                   to="/tenders/closing-this-week"
                   variant="danger"
+                  indentValue
                 />
               </View>
             </View>
