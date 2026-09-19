@@ -35,6 +35,10 @@ export default function AlertsScreen() {
   const openAlert = (a: any) => {
     markRead(a.id);
     if (a.tenderId) router.push(`/tenders/${a.tenderId}` as any);
+    // Bulk "N new tenders" alerts carry the ids the server reported as new —
+    // open a screen with exactly those. Alerts created before that field
+    // existed have no ids and fall through to the org's tender list.
+    else if (a.newTenderIds?.length) router.push(`/new-tenders/${a.id}` as any);
     else if (a.orgName) router.push(`/tenders/org/${encodeURIComponent(a.orgName)}?sort_by=published_date&sort_order=desc` as any);
   };
 

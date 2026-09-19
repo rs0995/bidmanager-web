@@ -39,11 +39,24 @@ export function getAlerts() {
   return alertsCache;
 }
 
-export function addAlert({ kind, message, tenderId, orgName }) {
+export function getAlert(id) {
+  return alertsCache.find((a) => a.id === Number(id)) || null;
+}
+
+// A bulk "N new tenders added under <org>" alert carries the ids the server
+// reported as new, so the alert can open a screen showing exactly those
+// tenders (there is no server filter for "tenders first seen after X").
+// Capped so a huge first sync can't bloat the persisted alert list.
+const MAX_NEW_TENDER_IDS = 300;
+
+export function addAlert({ kind, message, tenderId, orgName, newTenderIds }) {
   const entry = {
     id: nextId++, kind, message, at: new Date().toISOString(), read: false,
     tenderId: tenderId ?? null, orgName: orgName ?? null,
   };
+  if (Array.isArray(newTenderIds) && newTenderIds.length > 0) {
+    entry.newTenderIds = newTenderIds.slice(0, MAX_NEW_TENDER_IDS);
+  }
   alertsCache = [entry, ...alertsCache].slice(0, MAX_ALERTS);
   writeJSON(ALERTS_KEY, alertsCache);
   emit();

@@ -189,7 +189,12 @@ async function fetchServerChanges() {
       const list = items || [];
       if (list.length > 10) {
         count += 1;
-        addAlert({ kind: "new", message: `${list.length} new tenders added under ${org}.`, orgName: org });
+        addAlert({
+          kind: "new",
+          message: `${list.length} new tenders added under ${org}.`,
+          orgName: org,
+          newTenderIds: list.map((t) => t.id),
+        });
       } else {
         list.forEach((t) => {
           count += 1;

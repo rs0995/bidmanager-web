@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { View, Text, Pressable, ScrollView, Linking } from "react-native";
 import { useLocalSearchParams, router } from "expo-router";
-import { Star, ExternalLink, Plus, DownloadCloud } from "lucide-react-native";
+import { Star, ExternalLink, Plus, DownloadCloud, RefreshCw } from "lucide-react-native";
 import { ScreenHeader } from "@/components/shell/ScreenHeader";
+import { SpinningIcon } from "@/components/common/SpinningIcon";
 import { FieldRow } from "@/components/tender/FieldRow";
 import { DocumentRow } from "@/components/tender/DocumentRow";
 import { RequestDownloadPanel } from "@/components/tender/RequestDownloadPanel";
@@ -14,7 +15,10 @@ import { useBookmarkToggle } from "@/hooks/useBookmarks";
 import { fmtINR, formatDate, formatDateTimeIST, timeRemaining, urgency } from "@/lib/format";
 import { useToast } from "@/components/feedback/ToastProvider";
 import { createProjectFromTender } from "@/lib/projects";
-import { syncTenderDocuments, downloadAllForTender } from "@/lib/documents";
+import { syncTenderDocuments, downloadAllForTender, useDocumentsForTender } from "@/lib/documents";
+import { getTenderSyncGate, requestTenderUpdate, useTenderUpdatePending } from "@/lib/tenderUpdates";
+import { queryClient } from "@/lib/queryClient";
+import { api } from "@/lib/api";
 import { useThemeColors, urgencyColor, hexToRgba } from "@/constants/colors";
 
 export default function TenderDetailScreen() {
@@ -25,6 +29,13 @@ export default function TenderDetailScreen() {
   const toast = useToast();
   const colors = useThemeColors();
   const [downloadingAll, setDownloadingAll] = useState(false);
+  const [startingUpdate, setStartingUpdate] = useState(false);
+  // Hooks stay above the early returns below (rules of hooks).
+  const localDocs = useDocumentsForTender(Number(id));
+  const updatePending = useTenderUpdatePending(Number(id));
+  // The sync button is only for tenders with documents on this device; the
+  // "-tenderId" placeholder row (first-time request in flight) doesn't count.
+  const hasDownloadedDocs = localDocs.some((r: any) => r.id > 0 && r.client_status === "downloaded");
 
   useEffect(() => {
     if (tender && docsPage?.items?.length) syncTenderDocuments(tender, docsPage.items);
@@ -46,6 +57,67 @@ export default function TenderDetailScreen() {
   const handleToggle = () => {
     toggle(tender.id);
   };
+
+  const handleSyncUpdates = async () => {
+    if (updatePending || startingUpdate) return;
+    setStartingUpdate(true);
+    try {
+      // Fresh copy, not the cached one, so a newly issued corrigendum is seen.
+      const fresh: any = await queryClient.fetchQuery({
+        queryKey: ["tender", Number(tender.id)],
+        queryFn: () => api.tender(tender.id),
+        staleTime: 0,
+      });
+      const gate = getTenderSyncGate(fresh);
+      if (!gate.allowed) {
+        const when = new Date(gate.lastSyncAt as number).toLocaleString("en-IN", {
+          day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit",
+        });
+        toast?.push({
+          title: "No new updates",
+          body: `Documents were last checked ${when}, and nothing new has been issued since.`,
+          type: "info",
+        });
+        return;
+      }
+      await requestTenderUpdate(fresh, (result: any) => {
+        if (!result.ok) {
+          toast?.push({ title: "Update check failed", body: result.error, type: "error" });
+        } else if (result.newDocuments > 0) {
+          toast?.push({
+            title: `${result.newDocuments} new document${result.newDocuments === 1 ? "" : "s"}`,
+            body: "They're listed below — download to save them to this device.",
+          });
+        } else {
+          toast?.push({ title: "Documents are up to date", body: "No new documents were found." });
+        }
+      });
+      toast?.push({
+        title: "Checking for updates",
+        body: "The server is checking this tender for new documents — this can take a few minutes.",
+        type: "info",
+      });
+    } catch (e: any) {
+      toast?.push({ title: "Could not check for updates", body: e?.message, type: "error" });
+    } finally {
+      setStartingUpdate(false);
+    }
+  };
+
+  const syncBusy = updatePending || startingUpdate;
+  const syncButton = hasDownloadedDocs ? (
+    <Pressable
+      className="p-1.5"
+      style={{ opacity: syncBusy ? 0.6 : 1 }}
+      onPress={handleSyncUpdates}
+      disabled={syncBusy}
+      accessibilityLabel="Check for document updates"
+    >
+      <SpinningIcon spinning={syncBusy}>
+        <RefreshCw size={18} color={colors.accent} />
+      </SpinningIcon>
+    </Pressable>
+  ) : undefined;
 
   const handleAddToProject = () => {
     const project = createProjectFromTender(tender);
@@ -72,7 +144,7 @@ export default function TenderDetailScreen() {
 
   return (
     <View className="flex-1 bg-bg">
-      <ScreenHeader title="Tender detail" back />
+      <ScreenHeader title="Tender detail" back actions={syncButton} />
       <ScrollView contentContainerClassName="p-4">
         <Text className="font-mono text-[13px] font-bold" style={{ color: colors.accentHover }}>{tender.tender_id}</Text>
         <Text className="mt-1 mb-2 text-lg font-bold leading-snug text-text">{tender.title}</Text>

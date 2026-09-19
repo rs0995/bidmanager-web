@@ -15,6 +15,7 @@ import { useSignedIn } from "@/lib/auth";
 import { pullBookmarks } from "@/lib/sync";
 import { resumePendingDownloadJobs } from "@/lib/documents";
 import { resumePendingOrgRequests } from "@/lib/orgRequests";
+import { resumePendingTenderUpdates } from "@/lib/tenderUpdates";
 import { fetchWebsites, WEBSITES_QUERY_KEY } from "@/hooks/useWebsites";
 import { isAppLockEnabled, verifyAppLock } from "@/lib/appLock";
 import { interopIcon } from "@/lib/nativeIcons";
@@ -79,6 +80,7 @@ function AuthGate() {
     pullBookmarks().catch(() => {});
     resumePendingDownloadJobs();
     resumePendingOrgRequests();
+    resumePendingTenderUpdates();
     // Warms the SiteScope portal-picker query well before the user ever
     // taps the Tenders tab, instead of only starting the paginated
     // /client/organizations fetch once they land there (see useWebsites.js).

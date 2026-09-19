@@ -23,6 +23,7 @@ import { useActiveDownloads, rehydrateDocuments } from "@/lib/documents";
 import { rehydrateProjects } from "@/lib/projects";
 import { rehydrateAlerts } from "@/lib/alerts";
 import { rehydrateOrgRequests } from "@/lib/orgRequests";
+import { rehydrateTenderUpdates } from "@/lib/tenderUpdates";
 import { clearLocalCache } from "@/lib/localCache";
 import { useThemeColors } from "@/constants/colors";
 
@@ -116,6 +117,7 @@ export default function MoreScreen() {
     rehydrateAlerts();
     rehydrateProjects();
     rehydrateOrgRequests();
+    rehydrateTenderUpdates();
     rehydrateDocuments();
     rehydrateSync();
     setConfirmClearCache(false);

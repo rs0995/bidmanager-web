@@ -4,6 +4,7 @@ import { rehydrateStore } from "./store.js";
 import { rehydrateAlerts } from "./alerts.js";
 import { rehydrateProjects } from "./projects.js";
 import { rehydrateOrgRequests } from "./orgRequests.js";
+import { rehydrateTenderUpdates } from "./tenderUpdates.js";
 import { rehydrateDocuments } from "./documents.js";
 import { rehydrateSync } from "./sync.js";
 
@@ -15,6 +16,7 @@ const KV_KEYS = [
   "bm.alerts",
   "bm.projects", "bm.checklist",
   "bm.pendingOrgRequests",
+  "bm.pendingTenderUpdates", "bm.tenderUpdateState",
   "bm.documents",
   "bm.syncBlob", "bm.syncBase", "bm.syncDirty", "bm.tenderSnapshot", "bm.lastChangesAt",
   "bm.remindersFired",
@@ -31,6 +33,7 @@ export async function bootstrapApp() {
   rehydrateAlerts();
   rehydrateProjects();
   rehydrateOrgRequests();
+  rehydrateTenderUpdates();
   rehydrateDocuments();
   rehydrateSync();
 }
