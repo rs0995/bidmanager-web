@@ -1,0 +1,7 @@
+{
+  "build": {
+    "preview": { "distribution": "internal", "ios": { "simulator": true } },
+    "device": { "distribution": "internal" },
+    "production": {}
+  }
+}
