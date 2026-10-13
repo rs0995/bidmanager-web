@@ -1,12 +1,14 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { FlatList, StyleSheet, Text, View } from 'react-native';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useRoute } from '@react-navigation/native';
+import type { RouteProp } from '@react-navigation/native';
+import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { SearchX } from 'lucide-react-native';
 import { BookmarkFilterButton } from '../../components/tender/BookmarkFilterButton';
 import { FilterBar } from '../../components/tender/FilterBar';
 import { OrganizationCard } from '../../components/tender/OrganizationCard';
-import { SiteScope } from '../../components/tender/SiteScope';
+import { PortalSelect } from '../../components/tender/PortalSelect';
 import { TenderCard } from '../../components/tender/TenderCard';
 import {
   EmptyState,
@@ -27,7 +29,7 @@ import {
   groupByOrg,
 } from '../../lib/tenderFilters';
 import { fonts, useTheme } from '../../theme';
-import type { RootStackParamList } from '../navigation/types';
+import type { RootStackParamList, TabParamList } from '../navigation/types';
 
 type SubTab = 'tenders' | 'orgs';
 
@@ -46,6 +48,28 @@ export function TendersScreen() {
   const [custom, setCustom] = useState<CustomFilterKey[]>([]);
   const [starOnly, setStarOnly] = useState(false);
   const [ribbonOnly, setRibbonOnly] = useState(false);
+
+  // Presets from the Dashboard tiles ("20 Tenders" bookmarked, "3 Orgs" bookmarked, ...).
+  const route = useRoute<RouteProp<TabParamList, 'Tenders'>>();
+  const tabNav =
+    useNavigation<BottomTabNavigationProp<TabParamList, 'Tenders'>>();
+  useEffect(() => {
+    const preset = route.params;
+    // Cleared presets (both undefined) must not re-run this, or setParams loops forever.
+    if (
+      !preset ||
+      (preset.view === undefined && preset.bookmarked === undefined)
+    )
+      return;
+    const nextView = preset.view ?? 'tenders';
+    setView(nextView);
+    setSearch('');
+    if (preset.bookmarked !== undefined) {
+      if (nextView === 'orgs') setRibbonOnly(preset.bookmarked);
+      else setStarOnly(preset.bookmarked);
+    }
+    tabNav.setParams({ view: undefined, bookmarked: undefined });
+  }, [route.params, tabNav]);
 
   const counts = useMemo(
     () =>
@@ -104,11 +128,11 @@ export function TendersScreen() {
     <View style={styles.header}>
       <ScreenHeader title="Tenders" subtitle={subtitle} />
       <Text style={[styles.label, { color: t.colors.muted }]}>PORTAL</Text>
-      <SiteScope
-        portals={PORTALS}
+      <PortalSelect
+        options={PORTALS}
         value={portal}
         counts={counts}
-        onChange={changePortal}
+        onChange={p => changePortal(p as Portal)}
       />
       <View style={styles.seg}>
         <SegmentedControl

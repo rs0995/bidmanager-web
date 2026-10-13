@@ -107,8 +107,8 @@ export const tenders: Tender[] = [
     category: 'Water supply',
     location: 'Ratnagiri',
     published: '19-Aug-2024',
-    closing: '06-Sep-2024 17:00',
-    closeIn: '13d',
+    closing: '05-Sep-2024 17:00',
+    closeIn: '12d',
     state: 'ok',
     prebid: '28-Aug-2024 15:00',
     docs: [

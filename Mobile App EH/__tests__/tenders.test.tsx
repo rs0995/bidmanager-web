@@ -68,14 +68,26 @@ const collectLabels = (j: any, out: string[] = []): string[] => {
 const labelled = (r: Renderer, pred: (label: string) => boolean) =>
   collectLabels(r.toJSON()).filter(pred);
 
+// Both the Dashboard and Tenders tabs stay mounted; the Tenders dropdown is the last one.
+async function openPortalMenu(r: Renderer) {
+  const node = pressables(r)
+    .filter(n => String(n.props.accessibilityLabel).startsWith('Portal:'))
+    .pop();
+  if (!node) throw new Error('No portal dropdown');
+  await ReactTestRenderer.act(async () => {
+    node.props.onPress();
+  });
+}
+
 async function openTenders(r: Renderer) {
   await pressLabel(r, 'Tenders');
 }
 
 describe('Tenders tab', () => {
-  it('shows the portal row above the view switch, without an All option', async () => {
+  it('shows the portal dropdown above the view switch, without an All option', async () => {
     const r = await mount();
     await openTenders(r);
+    await openPortalMenu(r);
     const all = screenText(r);
     const s = all.slice(all.indexOf('PORTAL'));
     [
@@ -92,9 +104,12 @@ describe('Tenders tab', () => {
   it('switches portals and lists organisations', async () => {
     const r = await mount();
     await openTenders(r);
-    await pressText(r, 'eProcure');
-    expect(screenText(r)).toContain('eProc/CPWD/2024/2211');
-    expect(screenText(r)).not.toContain('MJP/2024/WS/318');
+    await openPortalMenu(r);
+    await pressText(r, 'eProcure', 'menuitem');
+    const all = screenText(r);
+    const s = all.slice(all.indexOf('PORTAL'));
+    expect(s).toContain('eProc/CPWD/2024/2211');
+    expect(s).not.toContain('MJP/2024/WS/318');
     await pressText(r, 'Organisations', 'tab');
     expect(screenText(r)).toContain('Central Public Works Department');
   });
@@ -129,10 +144,35 @@ describe('Tenders tab', () => {
 });
 
 describe('Dashboard links', () => {
-  it('opens Closing this week from See all', async () => {
+  it('opens Closing this week from its tile', async () => {
     const r = await mount();
-    await pressText(r, 'See all');
-    expect(screenText(r)).toContain('Closing this week');
+    const tile = pressables(r).find(n =>
+      String(n.props.accessibilityLabel ?? '').startsWith('Closing this week'),
+    )!;
+    await ReactTestRenderer.act(async () => {
+      tile.props.onPress();
+    });
+    expect(screenText(r)).toContain(
+      'Your bookmarked tenders closing within 7 days',
+    );
+  });
+
+  it('opens bookmarked tenders on the Tenders tab from its tile', async () => {
+    const r = await mount();
+    await pressLabel(r, 'Bookmarked tenders: 4');
+    const all = screenText(r);
+    const s = all.slice(all.indexOf('PORTAL'));
+    expect(s).toContain('MJP/2024/WS/318');
+    expect(s).not.toContain('2024_PWD_1041902_1');
+  });
+
+  it('opens bookmarked organisations from its tile', async () => {
+    const r = await mount();
+    await pressLabel(r, 'Bookmarked organisations: 1');
+    const all = screenText(r);
+    const s = all.slice(all.indexOf('PORTAL'));
+    expect(s).toContain('Maharashtra Jeevan Pradhikaran');
+    expect(s).not.toContain('Public Works Department, Konkan Region');
   });
 });
 

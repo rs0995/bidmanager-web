@@ -33,6 +33,11 @@
           0 30px 80px -20px rgba(30, 20, 60, 0.5);
         transform-origin: center center;
       }
+      /* Preview only: no square browser focus ring around rounded pressables. */
+      #root [tabindex]:focus,
+      #root [tabindex]:focus-visible {
+        outline: none;
+      }
       .bm-panel {
         position: fixed;
         top: 20px;

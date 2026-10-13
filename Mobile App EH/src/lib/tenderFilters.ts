@@ -126,14 +126,15 @@ export type OrgQueryOptions = {
 
 export function groupByOrg(
   all: Tender[],
-  portal: string,
+  /** `null` groups across every portal. */
+  portal: string | null,
   search = '',
   opts: OrgQueryOptions = {},
 ): OrgGroup[] {
   const needle = search.trim().toLowerCase();
   const map = new Map<string, OrgGroup>();
   all
-    .filter(t => t.portal === portal)
+    .filter(t => portal === null || t.portal === portal)
     .forEach(t => {
       const g = map.get(t.org) ?? {
         name: t.org,

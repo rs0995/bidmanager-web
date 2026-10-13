@@ -21,13 +21,13 @@ export function SearchField({
       style={[
         styles.wrap,
         {
-          backgroundColor: t.isGlass ? t.glass.fill : t.colors.surfaceSunk,
+          backgroundColor: t.isGlass ? t.glass.fill : t.colors.surfaceSoft,
           borderColor: t.isGlass ? t.glass.border : t.colors.hair,
         },
       ]}
     >
       <GlassBlur amount={18} />
-      <Search size={16} color={t.colors.muted} />
+      <Search size={18} color={t.colors.muted} />
       <TextInput
         accessibilityLabel={placeholder}
         value={value}

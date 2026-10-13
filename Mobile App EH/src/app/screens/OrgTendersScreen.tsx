@@ -26,7 +26,8 @@ export function OrgTendersScreen() {
   const toast = useToast();
   const { isBookmarked, toggle } = useBookmarks();
   const rows = tenders.filter(
-    x => x.org === params.name && x.portal === params.portal,
+    x =>
+      x.org === params.name && (!params.portal || x.portal === params.portal),
   );
 
   const header = (
@@ -39,7 +40,9 @@ export function OrgTendersScreen() {
       />
       <View style={styles.chips}>
         <StatusChip tone="plain" label={`${rows.length} tenders`} />
-        <StatusChip tone="plain" label={params.portal} />
+        {params.portal ? (
+          <StatusChip tone="plain" label={params.portal} />
+        ) : null}
       </View>
     </View>
   );

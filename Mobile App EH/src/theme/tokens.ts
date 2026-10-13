@@ -152,6 +152,12 @@ const PAPER: Surfaces = {
   hair: '#e2dfd4',
 };
 
+/** Base colour choices for the Appearance screen: name and the swatch to draw. */
+export const BASES: Record<BaseKey, { label: string; swatch: string }> = {
+  white: { label: 'White', swatch: WHITE.bg },
+  paper: { label: 'Paper', swatch: PAPER.bg },
+};
+
 const DARK: Surfaces = {
   bg: '#131017',
   surface: '#1d1a24',
@@ -267,6 +273,14 @@ export type Theme = {
   space: (n: number) => number;
 };
 
+const NO_SHADOW: ShadowStyle = {
+  shadowColor: 'transparent',
+  shadowOpacity: 0,
+  shadowRadius: 0,
+  shadowOffset: { width: 0, height: 0 },
+  elevation: 0,
+};
+
 export function buildTheme(scheme: Scheme, prefs: ThemePrefs): Theme {
   const isDark = scheme === 'dark';
   const isGlass = prefs.style === 'glass';
@@ -282,8 +296,8 @@ export function buildTheme(scheme: Scheme, prefs: ThemePrefs): Theme {
     : prefs.base === 'paper'
     ? '#463719'
     : '#281c46';
-  let smOpacity = isDark ? 0.5 : 0.14;
-  let mdOpacity = isDark ? 0.6 : 0.18;
+  let smOpacity = isDark ? 0.5 : 0.2;
+  let mdOpacity = isDark ? 0.6 : 0.26;
 
   const g = isDark ? GLASS_DARK : GLASS_LIGHT;
   if (isGlass) {
@@ -324,22 +338,25 @@ export function buildTheme(scheme: Scheme, prefs: ThemePrefs): Theme {
       orbs: g.orbs,
       blurType: g.blurType,
     },
-    shadow: {
-      sm: {
-        shadowColor,
-        shadowOpacity: smOpacity,
-        shadowRadius: 8,
-        shadowOffset: { width: 0, height: 4 },
-        elevation: 2,
-      },
-      md: {
-        shadowColor,
-        shadowOpacity: mdOpacity,
-        shadowRadius: 16,
-        shadowOffset: { width: 0, height: 10 },
-        elevation: 4,
-      },
-    },
+    // Solid is flat; only Glass carries drop shadows.
+    shadow: isGlass
+      ? {
+          sm: {
+            shadowColor,
+            shadowOpacity: smOpacity,
+            shadowRadius: 10,
+            shadowOffset: { width: 0, height: 5 },
+            elevation: 2,
+          },
+          md: {
+            shadowColor,
+            shadowOpacity: mdOpacity,
+            shadowRadius: 20,
+            shadowOffset: { width: 0, height: 11 },
+            elevation: 4,
+          },
+        }
+      : { sm: NO_SHADOW, md: NO_SHADOW },
     radius: { sm: 10, md: 16, lg: 22, xl: 26, pill: 999 },
     space: n => n * 4,
   };
