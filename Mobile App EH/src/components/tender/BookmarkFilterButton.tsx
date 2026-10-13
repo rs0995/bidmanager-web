@@ -19,17 +19,18 @@ export function BookmarkFilterButton({ kind, active, onPress }: Props) {
     kind === 'star'
       ? 'Show bookmarked tenders only'
       : 'Show bookmarked organisations only';
+  // Neutral field look (matches the search box) until switched on, then solid accent.
   const surface = {
     backgroundColor: active
-      ? t.colors.accentWash
+      ? t.colors.accent
       : t.isGlass
       ? t.glass.fill
-      : t.colors.surface,
+      : t.colors.surfaceSoft,
     borderColor: active
       ? t.colors.accent
       : t.isGlass
       ? t.glass.border
-      : 'transparent',
+      : t.colors.hair,
   };
   return (
     <Pressable
@@ -37,13 +38,13 @@ export function BookmarkFilterButton({ kind, active, onPress }: Props) {
       accessibilityLabel={label}
       accessibilityState={{ selected: active }}
       onPress={onPress}
-      style={[styles.btn, surface, t.shadow.sm]}
+      style={[styles.btn, surface]}
     >
       {active ? null : <GlassBlur amount={16} />}
       <Icon
         size={20}
-        color={t.colors.accent}
-        fill={active ? t.colors.accent : 'transparent'}
+        color={active ? t.colors.onAccent : t.colors.muted}
+        fill={active ? t.colors.onAccent : 'transparent'}
         strokeWidth={2}
       />
     </Pressable>
@@ -55,7 +56,7 @@ const styles = StyleSheet.create({
     width: 46,
     height: 46,
     borderRadius: 14,
-    borderWidth: 1.5,
+    borderWidth: 1,
     alignItems: 'center',
     justifyContent: 'center',
     overflow: 'hidden',

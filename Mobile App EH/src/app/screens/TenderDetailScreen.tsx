@@ -17,6 +17,7 @@ import {
   useToast,
 } from '../../components/ui';
 import { useBookmarks } from '../../fixtures/bookmarks';
+import { useDownloads } from '../../fixtures/downloads';
 import { getTender } from '../../fixtures/tenders';
 import { fonts, useTheme } from '../../theme';
 import type { RootStackParamList } from '../navigation/types';
@@ -31,6 +32,7 @@ export function TenderDetailScreen() {
     >();
   const toast = useToast();
   const { isBookmarked, toggle } = useBookmarks();
+  const { request } = useDownloads();
   const tender = getTender(params.id);
 
   if (!tender) {
@@ -78,13 +80,13 @@ export function TenderDetailScreen() {
       <View style={styles.actions}>
         <Button
           block
-          variant={bookmarked ? 'secondary' : 'primary'}
+          variant={bookmarked ? 'solid' : 'outline'}
           label={bookmarked ? 'Bookmarked' : 'Bookmark'}
           icon={
             <Star
               size={16}
-              color={bookmarked ? t.colors.accent : t.colors.onAccent}
-              fill={bookmarked ? t.colors.accent : 'transparent'}
+              color={bookmarked ? t.colors.onAccent : t.colors.accent}
+              fill={bookmarked ? t.colors.onAccent : 'transparent'}
             />
           }
           onPress={() =>
@@ -120,9 +122,10 @@ export function TenderDetailScreen() {
         <DocumentRow
           key={d.name}
           doc={d}
-          onRequest={() =>
-            toast.show('Requested — it will arrive with the next update')
-          }
+          onRequest={() => {
+            request(tender.id, tender.short, d.name);
+            toast.show('Requested — it will arrive with the next update');
+          }}
         />
       ))}
     </Screen>

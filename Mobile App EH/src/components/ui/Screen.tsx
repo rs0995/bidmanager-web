@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useId } from 'react';
 import {
   ScrollView,
   StyleProp,
@@ -19,12 +19,13 @@ import { BlurView } from '@react-native-community/blur';
 import { useTheme } from '../../theme';
 import { EdgeFade } from './EdgeFade';
 
-const TAB_BAR_HEIGHT = 62;
+/** Height of the tab row, above the bottom safe-area inset the docked bar adds. */
+export const TAB_BAR_HEIGHT = 62;
 
 /** Bottom padding that keeps the last item clear of the floating tab bar. */
 export function useTabBarClearance() {
   const insets = useSafeAreaInsets();
-  return TAB_BAR_HEIGHT + Math.max(insets.bottom, 12) + 22;
+  return TAB_BAR_HEIGHT + insets.bottom + 18;
 }
 
 const ORBS = [
@@ -39,6 +40,8 @@ const ORBS = [
 /** Flat colour in Solid style; gradient + soft colour orbs in Glass style. */
 export function ScreenBackground() {
   const t = useTheme();
+  // Unique per instance: duplicate SVG ids across mounted screens break on web.
+  const uid = `sb${useId().replace(/[^a-zA-Z0-9]/g, '')}`;
   if (!t.isGlass) {
     return (
       <View
@@ -51,12 +54,18 @@ export function ScreenBackground() {
     <View pointerEvents="none" style={StyleSheet.absoluteFill}>
       <Svg width="100%" height="100%" preserveAspectRatio="none">
         <Defs>
-          <LinearGradient id="bgGrad" x1="0" y1="0" x2="0.4" y2="1">
+          <LinearGradient id={`${uid}bg`} x1="0" y1="0" x2="0.4" y2="1">
             <Stop offset="0" stopColor={t.glass.screenA} />
             <Stop offset="1" stopColor={t.glass.screenB} />
           </LinearGradient>
           {ORBS.map((o, i) => (
-            <RadialGradient key={i} id={`orb${i}`} cx="50%" cy="50%" r="50%">
+            <RadialGradient
+              key={i}
+              id={`${uid}orb${i}`}
+              cx="50%"
+              cy="50%"
+              r="50%"
+            >
               <Stop
                 offset="0"
                 stopColor={t.glass.orbs[o.c]}
@@ -66,9 +75,15 @@ export function ScreenBackground() {
             </RadialGradient>
           ))}
         </Defs>
-        <Rect x="0" y="0" width="100%" height="100%" fill="url(#bgGrad)" />
+        <Rect x="0" y="0" width="100%" height="100%" fill={`url(#${uid}bg)`} />
         {ORBS.map((o, i) => (
-          <Circle key={i} cx={o.cx} cy={o.cy} r={o.r} fill={`url(#orb${i})`} />
+          <Circle
+            key={i}
+            cx={o.cx}
+            cy={o.cy}
+            r={o.r}
+            fill={`url(#${uid}orb${i})`}
+          />
         ))}
       </Svg>
     </View>

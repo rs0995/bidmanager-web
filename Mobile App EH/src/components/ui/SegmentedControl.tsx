@@ -1,9 +1,15 @@
 import React from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { LucideIcon } from 'lucide-react-native';
 import { fonts, useTheme } from '../../theme';
 import { GlassBlur } from './GlassBlur';
 
-type Option<K extends string> = { key: K; label: string };
+type Option<K extends string> = {
+  key: K;
+  label: string;
+  /** Optional leading icon. */
+  icon?: LucideIcon;
+};
 
 type Props<K extends string> = {
   options: Option<K>[];
@@ -45,6 +51,9 @@ export function SegmentedControl<K extends string>({
               on && t.shadow.sm,
             ]}
           >
+            {o.icon ? (
+              <o.icon size={15} color={on ? t.colors.ink : t.colors.muted} />
+            ) : null}
             <Text
               style={[
                 styles.label,
@@ -73,6 +82,8 @@ const styles = StyleSheet.create({
   },
   seg: {
     flex: 1,
+    flexDirection: 'row',
+    gap: 7,
     alignItems: 'center',
     justifyContent: 'center',
     paddingVertical: 8,

@@ -13,7 +13,8 @@ import { Gradient } from './Gradient';
 type Props = {
   label: string;
   onPress?: () => void;
-  variant?: 'primary' | 'secondary' | 'ghost' | 'danger';
+  /** `solid`: flat accent fill. `outline`: white with an accent border. */
+  variant?: 'primary' | 'secondary' | 'ghost' | 'danger' | 'solid' | 'outline';
   size?: 'sm' | 'md';
   icon?: React.ReactNode;
   loading?: boolean;
@@ -34,8 +35,10 @@ export function Button({
 }: Props) {
   const t = useTheme();
   const fg =
-    variant === 'primary'
+    variant === 'primary' || variant === 'solid'
       ? t.colors.onAccent
+      : variant === 'outline'
+      ? t.colors.accentInk
       : variant === 'danger'
       ? t.colors.crit
       : variant === 'ghost'
@@ -59,11 +62,22 @@ export function Button({
 
   const shape = { borderRadius: size === 'sm' ? 12 : 16 };
   const inactive = disabled || loading;
+  // Glass: the same soft edge every glass surface uses, not the accent — the accent
+  // border is a Solid-only way of marking the unchecked state.
+  const outlineColors = {
+    backgroundColor: t.isGlass
+      ? t.glass.fill
+      : t.scheme === 'dark'
+      ? t.colors.surfaceSoft
+      : '#ffffff',
+    borderColor: t.isGlass ? t.glass.border : t.colors.accent,
+  };
   const glassSecondary = t.isGlass && variant === 'secondary';
 
   return (
     <Pressable
       accessibilityRole="button"
+      accessibilityLabel={label}
       accessibilityState={{ disabled: !!inactive }}
       disabled={inactive}
       onPress={onPress}
@@ -72,7 +86,26 @@ export function Button({
         { opacity: inactive ? 0.5 : pressed ? 0.85 : 1 },
       ]}
     >
-      {variant === 'primary' ? (
+      {variant === 'solid' ? (
+        <View
+          style={[shape, { backgroundColor: t.colors.accent }, t.shadow.sm]}
+        >
+          {content}
+        </View>
+      ) : variant === 'outline' ? (
+        <View
+          style={[
+            shape,
+            styles.outline,
+            styles.clip,
+            outlineColors,
+            t.shadow.sm,
+          ]}
+        >
+          {t.isGlass ? <GlassBlur amount={16} /> : null}
+          {content}
+        </View>
+      ) : variant === 'primary' ? (
         <Gradient colors={[t.colors.accent, t.colors.accent2]} style={shape}>
           {content}
         </Gradient>
@@ -117,6 +150,7 @@ const styles = StyleSheet.create({
   labelMd: { fontSize: 14 },
   transparent: { backgroundColor: 'transparent' },
   clip: { overflow: 'hidden' },
+  outline: { borderWidth: 1.5 },
   label: { fontFamily: fonts.bold },
   block: { alignSelf: 'stretch' },
   auto: { alignSelf: 'flex-start' },

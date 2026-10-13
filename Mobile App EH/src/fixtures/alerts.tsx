@@ -21,6 +21,9 @@ export type AlertItem = {
   tenderId?: string;
   /** Opens this project when tapped. */
   projectId?: string;
+  /** "New tenders" alerts: the tenders that arrived, listed on the New tenders screen. */
+  newTenderIds?: string[];
+  orgName?: string;
 };
 
 const seed: AlertItem[] = [
@@ -46,9 +49,11 @@ const seed: AlertItem[] = [
     id: 'a3',
     kind: 'new',
     message:
-      'The latest update added 3 new tenders under Public Works Department and MCGM.',
+      'The latest update added 2 new tenders under Municipal Corp. of Greater Mumbai.',
     time: 'Updated 4 min ago',
     unread: true,
+    orgName: 'Municipal Corp. of Greater Mumbai',
+    newTenderIds: ['MCGM/RD/2024/1601', 'MCGM/SWD/2024/1567'],
   },
   {
     id: 'a4',

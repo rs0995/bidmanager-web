@@ -23,6 +23,7 @@ export function Field({ label, error, hint, ...input }: Props) {
       ) : null}
       <TextInput
         placeholderTextColor={t.colors.muted}
+        accessibilityLabel={label}
         {...input}
         style={[
           styles.input,

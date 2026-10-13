@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useId } from 'react';
 import { StyleProp, StyleSheet, View, ViewStyle } from 'react-native';
 import { BlurView } from '@react-native-community/blur';
 import Svg, { Defs, LinearGradient, Rect, Stop } from 'react-native-svg';
@@ -19,11 +19,12 @@ type Props = {
 
 /** Soft specular highlight across the top of a glass surface. */
 function GlassSheen({ dark }: { dark: boolean }) {
+  const id = `sh${useId().replace(/[^a-zA-Z0-9]/g, '')}`;
   return (
     <View pointerEvents="none" style={styles.sheen}>
       <Svg width="100%" height="100%" preserveAspectRatio="none">
         <Defs>
-          <LinearGradient id="sheen" x1="0" y1="0" x2="0.35" y2="1">
+          <LinearGradient id={id} x1="0" y1="0" x2="0.35" y2="1">
             <Stop
               offset="0"
               stopColor="#ffffff"
@@ -37,7 +38,7 @@ function GlassSheen({ dark }: { dark: boolean }) {
             <Stop offset="1" stopColor="#ffffff" stopOpacity={0} />
           </LinearGradient>
         </Defs>
-        <Rect x="0" y="0" width="100%" height="100%" fill="url(#sheen)" />
+        <Rect x="0" y="0" width="100%" height="100%" fill={`url(#${id})`} />
       </Svg>
     </View>
   );
@@ -55,17 +56,15 @@ export function Card({
 }: Props) {
   const t = useTheme();
   const base: ViewStyle = { borderRadius: t.radius[radius], padding };
+  const solidSurface: ViewStyle = {
+    backgroundColor: t.colors.surface,
+    borderWidth: 1,
+    borderColor: t.colors.hair,
+  };
 
   if (!t.isGlass) {
     return (
-      <View
-        style={[
-          base,
-          { backgroundColor: t.colors.surface },
-          t.shadow[elevation],
-          style,
-        ]}
-      >
+      <View style={[base, solidSurface, t.shadow[elevation], style]}>
         {children}
       </View>
     );
