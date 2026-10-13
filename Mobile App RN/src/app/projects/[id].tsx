@@ -1,9 +1,8 @@
 import { useState, useMemo, useEffect } from "react";
 import { View, Text, Pressable, ScrollView } from "react-native";
 import { useLocalSearchParams, router } from "expo-router";
-import { Plus, DownloadCloud, FolderOpen, Archive, ArchiveRestore } from "lucide-react-native";
+import { Plus, DownloadCloud, FolderOpen, Archive, ArchiveRestore, Trash2 } from "lucide-react-native";
 import { ScreenHeader } from "@/components/shell/ScreenHeader";
-import { FieldRow } from "@/components/tender/FieldRow";
 import { DocumentRow } from "@/components/tender/DocumentRow";
 import { RequestDownloadPanel } from "@/components/tender/RequestDownloadPanel";
 import { ChecklistItem } from "@/components/project/ChecklistItem";
@@ -12,8 +11,8 @@ import { FilePreview } from "@/components/project/FilePreview";
 import { EmptyState } from "@/components/feedback/EmptyState";
 import { Sheet } from "@/components/common/Sheet";
 import { Button } from "@/components/common/Button";
-import { fmtINR, formatDate, timeRemaining, urgency } from "@/lib/format";
-import { useProject, useChecklist, folderNames, addChecklistItem, getAttachedFile, archiveProject, updateProject } from "@/lib/projects";
+import { fmtINR, formatDate, formatDateTime, timeRemaining, urgency } from "@/lib/format";
+import { useProject, useChecklist, folderNames, addChecklistItem, getAttachedFile, archiveProject, deleteProject, updateProject } from "@/lib/projects";
 import { useTenderDocuments } from "@/hooks/useTenderDocuments";
 import { useLinkedTender } from "@/hooks/useLinkedTender";
 import { useTenderDocActions } from "@/hooks/useTenderDocActions";
@@ -29,6 +28,7 @@ export default function ProjectDetailScreen() {
   const [previewItem, setPreviewItem] = useState<any>(null);
   const [downloadingAll, setDownloadingAll] = useState(false);
   const [confirmArchive, setConfirmArchive] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const toast = useToast();
   const colors = useThemeColors();
 
@@ -107,14 +107,41 @@ export default function ProjectDetailScreen() {
     router.replace("/projects" as any);
   };
 
+  const handleDelete = () => {
+    setConfirmDelete(false);
+    router.replace("/projects" as any);
+    deleteProject(project.id);
+    toast?.push({ title: "Project deleted" });
+  };
+
   const archiveButton = (
     <>
     {syncButton}
     <Pressable className="p-1.5" onPress={() => (archived ? handleUnarchive() : setConfirmArchive(true))}>
       {archived ? <ArchiveRestore size={18} color={colors.accent} /> : <Archive size={18} color={colors.textMuted} />}
     </Pressable>
+    {archived && (
+      <Pressable className="p-1.5" onPress={() => setConfirmDelete(true)}>
+        <Trash2 size={18} color={colors.danger} />
+      </Pressable>
+    )}
     </>
   );
+
+  const detailCells: { label: string; value: any }[] = [
+    { label: "Client", value: liveTender?.organization || project.client_name },
+    { label: "Project value", value: fmtINR(liveTender?.tender_value || project.project_value) },
+    { label: "EMD", value: fmtINR(liveTender?.emd || project.emd) },
+    { label: "Deadline", value: formatDate(deadline) },
+    { label: "Status", value: project.status },
+    { label: "Documents ready", value: `${done} / ${total}` },
+    ...(liveTender ? [
+      { label: "Corrigenda", value: String(liveTender.corrigendum_count ?? 0) },
+      { label: "Pre-bid meeting", value: formatDateTime(prebid) },
+    ] : []),
+  ];
+  const detailRows: { label: string; value: any }[][] = [];
+  for (let i = 0; i < detailCells.length; i += 2) detailRows.push(detailCells.slice(i, i + 2));
 
   return (
     <View className="flex-1 bg-bg">
@@ -141,19 +168,23 @@ export default function ProjectDetailScreen() {
           )}
         </View>
 
-        <View className="bg-surface-0 border border-border rounded-[14px] p-3 mb-4 flex-row flex-wrap">
-          <View className="w-1/2 pr-2"><FieldRow stacked label="Client" value={liveTender?.organization || project.client_name} /></View>
-          <View className="w-1/2 pl-2"><FieldRow stacked label="Project value" value={fmtINR(liveTender?.tender_value || project.project_value)} /></View>
-          <View className="w-1/2 pr-2"><FieldRow stacked label="EMD" value={fmtINR(liveTender?.emd || project.emd)} /></View>
-          <View className="w-1/2 pl-2"><FieldRow stacked label="Deadline" value={formatDate(deadline)} /></View>
-          <View className="w-1/2 pr-2"><FieldRow stacked label="Status" value={project.status} /></View>
-          <View className="w-1/2 pl-2"><FieldRow stacked label="Documents ready" value={`${done} / ${total}`} /></View>
-          {liveTender && (
-            <>
-              <View className="w-1/2 pr-2"><FieldRow stacked label="Corrigenda" value={String(liveTender.corrigendum_count ?? 0)} /></View>
-              <View className="w-1/2 pl-2"><FieldRow stacked label="Pre-bid meeting" value={formatDate(prebid)} /></View>
-            </>
-          )}
+        {/* The row owns the divider, so it sits at one height across both
+            columns even when one cell wraps to more lines than the other. */}
+        <View className="bg-surface-0 border border-border rounded-[14px] px-3 py-0.5 mb-4">
+          {detailRows.map((pair, rowIndex) => (
+            <View
+              key={pair[0].label}
+              className={`flex-row${rowIndex === detailRows.length - 1 ? "" : " border-b border-border"}`}
+            >
+              {pair.map((cell, i) => (
+                <View key={cell.label} className={`flex-1 py-2.5 ${i === 0 ? "pr-2" : "pl-2"}`}>
+                  <Text className="text-[14px] text-text-muted">{cell.label}</Text>
+                  <Text className="mt-1 text-sm font-medium text-text">{cell.value == null || cell.value === "" ? "—" : cell.value}</Text>
+                </View>
+              ))}
+              {pair.length === 1 && <View className="flex-1" />}
+            </View>
+          ))}
         </View>
         {project.description && (
           <View className="bg-surface-0 border border-border rounded-[14px] p-3 mb-4">
@@ -238,6 +269,22 @@ export default function ProjectDetailScreen() {
       >
         <Text className="text-[14px] text-text-muted">
           "{project.title}" will move to the Archived tab in Projects. You can restore it from there at any time.
+        </Text>
+      </Sheet>
+
+      <Sheet
+        open={confirmDelete}
+        onClose={() => setConfirmDelete(false)}
+        title="Delete this project?"
+        footer={(
+          <>
+            <Button variant="secondary" className="flex-1" onPress={() => setConfirmDelete(false)}>Cancel</Button>
+            <Button variant="danger" className="flex-1" onPress={handleDelete}>Delete</Button>
+          </>
+        )}
+      >
+        <Text className="text-[14px] text-text-muted">
+          "{project.title}" and its checklist will be removed from your account on every device. This can't be undone.
         </Text>
       </Sheet>
     </View>

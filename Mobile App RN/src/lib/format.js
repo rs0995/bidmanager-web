@@ -86,6 +86,19 @@ export function formatDate(dateLike) {
   return date.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
 }
 
+// Date plus the time of day when the value carries one. Formats in the
+// device's own zone, the same zone parseFlexibleDate parses in, so a scraped
+// wall-clock time ("08-Sep-2026 03:00 PM") is shown as scraped.
+export function formatDateTime(dateLike) {
+  if (!dateLike) return "—";
+  const date = parseFlexibleDate(dateLike);
+  if (!date) return String(dateLike);
+  const day = date.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+  if (date.getHours() === 0 && date.getMinutes() === 0) return day;
+  const time = date.toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", hour12: true });
+  return `${day}, ${time}`;
+}
+
 const IST_TZ = "Asia/Kolkata";
 
 function istNowParts() {

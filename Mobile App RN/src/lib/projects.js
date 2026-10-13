@@ -109,6 +109,16 @@ export function archiveProject(id) {
   updateProject(id, { status: "Archived" });
 }
 
+// sync.js reports ids that were in the last server blob and are no longer
+// local as `removed`, so dropping the rows here is all the server needs.
+export function deleteProject(id) {
+  const projectId = Number(id);
+  checklistCache.filter((row) => row.project_id === projectId).forEach((row) => fileObjects.delete(row.id));
+  checklistCache = checklistCache.filter((row) => row.project_id !== projectId);
+  projectsCache = projectsCache.filter((row) => row.id !== projectId);
+  persist();
+}
+
 export function folderNames(projectId) {
   const used = getChecklist(projectId).map((row) => row.subfolder);
   return [...new Set([...DEFAULT_FOLDERS, ...used])];

@@ -2,7 +2,7 @@
   "expo": {
     "name": "bidmanager-mobile",
     "slug": "bidmanager-mobile",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "bidmanagermobile",
@@ -12,7 +12,7 @@
       "requireFullScreen": true,
       "icon": "./assets/images/icon.png",
       "bundleIdentifier": "com.raku.s0995.bidmanager-mobile",
-      "buildNumber": "19",
+      "buildNumber": "1",
       "infoPlist": {
         "CFBundleDisplayName": "BM Pro",
         "NSAppTransportSecurity": {
