@@ -116,6 +116,9 @@ export default function MoreScreen() {
     rehydrateTenderUpdates();
     rehydrateDocuments();
     rehydrateSync();
+    // Fetched organisations, tenders and documents live in the query cache,
+    // not in the kv store cleared above.
+    queryClient.clear();
     setConfirmClearCache(false);
     await pullBookmarks().catch(() => {});
     toast?.push({ title: "Cache cleared" });
@@ -231,7 +234,7 @@ export default function MoreScreen() {
         )}
       >
         <Text className="text-[14px] text-text-muted">
-          Removes downloaded document info, alerts, and other data cached on this device. Nothing is deleted from your account — bookmarks and projects are re-synced from the cloud right after.
+          Removes downloaded files, alerts, and the organisations and tenders fetched to this device. Nothing is deleted from your account — bookmarks and projects are re-synced from the cloud right after.
         </Text>
       </Sheet>
     </View>

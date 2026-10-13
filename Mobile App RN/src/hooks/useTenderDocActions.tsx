@@ -64,7 +64,7 @@ export function useTenderDocActions(tender: any, documents: any[]) {
         } else if (result.newDocuments > 0) {
           toast?.push({
             title: `${result.newDocuments} new document${result.newDocuments === 1 ? "" : "s"}`,
-            body: "They're listed below — download to save them to this device.",
+            body: "Saved to this device. They're listed below and on the Downloads page.",
           });
         } else {
           noUpdates(result.lastCheckedAt);

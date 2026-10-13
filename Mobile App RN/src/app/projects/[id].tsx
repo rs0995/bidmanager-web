@@ -170,19 +170,19 @@ export default function ProjectDetailScreen() {
 
         {/* The row owns the divider, so it sits at one height across both
             columns even when one cell wraps to more lines than the other. */}
-        <View className="bg-surface-0 border border-border rounded-[14px] px-3 py-0.5 mb-4">
+        <View className="bg-surface-0 border border-border rounded-[14px] mb-4 overflow-hidden">
           {detailRows.map((pair, rowIndex) => (
             <View
               key={pair[0].label}
               className={`flex-row${rowIndex === detailRows.length - 1 ? "" : " border-b border-border"}`}
             >
               {pair.map((cell, i) => (
-                <View key={cell.label} className={`flex-1 py-2.5 ${i === 0 ? "pr-2" : "pl-2"}`}>
+                <View key={cell.label} className={`w-1/2 py-2.5 px-3${i === 0 ? " border-r border-border" : ""}`}>
                   <Text className="text-[14px] text-text-muted">{cell.label}</Text>
                   <Text className="mt-1 text-sm font-medium text-text">{cell.value == null || cell.value === "" ? "—" : cell.value}</Text>
                 </View>
               ))}
-              {pair.length === 1 && <View className="flex-1" />}
+              {pair.length === 1 && <View className="w-1/2" />}
             </View>
           ))}
         </View>

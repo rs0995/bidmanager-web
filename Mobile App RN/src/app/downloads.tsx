@@ -52,6 +52,8 @@ export default function DownloadsScreen() {
       for (const id of ids) {
         try {
           const tender = await api.tender(id);
+          // The portal no longer serves documents for a closed tender.
+          if (tender.is_archived) continue;
           await new Promise<void>((resolve) => {
             requestTenderUpdate(tender, (result: any) => {
               if (result?.ok) ok += 1; else failed += 1;
@@ -64,6 +66,8 @@ export default function DownloadsScreen() {
       }
       if (ids.length === 0) {
         toast?.push({ title: "Nothing to sync", body: "Bookmark a tender or start a project first." });
+      } else if (ok + failed === 0) {
+        toast?.push({ title: "Nothing to check", body: "All bookmarked and project tenders are closed." });
       } else if (failed === 0) {
         toast?.push({ title: `Checked ${ok} tender${ok === 1 ? "" : "s"}`, body: "Any new corrigendum or pre-bid minutes have been downloaded." });
       } else {

@@ -2,7 +2,7 @@ import { useSyncExternalStore } from "react";
 import { getRaw, setRaw } from "./kv.js";
 import { api } from "./api.js";
 import { queryClient } from "./queryClient.js";
-import { getDocumentsForTender, syncTenderDocuments } from "./documents.js";
+import { getDocumentsForTender, syncTenderDocuments, saveDocsToDevice } from "./documents.js";
 
 // "Check for updates" jobs for a tender whose documents are already
 // downloaded — the per-tender counterpart of orgRequests.js. Sends the same
@@ -102,7 +102,9 @@ async function finishUpdate(tenderId, entry, onDone) {
     const items = page.items || [];
     syncTenderDocuments({ id: tenderId }, items);
     const known = new Set(entry.knownDocIds || []);
-    newDocuments = items.filter((d) => !known.has(d.id)).length;
+    const fresh = items.filter((d) => !known.has(d.id));
+    newDocuments = fresh.length;
+    if (fresh.length) await saveDocsToDevice({ id: tenderId }, fresh);
   } catch {
     // The job itself succeeded; the documents query below refetches on its own.
   }

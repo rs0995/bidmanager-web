@@ -179,7 +179,7 @@ export async function syncNow() {
       nextSnapshot[id] = cur;
       const prev = snapshot[id];
       if (!prev) {
-        if (cur.corrigendum_count > 0) requestTenderUpdate(tender).catch(() => {});
+        if (cur.corrigendum_count > 0 && !tender.is_archived) requestTenderUpdate(tender).catch(() => {});
         continue;
       }
 
@@ -191,7 +191,7 @@ export async function syncNow() {
         changedCount += 1;
         addAlert({ kind: "prebid", message: `"${tender.title}" has a new pre-bid or corrigendum.`, tenderId: tender.id });
       }
-      if (cur.corrigendum_count > (prev.corrigendum_count || 0)) {
+      if (cur.corrigendum_count > (prev.corrigendum_count || 0) && !tender.is_archived) {
         requestTenderUpdate(tender).catch(() => {});
       }
     }

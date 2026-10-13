@@ -202,6 +202,26 @@ async function refetchCorruptLocalDocs(tender) {
   }
 }
 
+// Saves every listed document that isn't on the phone yet, so a finished
+// server job shows up on the Downloads page. No share sheet: this runs
+// without the user watching.
+export async function saveDocsToDevice(tender, serverItems) {
+  const tenderDbId = Number(tender.id);
+  let saved = 0;
+  for (const it of getUndownloadedDocs(tenderDbId, serverItems)) {
+    try {
+      await downloadDocument(
+        { id: it.id, tender_db_id: tenderDbId, tender_id: tender.tender_id, file_name: it.name },
+        { share: false },
+      );
+      saved += 1;
+    } catch {
+      // Left as "failed"; the document row shows a retry.
+    }
+  }
+  return saved;
+}
+
 export async function pollTenderDownloadJob(tender, jobId, attempt = 0, mode) {
   try {
     const { status, error } = await api.downloadStatus(tender.id, jobId);
@@ -212,6 +232,7 @@ export async function pollTenderDownloadJob(tender, jobId, attempt = 0, mode) {
       queryClient.invalidateQueries({ queryKey: ["tenderDocuments", Number(tender.id)] });
       queryClient.invalidateQueries({ queryKey: ["tender", Number(tender.id)] });
       if (mode === "redownload") await refetchCorruptLocalDocs(tender);
+      if (page) await saveDocsToDevice(tender, page.items || []);
       // Local-only, same as the status/prebid alerts above in sync.js -- the
       // job itself runs server-side, but completion is only noticed once
       // something on the device actually polls it (here, or
@@ -261,7 +282,7 @@ export function resumePendingDownloadJobs() {
 // saved. Everything else (Word/Excel/etc.) still gets handed to the OS share
 // sheet (expo-sharing) immediately, same as before.
 // doc: { id, tender_db_id, tender_id, file_name }
-export async function downloadDocument(doc) {
+export async function downloadDocument(doc, options = {}) {
   upsertDocument({ id: doc.id, client_status: "downloading", error: null });
   try {
     const { url } = await api.downloadRequest(doc.tender_db_id, doc.id);
@@ -269,7 +290,7 @@ export async function downloadDocument(doc) {
     destDir.create({ intermediates: true, idempotent: true });
     const dest = new File(destDir, doc.file_name || `document-${doc.id}`);
     const file = await File.downloadFileAsync(url, dest, { idempotent: true });
-    if (!isPdfDoc(doc) && !isZipDoc(doc) && (await Sharing.isAvailableAsync())) {
+    if (options.share !== false && !isPdfDoc(doc) && !isZipDoc(doc) && (await Sharing.isAvailableAsync())) {
       await Sharing.shareAsync(file.uri);
     }
     return upsertDocument({
