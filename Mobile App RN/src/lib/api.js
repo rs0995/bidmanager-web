@@ -10,6 +10,11 @@ export const api = {
   register: (body) => request("/client/auth/register", { method: "POST", body, auth: false }),
   login: (body) => request("/client/auth/login", { method: "POST", body, auth: false }),
   logout: () => request("/client/auth/logout", { method: "POST" }),
+  registerPushToken: (token, platform = "ios") => request("/client/push-token", { method: "POST", body: { token, platform } }),
+  unregisterPushToken: (token) => request("/client/push-token", { method: "DELETE", body: { token } }),
+  syncBadge: (count) => request("/client/badge", { method: "PUT", body: { count } }),
+  captchaPending: () => request("/client/captcha/pending"),
+  answerCaptcha: (id, text) => request(`/client/captcha/${id}/answer`, { method: "POST", body: { text } }),
   changePassword: (body) => request("/client/auth/change-password", { method: "POST", body }),
 
   health: () => request("/client/health"),
@@ -21,13 +26,17 @@ export const api = {
     `/client/tenders/${Number(id)}/documents?${new URLSearchParams(clean({ page: 1, page_size: 50, ...params }))}`,
   ),
 
+  fetchTenderStatus: (tenderId) => request(
+    `/client/tenders/${Number(tenderId)}/fetch-status`,
+    { method: "POST", body: {} },
+  ),
   downloadRequest: (tenderId, documentId) => request(
     `/client/tenders/${Number(tenderId)}/download-request`,
     { method: "POST", body: { document_id: Number(documentId) } },
   ),
-  requestDownloadJob: (tenderId) => request(
+  requestDownloadJob: (tenderId, mode) => request(
     `/client/tenders/${Number(tenderId)}/request-download`,
-    { method: "POST", body: {} },
+    { method: "POST", body: mode ? { mode } : {} },
   ),
   downloadStatus: (tenderId, jobId) => request(
     `/client/tenders/${Number(tenderId)}/download-status?job_id=${encodeURIComponent(jobId)}`,

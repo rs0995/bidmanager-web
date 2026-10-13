@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { getRaw, setRaw } from "./kv.js";
-import { schedulePush } from "./sync.js";
+import { schedulePush } from "./pushQueue.js";
 import { addAlert } from "./alerts.js";
 
 // Local-first projects + checklist. Field names are made to match the

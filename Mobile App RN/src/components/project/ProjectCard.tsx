@@ -4,13 +4,15 @@ import { Clock } from "lucide-react-native";
 import { ProgressRing } from "@/components/common/ProgressRing";
 import { fmtINR, timeRemaining, urgency } from "@/lib/format";
 import { getChecklist } from "@/lib/projects";
+import { useLinkedTender } from "@/hooks/useLinkedTender";
 import { useThemeColors, urgencyColor, hexToRgba } from "@/constants/colors";
 
 export function ProjectCard({ project }: { project: any }) {
   const items = getChecklist(project.id);
   const done = items.filter((i: any) => i.status === "Completed").length;
   const total = items.length;
-  const { totalDays, label, expired } = timeRemaining(project.deadline);
+  const liveTender = useLinkedTender(project);
+  const { totalDays, label, expired } = timeRemaining(liveTender?.closing_date || project.deadline);
   const u = urgency(totalDays);
   const colors = useThemeColors();
   const color = urgencyColor(u.key, colors);

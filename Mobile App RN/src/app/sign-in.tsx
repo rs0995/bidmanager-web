@@ -18,14 +18,22 @@ export default function SignInScreen() {
     mutationFn: async () => {
       const response = mode === "register" ? await api.register(form) : await api.login(form);
       setSession(response);
-      await pullBookmarks();
       return response;
     },
     onSuccess: () => {
+      // Sign-in itself already succeeded (setSession ran) -- the initial
+      // bookmarks/projects pull is a background concern from here, not a
+      // reason to tell the user sign-in failed if it hiccups. Any failure
+      // here surfaces on the next explicit sync instead.
+      pullBookmarks().catch(() => {});
       router.replace("/(tabs)");
     },
     onError: (error: any) => {
-      toast?.push({ title: mode === "register" ? "Registration failed" : "Sign in failed", body: error?.message, type: "error" });
+      toast?.push({
+        title: mode === "register" ? "Registration failed" : "Sign in failed",
+        body: error?.message || "Please check your details and try again.",
+        type: "error",
+      });
     },
   });
 

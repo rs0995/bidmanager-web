@@ -4,6 +4,8 @@ import { unzipSync } from "fflate";
 import * as Sharing from "expo-sharing";
 import { getRaw, setRaw } from "./kv.js";
 import { api } from "./api.js";
+import { queryClient } from "./queryClient.js";
+import { addAlert } from "./alerts.js";
 
 const DOCUMENTS_DIR_NAME = "documents";
 const ZIP_EXTRACTED_DIR_NAME = "zip-extracted";
@@ -131,7 +133,11 @@ export function syncTenderDocuments(tender, serverItems) {
   const others = docsCache.filter((r) => Number(r.tender_db_id) !== tenderDbId);
   const merged = serverRows.map((row) => {
     const existing = existingById.get(row.id);
+    // Spread the existing row first so fields this merge doesn't own
+    // (local_uri of a saved file, etc.) survive -- dropping local_uri made every
+    // downloaded document look "missing" (corrupt) after the next server sync.
     return {
+      ...existing,
       id: row.id,
       tender_db_id: tenderDbId,
       tender_id: tender.tender_id || existing?.tender_id || "",
@@ -153,8 +159,12 @@ export function syncTenderDocuments(tender, serverItems) {
   return serverRows;
 }
 
-export async function requestTenderDownload(tender) {
-  const { job_id: jobId } = await api.requestDownloadJob(tender.id);
+// mode: undefined ("full", first-time request) | "redownload" (re-fetch even
+// files the server already has stored). Resolves to the placeholder row plus
+// `created` -- false when the server joined an already in-flight job for this
+// tender instead of queuing a new one.
+export async function requestTenderDownload(tender, mode) {
+  const { job_id: jobId, created } = await api.requestDownloadJob(tender.id, mode);
   const placeholder = upsertDocument({
     id: -Number(tender.id),
     tender_db_id: Number(tender.id),
@@ -163,21 +173,59 @@ export async function requestTenderDownload(tender) {
     file_name: "", file_type: "", size_bytes: 0, downloadable: false,
     client_status: "requested",
     job_id: jobId,
+    job_mode: mode || null,
     requested_at: new Date().toISOString(),
     downloaded_at: null,
     error: null,
   });
-  pollTenderDownloadJob(tender, jobId, 0);
-  return placeholder;
+  pollTenderDownloadJob(tender, jobId, 0, mode);
+  return { ...placeholder, created: created !== false };
 }
 
-export async function pollTenderDownloadJob(tender, jobId, attempt = 0) {
+// After a "redownload" job the server holds good copies, but the phone still
+// has the old empty/corrupt files: drop them and fetch fresh ones.
+async function refetchCorruptLocalDocs(tender) {
+  const tenderDbId = Number(tender.id);
+  const bad = getDocumentsForTender(tenderDbId).filter((r) => r.id > 0 && isCorruptDownload(r));
+  for (const row of bad) {
+    try { getLocalFile(row)?.delete(); } catch { /* already gone */ }
+    upsertDocument({ id: row.id, client_status: "synced", local_uri: null, downloaded_at: null, error: null });
+  }
+  for (const row of bad) {
+    try {
+      await downloadDocument({
+        id: row.id, tender_db_id: tenderDbId, tender_id: row.tender_id, file_name: row.file_name,
+      });
+    } catch {
+      // Left as "failed"; the document row shows a retry.
+    }
+  }
+}
+
+export async function pollTenderDownloadJob(tender, jobId, attempt = 0, mode) {
   try {
     const { status, error } = await api.downloadStatus(tender.id, jobId);
     if (status === "completed") {
       removeDocument(-Number(tender.id));
       const page = await api.tenderDocuments(tender.id).catch(() => null);
       if (page) syncTenderDocuments(tender, page.items || []);
+      queryClient.invalidateQueries({ queryKey: ["tenderDocuments", Number(tender.id)] });
+      queryClient.invalidateQueries({ queryKey: ["tender", Number(tender.id)] });
+      if (mode === "redownload") await refetchCorruptLocalDocs(tender);
+      // Local-only, same as the status/prebid alerts above in sync.js -- the
+      // job itself runs server-side, but completion is only noticed once
+      // something on the device actually polls it (here, or
+      // resumePendingDownloadJobs() on next app open if the app was closed
+      // mid-job), so this can arrive late rather than never, not instantly
+      // while fully closed. That gap only closes with a server-side push
+      // tied to this specific job + device, which is a separate piece of
+      // work (apns_push.py has no notion of "this job belongs to this
+      // user's device" today).
+      addAlert({
+        kind: "download",
+        message: `Documents for "${tender.title || tender.tender_id || `Tender #${tender.id}`}" finished downloading.`,
+        tenderId: tender.id,
+      });
       return;
     }
     if (status === "failed") {
@@ -188,7 +236,7 @@ export async function pollTenderDownloadJob(tender, jobId, attempt = 0) {
       upsertDocument({ id: -Number(tender.id), client_status: "failed", error: "Timed out waiting for the server." });
       return;
     }
-    setTimeout(() => pollTenderDownloadJob(tender, jobId, attempt + 1), POLL_INTERVAL_MS);
+    setTimeout(() => pollTenderDownloadJob(tender, jobId, attempt + 1, mode), POLL_INTERVAL_MS);
   } catch (e) {
     upsertDocument({ id: -Number(tender.id), client_status: "failed", error: e?.message || String(e) });
   }
@@ -201,6 +249,7 @@ export function resumePendingDownloadJobs() {
       { id: row.tender_db_id, tender_id: row.tender_id, title: row.tender_title },
       row.job_id,
       0,
+      row.job_mode || undefined,
     );
   }
 }
@@ -240,9 +289,47 @@ export async function downloadDocument(doc) {
 // hasn't been downloaded (or was removed by Clear Cache).
 export function getLocalFile(doc) {
   const row = getDocument(doc?.id) ?? doc;
-  if (!row?.local_uri) return null;
-  const file = new File(row.local_uri);
-  return file.exists ? file : null;
+  if (!row || row.id == null) return null;
+  // The stored absolute URI embeds the app container path, which iOS can change
+  // across app updates/reinstalls -- so also look at the deterministic spot
+  // downloadDocument() writes to, or every saved file would suddenly look missing.
+  const candidates = [];
+  if (row.local_uri) candidates.push(new File(row.local_uri));
+  if (row.file_name) {
+    candidates.push(new File(new Directory(Paths.document, DOCUMENTS_DIR_NAME, String(row.id)), row.file_name));
+  }
+  for (const file of candidates) {
+    try { if (file.exists) return file; } catch { /* try the next location */ }
+  }
+  return null;
+}
+
+// A file that "downloaded" but is empty or far smaller than the server said
+// it should be almost always means the scrape produced something other than
+// the real document (e.g. a captcha page) instead of failing outright --
+// downloadDocument() below only checks that the HTTP request succeeded, not
+// that the bytes it got back are plausible.
+export function isCorruptDownload(doc) {
+  const row = getDocument(doc?.id) ?? doc;
+  if (row?.client_status !== "downloaded") return false;
+  const file = getLocalFile(row);
+  if (!file) return true; // marked downloaded but the file is gone/missing
+  const actual = file.size ?? 0;
+  if (actual === 0) return true;
+  const expected = Number(row.size_bytes) || 0;
+  return expected > 0 && actual < expected * 0.5;
+}
+
+// Server documents for a tender that still need fetching to this device: not
+// downloaded yet, or downloaded but empty/corrupt. Drives which of the
+// "Download all" / sync controls make sense on the tender and project screens.
+export function getUndownloadedDocs(tenderDbId, serverItems) {
+  const local = new Map(getDocumentsForTender(tenderDbId).filter((r) => r.id > 0).map((r) => [r.id, r]));
+  return (serverItems || []).filter((d) => {
+    if (d.downloadable === false) return false;
+    const row = local.get(d.id);
+    return !row || row.client_status !== "downloaded" || isCorruptDownload(row);
+  });
 }
 
 // Extracts a downloaded ZIP into its own folder (once — subsequent calls

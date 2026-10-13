@@ -33,11 +33,25 @@ function writeJSON(key, value) {
   setRaw(key, JSON.stringify(value));
 }
 
-const SETTINGS_DEFAULTS = { theme: "light", lastSyncAt: null, appLockEnabled: false, deadlineRemindersOn: false };
+const SETTINGS_DEFAULTS = {
+  theme: "light", lastSyncAt: null, appLockEnabled: false,
+  // Replaces the old single deadlineRemindersOn flag with three
+  // independently-toggleable notification options.
+  notifyOrgAlertsOn: false, notifyTenderAlertsOn: false, reminderDays: [],
+};
+
+// One-time migration from the old single toggle: opted-in users keep getting
+// tender-bookmark notifications under the new split rather than going silent.
+function migrateSettings(raw) {
+  if (raw && raw.deadlineRemindersOn && raw.notifyTenderAlertsOn === undefined) {
+    return { ...raw, notifyTenderAlertsOn: true };
+  }
+  return raw;
+}
 
 let bookmarksCache = new Set(readJSON(BOOKMARKS_KEY, []).map(Number));
 let bookmarkedOrgsCache = new Set(readJSON(BOOKMARKED_ORGS_KEY, []));
-let settingsCache = { ...SETTINGS_DEFAULTS, ...readJSON(SETTINGS_KEY, {}) };
+let settingsCache = { ...SETTINGS_DEFAULTS, ...migrateSettings(readJSON(SETTINGS_KEY, {})) };
 let orgIdByNameCache = readJSON(ORG_ID_BY_NAME_KEY, {});
 
 // Called once after lib/kv.js hydrateKV() resolves (see lib/bootstrap.js) to
@@ -45,7 +59,7 @@ let orgIdByNameCache = readJSON(ORG_ID_BY_NAME_KEY, {});
 export function rehydrateStore() {
   bookmarksCache = new Set(readJSON(BOOKMARKS_KEY, []).map(Number));
   bookmarkedOrgsCache = new Set(readJSON(BOOKMARKED_ORGS_KEY, []));
-  settingsCache = { ...SETTINGS_DEFAULTS, ...readJSON(SETTINGS_KEY, {}) };
+  settingsCache = { ...SETTINGS_DEFAULTS, ...migrateSettings(readJSON(SETTINGS_KEY, {})) };
   orgIdByNameCache = readJSON(ORG_ID_BY_NAME_KEY, {});
   emit();
 }

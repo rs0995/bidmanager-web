@@ -8,14 +8,17 @@
     "scheme": "bidmanagermobile",
     "userInterfaceStyle": "automatic",
     "ios": {
+      "supportsTablet": true,
+      "requireFullScreen": true,
       "icon": "./assets/images/icon.png",
       "bundleIdentifier": "com.raku.s0995.bidmanager-mobile",
-      "buildNumber": "8",
+      "buildNumber": "19",
       "infoPlist": {
         "CFBundleDisplayName": "BM Pro",
         "NSAppTransportSecurity": {
           "NSAllowsArbitraryLoads": true
-        }
+        },
+        "UIBackgroundModes": ["fetch"]
       }
     },
     "android": {
@@ -42,8 +45,7 @@
         }
       ],
       "expo-secure-store",
-      "expo-sharing",
-      "./plugins/withoutPushEntitlement.js"
+      "expo-sharing"
     ],
     "experiments": {
       "typedRoutes": true,

@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { View, Text, Pressable, ScrollView } from "react-native";
 import { router } from "expo-router";
 import { useMutation, useQueryClient, useQuery } from "@tanstack/react-query";
-import { Sun, Moon, Monitor, LogOut, RefreshCw, Wifi, WifiOff, Download, FileSpreadsheet, ClipboardList, Fingerprint, Bell, Trash2 } from "lucide-react-native";
+import { Sun, Moon, Monitor, LogOut, RefreshCw, Wifi, WifiOff, Download, FileSpreadsheet, ShieldQuestion, Fingerprint, Bell, Trash2, Archive } from "lucide-react-native";
 import { ScreenHeader } from "@/components/shell/ScreenHeader";
 import { Field, Input } from "@/components/common/Field";
 import { Button } from "@/components/common/Button";
@@ -14,18 +14,19 @@ import { useToast } from "@/components/feedback/ToastProvider";
 import { useTheme } from "@/hooks/useTheme";
 import { api } from "@/lib/api";
 import { getUser, clearSession } from "@/lib/auth";
-import { useSettings, setSettings, rehydrateStore } from "@/lib/store";
-import { requestNotificationPermission, startDeadlineChecks, stopDeadlineChecks } from "@/lib/deadlineCheck";
+import { useSettings, rehydrateStore } from "@/lib/store";
 import { syncNow, pullBookmarks, rehydrateSync } from "@/lib/sync";
 import { exportTendersCsv } from "@/lib/exportCsv";
 import { isAppLockAvailable, isAppLockEnabled, enableAppLock, disableAppLock } from "@/lib/appLock";
 import { useActiveDownloads, rehydrateDocuments } from "@/lib/documents";
+import { unregisterDevicePushToken } from "@/lib/pushToken";
 import { rehydrateProjects } from "@/lib/projects";
 import { rehydrateAlerts } from "@/lib/alerts";
 import { rehydrateOrgRequests } from "@/lib/orgRequests";
 import { rehydrateTenderUpdates } from "@/lib/tenderUpdates";
 import { clearLocalCache } from "@/lib/localCache";
 import { useThemeColors } from "@/constants/colors";
+import { useCaptchaPending } from "@/hooks/useCaptchaPending";
 
 function relativeTime(iso?: string) {
   if (!iso) return "never";
@@ -35,13 +36,13 @@ function relativeTime(iso?: string) {
   return `${Math.round(mins / 60)}h ago`;
 }
 
-function MoreRow({ icon: Icon, label, value, onPress, disabled, spin }: {
-  icon: any; label: string; value?: string; onPress?: () => void; disabled?: boolean; spin?: boolean;
+function MoreRow({ icon: Icon, label, value, onPress, disabled, spin, last, badge }: {
+  icon: any; label: string; value?: string; onPress?: () => void; disabled?: boolean; spin?: boolean; last?: boolean; badge?: boolean;
 }) {
   const colors = useThemeColors();
   return (
     <Pressable
-      className="flex-row items-center gap-3 py-3 px-3 border-b border-border"
+      className={`flex-row items-center gap-3 py-3 px-3${last ? "" : " border-b border-border"}`}
       style={{ opacity: disabled ? 0.5 : 1 }}
       onPress={onPress}
       disabled={disabled}
@@ -52,6 +53,7 @@ function MoreRow({ icon: Icon, label, value, onPress, disabled, spin }: {
         </SpinningIcon>
       </View>
       <Text className="flex-1 text-sm text-text">{label}</Text>
+      {badge && <View className="w-[8px] h-[8px] rounded-full bg-danger" />}
       {value && <Text className="font-mono text-[14px] text-text-muted">{value}</Text>}
     </Pressable>
   );
@@ -62,7 +64,7 @@ export default function MoreScreen() {
   const queryClient = useQueryClient();
   const { theme, setTheme } = useTheme();
   const user = getUser();
-  const { lastSyncAt, deadlineRemindersOn } = useSettings();
+  const { lastSyncAt } = useSettings();
   const colors = useThemeColors();
   const [pwOpen, setPwOpen] = useState(false);
   const [pwForm, setPwForm] = useState({ current_password: "", new_password: "" });
@@ -72,15 +74,6 @@ export default function MoreScreen() {
   const [confirmClearCache, setConfirmClearCache] = useState(false);
 
   useEffect(() => { isAppLockAvailable().then(setLockAvailable); }, []);
-
-  useEffect(() => {
-    if (deadlineRemindersOn) {
-      startDeadlineChecks((id: any) => api.tender(id));
-    } else {
-      stopDeadlineChecks();
-    }
-    return stopDeadlineChecks;
-  }, [deadlineRemindersOn]);
 
   const health = useQuery({ queryKey: ["health-check"], queryFn: api.health, enabled: false, retry: 0 });
 
@@ -103,7 +96,10 @@ export default function MoreScreen() {
   });
 
   const signOut = useMutation({
-    mutationFn: () => api.logout().catch(() => {}),
+    mutationFn: async () => {
+      await unregisterDevicePushToken();
+      await api.logout().catch(() => {});
+    },
     onSettled: () => { clearSession(); queryClient.clear(); router.replace("/sign-in"); },
   });
 
@@ -125,18 +121,6 @@ export default function MoreScreen() {
     toast?.push({ title: "Cache cleared" });
   };
 
-  const toggleReminders = async (next: boolean) => {
-    if (next) {
-      const granted = await requestNotificationPermission();
-      setSettings({ deadlineRemindersOn: true });
-      if (!granted) {
-        toast?.push({ title: "Reminders on", body: "Notifications permission was not granted — you will still see alerts in this list while the app is open.", type: "info" });
-      }
-    } else {
-      setSettings({ deadlineRemindersOn: false });
-    }
-  };
-
   const toggleAppLock = async (next: boolean) => {
     try {
       if (next) { await enableAppLock(); setLockEnabled(true); toast?.push({ title: "App lock enabled" }); }
@@ -145,6 +129,9 @@ export default function MoreScreen() {
       toast?.push({ title: "Could not set up app lock", body: e?.message, type: "error" });
     }
   };
+
+  const captchaPending = useCaptchaPending();
+  const hasCaptchaPending = Boolean(captchaPending.data);
 
   return (
     <View className="flex-1 bg-bg">
@@ -160,14 +147,16 @@ export default function MoreScreen() {
             value={health.isFetching ? "Checking…" : health.data?.status === "ok" ? "reachable" : health.isFetched ? "unreachable" : "tap to check"}
             onPress={() => health.refetch()}
           />
-          <MoreRow icon={Download} label="Downloads" value={activeDownloads.length ? `${activeDownloads.length} in progress` : "›"} onPress={() => router.push("/downloads")} />
+          <MoreRow icon={Archive} label="Archive" value="›" onPress={() => router.push("/archive" as any)} />
+          <MoreRow icon={Download} label="Downloads" value={activeDownloads.length ? `${activeDownloads.length} in progress` : "›"} onPress={() => router.push("/downloads")} last />
         </View>
 
         <View className="bg-surface-0 border border-border rounded-[14px] mb-3">
           <MoreRow icon={FileSpreadsheet} label="Export tenders (CSV)" value={exportCsv.isPending ? "Exporting…" : "›"} onPress={() => exportCsv.mutate()} disabled={exportCsv.isPending} spin={exportCsv.isPending} />
-          <MoreRow icon={ClipboardList} label="Checklist templates" value="Coming soon" onPress={() => toast?.push({ title: "Coming soon", body: "Checklist templates are managed on the desktop app for now." })} disabled />
+          <MoreRow icon={ShieldQuestion} label="Captcha" value="›" onPress={() => router.push("/captcha" as any)} badge={hasCaptchaPending} />
           {lockAvailable && (
             <View className="flex-row items-center gap-3 py-3 px-3 border-b border-border">
+              {/* always followed by Push notifications below -- border-b intentionally kept */}
               <View className="w-[26px] h-[26px] rounded-lg items-center justify-center bg-accent-bg">
                 <Fingerprint size={15} color={colors.accent} />
               </View>
@@ -175,18 +164,7 @@ export default function MoreScreen() {
               <Toggle checked={lockEnabled} onChange={toggleAppLock} />
             </View>
           )}
-          <View className="flex-row items-center gap-3 py-3 px-3">
-            <View className="w-[26px] h-[26px] rounded-lg items-center justify-center bg-accent-bg">
-              <Bell size={15} color={colors.accent} />
-            </View>
-            <View className="flex-1">
-              <Text className="text-sm text-text">Deadline reminders</Text>
-              <Text className="mt-0.5 text-[14px] text-text-muted">
-                On-device notifications at 72h, 24h & 3h before close (while the app is open)
-              </Text>
-            </View>
-            <Toggle checked={Boolean(deadlineRemindersOn)} onChange={toggleReminders} />
-          </View>
+          <MoreRow icon={Bell} label="Push notifications" value="›" onPress={() => router.push("/notification-settings" as any)} last />
         </View>
 
         <View className="bg-surface-0 border border-border rounded-[14px] p-3 mb-3">
@@ -204,7 +182,7 @@ export default function MoreScreen() {
         </View>
 
         <View className="bg-surface-0 border border-border rounded-[14px] mb-3">
-          <MoreRow icon={Trash2} label="Clear local cache" value="›" onPress={() => setConfirmClearCache(true)} />
+          <MoreRow icon={Trash2} label="Clear local cache" value="›" onPress={() => setConfirmClearCache(true)} last />
         </View>
 
         <View className="mb-2">

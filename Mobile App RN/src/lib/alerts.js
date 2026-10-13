@@ -1,11 +1,24 @@
 import { useSyncExternalStore } from "react";
 import { getRaw, setRaw } from "./kv.js";
+import { getSettings, isBookmarked, isOrgBookmarked } from "./store.js";
+import { notifyAlert, setBadgeCount } from "./notifications.js";
+import { api } from "./api.js";
+
+// Tells the server the device's real unread count so api_server.py's push
+// pass (which otherwise just increments its own counter by 1 per push) has
+// an accurate baseline to climb from, instead of drifting upward forever
+// once something here has actually been read. Best-effort, same as
+// setBadgeCount itself -- a failed sync just means the next push's badge
+// number is off by a bit until the next successful one.
+function syncBadgeToServer(count) {
+  api.syncBadge(count).catch(() => {});
+}
 
 // Locally-derived alert feed (no server push infrastructure in scope).
 // Entries are appended by real local events: a sync pass noticing a
 // bookmarked/project tender closing-date change or new tenders appearing
 // (see sync.js), a checklist reaching 100% (see projects.js), and a
-// periodic local deadline-threshold check (see deadlineCheck.js).
+// periodic local closing-date reminder check (see closingReminders.js).
 const ALERTS_KEY = "bm.alerts";
 const MAX_ALERTS = 100;
 
@@ -33,6 +46,8 @@ export function rehydrateAlerts() {
   alertsCache = readJSON(ALERTS_KEY, []);
   nextId = 1 + alertsCache.reduce((m, a) => Math.max(m, a.id), 0);
   emit();
+  setBadgeCount(unreadCount());
+  syncBadgeToServer(unreadCount());
 }
 
 export function getAlerts() {
@@ -60,6 +75,32 @@ export function addAlert({ kind, message, tenderId, orgName, newTenderIds }) {
   alertsCache = [entry, ...alertsCache].slice(0, MAX_ALERTS);
   writeJSON(ALERTS_KEY, alertsCache);
   emit();
+  // Whether this alert also surfaces as an on-device notification depends on
+  // which of the three independent options (Push notifications screen) cover
+  // it -- org-bookmark alerts, tender-bookmark alerts, or closing reminders
+  // (kind "closing", which decided to fire on its own and always notifies
+  // here as long as OS permission is granted -- see closingReminders.js).
+  const settings = getSettings();
+  // kind "new" (bulk or single) is always about tenders appearing under a
+  // bookmarked org -- gate on the org, not the tender, even when a single
+  // new-tender alert also carries a tenderId.
+  // "new", "closing", "status", "prebid" and now "download" (see
+  // api_server.py's _push_download_complete, pushed straight from the job
+  // that requested it, no settings gating needed since it's a direct result
+  // of the user's own action) are all delivered as real APNs push --
+  // scheduling a second, local notification here for the same event would
+  // just duplicate whatever the server already pushed. Only "success"
+  // (checklist complete, a purely local event with no tenderId so it never
+  // matches the gated branch below anyway) still goes through the local
+  // path.
+  const shouldNotifyLocally = kind !== "new" && kind !== "closing" && kind !== "status"
+    && kind !== "prebid" && kind !== "download"
+    && entry.tenderId && settings.notifyTenderAlertsOn && isBookmarked(entry.tenderId);
+  if (shouldNotifyLocally) {
+    notifyAlert(entry);
+  }
+  setBadgeCount(unreadCount());
+  syncBadgeToServer(unreadCount());
   return entry;
 }
 
@@ -70,13 +111,15 @@ export function markRead(id) {
     changed = true;
     return { ...a, read: true };
   });
-  if (changed) { writeJSON(ALERTS_KEY, alertsCache); emit(); }
+  if (changed) { writeJSON(ALERTS_KEY, alertsCache); emit(); setBadgeCount(unreadCount()); syncBadgeToServer(unreadCount()); }
 }
 
 export function markAllRead() {
   alertsCache = alertsCache.map((a) => ({ ...a, read: true }));
   writeJSON(ALERTS_KEY, alertsCache);
   emit();
+  setBadgeCount(unreadCount());
+  syncBadgeToServer(unreadCount());
 }
 
 export function unreadCount() {

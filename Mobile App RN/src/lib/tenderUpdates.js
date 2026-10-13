@@ -9,15 +9,18 @@ import { getDocumentsForTender, syncTenderDocuments } from "./documents.js";
 // scraper job the first-time "Request documents" flow uses, then polls it.
 // Device-local only (a job id is meaningless cross-device).
 //
-// The server has no cooldown on per-tender jobs (only orgs get a 24h one) and
-// each job drives a Selenium session, so the client gates it: one check per
-// 24h, unless a new corrigendum has been issued since the last check.
+// An "update" job first re-reads the tender's portal page over plain HTTP and
+// only starts a browser download if the portal lists corrigendum/pre-bid files
+// the last run didn't cover -- the server decides "is there anything new", so
+// the client only adds a short cooldown to avoid hammering the portal.
 const PENDING_KEY = "bm.pendingTenderUpdates"; // { tenderId: { jobId, corrigendumCount, knownDocIds } }
 const STATE_KEY = "bm.tenderUpdateState"; // { tenderId: { lastSyncAt, corrigendumCount } }
 const POLL_INTERVAL_MS = 15_000;
-const MAX_ATTEMPTS = 40;
+const QUICK_POLL_MS = 4_000; // the no-new-files path finishes in seconds
+const QUICK_POLL_ATTEMPTS = 8;
+const MAX_ATTEMPTS = 48;
 const MAX_CONSECUTIVE_ERRORS = 3;
-export const SYNC_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+export const SYNC_COOLDOWN_MS = 60 * 60 * 1000;
 
 const listeners = new Set();
 function emit() { listeners.forEach((fn) => fn()); }
@@ -59,16 +62,21 @@ export function isTenderUpdatePending(tenderId) {
   return Number(tenderId) in pendingCache;
 }
 
-// Whether a new check may be started for `tender` (a FRESH tender payload —
-// a stale cached one could hide a newly issued corrigendum).
+// Whether a new check may be started for `tender` (cooldown only -- see above).
 export function getTenderSyncGate(tender) {
   const state = stateCache[Number(tender.id)];
   if (!state) return { allowed: true };
-  if ((Number(tender.corrigendum_count) || 0) > (state.corrigendumCount || 0)) {
-    return { allowed: true, reason: "corrigendum" };
-  }
   if (Date.now() - state.lastSyncAt >= SYNC_COOLDOWN_MS) return { allowed: true };
   return { allowed: false, lastSyncAt: state.lastSyncAt };
+}
+
+// Epoch ms of the most recent portal check we know of: the server's own
+// last_update_checked_at (any client or scheduled run) or this device's last
+// completed check, whichever is newer.
+export function getLastCheckedAt(tender) {
+  const serverMs = (Number(tender?.last_update_checked_at) || 0) * 1000;
+  const localMs = stateCache[Number(tender?.id)]?.lastSyncAt || 0;
+  return Math.max(serverMs, localMs) || null;
 }
 
 // onDone({ ok, newDocuments?, error? }) fires when the job settles while the
@@ -76,7 +84,7 @@ export function getTenderSyncGate(tender) {
 // so it settles silently (like orgRequests.js).
 export async function requestTenderUpdate(tender, onDone) {
   const tenderId = Number(tender.id);
-  const { job_id: jobId } = await api.requestDownloadJob(tenderId);
+  const { job_id: jobId } = await api.requestDownloadJob(tenderId, "update");
   const entry = {
     jobId,
     corrigendumCount: Number(tender.corrigendum_count) || 0,
@@ -100,9 +108,17 @@ async function finishUpdate(tenderId, entry, onDone) {
   }
   recordSync(tenderId, entry.corrigendumCount);
   clearPending(tenderId);
+  let lastCheckedAt = Date.now();
+  try {
+    const fresh = await queryClient.fetchQuery({
+      queryKey: ["tender", tenderId], queryFn: () => api.tender(tenderId), staleTime: 0,
+    });
+    lastCheckedAt = getLastCheckedAt(fresh) || lastCheckedAt;
+  } catch {
+    // The status text just falls back to "now".
+  }
   queryClient.invalidateQueries({ queryKey: ["tenderDocuments", tenderId] });
-  queryClient.invalidateQueries({ queryKey: ["tender", tenderId] });
-  onDone?.({ ok: true, newDocuments });
+  onDone?.({ ok: true, newDocuments, lastCheckedAt });
 }
 
 async function pollTenderUpdate(tenderId, entry, attempt = 0, consecutiveErrors = 0, onDone) {
@@ -122,7 +138,10 @@ async function pollTenderUpdate(tenderId, entry, attempt = 0, consecutiveErrors 
       onDone?.({ ok: false, error: "Timed out waiting for the server." });
       return;
     }
-    setTimeout(() => pollTenderUpdate(tenderId, entry, attempt + 1, 0, onDone), POLL_INTERVAL_MS);
+    setTimeout(
+      () => pollTenderUpdate(tenderId, entry, attempt + 1, 0, onDone),
+      attempt < QUICK_POLL_ATTEMPTS ? QUICK_POLL_MS : POLL_INTERVAL_MS,
+    );
   } catch (e) {
     if (consecutiveErrors + 1 >= MAX_CONSECUTIVE_ERRORS) {
       clearPending(tenderId);

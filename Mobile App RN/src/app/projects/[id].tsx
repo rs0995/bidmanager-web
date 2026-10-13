@@ -15,6 +15,8 @@ import { Button } from "@/components/common/Button";
 import { fmtINR, formatDate, timeRemaining, urgency } from "@/lib/format";
 import { useProject, useChecklist, folderNames, addChecklistItem, getAttachedFile, archiveProject, updateProject } from "@/lib/projects";
 import { useTenderDocuments } from "@/hooks/useTenderDocuments";
+import { useLinkedTender } from "@/hooks/useLinkedTender";
+import { useTenderDocActions } from "@/hooks/useTenderDocActions";
 import { syncTenderDocuments, downloadAllForTender } from "@/lib/documents";
 import { useToast } from "@/components/feedback/ToastProvider";
 import { useThemeColors, urgencyColor, hexToRgba } from "@/constants/colors";
@@ -30,10 +32,17 @@ export default function ProjectDetailScreen() {
   const toast = useToast();
   const colors = useThemeColors();
 
-  const sourceTender = project?.source_tender_db_id
-    ? { id: project.source_tender_db_id, tender_id: project.source_tender_id, title: project.title }
-    : null;
-  const { data: docsPage } = useTenderDocuments(project?.source_tender_db_id);
+  // Live tender behind this project (null if unlinked / not loaded yet): its
+  // deadline, pre-bid, corrigenda and documents override the creation-time
+  // snapshot so changes show up here automatically.
+  const liveTender = useLinkedTender(project);
+  const linkedId = liveTender?.id ?? project?.source_tender_db_id ?? null;
+  const sourceTender = liveTender
+    || (linkedId
+      ? { id: linkedId, tender_id: project?.source_tender_id, title: project?.title }
+      : null);
+  const { data: docsPage } = useTenderDocuments(linkedId);
+  const { syncButton, reDownloadBanner } = useTenderDocActions(liveTender, docsPage?.items || []);
 
   useEffect(() => {
     if (sourceTender && docsPage?.items?.length) syncTenderDocuments(sourceTender, docsPage.items);
@@ -64,7 +73,9 @@ export default function ProjectDetailScreen() {
   const done = checklist.filter((i: any) => i.status === "Completed").length;
   const total = checklist.length;
   const pct = total ? Math.round((done / total) * 100) : 0;
-  const { totalDays, label, expired } = timeRemaining(project.deadline);
+  const deadline = liveTender?.closing_date || project.deadline;
+  const prebid = liveTender?.pre_bid_meeting_date || project.prebid;
+  const { totalDays, label, expired } = timeRemaining(deadline);
   const u = urgency(totalDays);
   const color = urgencyColor(u.key, colors);
   const documents = docsPage?.items || [];
@@ -97,9 +108,12 @@ export default function ProjectDetailScreen() {
   };
 
   const archiveButton = (
+    <>
+    {syncButton}
     <Pressable className="p-1.5" onPress={() => (archived ? handleUnarchive() : setConfirmArchive(true))}>
       {archived ? <ArchiveRestore size={18} color={colors.accent} /> : <Archive size={18} color={colors.textMuted} />}
     </Pressable>
+    </>
   );
 
   return (
@@ -120,20 +134,26 @@ export default function ProjectDetailScreen() {
               Due {expired ? "past" : label}
             </Text>
           </View>
-          {project.prebid && (
+          {prebid && (
             <View className="px-2.5 py-1 rounded-full bg-surface-2">
-              <Text className="text-[14px] font-medium text-text-muted">Pre-bid {formatDate(project.prebid)}</Text>
+              <Text className="text-[14px] font-medium text-text-muted">Pre-bid {formatDate(prebid)}</Text>
             </View>
           )}
         </View>
 
         <View className="bg-surface-0 border border-border rounded-[14px] p-3 mb-4 flex-row flex-wrap">
-          <View className="w-1/2 pr-2"><FieldRow stacked label="Client" value={project.client_name} /></View>
-          <View className="w-1/2 pl-2"><FieldRow stacked label="Project value" value={fmtINR(project.project_value)} /></View>
-          <View className="w-1/2 pr-2"><FieldRow stacked label="EMD" value={fmtINR(project.emd)} /></View>
-          <View className="w-1/2 pl-2"><FieldRow stacked label="Deadline" value={formatDate(project.deadline)} /></View>
+          <View className="w-1/2 pr-2"><FieldRow stacked label="Client" value={liveTender?.organization || project.client_name} /></View>
+          <View className="w-1/2 pl-2"><FieldRow stacked label="Project value" value={fmtINR(liveTender?.tender_value || project.project_value)} /></View>
+          <View className="w-1/2 pr-2"><FieldRow stacked label="EMD" value={fmtINR(liveTender?.emd || project.emd)} /></View>
+          <View className="w-1/2 pl-2"><FieldRow stacked label="Deadline" value={formatDate(deadline)} /></View>
           <View className="w-1/2 pr-2"><FieldRow stacked label="Status" value={project.status} /></View>
           <View className="w-1/2 pl-2"><FieldRow stacked label="Documents ready" value={`${done} / ${total}`} /></View>
+          {liveTender && (
+            <>
+              <View className="w-1/2 pr-2"><FieldRow stacked label="Corrigenda" value={String(liveTender.corrigendum_count ?? 0)} /></View>
+              <View className="w-1/2 pl-2"><FieldRow stacked label="Pre-bid meeting" value={formatDate(prebid)} /></View>
+            </>
+          )}
         </View>
         {project.description && (
           <View className="bg-surface-0 border border-border rounded-[14px] p-3 mb-4">
@@ -144,6 +164,7 @@ export default function ProjectDetailScreen() {
 
         {sourceTender && (
           <>
+            {reDownloadBanner}
             <View className="flex-row items-center justify-between mb-2">
               <Text className="text-sm font-semibold text-text">
                 Published documents{documents.length ? ` (${documents.length})` : ""}

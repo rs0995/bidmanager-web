@@ -2,6 +2,7 @@ import { View, Text } from "react-native";
 import { Tabs } from "expo-router";
 import { LayoutDashboard, Globe, FolderOpen, Bell, Menu } from "lucide-react-native";
 import { useAlerts } from "@/lib/alerts";
+import { useCaptchaPending } from "@/hooks/useCaptchaPending";
 import { useThemeColors } from "@/constants/colors";
 import { interopIcon } from "@/lib/nativeIcons";
 
@@ -17,6 +18,8 @@ const MoreIcon = interopIcon(Menu);
 export default function TabsLayout() {
   const alerts = useAlerts();
   const unread = alerts.filter((a: any) => !a.read).length;
+  const captchaPending = useCaptchaPending();
+  const hasCaptchaPending = Boolean(captchaPending.data);
   const colors = useThemeColors();
 
   return (
@@ -58,7 +61,17 @@ export default function TabsLayout() {
       />
       <Tabs.Screen
         name="more"
-        options={{ title: "More", tabBarIcon: ({ color, size }) => <MoreIcon color={color} size={size} /> }}
+        options={{
+          title: "More",
+          tabBarIcon: ({ color, size }) => (
+            <View>
+              <MoreIcon color={color} size={size} />
+              {hasCaptchaPending && (
+                <View className="absolute -top-1.5 -right-2 min-w-[9px] h-[9px] rounded-full bg-danger" />
+              )}
+            </View>
+          ),
+        }}
       />
     </Tabs>
   );

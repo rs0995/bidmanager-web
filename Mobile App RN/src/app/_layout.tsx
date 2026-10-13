@@ -1,6 +1,6 @@
 import "../theme-new/global.css";
-import { useEffect, useState } from "react";
-import { View, Text, Pressable, ActivityIndicator } from "react-native";
+import { useEffect, useState, useRef } from "react";
+import { View, Text, Pressable, ActivityIndicator, LogBox, AppState } from "react-native";
 import { Stack, router } from "expo-router";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { Fingerprint } from "lucide-react-native";
@@ -16,12 +16,23 @@ import { pullBookmarks } from "@/lib/sync";
 import { resumePendingDownloadJobs } from "@/lib/documents";
 import { resumePendingOrgRequests } from "@/lib/orgRequests";
 import { resumePendingTenderUpdates } from "@/lib/tenderUpdates";
+import { resumePendingTenderStatus } from "@/lib/tenderStatus";
+import { runNotificationEngine } from "@/lib/backgroundSync";
+import { registerDevicePushToken } from "@/lib/pushToken";
 import { fetchWebsites, WEBSITES_QUERY_KEY } from "@/hooks/useWebsites";
 import { isAppLockEnabled, verifyAppLock } from "@/lib/appLock";
 import { interopIcon } from "@/lib/nativeIcons";
 import { ToastProvider } from "@/components/feedback/ToastProvider";
 
 const FingerprintIcon = interopIcon(Fingerprint);
+
+// Known-benign RN/react-native-screens native-stack transition warning --
+// fires from the navigation library's own internal Animated bridge usage,
+// not from any Animated.Value in this app's own code (verified: every
+// animation here uses Reanimated's useSharedValue, not the legacy Animated
+// API). No app-side listener leak to fix; ignored so it stops surfacing as a
+// LogBox banner in dev builds.
+LogBox.ignoreLogs(["Sending `onAnimatedValueUpdate` with no listeners registered"]);
 
 // Root layout — the RN equivalent of the web app RequireAuth + AppLockGate
 // wrapper around AppShell. Order of gates: boot (async storage hydration)
@@ -81,10 +92,29 @@ function AuthGate() {
     resumePendingDownloadJobs();
     resumePendingOrgRequests();
     resumePendingTenderUpdates();
+    resumePendingTenderStatus();
+    registerDevicePushToken();
     // Warms the SiteScope portal-picker query well before the user ever
     // taps the Tenders tab, instead of only starting the paginated
     // /client/organizations fetch once they land there (see useWebsites.js).
     queryClient.prefetchQuery({ queryKey: WEBSITES_QUERY_KEY, queryFn: fetchWebsites, staleTime: 5 * 60_000 }).catch(() => {});
+  }, [signedIn]);
+
+  // Foreground fallback for the notification engine (backgroundSync.js):
+  // covers both the very first run after sign-in and every time the app is
+  // reopened, which is what actually delivers org/tender/closing-reminder
+  // checks on days the OS never granted the background-fetch job any time.
+  const appState = useRef(AppState.currentState);
+  useEffect(() => {
+    if (!signedIn) return;
+    runNotificationEngine().catch(() => {});
+    const sub = AppState.addEventListener("change", (next) => {
+      if (appState.current.match(/inactive|background/) && next === "active") {
+        runNotificationEngine().catch(() => {});
+      }
+      appState.current = next;
+    });
+    return () => sub.remove();
   }, [signedIn]);
 
   if (!signedIn) {

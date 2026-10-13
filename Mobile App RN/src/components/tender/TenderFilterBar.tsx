@@ -1,8 +1,8 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { View, ScrollView, Pressable } from "react-native";
-import { Search, Plus, Star, X } from "lucide-react-native";
+import { Plus, Star, X } from "lucide-react-native";
 import { Chip } from "@/components/common/Chip";
-import { Input } from "@/components/common/Field";
+import { SearchField } from "./SearchField";
 import { CustomFilterMenu, customFilterLabel } from "./CustomFilterMenu";
 import { useThemeColors } from "@/constants/colors";
 
@@ -26,15 +26,8 @@ export function TenderFilterBar({
   q, onSearch, bookmarkedOnly, onToggleBookmarked, closingSoon, onToggleClosingSoon,
   customFilters, onAddCustom, onRemoveCustom, rows, onOpenAdvanced,
 }: TenderFilterBarProps) {
-  const [text, setText] = useState(q || "");
   const [menuOpen, setMenuOpen] = useState(false);
   const colors = useThemeColors();
-
-  useEffect(() => {
-    const t = setTimeout(() => { if (text !== (q || "")) onSearch(text); }, 300);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [text]);
 
   return (
     <View className="pt-3 pb-2 bg-surface-0 border-b border-border">
@@ -48,15 +41,7 @@ export function TenderFilterBar({
           >
             <Star size={16} color={bookmarkedOnly ? colors.accent : colors.textMuted} fill={bookmarkedOnly ? colors.accent : "none"} />
           </Pressable>
-          <View className="relative flex-1 justify-center">
-            <Search size={15} color={colors.textMuted} style={{ position: "absolute", left: 12, zIndex: 1 }} />
-            <Input
-              style={{ paddingLeft: 34 }}
-              placeholder="Search title, org, tender ID"
-              value={text}
-              onChangeText={setText}
-            />
-          </View>
+          <SearchField value={q} onSearch={onSearch} placeholder="Search title, org, tender ID" />
         </View>
       </View>
       {/* Padding lives in the scroll content (not the outer row) so the chip
