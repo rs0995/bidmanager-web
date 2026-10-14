@@ -163,7 +163,7 @@ export default function ProjectDetailScreen() {
           </View>
           {prebid && (
             <View className="px-2.5 py-1 rounded-full bg-surface-2">
-              <Text className="text-[14px] font-medium text-text-muted">Pre-bid {formatDate(prebid)}</Text>
+              <Text className="text-[14px] font-medium text-text-muted">Pre-bid {formatDateTime(prebid)}</Text>
             </View>
           )}
         </View>

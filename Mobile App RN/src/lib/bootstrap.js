@@ -23,7 +23,7 @@ const KV_KEYS = [
   "bm.documents",
   "bm.syncBlob", "bm.syncBase", "bm.syncDirty", "bm.tenderSnapshot", "bm.lastChangesAt",
   "bm.remindersFired", "bm.closingRemindersFired", "bm.notificationEngineLastRun", "bm.lastRegisteredPushToken",
-  "bm.tendersLastWebsiteId", "bm.tendersLastView",
+  "bm.tendersLastWebsiteId", "bm.tendersLastView", "bm.syncPaused",
 ];
 
 // Call once at app startup, before rendering anything that reads from these

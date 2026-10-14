@@ -127,7 +127,7 @@ export default function TenderDetailScreen() {
           </View>
           <View className="px-3">
             <FieldRow stacked label="Closing" value={formatDateTimeIST(tender.closing_date)} />
-            <FieldRow stacked label="Pre-bid meeting" value={formatDate(tender.pre_bid_meeting_date)} />
+            <FieldRow stacked label="Pre-bid meeting" value={formatDateTimeIST(tender.pre_bid_meeting_date)} />
             <FieldRow stacked label="Organisation chain" value={tender.organization} />
           </View>
         </View>

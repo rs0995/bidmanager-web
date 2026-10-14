@@ -4,6 +4,7 @@ import { api } from "./api.js";
 import { queryClient } from "./queryClient.js";
 import { WEBSITES_QUERY_KEY } from "../hooks/useWebsites.js";
 import { CAPTCHA_PENDING_QUERY_KEY } from "../hooks/useCaptchaPending.js";
+import { isSyncPaused } from "./syncPause.js";
 import { getRaw, setRaw } from "./kv.js";
 import {
   getBookmarks, setBookmarks, getBookmarkedOrgs, setBookmarkedOrgs,
@@ -91,6 +92,7 @@ let inFlightPush = null;
 
 async function doPush() {
   cancelScheduledPush();
+  if (isSyncPaused()) return false;
   if (inFlightPush) { try { await inFlightPush; } catch { /* ignore */ } }
   const { data, removed, base_updated_at } = buildPushBody();
   inFlightPush = (async () => {
@@ -123,6 +125,7 @@ async function doPull() {
 
 let syncInFlight = null;
 export async function syncUserData() {
+  if (isSyncPaused()) return;
   if (syncInFlight) { await syncInFlight; return; }
   syncInFlight = (async () => {
     if (isDirty()) {
@@ -156,6 +159,7 @@ let syncNowInFlight = null;
 // real result instead of each doing its own redundant, duplicate-producing
 // pass.
 export async function syncNow() {
+  if (isSyncPaused()) return { changedCount: 0 };
   if (syncNowInFlight) return syncNowInFlight;
   syncNowInFlight = (async () => {
     await syncUserData();

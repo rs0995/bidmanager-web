@@ -4,6 +4,7 @@ import { syncNow } from "./sync.js";
 import { runClosingReminderCheck } from "./closingReminders.js";
 import { api } from "./api.js";
 import { getRaw, setRaw } from "./kv.js";
+import { isSyncPaused } from "./syncPause.js";
 import { queryClient } from "./queryClient.js";
 import { WEBSITES_QUERY_KEY, fetchWebsites } from "../hooks/useWebsites.js";
 
@@ -37,6 +38,7 @@ export function getLastEngineRunAt() {
 }
 
 export async function runNotificationEngine() {
+  if (isSyncPaused()) return;
   setRaw(LAST_RUN_KEY, String(Date.now()));
   // Unconditional, unlike the alert/reminder passes below -- a newly-synced
   // org should show up on the next background cycle regardless of whether

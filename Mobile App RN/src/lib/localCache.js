@@ -12,6 +12,7 @@ import { deleteAllLocalDocumentFiles } from "./documents.js";
 // definition.
 const KEEP_KEYS = new Set([
   "bm.settings", // theme / app-lock / reminders preferences, not "cache"
+  "bm.syncPaused", // set by the clear itself; lifted by the next manual sync
 ]);
 
 export function clearLocalCache() {

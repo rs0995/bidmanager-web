@@ -27,7 +27,7 @@ export default function OrganizationTendersScreen() {
 
   const query = useTenders({
     organization: orgName, website_id: websiteId, sort_by: sortBy, sort_order: sortOrder,
-    q: search, archived: archived === "1" ? "true" : undefined,
+    q: search, archived: archived === "1" ? "true" : "false",
   });
   // Client-side safety net for the sort the server was already asked for —
   // guarantees correct order even if the server doesn't apply sort_by/sort_order.

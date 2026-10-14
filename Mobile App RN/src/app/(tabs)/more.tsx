@@ -25,6 +25,8 @@ import { rehydrateAlerts } from "@/lib/alerts";
 import { rehydrateOrgRequests } from "@/lib/orgRequests";
 import { rehydrateTenderUpdates } from "@/lib/tenderUpdates";
 import { clearLocalCache } from "@/lib/localCache";
+import { setSyncPaused } from "@/lib/syncPause";
+import { resumeSync } from "@/lib/resumeSync";
 import { useThemeColors } from "@/constants/colors";
 import { useCaptchaPending } from "@/hooks/useCaptchaPending";
 
@@ -78,8 +80,8 @@ export default function MoreScreen() {
   const health = useQuery({ queryKey: ["health-check"], queryFn: api.health, enabled: false, retry: 0 });
 
   const sync = useMutation({
-    mutationFn: syncNow,
-    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ["tenders"] }); queryClient.invalidateQueries({ queryKey: ["stats"] }); toast?.push({ title: "Synced" }); },
+    mutationFn: resumeSync,
+    onSuccess: () => { toast?.push({ title: "Synced" }); },
     onError: (e: any) => toast?.push({ title: "Sync failed", body: e?.message, type: "error" }),
   });
 
@@ -108,6 +110,8 @@ export default function MoreScreen() {
   // kv.js mirror, then re-syncs bookmarks/projects from the server -- the same
   // end state a reload achieved on the web app, without the reload.
   const handleClearCache = async () => {
+    // Paused first so nothing refetches while the stores are being emptied.
+    setSyncPaused(true);
     clearLocalCache();
     rehydrateStore();
     rehydrateAlerts();
@@ -120,8 +124,7 @@ export default function MoreScreen() {
     // not in the kv store cleared above.
     queryClient.clear();
     setConfirmClearCache(false);
-    await pullBookmarks().catch(() => {});
-    toast?.push({ title: "Cache cleared" });
+    toast?.push({ title: "Cache cleared", body: "Tap Sync tenders to reload." });
   };
 
   const toggleAppLock = async (next: boolean) => {
@@ -234,7 +237,7 @@ export default function MoreScreen() {
         )}
       >
         <Text className="text-[14px] text-text-muted">
-          Removes downloaded files, alerts, and the organisations and tenders fetched to this device. Nothing is deleted from your account — bookmarks and projects are re-synced from the cloud right after.
+          Removes bookmarks, projects, downloaded files, alerts, and the organisations and tenders fetched to this device. Nothing is deleted from your account. Nothing reloads or syncs until you tap Sync tenders.
         </Text>
       </Sheet>
     </View>

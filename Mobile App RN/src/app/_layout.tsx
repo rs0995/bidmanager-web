@@ -19,6 +19,7 @@ import { resumePendingTenderUpdates } from "@/lib/tenderUpdates";
 import { resumePendingTenderStatus } from "@/lib/tenderStatus";
 import { runNotificationEngine } from "@/lib/backgroundSync";
 import { registerDevicePushToken } from "@/lib/pushToken";
+import { isSyncPaused } from "@/lib/syncPause";
 import { fetchWebsites, WEBSITES_QUERY_KEY } from "@/hooks/useWebsites";
 import { isAppLockEnabled, verifyAppLock } from "@/lib/appLock";
 import { interopIcon } from "@/lib/nativeIcons";
@@ -97,7 +98,9 @@ function AuthGate() {
     // Warms the SiteScope portal-picker query well before the user ever
     // taps the Tenders tab, instead of only starting the paginated
     // /client/organizations fetch once they land there (see useWebsites.js).
-    queryClient.prefetchQuery({ queryKey: WEBSITES_QUERY_KEY, queryFn: fetchWebsites, staleTime: 5 * 60_000 }).catch(() => {});
+    if (!isSyncPaused()) {
+      queryClient.prefetchQuery({ queryKey: WEBSITES_QUERY_KEY, queryFn: fetchWebsites, staleTime: 5 * 60_000 }).catch(() => {});
+    }
   }, [signedIn]);
 
   // Foreground fallback for the notification engine (backgroundSync.js):

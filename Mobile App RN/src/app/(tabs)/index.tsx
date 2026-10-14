@@ -14,7 +14,8 @@ import { useStats } from "@/hooks/useStats";
 import { useBookmarkToggle, useBookmarkedTenders, useOrgBookmarkToggle } from "@/hooks/useBookmarks";
 import { useProjects } from "@/lib/projects";
 import { useSettings } from "@/lib/store";
-import { syncNow } from "@/lib/sync";
+import { resumeSync } from "@/lib/resumeSync";
+import { SyncPausedBanner } from "@/components/feedback/SyncPausedBanner";
 import { fmtINR, timeRemaining, parseINR } from "@/lib/format";
 import { useToast } from "@/components/feedback/ToastProvider";
 import { useThemeColors } from "@/constants/colors";
@@ -46,7 +47,7 @@ export default function OverviewScreen() {
   const handleSync = async () => {
     setSyncing(true);
     try {
-      await syncNow();
+      await resumeSync();
       await refetch();
       toast?.push({ title: "Sync complete" });
     } catch (e: any) {
@@ -60,6 +61,7 @@ export default function OverviewScreen() {
     <View className="flex-1 bg-bg">
       <ScrollView contentContainerClassName="p-4" contentContainerStyle={{ paddingTop: insets.top + 16 }}>
         <Text className="text-2xl text-text mb-4" style={{ fontFamily: "BricolageGrotesque_700Bold" }}>Overview</Text>
+        <SyncPausedBanner />
         {isLoading && <SkeletonList count={2} />}
         {isError && <ErrorState message={error?.message} onRetry={refetch} />}
         {stats && (

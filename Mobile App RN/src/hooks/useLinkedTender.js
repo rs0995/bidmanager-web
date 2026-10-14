@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../lib/api.js";
+import { isSyncPaused } from "../lib/syncPause.js";
 
 // A project keeps a snapshot of its source tender (see createProjectFromTender)
 // plus the tender's ids. This reads the live tender through the same
@@ -20,7 +21,7 @@ export function useLinkedTender(project) {
       const hit = (page.items || []).find((t) => String(t.tender_id || "").trim().toUpperCase() === portalId.toUpperCase());
       return hit ? hit.id : null;
     },
-    enabled: storedId == null && portalId !== "",
+    enabled: () => storedId == null && portalId !== "" && !isSyncPaused(),
     staleTime: 24 * 60 * 60 * 1000,
   });
 
@@ -28,7 +29,7 @@ export function useLinkedTender(project) {
   const { data } = useQuery({
     queryKey: ["tender", Number(dbId)],
     queryFn: () => api.tender(dbId),
-    enabled: dbId != null,
+    enabled: () => dbId != null && !isSyncPaused(),
     staleTime: 5 * 60 * 1000,
   });
   return data || null;

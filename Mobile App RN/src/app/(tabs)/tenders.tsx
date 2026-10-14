@@ -2,6 +2,7 @@ import { useState, useMemo, useCallback } from "react";
 import { View } from "react-native";
 import { useLocalSearchParams, router } from "expo-router";
 import { ScreenHeader } from "@/components/shell/ScreenHeader";
+import { SyncPausedBanner } from "@/components/feedback/SyncPausedBanner";
 import { SiteScope } from "@/components/tender/SiteScope";
 import { SegmentedControl } from "@/components/common/SegmentedControl";
 import { TenderFilterBar } from "@/components/tender/TenderFilterBar";
@@ -113,6 +114,7 @@ export default function TendersScreen() {
   return (
     <View className="flex-1 bg-bg">
       <ScreenHeader title="Tenders" />
+      <View className="px-4 pt-3"><SyncPausedBanner /></View>
       <SiteScope
         websiteId={apiFilters.website_id}
         onChange={(id) => {

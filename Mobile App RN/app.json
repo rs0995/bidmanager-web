@@ -12,7 +12,7 @@
       "requireFullScreen": true,
       "icon": "./assets/images/icon.png",
       "bundleIdentifier": "com.raku.s0995.bidmanager-mobile",
-      "buildNumber": "2",
+      "buildNumber": "4",
       "infoPlist": {
         "CFBundleDisplayName": "BM Pro",
         "NSAppTransportSecurity": {
