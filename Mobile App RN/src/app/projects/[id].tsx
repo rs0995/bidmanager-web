@@ -73,8 +73,18 @@ export default function ProjectDetailScreen() {
   const done = checklist.filter((i: any) => i.status === "Completed").length;
   const total = checklist.length;
   const pct = total ? Math.round((done / total) * 100) : 0;
-  const deadline = liveTender?.closing_date || project.deadline;
-  const prebid = liveTender?.pre_bid_meeting_date || project.prebid;
+  // A field follows the live tender unless it was edited by hand on the
+  // desktop (it no longer equals what was copied from the tender).
+  const snapshot = project.tender_snapshot || null;
+  const norm = (v: any) => String(v ?? "").replace(/[,\s]/g, "").trim();
+  const followTender = (field: string, tenderKey: string) => {
+    const live = liveTender?.[tenderKey];
+    if (!live) return project[field];
+    if (snapshot && norm(project[field]) !== norm(snapshot[tenderKey])) return project[field];
+    return live;
+  };
+  const deadline = followTender("deadline", "closing_date");
+  const prebid = followTender("prebid", "pre_bid_meeting_date");
   const { totalDays, label, expired } = timeRemaining(deadline);
   const u = urgency(totalDays);
   const color = urgencyColor(u.key, colors);
@@ -130,7 +140,7 @@ export default function ProjectDetailScreen() {
 
   const detailCells: { label: string; value: any }[] = [
     { label: "Client", value: liveTender?.organization || project.client_name },
-    { label: "Project value", value: fmtINR(liveTender?.tender_value || project.project_value) },
+    { label: "Project value", value: fmtINR(followTender("project_value", "tender_value")) },
     { label: "EMD", value: fmtINR(liveTender?.emd || project.emd) },
     { label: "Deadline", value: formatDate(deadline) },
     { label: "Status", value: project.status },

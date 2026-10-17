@@ -1,5 +1,7 @@
 import { getAllKeysRaw, removeRaw } from "./kv.js";
+import { Directory, Paths } from "expo-file-system";
 import { deleteAllLocalDocumentFiles } from "./documents.js";
+import { ATTACHMENTS_DIR_NAME } from "./projects.js";
 
 // Wipes locally-cached data (bookmarks/projects/documents/alerts/etc.) so the
 // app rebuilds it from scratch. NOT a sign-out and NOT a cloud delete.
@@ -20,4 +22,10 @@ export function clearLocalCache() {
     .filter((key) => key.startsWith("bm.") && !KEEP_KEYS.has(key))
     .forEach((key) => removeRaw(key));
   deleteAllLocalDocumentFiles();
+  try {
+    const dir = new Directory(Paths.document, ATTACHMENTS_DIR_NAME);
+    if (dir.exists) dir.delete();
+  } catch {
+    // nothing to delete
+  }
 }

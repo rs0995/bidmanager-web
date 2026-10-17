@@ -43,6 +43,7 @@ export const api = {
   ),
 
   organizations: (params) => request(`/client/organizations?${new URLSearchParams(clean(params))}`),
+  websites: () => request("/client/websites"),
   requestOrgTenders: (orgId) => request(`/client/organizations/${Number(orgId)}/request-tenders`, { method: "POST", body: {} }),
   orgRequestStatus: (orgId, jobId) => request(
     `/client/organizations/${Number(orgId)}/request-tenders-status?job_id=${encodeURIComponent(jobId)}`,

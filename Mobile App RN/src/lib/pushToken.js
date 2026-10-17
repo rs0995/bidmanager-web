@@ -57,3 +57,15 @@ export async function unregisterDevicePushToken() {
     // best-effort
   }
 }
+
+// Used when saved preferences arrive from the server (e.g. after a reinstall):
+// asks for notification permission if it hasn't been decided yet, then
+// registers this device so server push reaches it again.
+export async function ensurePushRegistration() {
+  try {
+    const granted = await requestNotificationPermission();
+    if (granted) await registerDevicePushToken();
+  } catch {
+    // best-effort
+  }
+}

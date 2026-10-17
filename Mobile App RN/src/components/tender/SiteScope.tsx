@@ -13,8 +13,12 @@ export function SiteScope({ websiteId, onChange }: SiteScopeProps) {
   const [open, setOpen] = useState(false);
   const colors = useThemeColors();
 
+  // Also covers a remembered portal that has since been deleted on the
+  // server: switch to the first one instead of showing empty lists.
   useEffect(() => {
-    if (!websiteId && websites.length > 0) onChange(String(websites[0].id));
+    if (websites.length === 0) return;
+    const known = websites.some((s: any) => String(s.id) === String(websiteId));
+    if (!websiteId || !known) onChange(String(websites[0].id));
   }, [websiteId, websites, onChange]);
 
   // Reserve the same footprint as the real picker while loading -- returning

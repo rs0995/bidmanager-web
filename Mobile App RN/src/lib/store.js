@@ -38,6 +38,9 @@ const SETTINGS_DEFAULTS = {
   // Replaces the old single deadlineRemindersOn flag with three
   // independently-toggleable notification options.
   notifyOrgAlertsOn: false, notifyTenderAlertsOn: false, reminderDays: [],
+  // ms; set only when the user changes a push toggle. The server keeps the
+  // newer stamp, so a fresh install's defaults can't overwrite saved prefs.
+  notificationPrefsUpdatedAt: 0,
 };
 
 // One-time migration from the old single toggle: opted-in users keep getting

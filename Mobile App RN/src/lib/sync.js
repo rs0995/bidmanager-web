@@ -5,6 +5,7 @@ import { queryClient } from "./queryClient.js";
 import { WEBSITES_QUERY_KEY } from "../hooks/useWebsites.js";
 import { CAPTCHA_PENDING_QUERY_KEY } from "../hooks/useCaptchaPending.js";
 import { isSyncPaused } from "./syncPause.js";
+import { ensurePushRegistration } from "./pushToken.js";
 import { getRaw, setRaw } from "./kv.js";
 import {
   getBookmarks, setBookmarks, getBookmarkedOrgs, setBookmarkedOrgs,
@@ -61,24 +62,30 @@ function buildPushBody() {
   const { projects, checklist } = projectsForSync();
   const localProjIds = new Set(idsOf(projects));
   const localChkIds = new Set(idsOf(checklist));
-  // Server-side push (apns_push.py, via api_server.py's scheduler) reads this
-  // to know which notifications a user wants -- without it the server has no
-  // way to tell "push nothing" from "push everything" for a given device.
-  // Last-write-wins (see _merge_sync_blob's generic-key path) is fine here:
-  // it's one small object, not a set that needs cross-device union.
+  // Server-side push (apns_push.py) reads notificationPrefs to know which
+  // notifications a user wants. Sent only once the user has set them (or an
+  // older install already has one on); a fresh install sends nothing, so its
+  // "off" defaults can't overwrite the saved preferences. The server also
+  // keeps whichever copy has the newer updatedAt.
   const settings = getSettings();
+  const prefsStamp = Number(settings.notificationPrefsUpdatedAt) || 0;
+  const reminderDays = Array.isArray(settings.reminderDays) ? settings.reminderDays : [];
+  const sendPrefs = prefsStamp > 0 || settings.notifyOrgAlertsOn || settings.notifyTenderAlertsOn || reminderDays.length > 0;
   const data = {
     bookmarks: [...localBm],
     bookmarkedOrgs,
     bookmarkedOrgIds: bookmarkedOrgs.map((n) => orgIdByName[n]).filter((id) => Number.isFinite(id)),
     projects,
     checklist,
-    notificationPrefs: {
+  };
+  if (sendPrefs) {
+    data.notificationPrefs = {
       notifyOrgAlertsOn: Boolean(settings.notifyOrgAlertsOn),
       notifyTenderAlertsOn: Boolean(settings.notifyTenderAlertsOn),
-      reminderDays: Array.isArray(settings.reminderDays) ? settings.reminderDays : [],
-    },
-  };
+      reminderDays,
+      updatedAt: prefsStamp,
+    };
+  }
   const removed = {
     bookmarks: (lastBlob.bookmarks || []).map(Number).filter((id) => Number.isFinite(id) && !localBm.has(id)),
     bookmarkedOrgs: (lastBlob.bookmarkedOrgs || []).filter((n) => !localOrg.has(n)),
@@ -109,6 +116,24 @@ async function doPush() {
   return inFlightPush;
 }
 
+// The server copy wins unless this device changed its toggles more recently.
+function applyServerNotificationPrefs(prefs) {
+  if (!prefs || typeof prefs !== "object") return;
+  const remoteStamp = Number(prefs.updatedAt) || 0;
+  const localStamp = Number(getSettings().notificationPrefsUpdatedAt) || 0;
+  if (remoteStamp < localStamp) return;
+  const next = {
+    notifyOrgAlertsOn: Boolean(prefs.notifyOrgAlertsOn),
+    notifyTenderAlertsOn: Boolean(prefs.notifyTenderAlertsOn),
+    reminderDays: Array.isArray(prefs.reminderDays) ? prefs.reminderDays : [],
+    notificationPrefsUpdatedAt: remoteStamp,
+  };
+  setSettings(next);
+  if (next.notifyOrgAlertsOn || next.notifyTenderAlertsOn || next.reminderDays.length > 0) {
+    ensurePushRegistration();
+  }
+}
+
 async function doPull() {
   const res = await api.getSync().catch(() => null);
   if (!res) return false;
@@ -117,6 +142,7 @@ async function doPull() {
   setBookmarks((blob.bookmarks || []).map(Number));
   setBookmarkedOrgs(blob.bookmarkedOrgs || []);
   mergeProjectsFromServer(blob.projects || [], blob.checklist || []);
+  applyServerNotificationPrefs(blob.notificationPrefs);
 
   setLastBlob(blob);
   if (res.updated_at) setBase(res.updated_at);

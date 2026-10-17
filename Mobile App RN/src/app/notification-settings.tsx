@@ -91,16 +91,16 @@ export default function NotificationSettingsScreen() {
   };
 
   const toggleOrgAlerts = async (next: boolean) => {
-    setSettings({ notifyOrgAlertsOn: next }); schedulePush();
+    setSettings({ notifyOrgAlertsOn: next, notificationPrefsUpdatedAt: Date.now() }); schedulePush();
     if (next) await ensurePermission();
   };
   const toggleTenderAlerts = async (next: boolean) => {
-    setSettings({ notifyTenderAlertsOn: next }); schedulePush();
+    setSettings({ notifyTenderAlertsOn: next, notificationPrefsUpdatedAt: Date.now() }); schedulePush();
     if (next) await ensurePermission();
   };
   const toggleDay = async (day: number, next: boolean) => {
     const nextDays = next ? [...reminderDays, day] : reminderDays.filter((d) => d !== day);
-    setSettings({ reminderDays: nextDays }); schedulePush();
+    setSettings({ reminderDays: nextDays, notificationPrefsUpdatedAt: Date.now() }); schedulePush();
     if (next) await ensurePermission();
   };
 

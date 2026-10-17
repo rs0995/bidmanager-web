@@ -57,7 +57,7 @@ export default function TenderDetailScreen() {
     const project = createProjectFromTender(tender);
     toast?.push({
       title: "Project created",
-      body: `"${project.title}" added with a Ready Docs checklist.`,
+      body: `"${project.title}" added to Projects.`,
       action: { label: "View project", onClick: () => router.push(`/projects/${project.id}` as any) },
     });
   };
