@@ -8,6 +8,17 @@ const leaf = (value) => String(value || 'Project').replace(/[<>:"/\\|?*]+/g, ' '
 const joinPath = (...parts) => parts.filter(Boolean).join('\\').replace(/[\\/]+/g, '\\');
 const valueNumber = (value) => Number(String(value || '').replace(/[^0-9.]/g, '')) || 0;
 
+// A tender's identity everywhere is its portal tender id (e.g.
+// "2026_MCGM_1345164_1"), compared in this canonical form — the same
+// normaliser as the server's _canon_tender_id. The server DB row id
+// (tender.id) only lives as long as that DB does: it's a short-lived handle
+// for /client/tenders/{id} calls, looked up from the tender id right before
+// use (api.resolveTenderRowId). Anything persisted (bookmarks, documents,
+// notifications, project links) is keyed by tender id so a server DB
+// restore that renumbers every row reconnects automatically.
+export const canonTenderId = (value) => String(value ?? '').split(/\s+/).filter(Boolean).join(' ').toUpperCase();
+export const tenderKey = (tender) => canonTenderId(tender?.tender_id);
+
 function filterRows(rows, search, fields) {
   const q = String(search || '').trim().toLowerCase();
   if (!q) return rows;
@@ -202,6 +213,10 @@ async function downloadServerSnapshot(overrides = {}) {
   // Best-effort: the org cache only feeds the bookmark->id lookup for cloud
   // sync (see pushUserData) — a failure here shouldn't block a tender sync.
   const organizations = await downloadServerOrganizations(overrides).catch(() => []);
+  // The server's own portal list, so a portal shows before anything is
+  // scraped and a deleted one disappears. Older servers without the
+  // endpoint fall back to the portals seen on tenders.
+  const serverWebsites = await requestClient('/client/websites', {}, overrides).catch(() => null);
   const websiteMap = new Map();
   tenders.forEach((tender) => {
     const id = Number(tender.website_id);
@@ -210,10 +225,17 @@ async function downloadServerSnapshot(overrides = {}) {
     if (!tender.is_archived) current.active_tenders += 1;
     websiteMap.set(id, current);
   });
-  const websites = [...websiteMap.values()].map((website) => ({
+  const derivedWebsites = [...websiteMap.values()].map((website) => ({
     ...website,
     orgs: new Set(tenders.filter((t) => Number(t.website_id) === website.id).map((t) => t.org_chain).filter(Boolean)).size,
   }));
+  const websites = Array.isArray(serverWebsites)
+    ? serverWebsites.map((w) => {
+      const id = Number(w.id);
+      const seen = derivedWebsites.find((d) => d.id === id);
+      return { id, name: w.name || `Website ${id}`, url: w.url || '', orgs: seen?.orgs || 0, active_tenders: seen?.active_tenders || 0, selected_orgs: 0 };
+    })
+    : derivedWebsites;
   return { websites, tenders, organizations, server_stats: serverStats };
 }
 
@@ -266,6 +288,24 @@ async function saveSyncBaseline(blob, updatedAt) {
   });
 }
 const _idSet = (values) => new Set((values || []).map(Number).filter(Number.isFinite));
+const _tenderIdList = (values) => [...new Set((values || []).map(canonTenderId).filter(Boolean))];
+// Bookmarked tender ids in the last server blob. A baseline saved before
+// bookmarks were keyed by tender id only has row ids — translated once via
+// the loaded tenders (an id that can't be translated is neither carried nor
+// claimed removed; the server keeps it).
+function baselineBookmarkTenderIds(tenders) {
+  if (Array.isArray(_lastServerBlob.bookmarkTenderIds)) return _tenderIdList(_lastServerBlob.bookmarkTenderIds);
+  const keyByRowId = new Map((tenders || []).map((row) => [Number(row.id), tenderKey(row)]));
+  return _tenderIdList((_lastServerBlob.bookmarks || []).map((id) => keyByRowId.get(Number(id))));
+}
+// The locally-issued "request" placeholder document row (negative id) for a
+// tender — found by tender id, so a row-id change since the request doesn't
+// orphan it.
+async function placeholderDocId(tender) {
+  const key = tenderKey(tender);
+  const row = key && (await getState()).documents.find((doc) => doc.id < 0 && canonTenderId(doc.tender_id) === key);
+  return row ? row.id : -Number(tender.id);
+}
 const _rowIdSet = (rows) => new Set((rows || []).map((r) => Number(r?.id)).filter(Number.isFinite));
 // `_syncPushPending` alone doesn't survive an app restart — it's just a JS
 // module variable, gone the instant the process exits. If a push fails and
@@ -343,6 +383,27 @@ function notifyTendersChanged() {
   _tendersChangedListeners.forEach((fn) => { try { fn(); } catch { /* listener's problem, not ours */ } });
 }
 
+// Maps the server's `account` block (identical shape from login/register's
+// `response.account` and GET /client/me) onto the local settings fields —
+// see db.js initialState().settings and Server UI/server/org_access.py
+// public_account(). Tolerant of a missing/null account (keeps the
+// individual/all-sections default) so a pre-this-change server response
+// (no `account` key at all) doesn't break sign-in.
+function accountSettingsPatch(account) {
+  if (!account || typeof account !== 'object') return {};
+  return {
+    account_type: account.account_type === 'organisation' ? 'organisation' : 'individual',
+    org: account.org || null,
+    permissions: {
+      active: account.permissions?.active !== false,
+      archived: account.permissions?.archived !== false,
+      bookmarks: account.permissions?.bookmarks !== false,
+      projects: account.permissions?.projects !== false,
+    },
+    pending_request: account.pending_request || null,
+  };
+}
+
 export const api = {
   defaultServerUrl: DEFAULT_SERVER_URL,
 
@@ -362,7 +423,19 @@ export const api = {
   // ── Auth ───────────────────────────────────────────────────────────
   registerAccount: (input, overrides = {}) => requestClient(
     '/client/auth/register',
-    { method: 'POST', body: { email: input.email, password: input.password, display_name: input.display_name || '' } },
+    {
+      method: 'POST',
+      body: {
+        email: input.email,
+        password: input.password,
+        display_name: input.display_name || '',
+        // Organisation signup — omitted/undefined for a plain individual
+        // account, matching the server's default. See Server UI/server/
+        // org_access.py for the account/org/permissions model this feeds.
+        ...(input.account_type ? { account_type: input.account_type } : {}),
+        ...(input.org_name ? { org_name: input.org_name } : {}),
+      },
+    },
     overrides,
     { requireAuth: false },
   ),
@@ -383,6 +456,7 @@ export const api = {
       user_email: response.email,
       user_id: response.user_id,
       display_name: response.display_name || '',
+      ...accountSettingsPatch(response.account),
     };
     if (remember) { sessionAuth = null; await api.updateSettings(auth); }
     else sessionAuth = auth;
@@ -392,12 +466,75 @@ export const api = {
   signOut: async () => {
     try { await api.logoutAccount(); } catch { /* best-effort */ }
     sessionAuth = null;
-    await api.updateSettings({ auth_token: '', user_email: '', user_id: null, display_name: '' });
+    await api.updateSettings({
+      auth_token: '', user_email: '', user_id: null, display_name: '',
+      account_type: 'individual', org: null,
+      permissions: { active: true, archived: true, bookmarks: true, projects: true },
+      pending_request: null,
+    });
+  },
+  // Refreshes this device's local view of account/org/permissions state —
+  // call after signing in (redundant with the auth response but harmless)
+  // and after any org action below, since approving/declining/de-linking
+  // can change what THIS device's own account looks like too (e.g. an org
+  // admin approving a request doesn't change their own account, but acting
+  // on their own pending request or being de-linked by another admin does).
+  getMe: async (overrides = {}) => {
+    const me = await requestClient('/client/me', {}, overrides);
+    await api.updateSettings(accountSettingsPatch(me));
+    return me;
   },
   changePassword: (input, overrides = {}) => requestClient(
     '/client/auth/change-password',
     { method: 'POST', body: { current_password: input.current_password, new_password: input.new_password } },
     overrides,
+  ),
+
+  // ── Organisation accounts (Server UI/server/org_access.py) ───────────
+  // Any individual can create or request to join an org; the rest are
+  // admin-only (the server itself enforces this — a plain member or
+  // individual calling them just gets back the server's own 403/404).
+  createOrg: (name, overrides = {}) => requestClient(
+    '/client/org', { method: 'POST', body: { name } }, overrides,
+  ).then(async (detail) => { await api.getMe(overrides); return detail; }),
+  requestJoinOrg: (joinCode, note = '', overrides = {}) => requestClient(
+    '/client/org/join-requests', { method: 'POST', body: { join_code: joinCode, note } }, overrides,
+  ).then(async (result) => { await api.getMe(overrides); return result; }),
+  getMyJoinRequest: (overrides = {}) => requestClient('/client/org/join-requests/mine', {}, overrides),
+  cancelJoinRequest: (overrides = {}) => requestClient(
+    '/client/org/join-requests/mine', { method: 'DELETE' }, overrides,
+  ).then(async (result) => { await api.getMe(overrides); return result; }),
+  getOrgDetail: (overrides = {}) => requestClient('/client/org', {}, overrides),
+  renameOrg: (name, overrides = {}) => requestClient(
+    '/client/org', { method: 'PUT', body: { name } }, overrides,
+  ),
+  regenerateJoinCode: (overrides = {}) => requestClient(
+    '/client/org/join-code/regenerate', { method: 'POST' }, overrides,
+  ),
+  listJoinRequests: (overrides = {}) => requestClient('/client/org/join-requests', {}, overrides),
+  // permissions: optional partial { active, archived, bookmarks, projects } —
+  // omitted keys default to every section on, matching the server's own
+  // default for a newly approved member.
+  approveJoinRequest: (requestId, permissions, overrides = {}) => requestClient(
+    `/client/org/join-requests/${Number(requestId)}/approve`,
+    { method: 'POST', body: permissions ? { permissions } : {} },
+    overrides,
+  ),
+  rejectJoinRequest: (requestId, overrides = {}) => requestClient(
+    `/client/org/join-requests/${Number(requestId)}/reject`, { method: 'POST' }, overrides,
+  ),
+  setMemberPermissions: (memberId, permissions, overrides = {}) => requestClient(
+    `/client/org/members/${Number(memberId)}/permissions`,
+    { method: 'PUT', body: permissions },
+    overrides,
+  ),
+  setMemberRole: (memberId, role, overrides = {}) => requestClient(
+    `/client/org/members/${Number(memberId)}/role`, { method: 'PUT', body: { role } }, overrides,
+  ),
+  // retain: true keeps the member's bookmarks (if they had bookmark access),
+  // false wipes their account back to an empty individual.
+  delinkMember: (memberId, retain, overrides = {}) => requestClient(
+    `/client/org/members/${Number(memberId)}/delink`, { method: 'POST', body: { retain: Boolean(retain) } }, overrides,
   ),
 
   health: (overrides = {}) => requestClient('/client/health', {}, overrides),
@@ -433,15 +570,90 @@ export const api = {
     `/client/tenders/${Number(tenderId)}/download-status?job_id=${encodeURIComponent(jobId)}`,
     {}, overrides,
   ),
+  // "Check for updates" on an open tender: the server re-reads the portal and
+  // fetches only corrigendum / pre-bid files the last run didn't cover.
+  requestTenderUpdateJob: (tenderId, overrides = {}) => requestClient(
+    `/client/tenders/${Number(tenderId)}/request-download`,
+    { method: 'POST', body: { mode: 'update' } },
+    overrides,
+  ),
+  // "Fetch status" on a closed tender: the portal's tender stage plus any
+  // result files. Polled with getTenderDownloadStatus like a download job.
+  fetchTenderStatus: (tenderId, overrides = {}) => requestClient(
+    `/client/tenders/${Number(tenderId)}/fetch-status`,
+    { method: 'POST', body: {} },
+    overrides,
+  ),
+  // Runs a request-download / fetch-status job to the end: 5 s steps at
+  // first, then 15 s, capped at ~30 min; three failed polls in a row give up.
+  waitForTenderJob: async (tenderId, jobId, overrides = {}) => {
+    let errors = 0;
+    for (let attempt = 0; attempt < 128; attempt += 1) {
+      try {
+        const { status, error } = await api.getTenderDownloadStatus(tenderId, jobId, overrides);
+        if (status === 'completed' || status === 'failed') return { status, error };
+        errors = 0;
+      } catch (err) {
+        errors += 1;
+        if (errors >= 3) return { status: 'failed', error: err?.message || String(err) };
+      }
+      await new Promise((resolve) => setTimeout(resolve, attempt < 8 ? 5000 : 15000));
+    }
+    return { status: 'failed', error: 'Timed out waiting for the server.' };
+  },
+  // CAPTCHAs raised by this user's own jobs (request-download, fetch-status,
+  // request-tenders). Whichever answer reaches the server first wins -- the
+  // operator console can answer the same one.
+  getPendingCaptcha: (overrides = {}) => requestClient('/client/captcha/pending', {}, overrides),
+  answerCaptcha: (id, text, overrides = {}) => requestClient(
+    `/client/captcha/${encodeURIComponent(id)}/answer`,
+    { method: 'POST', body: { text } },
+    overrides,
+  ),
+  // `ref` is { tender_id, id? }: found by tender id; the row id is only used
+  // when there's no tender id to go on.
+  getLocalTender: async (ref) => {
+    const key = tenderKey(ref);
+    const rows = (await getState()).tenders;
+    return (key ? rows.find((row) => tenderKey(row) === key) : rows.find((row) => row.id === Number(ref?.id))) || null;
+  },
+  // POST { tender_ids } -> { tenders: { CANON_ID: tender } } (missing ids absent).
+  resolveTenders: (tenderIds, overrides = {}) => requestClient(
+    '/client/tenders/resolve',
+    { method: 'POST', body: { tender_ids: _tenderIdList(tenderIds) } },
+    overrides,
+  ),
+  // Current server row id for `ref` ({ tender_id, id? }) — the local tender
+  // list first, then /client/tenders/resolve for one this device hasn't
+  // synced. null when the server no longer has that tender. The row id
+  // carried on `ref` is only trusted when there's no tender id or the server
+  // can't be asked (offline / older server), since a DB restore renumbers rows.
+  resolveTenderRowId: async (ref, overrides = {}) => {
+    const key = tenderKey(ref);
+    const hint = Number(ref?.id);
+    const fallback = Number.isFinite(hint) && hint > 0 ? hint : null;
+    if (!key) return fallback;
+    const local = (await getState()).tenders.find((row) => tenderKey(row) === key);
+    if (local) return Number(local.id);
+    try {
+      const found = (await api.resolveTenders([key], overrides))?.tenders?.[key];
+      return found ? Number(found.id) : null;
+    } catch {
+      return fallback;
+    }
+  },
 
   // ── Document download tracking (local-first: one cached row per server
   // document, plus a locally-issued placeholder row while a whole-tender
   // request has no document yet). Every UI button reads client_status/
   // local_path/downloadable straight off these rows — never a derived count.
+  // Rows belong to a tender by tender_id; tender_db_id is just the current
+  // row-id handle, re-pointed on every syncFromServer.
   listAllDocuments: async () => (await getState()).documents,
-  listDocuments: async (tenderDbId) => (
-    (await getState()).documents.filter((row) => Number(row.tender_db_id) === Number(tenderDbId))
-  ),
+  listDocuments: async (tenderId) => {
+    const key = canonTenderId(tenderId);
+    return (await getState()).documents.filter((row) => key && canonTenderId(row.tender_id) === key);
+  },
   listPendingDocuments: async () => (
     (await getState()).documents.filter((row) => row.client_status === 'requested')
   ),
@@ -470,17 +682,25 @@ export const api = {
   // still has nothing for this tender, the local placeholder row (if any) is
   // left untouched rather than being wiped.
   syncTenderDocuments: async (tender, params = {}, overrides = {}) => {
-    const tenderDbId = Number(tender.id);
+    const key = tenderKey(tender);
+    const tenderDbId = await api.resolveTenderRowId(tender, overrides);
+    if (!tenderDbId) return [];
     const payload = await api.listTenderDocuments(tenderDbId, params, overrides);
     const serverRows = payload.items || [];
     if (serverRows.length === 0) return serverRows;
+    const isThisTender = (row) => (key
+      ? canonTenderId(row.tender_id) === key || (!row.tender_id && Number(row.tender_db_id) === tenderDbId)
+      : Number(row.tender_db_id) === tenderDbId);
     await updateState((state) => {
-      const others = state.documents.filter((row) => Number(row.tender_db_id) !== tenderDbId);
-      const existingById = new Map(
-        state.documents.filter((row) => Number(row.tender_db_id) === tenderDbId).map((row) => [row.id, row])
-      );
+      const others = state.documents.filter((row) => !isThisTender(row));
+      const mine = state.documents.filter(isThisTender);
+      const existingById = new Map(mine.map((row) => [row.id, row]));
+      // Server document ids are renumbered by a DB restore too — fall back to
+      // the file name within this same tender so a downloaded file keeps its
+      // local status/path.
+      const existingByName = new Map(mine.filter((row) => row.id > 0 && row.file_name).map((row) => [row.file_name, row]));
       const merged = serverRows.map((row) => {
-        const existing = existingById.get(row.id);
+        const existing = existingById.get(row.id) || existingByName.get(row.name);
         return {
           id: row.id,
           tender_db_id: tenderDbId,
@@ -499,12 +719,15 @@ export const api = {
         };
       });
       // Real rows now exist server-side, so the locally-issued placeholder
-      // request row (negative id) for this tender is superseded.
-      state.documents = [...others, ...merged];
+      // request row (negative id) for this tender is superseded. A stale
+      // row of another tender holding one of these document ids (only after
+      // a server DB restore renumbered them) goes too, so ids stay unique.
+      const mergedIds = new Set(merged.map((row) => row.id));
+      state.documents = [...others.filter((row) => !mergedIds.has(row.id)), ...merged];
       // Also flip the tender row itself so the "Request"/"Download" pill
       // updates immediately, without waiting for a full manual Sync.
       state.tenders = state.tenders.map((row) => (
-        row.id === tenderDbId ? { ...row, has_documents: true, document_count: merged.length } : row
+        (key ? tenderKey(row) === key : row.id === tenderDbId) ? { ...row, has_documents: true, document_count: merged.length } : row
       ));
       return state;
     });
@@ -516,10 +739,13 @@ export const api = {
   // "Download Requested" and stays that way across restarts, then polls the
   // job in the background and refreshes the real document list once it lands.
   requestTenderDownload: async (tender, overrides = {}) => {
-    const { job_id: jobId } = await api.requestTenderDownloadJob(tender.id, overrides);
+    const tenderDbId = await api.resolveTenderRowId(tender, overrides);
+    if (!tenderDbId) throw new Error('This tender is no longer on the server.');
+    const { job_id: jobId } = await api.requestTenderDownloadJob(tenderDbId, overrides);
+    const current = { ...tender, id: tenderDbId };
     const placeholder = await api.upsertDocument({
-      id: -Number(tender.id),
-      tender_db_id: Number(tender.id),
+      id: await placeholderDocId(current),
+      tender_db_id: tenderDbId,
       tender_id: tender.tender_id || '',
       tender_title: tender.title || '',
       file_name: '', file_type: '', size_bytes: 0, downloadable: false,
@@ -530,7 +756,7 @@ export const api = {
       downloaded_at: null,
       error: null,
     });
-    api.pollTenderDownloadJob(tender, jobId, overrides, 0);
+    api.pollTenderDownloadJob(current, jobId, overrides, 0);
     return placeholder;
   },
   // Fire-and-forget: polls the server download job every 15s (capped at ~30
@@ -547,22 +773,22 @@ export const api = {
     try {
       const { status, error } = await api.getTenderDownloadStatus(tender.id, jobId, overrides);
       if (status === 'completed') {
-        await api.removeDocument(-Number(tender.id));
+        await api.removeDocument(await placeholderDocId(tender));
         await api.syncTenderDocuments(tender, {}, overrides);
         return;
       }
       if (status === 'failed') {
-        await api.upsertDocument({ id: -Number(tender.id), client_status: 'failed', error: error || 'Download failed.' });
+        await api.upsertDocument({ id: await placeholderDocId(tender), client_status: 'failed', error: error || 'Download failed.' });
         return;
       }
       if (attempt >= MAX_ATTEMPTS) {
-        await api.upsertDocument({ id: -Number(tender.id), client_status: 'failed', error: 'Timed out waiting for the server.' });
+        await api.upsertDocument({ id: await placeholderDocId(tender), client_status: 'failed', error: 'Timed out waiting for the server.' });
         return;
       }
       setTimeout(() => api.pollTenderDownloadJob(tender, jobId, overrides, attempt + 1, 0), 15000);
     } catch (error) {
       if (consecutiveErrors + 1 >= MAX_CONSECUTIVE_ERRORS) {
-        await api.upsertDocument({ id: -Number(tender.id), client_status: 'failed', error: error?.message || String(error) });
+        await api.upsertDocument({ id: await placeholderDocId(tender), client_status: 'failed', error: error?.message || String(error) });
         return;
       }
       setTimeout(() => api.pollTenderDownloadJob(tender, jobId, overrides, attempt + 1, consecutiveErrors + 1), 15000);
@@ -576,8 +802,17 @@ export const api = {
     const pending = await api.listPendingDocuments();
     for (const placeholder of pending) {
       if (!placeholder.job_id) continue;
+      // Polled by the tender's current row id (looked up from tender_id).
+      // The job only exists on the server DB it was queued on, so a tender
+      // the server no longer has can't be polled — mark it failed (Retry
+      // re-queues it) instead of leaving it "Requested…" forever.
+      const tenderDbId = await api.resolveTenderRowId({ tender_id: placeholder.tender_id, id: placeholder.tender_db_id }, overrides);
+      if (!tenderDbId) {
+        await api.upsertDocument({ id: placeholder.id, client_status: 'failed', error: 'This tender is no longer on the server.' });
+        continue;
+      }
       const tender = {
-        id: placeholder.tender_db_id,
+        id: tenderDbId,
         tender_id: placeholder.tender_id,
         title: placeholder.tender_title,
       };
@@ -624,6 +859,12 @@ export const api = {
             return state;
           });
         }
+        return { skipped: true };
+      }
+      // Org account whose "active" section was turned off after this device
+      // last loaded — server's defense-in-depth (_require_section) wins.
+      if (error?.status === 403 && error.detail?.reason === 'section_forbidden') {
+        useAppStore.getState().pushToast({ type: 'info', message: error.detail?.message || "Your account doesn't have access to this section." });
         return { skipped: true };
       }
       throw error;
@@ -690,7 +931,7 @@ export const api = {
     // makes, not just the caller's own upsert — otherwise a document row with
     // no prior syncTenderDocuments/requestTenderDownload row behind it
     // (upsertDocument's default base carries none of these) ends up titleless
-    // in the Downloads panel ("Untitled tender") and, missing tender_db_id,
+    // in the Downloads panel ("Untitled tender") and, missing tender_id,
     // invisible to the downloadedTenderIds ledger — so the tender's pill
     // never flips to "Downloaded" even though the file downloaded fine.
     const identity = {};
@@ -699,7 +940,12 @@ export const api = {
     if (doc.tender_title) identity.tender_title = doc.tender_title;
     await api.upsertDocument({ id: doc.id, ...identity, client_status: 'downloading', error: null });
     try {
-      const { url } = await api.requestDocumentDownload(doc.tender_db_id, doc.id, overrides);
+      // The row id on `doc` may predate a server DB restore — use the
+      // tender's current one, looked up by tender_id.
+      const tenderDbId = await api.resolveTenderRowId({ tender_id: doc.tender_id, id: doc.tender_db_id }, overrides);
+      if (!tenderDbId) throw new Error('This tender is no longer on the server.');
+      identity.tender_db_id = tenderDbId;
+      const { url } = await api.requestDocumentDownload(tenderDbId, doc.id, overrides);
       const bridge = desktop();
       if (bridge?.downloadFile) {
         const settings = (await getState()).settings;
@@ -740,6 +986,46 @@ export const api = {
   },
 
   listWebsites: async () => (await getState()).websites,
+  // Keeps projects created from a tender in step with it. Each project
+  // remembers what it copied (tender_snapshot); a field still equal to that
+  // follows the tender, a field that differs was edited by hand and is kept.
+  // Projects from before tender_snapshot existed take the tender's current
+  // values once. Changes sync to the user's other devices.
+  refreshLinkedProjects: async () => {
+    const state = await getState();
+    const byTenderId = new Map();
+    for (const t of state.tenders || []) {
+      const key = tenderKey(t);
+      if (key && !byTenderId.has(key)) byTenderId.set(key, t);
+    }
+    const norm = (v) => String(v ?? '').replace(/[,\s]/g, '').replace(/\.0+$/, '').trim();
+    const pairs = [['deadline', 'closing_date'], ['prebid', 'pre_bid_meeting_date'], ['project_value', 'tender_value']];
+    const updates = new Map();
+    for (const project of state.projects || []) {
+      const tender = byTenderId.get(canonTenderId(project.source_tender_id));
+      if (!tender) continue;
+      const legacy = !project.tender_snapshot;
+      const snapshot = { ...(project.tender_snapshot || {}) };
+      const patch = {};
+      for (const [field, key] of pairs) {
+        const live = tender[key];
+        if (live == null || live === '') continue;
+        const editedByHand = !legacy && norm(project[field]) !== norm(snapshot[key]);
+        if (editedByHand) continue;
+        if (norm(project[field]) !== norm(live)) patch[field] = live;
+        snapshot[key] = live;
+      }
+      if (legacy || Object.keys(patch).length || JSON.stringify(snapshot) !== JSON.stringify(project.tender_snapshot)) {
+        updates.set(project.id, { ...patch, tender_snapshot: snapshot });
+      }
+    }
+    if (!updates.size) return 0;
+    await updateSyncedState((s) => {
+      s.projects = s.projects.map((row) => (updates.has(row.id) ? { ...row, ...updates.get(row.id) } : row));
+      return s;
+    });
+    return updates.size;
+  },
   listOrganizations: async () => (await getState()).organizations || [],
   listBookmarkedOrgs: async () => (await getState()).bookmarkedOrgs || [],
   toggleOrgBookmark: async (orgChain) => {
@@ -799,9 +1085,9 @@ export const api = {
     return filterRows(rows, search, ['title', 'client_name', 'source_tender_id', 'description']);
   },
   createProject: async (data) => {
-    const sourceTenderId = String(data?.source_tender_id || '').trim();
+    const sourceTenderId = canonTenderId(data?.source_tender_id);
     if (sourceTenderId) {
-      const existing = (await getState()).projects.find((row) => String(row.source_tender_id || '').trim() === sourceTenderId);
+      const existing = (await getState()).projects.find((row) => canonTenderId(row.source_tender_id) === sourceTenderId);
       if (existing) throw new Error('Tender already added to Projects.');
     }
     let result;
@@ -929,9 +1215,9 @@ export const api = {
     // Only surface deadlines for tenders the user has actually acted on
     // (bookmarked, or already turned into a project) — not every closing
     // tender, which is what the "Closing < 7 Days" stat card is for instead.
-    const activeProjectTenderIds = new Set(activeProjects.map((row) => row.source_tender_id).filter(Boolean));
+    const activeProjectTenderIds = new Set(activeProjects.map((row) => canonTenderId(row.source_tender_id)).filter(Boolean));
     const upcoming = active
-      .filter((row) => row.closing_date && (row.is_bookmarked || activeProjectTenderIds.has(row.tender_id)))
+      .filter((row) => row.closing_date && (row.is_bookmarked || activeProjectTenderIds.has(tenderKey(row))))
       .slice().sort((a, b) => String(a.closing_date).localeCompare(String(b.closing_date))).slice(0, 12);
     const bookmarkedItems = state.tenders.filter((row) => row.is_bookmarked).slice().sort((a, b) => String(a.closing_date || '').localeCompare(String(b.closing_date || ''))).slice(0, 6);
     const closingSoon = active.filter((row) => {
@@ -1003,31 +1289,44 @@ export const api = {
     // one per tender — see the post-loop flush below.
     const newTendersByOrg = new Map();
     await updateState((state) => {
-      const bookmarks = new Map(state.tenders.map((row) => [String(row.tender_id || row.id), Boolean(row.is_bookmarked)]));
-      const previousById = new Map(state.tenders.map((row) => [String(row.tender_id || row.id), row]));
+      // Keyed by tender id only — a row without one can't be matched across
+      // syncs, so it's neither diffed nor carries a bookmark.
+      const previousByKey = new Map(state.tenders.filter((row) => tenderKey(row)).map((row) => [tenderKey(row), row]));
+      const previousKeyByRowId = new Map(state.tenders.map((row) => [Number(row.id), tenderKey(row)]));
       const bookmarkedOrgsSet = new Set(state.bookmarkedOrgs || []);
       changesSince = Number(state.settings?.last_changes_at) || 0;
       state.websites = Array.isArray(snapshot.websites) ? snapshot.websites : state.websites;
       state.organizations = Array.isArray(snapshot.organizations) ? snapshot.organizations : state.organizations;
       state.tenders = snapshot.tenders.map((row) => {
-        const key = String(row.tender_id || row.id);
-        const previous = previousById.get(key);
+        const key = tenderKey(row);
+        if (!key) return { ...row, is_bookmarked: false };
+        const previous = previousByKey.get(key);
         if (previous?.is_bookmarked) {
           // closing_date is covered by the /client/changes feed below; the
           // local diff owns status + pre-bid/corrigendum, which the server's
           // tender_history snapshot doesn't track.
           if (previous.status !== row.status) {
-            notificationsToEmit.push({ type: 'status', message: `"${row.title || row.tender_id}" status changed to ${row.status || 'unknown'}.`, tenderId: row.id });
+            notificationsToEmit.push({ type: 'status', message: `"${row.title || row.tender_id}" status changed to ${row.status || 'unknown'}.`, tenderId: key, tenderDbId: row.id });
           }
           if ((Number(previous.prebid_count) || 0) !== (Number(row.prebid_count) || 0) || (Number(previous.corrigendum_count) || 0) !== (Number(row.corrigendum_count) || 0)) {
-            notificationsToEmit.push({ type: 'prebid', message: `"${row.title || row.tender_id}" has a new pre-bid or corrigendum.`, tenderId: row.id });
+            notificationsToEmit.push({ type: 'prebid', message: `"${row.title || row.tender_id}" has a new pre-bid or corrigendum.`, tenderId: key, tenderDbId: row.id });
           }
         } else if (!previous && row.org_chain && bookmarkedOrgsSet.has(row.org_chain)) {
           const bucket = newTendersByOrg.get(row.org_chain) || [];
           bucket.push(row);
           newTendersByOrg.set(row.org_chain, bucket);
         }
-        return { ...row, is_bookmarked: bookmarks.get(key) ?? false };
+        return { ...row, is_bookmarked: Boolean(previous?.is_bookmarked) };
+      });
+      // Documents belong to a tender by tender_id; re-point each one's
+      // tender_db_id handle at this snapshot's row for that tender (null once
+      // the server no longer has it). A row saved before documents carried a
+      // tender_id gets it from the pre-sync row it pointed at.
+      const rowIdByKey = new Map(state.tenders.filter((row) => tenderKey(row)).map((row) => [tenderKey(row), Number(row.id)]));
+      state.documents = (state.documents || []).map((doc) => {
+        const key = canonTenderId(doc.tender_id) || previousKeyByRowId.get(Number(doc.tender_db_id)) || '';
+        if (!key) return doc;
+        return { ...doc, tender_id: doc.tender_id || key, tender_db_id: rowIdByKey.get(key) ?? null };
       });
       state.settings = {
         ...state.settings,
@@ -1037,11 +1336,12 @@ export const api = {
       result = { tenders: state.tenders.length, websites: state.websites.length, syncedAt: state.settings.last_sync_at };
       return state;
     });
+    await api.refreshLinkedProjects().catch(() => {});
     for (const [org, rows] of newTendersByOrg) {
       if (rows.length > 10) {
         notificationsToEmit.push({ type: 'new', message: `${rows.length} new tenders added under ${org}.`, orgName: org });
       } else {
-        rows.forEach((row) => notificationsToEmit.push({ type: 'new', message: `"${row.title || row.tender_id}" added under ${org}.`, tenderId: row.id, orgName: org }));
+        rows.forEach((row) => notificationsToEmit.push({ type: 'new', message: `"${row.title || row.tender_id}" added under ${org}.`, tenderId: tenderKey(row), tenderDbId: row.id, orgName: org }));
       }
     }
     // Server-recorded changes for this account's bookmarks (closing-date
@@ -1052,7 +1352,7 @@ export const api = {
       if (changesSince > 0) {
         (changes?.tenders || []).forEach((t) => {
           if ((t.changed_fields || []).includes('closing_date')) {
-            notificationsToEmit.push({ type: 'status', message: `"${t.title || `Tender #${t.id}`}" — closing date changed.`, tenderId: t.id });
+            notificationsToEmit.push({ type: 'status', message: `"${t.title || t.tender_id || `Tender #${t.id}`}" — closing date changed.`, tenderId: canonTenderId(t.tender_id), tenderDbId: t.id });
           }
         });
         for (const [org, items] of Object.entries(changes?.new_by_org || {})) {
@@ -1060,7 +1360,7 @@ export const api = {
           if (list.length > 10) {
             notificationsToEmit.push({ type: 'new', message: `${list.length} new tenders added under ${org}.`, orgName: org });
           } else {
-            list.forEach((t) => notificationsToEmit.push({ type: 'new', message: `"${t.title || t.tender_id}" added under ${org}.`, tenderId: t.id, orgName: org }));
+            list.forEach((t) => notificationsToEmit.push({ type: 'new', message: `"${t.title || t.tender_id}" added under ${org}.`, tenderId: canonTenderId(t.tender_id), tenderDbId: t.id, orgName: org }));
           }
         }
       }
@@ -1074,7 +1374,9 @@ export const api = {
     if (notificationsToEmit.length) {
       const { addNotification } = useAppStore.getState();
       const time = new Date().toLocaleString();
-      notificationsToEmit.forEach((n) => addNotification({ type: n.type, message: n.message, time, tenderId: n.tenderId, orgName: n.orgName }));
+      // tenderId is the canonical tender id (the identity); tenderDbId is only
+      // an optional row-id hint for when the tender id is missing.
+      notificationsToEmit.forEach((n) => addNotification({ type: n.type, message: n.message, time, tenderId: n.tenderId || undefined, tenderDbId: n.tenderDbId, orgName: n.orgName }));
     }
     // Reconcile with whatever another device may have pushed since this
     // device's last sync. Runs after the notification diff above (which
@@ -1116,13 +1418,17 @@ export const api = {
     // Carry through any baseline bookmark whose tender row hasn't loaded here
     // yet — we can't see its real state, so we must not claim it was removed.
     await loadSyncBaseline();
-    const loadedTenderIds = _idSet(state.tenders.map((row) => row.id));
-    const flaggedBookmarks = state.tenders.filter((row) => row.is_bookmarked).map((row) => Number(row.id));
-    const carriedBookmarks = (_lastServerBlob.bookmarks || [])
-      .map(Number)
-      .filter((id) => Number.isFinite(id) && !loadedTenderIds.has(id));
+    // Bookmarks travel as canonical tender ids (bookmarkTenderIds) — the
+    // server's row ids change on a DB restore. `bookmarks` (row ids) is only
+    // for older servers; the current one ignores it when bookmarkTenderIds is
+    // present and recomputes it on read.
+    const loadedTenderKeys = new Set(state.tenders.map(tenderKey).filter(Boolean));
+    const flaggedRows = state.tenders.filter((row) => row.is_bookmarked);
+    const baselineBookmarks = baselineBookmarkTenderIds(state.tenders);
+    const carriedBookmarks = baselineBookmarks.filter((key) => !loadedTenderKeys.has(key));
     const data = {
-      bookmarks: [...new Set([...flaggedBookmarks, ...carriedBookmarks])],
+      bookmarkTenderIds: _tenderIdList([...flaggedRows.map(tenderKey), ...carriedBookmarks]),
+      bookmarks: flaggedRows.map((row) => Number(row.id)).filter(Number.isFinite),
       bookmarkedOrgs,
       bookmarkedOrgIds: bookmarkedOrgs.map((name) => orgIdByName.get(name)).filter((id) => Number.isFinite(id)),
       templates: state.templates,
@@ -1141,16 +1447,17 @@ export const api = {
     };
     // Removal delta: what the server last gave us but is gone locally now. The
     // server unions the rest, so this is the only way a delete propagates.
-    // `localBookmarks` includes the carried ids above, so `removed.bookmarks`
-    // reduces to "tenders this device HAS loaded and are now unbookmarked" —
-    // the only safe removal claim. Once the full snapshot is in, carried is
-    // empty and a genuine un-bookmark still propagates.
-    const localBookmarks = _idSet(data.bookmarks);
+    // `localBookmarks` includes the carried ids above, so
+    // `removed.bookmarkTenderIds` reduces to "tenders this device HAS loaded
+    // and are now unbookmarked" — the only safe removal claim. Once the full
+    // snapshot is in, carried is empty and a genuine un-bookmark still
+    // propagates.
+    const localBookmarks = new Set(data.bookmarkTenderIds);
     const localOrgs = new Set(bookmarkedOrgs);
     const localProjectIds = _rowIdSet(data.projects);
     const localChecklistIds = _rowIdSet(data.checklist);
     const removed = {
-      bookmarks: [...(_lastServerBlob.bookmarks || [])].map(Number).filter((id) => Number.isFinite(id) && !localBookmarks.has(id)),
+      bookmarkTenderIds: baselineBookmarks.filter((key) => !localBookmarks.has(key)),
       bookmarkedOrgs: [...(_lastServerBlob.bookmarkedOrgs || [])].filter((name) => !localOrgs.has(name)),
       projects: [...(_lastServerBlob.projects || [])].map((r) => Number(r?.id)).filter((id) => Number.isFinite(id) && !localProjectIds.has(id)),
       checklist: [...(_lastServerBlob.checklist || [])].map((r) => Number(r?.id)).filter((id) => Number.isFinite(id) && !localChecklistIds.has(id)),
@@ -1187,8 +1494,14 @@ export const api = {
     // data") clears the stale local copy too. Device-local filesystem paths
     // (folder_path / linked_file_path) are carried over by id.
     await updateState((state) => {
+      // Bookmarks by tender id; an older server without bookmarkTenderIds
+      // only has row ids.
+      const serverKeys = Array.isArray(data.bookmarkTenderIds) ? new Set(_tenderIdList(data.bookmarkTenderIds)) : null;
       const serverIds = _idSet(data.bookmarks || []);
-      state.tenders = state.tenders.map((row) => ({ ...row, is_bookmarked: serverIds.has(Number(row.id)) }));
+      state.tenders = state.tenders.map((row) => ({
+        ...row,
+        is_bookmarked: serverKeys ? serverKeys.has(tenderKey(row)) : serverIds.has(Number(row.id)),
+      }));
       state.bookmarkedOrgs = Array.isArray(data.bookmarkedOrgs) ? [...data.bookmarkedOrgs] : [];
       state.templates = Array.isArray(data.templates) ? data.templates : [];
       state.templateItems = Array.isArray(data.templateItems) ? data.templateItems : [];

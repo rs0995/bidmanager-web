@@ -49,6 +49,14 @@ const initialState = () => ({
     // scrape (see api.js requestOrgTenders/pollOrgTendersJob), so the button
     // still shows "Requesting…" and polling still resumes after a restart.
     pendingOrgRequests: {},
+    // Account/organisation state (see Server UI/server/org_access.py) —
+    // mirrors the `account` block returned by login/register/GET /client/me.
+    // An individual account (the only kind that existed before this) always
+    // reads account_type 'individual', org null, every permission true.
+    account_type: 'individual',
+    org: null, // { id, name, role: 'admin' | 'member' } | null
+    permissions: { active: true, archived: true, bookmarks: true, projects: true },
+    pending_request: null, // { id, org_id, org_name, status, note, created_at, ... } | null
   },
 });
 

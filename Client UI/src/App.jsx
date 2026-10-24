@@ -11,9 +11,10 @@ import {
   ChevronDown, Folder, ArrowUp, Wifi, WifiOff, CheckCircle2,
   Paperclip, FolderCog, Link2, BookOpen, Pencil,
   Palette, RotateCcw, Home, Download, Upload, Rows3, Type, Info, Filter,
-  LogOut, LogIn, UserPlus, KeyRound, ArrowLeft,
+  LogOut, LogIn, UserPlus, KeyRound, ArrowLeft, ShieldQuestion,
+  Users, Shield, UserMinus, Check, Ban,
 } from 'lucide-react';
-import { api } from './lib/api';
+import { api, canonTenderId, tenderKey } from './lib/api';
 import { cn, formatINR, formatCrores, timeRemaining } from './lib/utils';
 import { useAppStore } from './lib/store';
 import {
@@ -27,8 +28,10 @@ import {
    the same lib/api, lib/store, lib/utils and shared UI components — nothing
    here changes those files. What's removed, relative to the full app:
 
-     • No scraping controls: no "fetch tenders" / job queue / CAPTCHA solver /
-       live scraper log console / website & organization management.
+     • No scraping controls: no "fetch tenders" / job queue / live scraper log
+       console / website & organization management. (The Captcha page here is
+       not the operator solver: it only shows CAPTCHAs raised by this user's
+       own requests, and the operator console can answer the same one.)
      • Tenders page is now a read-only browse-and-bookmark list over tenders
        that already exist in the shared database (Organizations + Logs tabs
        from the operator app are gone).
@@ -230,8 +233,374 @@ class RenderErrorBoundary extends React.Component {
   }
 }
 
+// ── Tender detail drawer ───────────────────────────────────────────────────
+// Any screen opens it with openTenderDetailDrawer(tender); App owns the state.
+// The drawer is identified by the tender id — the row id rides along only as
+// a hint (see api.resolveTenderRowId).
+function openTenderDetailDrawer(tender) {
+  window.dispatchEvent(new CustomEvent('bm-open-tender-detail', { detail: { tenderId: tenderKey(tender), id: Number(tender?.id) || null } }));
+}
+
+// Same client-side cooldowns as the mobile app, so neither app hammers the
+// portal: update checks at most hourly, status fetches every 6 hours.
+const TENDER_CHECK_COOLDOWN_MS = { update: 60 * 60 * 1000, status: 6 * 60 * 60 * 1000 };
+const TENDER_CHECK_TIMES_KEY = 'bm-tender-check-times';
+const PENDING_TENDER_CHECKS_KEY = 'bm-pending-tender-checks';
+
+function readJsonStorage(key, fallback) {
+  try { return JSON.parse(localStorage.getItem(key) || '') ?? fallback; } catch { return fallback; }
+}
+// Cooldowns and pending checks are keyed by the canonical tender id (row id
+// only for a tender without one) so they survive a server DB restore.
+const tenderCheckKey = (tender) => tenderKey(tender) || `#${Number(tender?.id)}`;
+function lastTenderCheckAt(kind, checkKey) {
+  return Number(readJsonStorage(TENDER_CHECK_TIMES_KEY, {})[`${kind}:${checkKey}`]) || 0;
+}
+function recordTenderCheck(kind, checkKey) {
+  const times = readJsonStorage(TENDER_CHECK_TIMES_KEY, {});
+  times[`${kind}:${checkKey}`] = Date.now();
+  localStorage.setItem(TENDER_CHECK_TIMES_KEY, JSON.stringify(times));
+}
+function setPendingTenderCheck(checkKey, entry) {
+  const pending = readJsonStorage(PENDING_TENDER_CHECKS_KEY, {});
+  if (entry) pending[checkKey] = entry; else delete pending[checkKey];
+  localStorage.setItem(PENDING_TENDER_CHECKS_KEY, JSON.stringify(pending));
+}
+
+// Runs one check job to the end and refreshes the tender's documents.
+// Returns { ok, newDocuments, error }.
+async function runTenderCheck(kind, tender) {
+  const tenderId = Number(tender.id);
+  const before = await api.listTenderDocuments(tenderId, { page_size: 100 }).catch(() => null);
+  const knownIds = new Set((before?.items || []).map((d) => d.id));
+  const start = kind === 'status' ? api.fetchTenderStatus : api.requestTenderUpdateJob;
+  const { job_id: jobId } = await start(tenderId);
+  setPendingTenderCheck(tenderCheckKey(tender), { kind, jobId, knownIds: [...knownIds], tender: { id: tenderId, tender_id: tender.tender_id, title: tender.title } });
+  return finishTenderCheck(kind, tender, jobId, knownIds);
+}
+
+async function finishTenderCheck(kind, tender, jobId, knownIds, pendingKey = tenderCheckKey(tender)) {
+  try {
+    // A check resumed after a restart re-resolves the row id by tender_id.
+    const tenderId = await api.resolveTenderRowId(tender);
+    if (!tenderId) return { ok: false, error: 'This tender is no longer on the server.' };
+    const { status, error } = await api.waitForTenderJob(tenderId, jobId);
+    if (status !== 'completed') return { ok: false, error: error || 'The check failed.' };
+    recordTenderCheck(kind, tenderCheckKey(tender));
+    const after = await api.syncTenderDocuments(tender).catch(() => null);
+    const items = after?.items || (await api.listTenderDocuments(tenderId, { page_size: 100 }).catch(() => null))?.items || [];
+    return { ok: true, newDocuments: items.filter((d) => !knownIds.has(d.id)).length };
+  } finally {
+    setPendingTenderCheck(pendingKey, null);
+  }
+}
+
+// A check started before a restart finishes quietly in the background.
+// The entry's own storage key is cleared (an older entry may be row-id keyed).
+function resumePendingTenderChecks() {
+  const pending = readJsonStorage(PENDING_TENDER_CHECKS_KEY, {});
+  for (const [pendingKey, entry] of Object.entries(pending)) {
+    if (!entry?.jobId || !entry?.tender) continue;
+    finishTenderCheck(entry.kind, entry.tender, entry.jobId, new Set(entry.knownIds || []), pendingKey).catch(() => {});
+  }
+}
+
+// `tenderRef` is { tenderId (canonical portal id), id (row-id hint) }. The
+// row id the /client/tenders/{id} calls need is resolved from the tender id.
+function TenderDetailDrawer({ tenderRef, onClose }) {
+  const qc = useQueryClient();
+  const pushToast = useAppStore((s) => s.pushToast);
+  const ref = { tender_id: tenderRef.tenderId, id: tenderRef.id };
+  const { data: tenderId, isLoading: resolving } = useQuery({
+    queryKey: ['tender-detail-row', tenderRef.tenderId, tenderRef.id],
+    queryFn: () => api.resolveTenderRowId(ref),
+  });
+  const { data: tender, isLoading: loadingTender, error } = useQuery({
+    queryKey: ['tender-detail', tenderId],
+    queryFn: () => api.getTenderDetail(tenderId),
+    enabled: Boolean(tenderId),
+  });
+  const isLoading = resolving || loadingTender;
+  const notFound = !resolving && !tenderId;
+  const { data: docsPage } = useQuery({
+    queryKey: ['tender-detail-docs', tenderId],
+    queryFn: () => api.listTenderDocuments(tenderId, { page_size: 100 }),
+    enabled: Boolean(tenderId),
+  });
+  const { data: localTender } = useQuery({
+    queryKey: ['tender-detail-local', tenderRef.tenderId, tenderRef.id],
+    queryFn: () => api.getLocalTender(ref),
+  });
+  const [checking, setChecking] = useState(false);
+  const docs = docsPage?.items || [];
+  const archived = Boolean(tender?.is_archived);
+  const kind = archived ? 'status' : 'update';
+
+  const refresh = () => {
+    qc.invalidateQueries({ queryKey: ['tender-detail', tenderId] });
+    qc.invalidateQueries({ queryKey: ['tender-detail-docs', tenderId] });
+    qc.invalidateQueries({ queryKey: ['tender-detail-local'] });
+    qc.invalidateQueries({ queryKey: ['client-documents'] });
+  };
+
+  const handleCheck = async () => {
+    if (!tender || checking) return;
+    const last = lastTenderCheckAt(kind, tenderCheckKey(tender));
+    if (last && Date.now() - last < TENDER_CHECK_COOLDOWN_MS[kind]) {
+      pushToast({ type: 'info', message: `Already checked ${new Date(last).toLocaleString('en-IN')}. Try again later.` });
+      return;
+    }
+    setChecking(true);
+    pushToast({ type: 'info', message: archived ? 'Fetching the tender status from the portal…' : 'Checking the portal for new corrigendum or pre-bid files…' });
+    try {
+      const result = await runTenderCheck(kind, tender);
+      refresh();
+      if (!result.ok) pushToast({ type: 'error', message: result.error });
+      else if (archived) pushToast({ type: 'success', message: 'Status updated.' });
+      else if (result.newDocuments > 0) pushToast({ type: 'success', message: `${result.newDocuments} new document(s) found.` });
+      else pushToast({ type: 'info', message: 'No updates available.' });
+    } catch (err) {
+      pushToast({ type: 'error', message: err?.message || String(err) });
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const toggleBookmark = useMutation({
+    mutationFn: async () => {
+      if (!localTender) throw new Error('Sync tenders first to bookmark this one.');
+      if (!localTender.is_bookmarked && (await api.countBookmarkedTenders()) >= 30) {
+        throw new Error('You can bookmark at most 30 tenders. Remove one before adding another.');
+      }
+      return api.patchTender(localTender.id, { is_bookmarked: !localTender.is_bookmarked });
+    },
+    onSuccess: () => qc.invalidateQueries(),
+    onError: (err) => pushToast({ type: 'error', message: err?.message || String(err) }),
+  });
+
+  const addToProject = useMutation({
+    mutationFn: () => api.createProject({
+      title: tender.title || '',
+      client_name: tender.organization || '',
+      source_tender_id: tender.tender_id || '',
+      project_value: tender.tender_value || '',
+      prebid: tender.pre_bid_meeting_date || '',
+      deadline: tender.closing_date || '',
+      tender_snapshot: { closing_date: tender.closing_date || '', pre_bid_meeting_date: tender.pre_bid_meeting_date || '', tender_value: tender.tender_value || '' },
+      description: tender.work_description || tender.title || '',
+      status: 'Active',
+    }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['projects'] });
+      qc.invalidateQueries({ queryKey: ['dashboard'] });
+      pushToast({ type: 'success', message: 'Added to Projects.' });
+    },
+    onError: (err) => pushToast({ type: 'error', message: err?.message || String(err) }),
+  });
+
+  const downloadAll = useMutation({
+    mutationFn: async () => {
+      if (!docs.length) {
+        await api.requestTenderDownload(tender);
+        return { requested: true };
+      }
+      let ok = 0;
+      let failed = 0;
+      for (const d of docs.filter((x) => x.downloadable !== false)) {
+        try {
+          await api.downloadDocument({ id: d.id, tender_db_id: tender.id, tender_id: tender.tender_id, tender_title: tender.title, file_name: d.name });
+          ok += 1;
+        } catch {
+          failed += 1;
+        }
+      }
+      return { ok, failed };
+    },
+    onSuccess: (r) => {
+      refresh();
+      if (r.requested) pushToast({ type: 'info', message: 'Documents requested. They will appear in Downloads when ready.' });
+      else pushToast({ type: r.failed ? 'error' : 'success', message: `Downloaded ${r.ok} file(s)${r.failed ? `, ${r.failed} failed` : ''}.` });
+    },
+    onError: (err) => pushToast({ type: 'error', message: err?.message || String(err) }),
+  });
+
+  const downloadOne = useMutation({
+    mutationFn: (d) => api.downloadDocument({ id: d.id, tender_db_id: tender.id, tender_id: tender.tender_id, tender_title: tender.title, file_name: d.name }),
+    onSuccess: refresh,
+    onError: (err) => pushToast({ type: 'error', message: err?.message || String(err) }),
+  });
+
+  const fields = tender ? [
+    ['Tender value', formatINR(tender.tender_value)],
+    ['EMD', formatINR(tender.emd)],
+    ['Category', tender.category],
+    ['Location', tender.location],
+    ['Published', tender.published_date],
+    ['Bid opening', tender.opening_date],
+    ['Closing', tender.closing_date],
+    ['Pre-bid meeting', tender.pre_bid_meeting_date],
+    ['Status', tender.status || (archived ? 'Closed' : 'Active')],
+    ['Portal', tender.website_name],
+  ] : [];
+
+  return (
+    <>
+      <div className="fixed inset-0 z-40 bg-black/35" onClick={onClose} />
+      <aside className="fixed inset-y-0 right-0 z-50 flex w-[560px] max-w-[92vw] flex-col border-l border-[var(--border)] bg-[var(--bg)] shadow-2xl">
+        <div className="flex h-11 shrink-0 items-center justify-between border-b border-[var(--border)] bg-[var(--surface-0)] px-3">
+          <h3 className="text-sm font-semibold text-[var(--text)]">Tender Details</h3>
+          <div className="flex items-center gap-2">
+            {tender && (
+              <button onClick={handleCheck} disabled={checking} className="btn-ghost gap-1 text-xs" title={archived ? 'Read the tender stage and result files from the portal' : 'Look for new corrigendum or pre-bid files'}>
+                {checking ? <Spinner size={12} /> : <RefreshCw size={12} />}
+                {archived ? 'Fetch status' : 'Check for updates'}
+              </button>
+            )}
+            <button onClick={onClose} className="rounded p-1 text-[var(--text-muted)] hover:bg-[var(--surface-1)] hover:text-[var(--text)]"><X size={16} /></button>
+          </div>
+        </div>
+        <div className="flex-1 overflow-y-auto p-4">
+          {isLoading && <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>}
+          {error && <p className="text-sm text-[var(--danger)]">{error.message || String(error)}</p>}
+          {notFound && <p className="text-sm text-[var(--text-muted)]">This tender is no longer on the server.</p>}
+          {tender && (
+            <div className="flex flex-col gap-4">
+              <div>
+                <p className="font-mono text-xs text-[var(--accent)]">{tender.tender_id || '—'}</p>
+                <h2 className="mt-1 text-base font-semibold leading-snug text-[var(--text)]">{tender.title || '—'}</h2>
+                <p className="mt-1 text-xs text-[var(--text-muted)]">{tender.organization || '—'}</p>
+              </div>
+              <div className="grid grid-cols-2 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface-0)]">
+                {fields.map(([label, value], i) => (
+                  <div key={label} className={cn('px-3 py-2.5', i % 2 === 0 && 'border-r border-[var(--border)]', i < fields.length - 2 && 'border-b border-[var(--border)]')}>
+                    <p className="text-xs text-[var(--text-muted)]">{label}</p>
+                    <p className="mt-0.5 text-sm text-[var(--text)]">{value || '—'}</p>
+                  </div>
+                ))}
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button onClick={() => toggleBookmark.mutate()} disabled={toggleBookmark.isPending} className="btn-ghost gap-1 text-xs">
+                  <Star size={12} fill={localTender?.is_bookmarked ? 'currentColor' : 'none'} />
+                  {localTender?.is_bookmarked ? 'Bookmarked' : 'Bookmark'}
+                </button>
+                <button onClick={() => addToProject.mutate()} disabled={addToProject.isPending} className="btn-ghost gap-1 text-xs"><Plus size={12} />Add to Project</button>
+                {tender.tender_url && (
+                  <button onClick={() => api.openTenderUrl({ ...tender, org_chain: tender.organization })} className="btn-ghost gap-1 text-xs"><ExternalLink size={12} />Open on portal</button>
+                )}
+                <button onClick={() => downloadAll.mutate()} disabled={downloadAll.isPending} className="btn-primary gap-1 text-xs">
+                  {downloadAll.isPending ? <Spinner size={12} /> : <Download size={12} />}
+                  {docs.length ? 'Download all' : 'Request download'}
+                </button>
+              </div>
+              <div>
+                <p className="mb-2 text-sm font-semibold text-[var(--text)]">Documents ({docs.length})</p>
+                {docs.length === 0 ? (
+                  <p className="text-xs text-[var(--text-muted)]">No documents downloaded yet for this tender.</p>
+                ) : (
+                  <div className="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface-0)]">
+                    {docs.map((d, i) => (
+                      <div key={d.id} className={cn('flex items-center gap-3 px-3 py-2', i < docs.length - 1 && 'border-b border-[var(--border)]')}>
+                        <FileText size={14} className="shrink-0 text-[var(--text-muted)]" />
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm text-[var(--text)]">{d.name}</p>
+                          <p className="text-xs text-[var(--text-muted)]">{[d.file_type, d.downloaded_at && String(d.downloaded_at).slice(0, 10)].filter(Boolean).join(' · ')}</p>
+                        </div>
+                        <button onClick={() => downloadOne.mutate(d)} disabled={d.downloadable === false || downloadOne.isPending} className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]" title="Download">
+                          <Download size={14} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      </aside>
+    </>
+  );
+}
+
+// ── Captcha page ───────────────────────────────────────────────────────────
+function CaptchaPage() {
+  const qc = useQueryClient();
+  const pushToast = useAppStore((s) => s.pushToast);
+  const { data: pending, isLoading, refetch } = useQuery({
+    queryKey: ['captcha-pending'],
+    queryFn: () => api.getPendingCaptcha(),
+    refetchInterval: 15000,
+  });
+  const [text, setText] = useState('');
+  const submit = useMutation({
+    mutationFn: () => api.answerCaptcha(pending.request_id, text.trim()),
+    onSuccess: () => { setText(''); pushToast({ type: 'success', message: 'Submitted. The job will continue shortly.' }); },
+    onError: (err) => pushToast({ type: 'error', message: `${err?.message || String(err)} It may have been answered already.` }),
+    onSettled: () => qc.invalidateQueries({ queryKey: ['captcha-pending'] }),
+  });
+
+  return (
+    <div className="h-full overflow-y-auto p-6">
+      <div className="mx-auto max-w-lg">
+        <h1 className="text-lg font-semibold text-[var(--text)]">Captcha</h1>
+        <p className="mt-1 text-sm text-[var(--text-muted)]">
+          When a portal asks for a CAPTCHA during one of your requests and it can't be solved automatically, it appears here.
+        </p>
+        <div className="card mt-4 p-4">
+          {isLoading ? (
+            <div className="flex justify-center py-10"><Spinner size={20} className="text-[var(--accent)]" /></div>
+          ) : !pending ? (
+            <div className="flex flex-col items-center gap-2 py-8 text-center">
+              <ShieldQuestion size={28} className="text-[var(--text-muted)]" />
+              <p className="text-sm text-[var(--text-muted)]">No CAPTCHA needs solving right now.</p>
+              <button onClick={() => refetch()} className="btn-ghost gap-1 text-xs"><RefreshCw size={12} />Check again</button>
+            </div>
+          ) : (
+            <form
+              className="flex flex-col gap-3"
+              onSubmit={(event) => { event.preventDefault(); if (text.trim()) submit.mutate(); }}
+            >
+              <img
+                src={`data:image/png;base64,${pending.image_base64}`}
+                alt="CAPTCHA"
+                className="mx-auto max-h-32 rounded border border-[var(--border)] bg-white object-contain"
+              />
+              <input
+                className="input"
+                value={text}
+                onChange={(event) => setText(event.target.value)}
+                placeholder="Enter the text shown above"
+                autoFocus
+                autoComplete="off"
+              />
+              <button type="submit" disabled={!text.trim() || submit.isPending} className="btn-primary justify-center">
+                {submit.isPending ? 'Submitting…' : 'Submit'}
+              </button>
+            </form>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Sidebar ────────────────────────────────────────────────────────────────
-function Sidebar({ active, onNavigate, collapsed, onToggle }) {
+// Which sidebar tabs a set of org-account permissions (active/archived/
+// bookmarks/projects — see Server UI/server/org_access.py) hides. An
+// unrestricted (individual, or org admin) account has every permission
+// true, so this is a no-op for the common case. "Online Tenders" only
+// hides outright when BOTH active and archived are off — otherwise the
+// page itself narrows to whichever sub-tab is still permitted (same
+// server-side scope rule _tender_scope uses: no filter when both are on).
+function sidebarKeyGatedOff(key, permissions) {
+  if (!permissions) return false;
+  if (key === 'tenders') return permissions.active === false && permissions.archived === false;
+  if (key === 'organizations') return permissions.active === false && permissions.archived === false && permissions.bookmarks === false;
+  if (key === 'bookmarks') return permissions.bookmarks === false;
+  if (key === 'projects' || key === 'archived_projects' || key === 'templates') return permissions.projects === false;
+  return false;
+}
+
+function Sidebar({ active, onNavigate, collapsed, onToggle, badges = {}, permissions }) {
   const mainItems = [
     { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
     { key: 'tenders', label: 'Online Tenders', icon: Globe },
@@ -239,12 +608,13 @@ function Sidebar({ active, onNavigate, collapsed, onToggle }) {
     { key: 'bookmarks', label: 'Bookmarks', icon: Star },
     { key: 'projects', label: 'Projects', icon: FolderOpen },
     { key: 'templates', label: 'Templates', icon: FileText },
-  ];
+  ].filter((item) => !sidebarKeyGatedOff(item.key, permissions));
   const bottomItems = [
     { key: 'archived_projects', label: 'Archived Projects', icon: FolderOpen },
+    { key: 'captcha', label: 'Captcha', icon: ShieldQuestion },
     { key: 'files', label: 'Files', icon: Server },
     { key: 'settings', label: 'Settings', icon: Settings },
-  ];
+  ].filter((item) => !sidebarKeyGatedOff(item.key, permissions));
 
   const NavButton = ({ item }) => (
     <button
@@ -257,7 +627,12 @@ function Sidebar({ active, onNavigate, collapsed, onToggle }) {
       )}
       title={collapsed ? item.label : undefined}
     >
-      <item.icon size={18} className="shrink-0" />
+      <span className="relative shrink-0">
+        <item.icon size={18} />
+        {badges[item.key] && (
+          <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-[var(--danger)]" />
+        )}
+      </span>
       {!collapsed && <span className="truncate">{item.label}</span>}
     </button>
   );
@@ -307,13 +682,19 @@ function NotificationPanel({ open, onClose, onOpenTender, onOpenOrg }) {
             <p className="text-sm text-[var(--text-muted)] text-center py-8">No notifications</p>
           )}
           {notifications.map(n => {
-            const navigable = Boolean(n.tenderId || n.orgName);
+            // tenderId is the canonical tender id; a numeric one (saved before
+            // that) or tenderDbId is only a row-id hint.
+            const tenderRef = typeof n.tenderId === 'string' && n.tenderId
+              ? { tender_id: n.tenderId, id: n.tenderDbId }
+              : { tender_id: '', id: n.tenderDbId ?? n.tenderId };
+            const opensTender = Boolean(tenderRef.tender_id || Number(tenderRef.id) > 0);
+            const navigable = opensTender || Boolean(n.orgName);
             return (
             <div
               key={n.id}
               onClick={() => {
                 markRead(n.id);
-                if (n.tenderId) { onClose(); onOpenTender?.(n.tenderId); }
+                if (opensTender) { onClose(); onOpenTender?.(tenderRef); }
                 else if (n.orgName) { onClose(); onOpenOrg?.(n.orgName); }
               }}
               className={cn(
@@ -410,10 +791,10 @@ function DashboardPage({ onNavigate, onOpenProjectWorkspace, onOpenWebsiteOrgani
     if (!target) return null;
     return Math.floor((target.getTime() - Date.now()) / 86400000);
   };
-  const projectTenderIds = new Set((activeProjects || []).map((p) => p.source_tender_id).filter(Boolean));
+  const projectTenderIds = new Set((activeProjects || []).map((p) => canonTenderId(p.source_tender_id)).filter(Boolean));
   const urgentUnclaimedBookmarks = (stats.bookmarked_items || []).filter((t) => {
     const days = daysUntil(t.closing_date);
-    return days !== null && days >= 0 && days <= 2 && !projectTenderIds.has(t.tender_id);
+    return days !== null && days >= 0 && days <= 2 && !projectTenderIds.has(tenderKey(t));
   });
   const syncAgeDays = settings?.last_sync_at ? (Date.now() - new Date(settings.last_sync_at).getTime()) / 86400000 : null;
   const staleSync = syncAgeDays === null || syncAgeDays > 1;
@@ -693,8 +1074,8 @@ function DownloadsPanel({ open, onClose, onOpenTender }) {
             return (
               <div
                 key={d.id}
-                onClick={() => d.tender_db_id && onOpenTender?.(d.tender_db_id)}
-                className={cn('flex items-start gap-3 px-4 py-3 border-b border-[var(--border)] last:border-0 transition-colors', d.tender_db_id && 'cursor-pointer hover:bg-[var(--surface-1)]')}
+                onClick={() => (d.tender_id || d.tender_db_id) && onOpenTender?.({ tender_id: d.tender_id, id: d.tender_db_id })}
+                className={cn('flex items-start gap-3 px-4 py-3 border-b border-[var(--border)] last:border-0 transition-colors', (d.tender_id || d.tender_db_id) && 'cursor-pointer hover:bg-[var(--surface-1)]')}
               >
                 <Icon size={16} className={cn('mt-0.5 shrink-0', meta.color)} />
                 <div className="flex-1 min-w-0">
@@ -1027,7 +1408,12 @@ function TenderTable({ columns, getColWidth, tableWidth, sortCol, sortDir, onTog
       </thead>
       <tbody>
         {rows.map((t, i) => (
-          <tr key={t.id} onClick={() => onSelectRow?.(t)} className={cn('cursor-pointer', selectedId === t.id && 'row-selected')}>
+          <tr
+            key={t.id}
+            onClick={() => onSelectRow?.(t)}
+            onDoubleClick={() => openTenderDetailDrawer(t)}
+            className={cn('cursor-pointer', selectedId === t.id && 'row-selected')}
+          >
             {columns.map((column) => (
               <td key={column.key} className={column.key === 'is_bookmarked' || column.key === '_sr' || column.key === '_download' ? 'text-center' : ''}>
                 {renderCell(t, column, i)}
@@ -1128,8 +1514,10 @@ function OrganizationTable({ rows, isLoading, emptyState, sortCol, sortDir, onTo
 function useTenderRowActions() {
   const qc = useQueryClient();
   const { data: allDocuments } = useQuery({ queryKey: ['client-documents'], queryFn: api.listAllDocuments });
+  // Both sets hold canonical tender ids — documents belong to a tender by
+  // tender_id, not by the (restore-unstable) row id.
   const pendingRequestIds = useMemo(
-    () => new Set((allDocuments || []).filter((row) => row.client_status === 'requested').map((row) => row.tender_db_id)),
+    () => new Set((allDocuments || []).filter((row) => row.client_status === 'requested').map((row) => canonTenderId(row.tender_id)).filter(Boolean)),
     [allDocuments]
   );
   // The durable, sync-safe record of what's actually been downloaded — read
@@ -1137,7 +1525,7 @@ function useTenderRowActions() {
   // wholesale tender-array replacement) instead of the tender row's own
   // `client_downloaded` flag, which gets silently dropped on every sync.
   const downloadedTenderIds = useMemo(
-    () => new Set((allDocuments || []).filter((row) => row.client_status === 'downloaded' && row.tender_db_id).map((row) => Number(row.tender_db_id))),
+    () => new Set((allDocuments || []).filter((row) => row.client_status === 'downloaded').map((row) => canonTenderId(row.tender_id)).filter(Boolean)),
     [allDocuments]
   );
 
@@ -1215,6 +1603,7 @@ function useTenderRowActions() {
       project_value: t.tender_value || '',
       prebid: t.pre_bid_meeting_date || '',
       deadline: t.closing_date || '',
+      tender_snapshot: { closing_date: t.closing_date || '', pre_bid_meeting_date: t.pre_bid_meeting_date || '', tender_value: t.tender_value || '' },
       description: t.work_description || t.title || '',
       status: 'Active',
     }),
@@ -1243,9 +1632,9 @@ function useTenderRowActions() {
     if (column.key === '_time') return <TimeBadge dateStr={tender.closing_date} />;
     if (column.key === '_download') {
       const hasDocs = tender.has_documents || Number(tender.document_count) > 0;
-      const isDownloaded = downloadedTenderIds.has(Number(tender.id));
+      const isDownloaded = downloadedTenderIds.has(tenderKey(tender));
       const busy = downloadTenderDocuments.isPending && downloadTenderDocuments.variables?.id === tender.id;
-      const requesting = pendingRequestIds.has(tender.id)
+      const requesting = pendingRequestIds.has(tenderKey(tender))
         || (requestTenderJob.isPending && requestTenderJob.variables?.id === tender.id);
       if (isDownloaded) {
         return (
@@ -1293,9 +1682,12 @@ function useTenderRowActions() {
       );
     }
     if (column.key === '_actions') {
-      const isDownloaded = downloadedTenderIds.has(Number(tender.id));
+      const isDownloaded = downloadedTenderIds.has(tenderKey(tender));
       return (
         <div className="flex items-center gap-1" onClick={(event) => event.stopPropagation()}>
+          <button onClick={() => openTenderDetailDrawer(tender)} className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]" title="Details">
+            <Info size={14} />
+          </button>
           <button onClick={() => addToProject.mutate(tender)} disabled={addToProject.isPending} className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]" title="Add to Project">
             <Plus size={14} />
           </button>
@@ -1347,6 +1739,8 @@ function useTenderRowActions() {
 
 function TendersPage({ onBackToOrganizations }) {
   const qc = useQueryClient();
+  const { data: authSettings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
+  const tenderTabPermissions = authSettings?.permissions;
   // A row on Organizations (OrganizationsPage) writes this before navigating
   // here, so "view this org's tenders" always lands on Active regardless of
   // whatever tab was last open.
@@ -1355,6 +1749,13 @@ function TendersPage({ onBackToOrganizations }) {
     if (forced) sessionStorage.removeItem(TENDERS_FORCE_TAB_KEY);
     return forced === 'archived' ? 'archived' : 'active';
   });
+  // If this account only has one of active/archived, land (and stay) on the
+  // permitted one rather than showing an always-empty tab.
+  useEffect(() => {
+    if (!tenderTabPermissions) return;
+    if (tab === 'active' && tenderTabPermissions.active === false && tenderTabPermissions.archived !== false) setTab('archived');
+    else if (tab === 'archived' && tenderTabPermissions.archived === false && tenderTabPermissions.active !== false) setTab('active');
+  }, [tab, tenderTabPermissions]);
   // Not one-shot here — App()'s `navigate` helper clears this on any other
   // navigation, so it stays accurate without TendersPage clearing it itself.
   const [cameFromOrg] = useState(() => sessionStorage.getItem(TENDERS_CAME_FROM_ORG_KEY) === '1');
@@ -1370,11 +1771,16 @@ function TendersPage({ onBackToOrganizations }) {
   const [selectedId, setSelectedId] = useState(null);
   // One-shot: the Downloads panel sets this before navigating here so the
   // clicked tender gets selected/highlighted once its data has loaded.
+  // Holds { tender_id, id } — matched by tender id (row id only without one).
   const [pendingSelectId, setPendingSelectId] = useState(() => {
     const forced = sessionStorage.getItem(TENDERS_FORCE_SELECT_KEY);
     if (forced) sessionStorage.removeItem(TENDERS_FORCE_SELECT_KEY);
-    const id = Number(forced);
-    return Number.isFinite(id) && id > 0 ? id : null;
+    try {
+      const ref = JSON.parse(forced || 'null');
+      return ref && (tenderKey(ref) || Number(ref.id) > 0) ? ref : null;
+    } catch {
+      return null;
+    }
   });
   const [showFilters, setShowFilters] = useState(false);
   // `website`/`savedByWebsite` are permanent (localStorage); `org`/`location`/
@@ -1445,12 +1851,14 @@ function TendersPage({ onBackToOrganizations }) {
   // across all configured sources rather than filtered by a single website.
   const { data: tenders, isLoading } = useQuery({
     queryKey: ['client-tenders', tab],
-    queryFn: () => api.listTenders(null, { archived: tab === 'archived', limit: 5000 }),
+    queryFn: () => api.listTenders(null, { archived: tab === 'archived' }),
   });
 
   useEffect(() => {
     if (!pendingSelectId || !tenders) return;
-    if (tenders.some((t) => t.id === pendingSelectId)) setSelectedId(pendingSelectId);
+    const key = tenderKey(pendingSelectId);
+    const match = tenders.find((t) => (key ? tenderKey(t) === key : t.id === Number(pendingSelectId.id)));
+    if (match) setSelectedId(match.id);
     setPendingSelectId(null);
   }, [pendingSelectId, tenders]);
 
@@ -1517,10 +1925,12 @@ function TendersPage({ onBackToOrganizations }) {
     () => [...new Set(websiteTenders.map((t) => t.tender_category).filter(Boolean))].sort(),
     [websiteTenders]
   );
-  const uniqueWebsites = useMemo(
-    () => [...new Set((tenders || []).map((t) => t.website_name).filter(Boolean))].sort(),
-    [tenders]
-  );
+  const { data: portalList } = useQuery({ queryKey: ['websites'], queryFn: api.listWebsites });
+  const uniqueWebsites = useMemo(() => {
+    const fromServer = (portalList || []).map((w) => w.name).filter(Boolean);
+    if (fromServer.length) return [...new Set(fromServer)].sort();
+    return [...new Set((tenders || []).map((t) => t.website_name).filter(Boolean))].sort();
+  }, [portalList, tenders]);
 
   // Exactly one website must always be selected — pick the first one the
   // moment there's a real list and the current selection is empty/stale.
@@ -1663,7 +2073,9 @@ function TendersPage({ onBackToOrganizations }) {
           </div>
         )}
         <div className="-mx-6 -mb-3 mt-1 flex border-t border-[var(--border)] px-6">
-          {[{ key: 'active', label: 'Active Tenders' }, { key: 'archived', label: 'Archived' }].map((t) => (
+          {[{ key: 'active', label: 'Active Tenders' }, { key: 'archived', label: 'Archived' }]
+            .filter((t) => tenderTabPermissions?.[t.key] !== false)
+            .map((t) => (
             <button
               key={t.key}
               onClick={() => setTab(t.key)}
@@ -1768,10 +2180,12 @@ function OrganizationsPage({ onOpenOrgTenders }) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['bookmarked-orgs'] }),
   });
 
-  const uniqueWebsites = useMemo(
-    () => [...new Set((organizations || []).map((o) => o.website_name).filter(Boolean))].sort(),
-    [organizations]
-  );
+  const { data: portalList } = useQuery({ queryKey: ['websites'], queryFn: api.listWebsites });
+  const uniqueWebsites = useMemo(() => {
+    const fromServer = (portalList || []).map((w) => w.name).filter(Boolean);
+    if (fromServer.length) return [...new Set(fromServer)].sort();
+    return [...new Set((organizations || []).map((o) => o.website_name).filter(Boolean))].sort();
+  }, [portalList, organizations]);
 
   // Exactly one website must always be selected — pick the first one the
   // moment there's a real list and the current selection is empty/stale.
@@ -1870,7 +2284,7 @@ function BookmarksPage({ onOpenOrgTenders }) {
   // applies the `archived` filter when that key is present in params.
   const { data: tenders, isLoading } = useQuery({
     queryKey: ['client-tenders-bookmarked'],
-    queryFn: () => api.listTenders(null, { limit: 5000 }),
+    queryFn: () => api.listTenders(null),
     enabled: tab === 'tenders',
   });
 
@@ -2829,9 +3243,9 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
 
   useEffect(() => { if (!selectedItem) return; setDocName(selectedItem.req_file_name || ''); setDesc(selectedItem.description || ''); setFolder(selectedItem.subfolder || 'Ready Docs'); }, [selectedItem?.id]);
   useEffect(() => {
-    if (!project) return;
+    if (!project || infoEditable) return;
     setInfoForm({ source_tender_id: String(project.source_tender_id || ''), title: String(project.title || ''), client_name: String(project.client_name || ''), project_value: normalizeValue2dp(String(project.project_value || '')), prebid: widenDateTimeGap(String(project.prebid || '')), deadline: String(project.deadline || '') });
-  }, [project?.id]);
+  }, [project?.id, project?.deadline, project?.prebid, project?.project_value]);
 
   const folderOptions = useMemo(() => {
     const names = new Set(FOLDER_ORDER);
@@ -3013,11 +3427,22 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
     await deleteItem.mutateAsync(selectedItem.id);
   };
 
+  // Extra folders are saved on the project row (checklist_folders) as well as
+  // locally, so they sync to other devices -- the phone shows them even
+  // before they hold any item.
+  const saveFolders = (next) => {
+    const clean = [...new Set(next.map((x) => String(x || '').trim()).filter(Boolean))]
+      .filter((x) => !FOLDER_ORDER.some((d) => d.toLowerCase() === x.toLowerCase()));
+    setManagedFolders(clean);
+    api.updateProject(projectId, { checklist_folders: clean })
+      .then(() => qc.invalidateQueries({ queryKey: ['project', projectId] }))
+      .catch(() => {});
+  };
   const ensureFolder = (name) => {
     const clean = String(name || '').trim();
     if (!clean) return false;
     if (folderOptions.some(x => x.toLowerCase() === clean.toLowerCase())) return true;
-    setManagedFolders(prev => [...prev, clean]);
+    saveFolders([...managedFolders, clean]);
     return true;
   };
   const addFolder = () => { if (!ensureFolder(newFolderName)) return; setFolder(String(newFolderName || '').trim()); setNewFolderName(''); };
@@ -3027,7 +3452,7 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
     ensureFolder(to);
     const hits = (checklist || []).filter(x => String(x.subfolder || '').trim().toLowerCase() === from.toLowerCase());
     await Promise.all(hits.map(x => api.updateChecklistItem(x.id, { subfolder: to })));
-    setManagedFolders(prev => prev.map(x => x.toLowerCase() === from.toLowerCase() ? to : x).filter(Boolean));
+    saveFolders([...managedFolders, to].map(x => x.toLowerCase() === from.toLowerCase() ? to : x));
     if (folder.toLowerCase() === from.toLowerCase()) setFolder(to);
     setRenameFrom(''); setRenameTo('');
     qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
@@ -3047,7 +3472,7 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
     if (FOLDER_ORDER.some(x => x.toLowerCase() === name.toLowerCase())) { alert('Default folder cannot be deleted.'); return; }
     const hits = (checklist || []).filter(x => String(x.subfolder || '').trim().toLowerCase() === name.toLowerCase());
     if (hits.length > 0) { const target = folderOptions.find(x => x.toLowerCase() !== name.toLowerCase()) || 'Ready Docs'; await Promise.all(hits.map(x => api.updateChecklistItem(x.id, { subfolder: target }))); }
-    setManagedFolders(prev => prev.filter(x => x.toLowerCase() !== name.toLowerCase()));
+    saveFolders(managedFolders.filter(x => x.toLowerCase() !== name.toLowerCase()));
     if (folder.toLowerCase() === name.toLowerCase()) setFolder('Ready Docs');
     setDeleteFolderName('');
     qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
@@ -3081,6 +3506,21 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
       if (Array.isArray(saved.managedFolders)) setManagedFolders(saved.managedFolders.map((x) => String(x || '').trim()).filter(Boolean));
     } catch { /* ignore */ }
   }, [projectId]);
+
+  // Folders saved on the project (by this or another desktop) are added to
+  // the local list; nothing is removed here.
+  useEffect(() => {
+    const synced = Array.isArray(project?.checklist_folders) ? project.checklist_folders : [];
+    if (!synced.length) return;
+    setManagedFolders((prev) => {
+      const next = [...prev];
+      for (const f of synced) {
+        const clean = String(f || '').trim();
+        if (clean && !next.some((x) => x.toLowerCase() === clean.toLowerCase())) next.push(clean);
+      }
+      return next.length === prev.length ? prev : next;
+    });
+  }, [project?.id, JSON.stringify(project?.checklist_folders || [])]);
 
   useEffect(() => {
     localStorage.setItem(WORKSPACE_VIEW_KEY(projectId), JSON.stringify({ selectedId, folder, previewWidth, previewCollapsed, infoEditable, managedFolders }));
@@ -3865,6 +4305,287 @@ const SETTINGS_TABS = [
   { key: 'data', label: 'Data & Cache', icon: RotateCcw },
 ];
 
+// Inline per-section (active/archived/bookmarks/projects) checkbox row —
+// used for a pending join request's initial grant and for an existing
+// member's permissions. Mirrors Server UI's own SectionToggles component
+// so admins see the same control in the admin console and here.
+const ACCOUNT_SECTIONS = [
+  { key: 'active', label: 'Active Tenders' },
+  { key: 'archived', label: 'Archived' },
+  { key: 'bookmarks', label: 'Bookmarks' },
+  { key: 'projects', label: 'Projects' },
+];
+function SectionToggles({ permissions, onChange, disabled }) {
+  return (
+    <div className="flex flex-wrap gap-3">
+      {ACCOUNT_SECTIONS.map((s) => (
+        <label key={s.key} className={cn('flex items-center gap-1.5 text-xs', disabled ? 'text-[var(--text-muted)] opacity-60' : 'text-[var(--text-muted)]')}>
+          <input
+            type="checkbox"
+            checked={permissions?.[s.key] !== false}
+            disabled={disabled}
+            onChange={(e) => onChange(s.key, e.target.checked)}
+            className="accent-[var(--accent)]"
+          />
+          {s.label}
+        </label>
+      ))}
+    </div>
+  );
+}
+
+// Settings' account-org management surface — shape depends entirely on
+// settings.account_type/org/pending_request (see db.js, populated from the
+// server's `account` block on sign-in/GET /client/me). Four states:
+// individual with nothing pending, individual with a pending join request,
+// org member, org admin.
+function OrganisationCard({ settings }) {
+  const qc = useQueryClient();
+  const isOrg = settings?.account_type === 'organisation';
+  const isAdmin = isOrg && settings?.org?.role === 'admin';
+  const [status, setStatus] = useState('');
+  const refreshAccount = () => { qc.invalidateQueries({ queryKey: ['settings'] }); qc.invalidateQueries({ queryKey: ['my-join-request'] }); qc.invalidateQueries({ queryKey: ['org-detail'] }); };
+
+  const { data: orgDetail, isLoading: orgLoading } = useQuery({ queryKey: ['org-detail'], queryFn: () => api.getOrgDetail(), enabled: isAdmin });
+  const { data: myRequestResult } = useQuery({ queryKey: ['my-join-request'], queryFn: () => api.getMyJoinRequest(), enabled: !isOrg });
+  const pendingRequest = settings?.pending_request || myRequestResult?.request || null;
+
+  const [createName, setCreateName] = useState('');
+  const createMut = useMutation({
+    mutationFn: () => api.createOrg(createName.trim()),
+    onSuccess: () => { refreshAccount(); setStatus('Organisation created.'); setCreateName(''); },
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+
+  const [joinCode, setJoinCode] = useState('');
+  const [joinNote, setJoinNote] = useState('');
+  const joinMut = useMutation({
+    mutationFn: () => api.requestJoinOrg(joinCode.trim(), joinNote.trim()),
+    onSuccess: () => { refreshAccount(); setStatus('Request sent — waiting for the admin to approve.'); setJoinCode(''); setJoinNote(''); },
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+  const cancelRequestMut = useMutation({
+    mutationFn: () => api.cancelJoinRequest(),
+    onSuccess: () => { refreshAccount(); setStatus('Request cancelled.'); },
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+
+  const [orgNameDraft, setOrgNameDraft] = useState('');
+  useEffect(() => { if (orgDetail?.name !== undefined) setOrgNameDraft(orgDetail.name); }, [orgDetail?.name]);
+  const renameMut = useMutation({
+    mutationFn: () => api.renameOrg(orgNameDraft.trim()),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['org-detail'] }); setStatus('Renamed.'); },
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+  const regenMut = useMutation({
+    mutationFn: () => api.regenerateJoinCode(),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['org-detail'] }),
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+
+  const [approvePerms, setApprovePerms] = useState({});
+  const approveMut = useMutation({
+    mutationFn: ({ id, permissions }) => api.approveJoinRequest(id, permissions),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['org-detail'] }); setStatus('Member approved.'); },
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+  const rejectMut = useMutation({
+    mutationFn: (id) => api.rejectJoinRequest(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['org-detail'] }),
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+  const permMut = useMutation({
+    mutationFn: ({ userId, permissions }) => api.setMemberPermissions(userId, permissions),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['org-detail'] }),
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+  const roleMut = useMutation({
+    mutationFn: ({ userId, role }) => api.setMemberRole(userId, role),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['org-detail'] }),
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+  const delinkMut = useMutation({
+    mutationFn: ({ userId, retain }) => api.delinkMember(userId, retain),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['org-detail'] }); setStatus('Member removed.'); },
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+
+  const confirmDelink = (member) => {
+    if (!window.confirm(`Remove ${member.display_name || member.email} from the organisation and keep their bookmarks (if they had bookmark access)? They become a regular individual account.`)) return;
+    delinkMut.mutate({ userId: member.user_id, retain: true });
+  };
+  const confirmWipe = (member) => {
+    if (!window.confirm(`Remove ${member.display_name || member.email} and wipe their account (no bookmarks kept)? This cannot be undone.`)) return;
+    delinkMut.mutate({ userId: member.user_id, retain: false });
+  };
+
+  return (
+    <div className="card p-5 space-y-4">
+      <div>
+        <h3 className="flex items-center gap-1.5 text-sm font-semibold text-[var(--text)]"><Users size={14} />Organisation</h3>
+        <p className="mt-1 text-xs text-[var(--text-muted)]">Share projects, bookmarks and checklists with a team. An admin approves who joins and what each member can see.</p>
+      </div>
+
+      {!isOrg && !pendingRequest && (
+        <div className="space-y-4">
+          <div className="border-t border-[var(--border)] pt-3">
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Create an organisation</label>
+            <div className="flex gap-2">
+              <input value={createName} onChange={(e) => setCreateName(e.target.value)} placeholder="Organisation name" className="input-field h-9 flex-1 text-sm" />
+              <button onClick={() => createMut.mutate()} disabled={createMut.isPending || !createName.trim()} className="btn-primary shrink-0 text-xs gap-1.5">
+                {createMut.isPending ? <Spinner size={13} /> : <Plus size={13} />}Create
+              </button>
+            </div>
+            <p className="mt-1 text-[11px] text-[var(--text-muted)]">You become the admin; your current projects/bookmarks/checklists become the org's shared data.</p>
+          </div>
+          <div className="border-t border-[var(--border)] pt-3">
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Join an organisation</label>
+            <div className="flex gap-2">
+              <input value={joinCode} onChange={(e) => setJoinCode(e.target.value)} placeholder="Join code" className="input-field h-9 w-32 font-mono text-sm uppercase" />
+              <input value={joinNote} onChange={(e) => setJoinNote(e.target.value)} placeholder="Note to admin (optional)" className="input-field h-9 flex-1 text-sm" />
+              <button onClick={() => joinMut.mutate()} disabled={joinMut.isPending || !joinCode.trim()} className="btn-secondary shrink-0 text-xs gap-1.5">
+                {joinMut.isPending ? <Spinner size={13} /> : <UserPlus size={13} />}Request
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {!isOrg && pendingRequest && (
+        <div className="border-t border-[var(--border)] pt-3 space-y-2">
+          <p className="text-sm text-[var(--text)]">Request pending for <strong>{pendingRequest.org_name}</strong></p>
+          <p className="text-[11px] text-[var(--text-muted)]">When approved, your current projects, bookmarks and checklists are discarded and you use the organisation's shared data instead.</p>
+          <button onClick={() => cancelRequestMut.mutate()} disabled={cancelRequestMut.isPending} className="btn-secondary text-xs gap-1.5">
+            {cancelRequestMut.isPending ? <Spinner size={13} /> : <X size={13} />}Cancel Request
+          </button>
+        </div>
+      )}
+
+      {isOrg && !isAdmin && (
+        <div className="border-t border-[var(--border)] pt-3 space-y-2">
+          <p className="text-sm text-[var(--text)]">{settings.org?.name}</p>
+          <p className="text-[11px] text-[var(--text-muted)]">You're a member. Your sections:</p>
+          <SectionToggles permissions={settings.permissions} onChange={() => {}} disabled />
+          <p className="text-[11px] text-[var(--text-muted)]">Only an organisation admin can change this or remove you.</p>
+        </div>
+      )}
+
+      {isAdmin && (
+        <div className="border-t border-[var(--border)] pt-3 space-y-4">
+          <div>
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Organisation name</label>
+            <div className="flex gap-2">
+              <input value={orgNameDraft} onChange={(e) => setOrgNameDraft(e.target.value)} className="input-field h-9 flex-1 text-sm" />
+              <button onClick={() => renameMut.mutate()} disabled={renameMut.isPending || !orgNameDraft.trim() || orgNameDraft.trim() === orgDetail?.name} className="btn-secondary shrink-0 text-xs gap-1.5">
+                {renameMut.isPending ? <Spinner size={13} /> : <Save size={13} />}Rename
+              </button>
+            </div>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Join code</label>
+            <div className="flex items-center gap-2">
+              <code className="input-field flex h-9 flex-1 items-center font-mono text-sm">{orgDetail?.join_code || '—'}</code>
+              <button
+                onClick={() => { if (orgDetail?.join_code) navigator.clipboard?.writeText(orgDetail.join_code); }}
+                className="btn-secondary shrink-0 text-xs gap-1.5"
+                title="Copy join code"
+              >
+                <Copy size={13} />
+              </button>
+              <button onClick={() => regenMut.mutate()} disabled={regenMut.isPending} className="btn-secondary shrink-0 text-xs gap-1.5">
+                {regenMut.isPending ? <Spinner size={13} /> : <RefreshCw size={13} />}New Code
+              </button>
+            </div>
+          </div>
+
+          {orgLoading && <Spinner size={16} />}
+
+          {!orgLoading && (orgDetail?.pending_requests || []).length > 0 && (
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Pending join requests</label>
+              <div className="space-y-2">
+                {orgDetail.pending_requests.map((req) => (
+                  <div key={req.id} className="rounded-md border border-[var(--border)] p-2.5 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-sm text-[var(--text)]">{req.display_name || req.email}</p>
+                        <p className="text-[11px] text-[var(--text-muted)]">{req.email}{req.note ? ` — "${req.note}"` : ''}</p>
+                      </div>
+                      <div className="flex gap-1.5">
+                        <button onClick={() => rejectMut.mutate(req.id)} disabled={rejectMut.isPending || approveMut.isPending} className="btn-ghost text-xs gap-1" title="Reject">
+                          <Ban size={13} />
+                        </button>
+                        <button
+                          onClick={() => approveMut.mutate({ id: req.id, permissions: approvePerms[req.id] })}
+                          disabled={approveMut.isPending || rejectMut.isPending}
+                          className="btn-primary text-xs gap-1"
+                        >
+                          <Check size={13} />Approve
+                        </button>
+                      </div>
+                    </div>
+                    <SectionToggles
+                      permissions={{ ...{ active: true, archived: true, bookmarks: true, projects: true }, ...approvePerms[req.id] }}
+                      onChange={(key, value) => setApprovePerms((p) => ({ ...p, [req.id]: { ...p[req.id], [key]: value } }))}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {!orgLoading && (
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Members ({(orgDetail?.members || []).length})</label>
+              <div className="space-y-2">
+                {(orgDetail?.members || []).map((member) => (
+                  <div key={member.user_id} className="rounded-md border border-[var(--border)] p-2.5 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="flex items-center gap-1.5 text-sm text-[var(--text)]">
+                          {member.role === 'admin' && <Shield size={12} className="text-[var(--accent)]" />}
+                          {member.display_name || member.email}
+                        </p>
+                        <p className="text-[11px] text-[var(--text-muted)]">{member.email}</p>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <select
+                          value={member.role}
+                          onChange={(e) => roleMut.mutate({ userId: member.user_id, role: e.target.value })}
+                          disabled={roleMut.isPending}
+                          className="input-field h-8 w-auto text-xs"
+                        >
+                          <option value="admin">Admin</option>
+                          <option value="member">Member</option>
+                        </select>
+                        <button onClick={() => confirmDelink(member)} disabled={delinkMut.isPending} className="btn-ghost text-xs gap-1" title="Remove (keep bookmarks)">
+                          <UserMinus size={13} />
+                        </button>
+                        <button onClick={() => confirmWipe(member)} disabled={delinkMut.isPending} className="btn-ghost text-xs gap-1 text-rose-400" title="Remove and wipe">
+                          <Trash2 size={13} />
+                        </button>
+                      </div>
+                    </div>
+                    {member.role !== 'admin' && (
+                      <SectionToggles
+                        permissions={member.permissions}
+                        onChange={(key, value) => permMut.mutate({ userId: member.user_id, permissions: { [key]: value } })}
+                        disabled={permMut.isPending}
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {status && <p className="text-xs text-[var(--text-muted)]">{status}</p>}
+    </div>
+  );
+}
+
 function SettingsPage() {
   const { theme, toggleTheme } = useAppStore();
   const qc = useQueryClient();
@@ -4106,6 +4827,8 @@ function SettingsPage() {
                 ) : <p className="text-xs text-[var(--text-muted)]">Not signed in.</p>}
               </div>
 
+              {settings?.auth_token && <OrganisationCard settings={settings} />}
+
               <div className="card p-5 space-y-4">
                 <div>
                   <h3 className="text-sm font-semibold text-[var(--text)]">Server & Sync</h3>
@@ -4181,7 +4904,7 @@ function SettingsPage() {
 function SignInScreen() {
   const qc = useQueryClient();
   const [mode, setMode] = useState('login'); // 'login' | 'register'
-  const [form, setForm] = useState({ email: '', password: '', display_name: '' });
+  const [form, setForm] = useState({ email: '', password: '', display_name: '', account_type: 'individual', org_name: '' });
   const [remember, setRemember] = useState(true);
   const [error, setError] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -4196,6 +4919,10 @@ function SignInScreen() {
   const handleSubmit = (event) => {
     event.preventDefault();
     if (!form.email.trim() || !form.password.trim()) { setError('Enter your email and password.'); return; }
+    if (mode === 'register' && form.account_type === 'organisation' && !form.org_name.trim()) {
+      setError('Enter an organisation name.');
+      return;
+    }
     submitMut.mutate();
   };
 
@@ -4211,6 +4938,38 @@ function SignInScreen() {
           <div>
             <label className="mb-1 block text-xs text-[var(--text-muted)]">Name</label>
             <input value={form.display_name} onChange={(e) => uf('display_name', e.target.value)} className="input-field h-9 w-full text-sm" placeholder="Your name" />
+          </div>
+        )}
+        {mode === 'register' && (
+          <div>
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Account type</label>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => uf('account_type', 'individual')}
+                className={cn('flex-1 rounded-md border px-2 py-1.5 text-xs', form.account_type === 'individual' ? 'border-[var(--accent)] bg-[var(--accent-bg)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-muted)]')}
+              >
+                Individual
+              </button>
+              <button
+                type="button"
+                onClick={() => uf('account_type', 'organisation')}
+                className={cn('flex-1 rounded-md border px-2 py-1.5 text-xs', form.account_type === 'organisation' ? 'border-[var(--accent)] bg-[var(--accent-bg)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-muted)]')}
+              >
+                Create an organisation
+              </button>
+            </div>
+            {form.account_type === 'organisation' && (
+              <input
+                value={form.org_name}
+                onChange={(e) => uf('org_name', e.target.value)}
+                className="input-field mt-2 h-9 w-full text-sm"
+                placeholder="Organisation name"
+              />
+            )}
+            {form.account_type === 'organisation' && (
+              <p className="mt-1 text-[11px] text-[var(--text-muted)]">You'll be the organisation's admin. To join an existing one instead, create an individual account first, then use "Join an organisation" in Settings.</p>
+            )}
           </div>
         )}
         <div>
@@ -4287,7 +5046,7 @@ export default function App() {
     retry: false,
   });
   const [page, setPage] = useState(() => {
-    const allowed = ['dashboard', 'tenders', 'organizations', 'bookmarks', 'projects', 'templates', 'archived_projects', 'files', 'settings'];
+    const allowed = ['dashboard', 'tenders', 'organizations', 'bookmarks', 'projects', 'templates', 'archived_projects', 'captcha', 'files', 'settings'];
     const startupPage = readClientPrefs().startupPage;
     if (startupPage && startupPage !== 'resume' && allowed.includes(startupPage)) return startupPage;
     const saved = localStorage.getItem('bm-client-last-page');
@@ -4305,8 +5064,32 @@ export default function App() {
     return Number.isFinite(value) && value > 0 ? value : null;
   });
   const [workspaceTimeRemaining, setWorkspaceTimeRemaining] = useState('');
+  // { tenderId (canonical portal id), id (row-id hint) } of the open drawer.
+  const [tenderDetailRef, setTenderDetailRef] = useState(null);
+  const { data: pendingCaptcha } = useQuery({
+    queryKey: ['captcha-pending'],
+    queryFn: () => api.getPendingCaptcha(),
+    enabled: Boolean(authSettings?.auth_token),
+    refetchInterval: 30000,
+    refetchOnWindowFocus: true,
+    retry: false,
+  });
 
   const unreadCount = notifications.filter((n) => !n.read).length;
+
+  useEffect(() => {
+    const onOpen = (evt) => {
+      const tenderId = canonTenderId(evt.detail?.tenderId);
+      const id = Number(evt.detail?.id);
+      if (tenderId || id > 0) setTenderDetailRef({ tenderId, id: id > 0 ? id : null });
+    };
+    window.addEventListener('bm-open-tender-detail', onOpen);
+    return () => window.removeEventListener('bm-open-tender-detail', onOpen);
+  }, []);
+
+  useEffect(() => {
+    if (authSettings?.auth_token) resumePendingTenderChecks();
+  }, [Boolean(authSettings?.auth_token)]);
 
   useEffect(() => { localStorage.setItem('bm-client-last-page', page); }, [page]);
 
@@ -4401,6 +5184,15 @@ export default function App() {
     setPage(target);
   };
 
+  // If this account's permissions change (an org admin restricts a section,
+  // or a stale saved "last page" is no longer reachable) while the gated
+  // page is still open, bounce to Dashboard instead of leaving a blocked
+  // page on screen.
+  useEffect(() => {
+    if (!authSettings?.permissions) return;
+    if (sidebarKeyGatedOff(page, authSettings.permissions)) navigate('dashboard');
+  }, [page, authSettings?.permissions]);
+
   // Websites are now a mandatory single-select filter (no "All" option), so
   // an org's own website must be preset explicitly — otherwise a different
   // website left selected in Tenders could hide this org's tenders entirely.
@@ -4423,9 +5215,13 @@ export default function App() {
 
   // Downloads panel row click — jump to Online Tenders with that tender
   // selected/highlighted (tolerates the tender no longer being present).
-  const openTenderDetails = (tenderDbId) => {
-    try { sessionStorage.setItem(TENDERS_FORCE_SELECT_KEY, String(tenderDbId || '')); } catch { /* ignore storage failures */ }
+  // `ref` is { tender_id, id } — opened by tender id, the row id is a hint.
+  const openTenderDetails = (ref) => {
+    const tenderId = tenderKey(ref);
+    const id = Number(ref?.id) > 0 ? Number(ref.id) : null;
+    try { sessionStorage.setItem(TENDERS_FORCE_SELECT_KEY, JSON.stringify({ tender_id: tenderId, id })); } catch { /* ignore storage failures */ }
     navigate('tenders');
+    if (tenderId || id) setTenderDetailRef({ tenderId, id });
   };
 
   // Dashboard stat cards navigate to a pre-filtered view — same cross-page
@@ -4452,6 +5248,7 @@ export default function App() {
     bookmarks: <BookmarksPage onOpenOrgTenders={openOrgTenders} />,
     projects: <ProjectsPage key="projects-active" onOpenProjectWorkspace={(projectId) => setWorkspaceProjectId(projectId)} />,
     archived_projects: <ProjectsPage key="projects-archived" archived onOpenProjectWorkspace={(projectId) => setWorkspaceProjectId(projectId)} />,
+    captcha: <CaptchaPage />,
     templates: <TemplatesPage />,
     files: <FilesPage />,
     settings: <SettingsPage />,
@@ -4488,7 +5285,7 @@ export default function App() {
             {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
           </button>
         </div>
-        <DownloadsPanel open={showDownloads} onClose={() => setShowDownloads(false)} onOpenTender={(tenderDbId) => { setShowDownloads(false); openTenderDetails(tenderDbId); }} />
+        <DownloadsPanel open={showDownloads} onClose={() => setShowDownloads(false)} onOpenTender={(ref) => { setShowDownloads(false); openTenderDetails(ref); }} />
         <NotificationPanel
           open={showNotifications}
           onClose={() => setShowNotifications(false)}
@@ -4499,7 +5296,7 @@ export default function App() {
       </header>
 
       <div className="flex flex-1 overflow-hidden">
-        <Sidebar active={page} onNavigate={navigate} collapsed={sidebarCollapsed} onToggle={toggleSidebar} />
+        <Sidebar active={page} onNavigate={navigate} collapsed={sidebarCollapsed} onToggle={toggleSidebar} badges={{ captcha: Boolean(pendingCaptcha) }} permissions={authSettings?.permissions} />
         <main className="flex-1 overflow-hidden bg-[var(--bg)]">
           <RenderErrorBoundary>{pages[page]}</RenderErrorBoundary>
         </main>
@@ -4526,6 +5323,10 @@ export default function App() {
             </div>
           </aside>
         </>
+      )}
+
+      {tenderDetailRef && (
+        <TenderDetailDrawer key={`${tenderDetailRef.tenderId}|${tenderDetailRef.id}`} tenderRef={tenderDetailRef} onClose={() => setTenderDetailRef(null)} />
       )}
     </div>
   );
