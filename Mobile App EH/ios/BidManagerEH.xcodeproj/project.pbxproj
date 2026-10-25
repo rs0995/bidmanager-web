@@ -9,15 +9,16 @@
 /* Begin PBXBuildFile section */
 		0C80B921A6F3F58F76C31292 /* libPods-BidManagerEH.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 5DCACB8F33CDC322A6C60F78 /* libPods-BidManagerEH.a */; };
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
+		13C22142007449EC8DDBF0FD /* IBMPlexMono_600SemiBold.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B808B16E28E248478EF10E57 /* IBMPlexMono_600SemiBold.ttf */; };
+		19FB45FB29D9415C9649513D /* IBMPlexMono_500Medium.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B6631EFD0D204BCA8915FF00 /* IBMPlexMono_500Medium.ttf */; };
 		761780ED2CA45674006654EE /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 761780EC2CA45674006654EE /* AppDelegate.swift */; };
 		81AB9BB82411601600AC10FF /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */; };
-		19FB45FB29D9415C9649513D /* IBMPlexMono_500Medium.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B6631EFD0D204BCA8915FF00 /* IBMPlexMono_500Medium.ttf */; };
-		13C22142007449EC8DDBF0FD /* IBMPlexMono_600SemiBold.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B808B16E28E248478EF10E57 /* IBMPlexMono_600SemiBold.ttf */; };
-		BA0F854CBF23457898B2B941 /* PlusJakartaSans_400Regular.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 37203B3F23544BDE8DF08A7A /* PlusJakartaSans_400Regular.ttf */; };
-		CA0A111CB8DE45EFBC2C7816 /* PlusJakartaSans_500Medium.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 3354204B6D594C7BAC5836D2 /* PlusJakartaSans_500Medium.ttf */; };
-		C230E66BA6ED45CD8F894329 /* PlusJakartaSans_600SemiBold.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 4D3047D63F884F05A612E74D /* PlusJakartaSans_600SemiBold.ttf */; };
-		BC94D6738D8A4EEB9576F5B3 /* PlusJakartaSans_700Bold.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 8E102347B80E4CC4A598AC34 /* PlusJakartaSans_700Bold.ttf */; };
+		8E1BECA383AE9295463169CA /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */; };
 		98D1E675F88A4B21B45933DA /* PlusJakartaSans_800ExtraBold.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 6E302A20777C44FB9E86A4AA /* PlusJakartaSans_800ExtraBold.ttf */; };
+		BA0F854CBF23457898B2B941 /* PlusJakartaSans_400Regular.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 37203B3F23544BDE8DF08A7A /* PlusJakartaSans_400Regular.ttf */; };
+		BC94D6738D8A4EEB9576F5B3 /* PlusJakartaSans_700Bold.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 8E102347B80E4CC4A598AC34 /* PlusJakartaSans_700Bold.ttf */; };
+		C230E66BA6ED45CD8F894329 /* PlusJakartaSans_600SemiBold.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 4D3047D63F884F05A612E74D /* PlusJakartaSans_600SemiBold.ttf */; };
+		CA0A111CB8DE45EFBC2C7816 /* PlusJakartaSans_500Medium.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 3354204B6D594C7BAC5836D2 /* PlusJakartaSans_500Medium.ttf */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -25,19 +26,19 @@
 		13B07FB51A68108700A75B9A /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Images.xcassets; path = BidManagerEH/Images.xcassets; sourceTree = "<group>"; };
 		13B07FB61A68108700A75B9A /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = Info.plist; path = BidManagerEH/Info.plist; sourceTree = "<group>"; };
 		13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = PrivacyInfo.xcprivacy; path = BidManagerEH/PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		3354204B6D594C7BAC5836D2 /* PlusJakartaSans_500Medium.ttf */ = {isa = PBXFileReference; explicitFileType = undefined; fileEncoding = undefined; includeInIndex = 0; lastKnownFileType = unknown; name = PlusJakartaSans_500Medium.ttf; path = ../assets/fonts/PlusJakartaSans_500Medium.ttf; sourceTree = "<group>"; };
+		37203B3F23544BDE8DF08A7A /* PlusJakartaSans_400Regular.ttf */ = {isa = PBXFileReference; explicitFileType = undefined; fileEncoding = undefined; includeInIndex = 0; lastKnownFileType = unknown; name = PlusJakartaSans_400Regular.ttf; path = ../assets/fonts/PlusJakartaSans_400Regular.ttf; sourceTree = "<group>"; };
 		3B4392A12AC88292D35C810B /* Pods-BidManagerEH.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-BidManagerEH.debug.xcconfig"; path = "Target Support Files/Pods-BidManagerEH/Pods-BidManagerEH.debug.xcconfig"; sourceTree = "<group>"; };
+		4D3047D63F884F05A612E74D /* PlusJakartaSans_600SemiBold.ttf */ = {isa = PBXFileReference; explicitFileType = undefined; fileEncoding = undefined; includeInIndex = 0; lastKnownFileType = unknown; name = PlusJakartaSans_600SemiBold.ttf; path = ../assets/fonts/PlusJakartaSans_600SemiBold.ttf; sourceTree = "<group>"; };
 		5709B34CF0A7D63546082F79 /* Pods-BidManagerEH.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-BidManagerEH.release.xcconfig"; path = "Target Support Files/Pods-BidManagerEH/Pods-BidManagerEH.release.xcconfig"; sourceTree = "<group>"; };
 		5DCACB8F33CDC322A6C60F78 /* libPods-BidManagerEH.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-BidManagerEH.a"; sourceTree = BUILT_PRODUCTS_DIR; };
+		6E302A20777C44FB9E86A4AA /* PlusJakartaSans_800ExtraBold.ttf */ = {isa = PBXFileReference; explicitFileType = undefined; fileEncoding = undefined; includeInIndex = 0; lastKnownFileType = unknown; name = PlusJakartaSans_800ExtraBold.ttf; path = ../assets/fonts/PlusJakartaSans_800ExtraBold.ttf; sourceTree = "<group>"; };
 		761780EC2CA45674006654EE /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = BidManagerEH/AppDelegate.swift; sourceTree = "<group>"; };
 		81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = LaunchScreen.storyboard; path = BidManagerEH/LaunchScreen.storyboard; sourceTree = "<group>"; };
+		8E102347B80E4CC4A598AC34 /* PlusJakartaSans_700Bold.ttf */ = {isa = PBXFileReference; explicitFileType = undefined; fileEncoding = undefined; includeInIndex = 0; lastKnownFileType = unknown; name = PlusJakartaSans_700Bold.ttf; path = ../assets/fonts/PlusJakartaSans_700Bold.ttf; sourceTree = "<group>"; };
+		B6631EFD0D204BCA8915FF00 /* IBMPlexMono_500Medium.ttf */ = {isa = PBXFileReference; explicitFileType = undefined; fileEncoding = undefined; includeInIndex = 0; lastKnownFileType = unknown; name = IBMPlexMono_500Medium.ttf; path = ../assets/fonts/IBMPlexMono_500Medium.ttf; sourceTree = "<group>"; };
+		B808B16E28E248478EF10E57 /* IBMPlexMono_600SemiBold.ttf */ = {isa = PBXFileReference; explicitFileType = undefined; fileEncoding = undefined; includeInIndex = 0; lastKnownFileType = unknown; name = IBMPlexMono_600SemiBold.ttf; path = ../assets/fonts/IBMPlexMono_600SemiBold.ttf; sourceTree = "<group>"; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
-		B6631EFD0D204BCA8915FF00 /* IBMPlexMono_500Medium.ttf */ = {isa = PBXFileReference; name = "IBMPlexMono_500Medium.ttf"; path = "../assets/fonts/IBMPlexMono_500Medium.ttf"; sourceTree = "<group>"; fileEncoding = undefined; lastKnownFileType = unknown; explicitFileType = undefined; includeInIndex = 0; };
-		B808B16E28E248478EF10E57 /* IBMPlexMono_600SemiBold.ttf */ = {isa = PBXFileReference; name = "IBMPlexMono_600SemiBold.ttf"; path = "../assets/fonts/IBMPlexMono_600SemiBold.ttf"; sourceTree = "<group>"; fileEncoding = undefined; lastKnownFileType = unknown; explicitFileType = undefined; includeInIndex = 0; };
-		37203B3F23544BDE8DF08A7A /* PlusJakartaSans_400Regular.ttf */ = {isa = PBXFileReference; name = "PlusJakartaSans_400Regular.ttf"; path = "../assets/fonts/PlusJakartaSans_400Regular.ttf"; sourceTree = "<group>"; fileEncoding = undefined; lastKnownFileType = unknown; explicitFileType = undefined; includeInIndex = 0; };
-		3354204B6D594C7BAC5836D2 /* PlusJakartaSans_500Medium.ttf */ = {isa = PBXFileReference; name = "PlusJakartaSans_500Medium.ttf"; path = "../assets/fonts/PlusJakartaSans_500Medium.ttf"; sourceTree = "<group>"; fileEncoding = undefined; lastKnownFileType = unknown; explicitFileType = undefined; includeInIndex = 0; };
-		4D3047D63F884F05A612E74D /* PlusJakartaSans_600SemiBold.ttf */ = {isa = PBXFileReference; name = "PlusJakartaSans_600SemiBold.ttf"; path = "../assets/fonts/PlusJakartaSans_600SemiBold.ttf"; sourceTree = "<group>"; fileEncoding = undefined; lastKnownFileType = unknown; explicitFileType = undefined; includeInIndex = 0; };
-		8E102347B80E4CC4A598AC34 /* PlusJakartaSans_700Bold.ttf */ = {isa = PBXFileReference; name = "PlusJakartaSans_700Bold.ttf"; path = "../assets/fonts/PlusJakartaSans_700Bold.ttf"; sourceTree = "<group>"; fileEncoding = undefined; lastKnownFileType = unknown; explicitFileType = undefined; includeInIndex = 0; };
-		6E302A20777C44FB9E86A4AA /* PlusJakartaSans_800ExtraBold.ttf */ = {isa = PBXFileReference; name = "PlusJakartaSans_800ExtraBold.ttf"; path = "../assets/fonts/PlusJakartaSans_800ExtraBold.ttf"; sourceTree = "<group>"; fileEncoding = undefined; lastKnownFileType = unknown; explicitFileType = undefined; includeInIndex = 0; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -103,17 +104,8 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
-		BBD78D7AC51CEA395F1C20DB /* Pods */ = {
-			isa = PBXGroup;
-			children = (
-				3B4392A12AC88292D35C810B /* Pods-BidManagerEH.debug.xcconfig */,
-				5709B34CF0A7D63546082F79 /* Pods-BidManagerEH.release.xcconfig */,
-			);
-			path = Pods;
-			sourceTree = "<group>";
-		};
 		A11C01AFDEF648459B9D0898 /* Resources */ = {
-			isa = "PBXGroup";
+			isa = PBXGroup;
 			children = (
 				B6631EFD0D204BCA8915FF00 /* IBMPlexMono_500Medium.ttf */,
 				B808B16E28E248478EF10E57 /* IBMPlexMono_600SemiBold.ttf */,
@@ -124,8 +116,17 @@
 				6E302A20777C44FB9E86A4AA /* PlusJakartaSans_800ExtraBold.ttf */,
 			);
 			name = Resources;
-			sourceTree = "<group>";
 			path = "";
+			sourceTree = "<group>";
+		};
+		BBD78D7AC51CEA395F1C20DB /* Pods */ = {
+			isa = PBXGroup;
+			children = (
+				3B4392A12AC88292D35C810B /* Pods-BidManagerEH.debug.xcconfig */,
+				5709B34CF0A7D63546082F79 /* Pods-BidManagerEH.release.xcconfig */,
+			);
+			path = Pods;
+			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 
@@ -196,6 +197,7 @@
 				C230E66BA6ED45CD8F894329 /* PlusJakartaSans_600SemiBold.ttf in Resources */,
 				BC94D6738D8A4EEB9576F5B3 /* PlusJakartaSans_700Bold.ttf in Resources */,
 				98D1E675F88A4B21B45933DA /* PlusJakartaSans_800ExtraBold.ttf in Resources */,
+				8E1BECA383AE9295463169CA /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -407,6 +409,10 @@
 				);
 				MTL_ENABLE_DEBUG_INFO = YES;
 				ONLY_ACTIVE_ARCH = YES;
+				OTHER_CFLAGS = (
+					"$(inherited)",
+					"-DRCT_REMOVE_LEGACY_ARCH=1",
+				);
 				OTHER_CPLUSPLUSFLAGS = (
 					"$(OTHER_CFLAGS)",
 					"-DFOLLY_NO_CONFIG",
@@ -414,8 +420,14 @@
 					"-DFOLLY_USE_LIBCPP=1",
 					"-DFOLLY_CFG_NO_COROUTINES=1",
 					"-DFOLLY_HAVE_CLOCK_GETTIME=1",
+					"-DRCT_REMOVE_LEGACY_ARCH=1",
 				);
+				PODFILE_DIR = "$(SRCROOT)";
+				REACT_NATIVE_PATH = "${PODS_ROOT}/../../node_modules/react-native";
 				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) DEBUG";
+				SWIFT_ENABLE_EXPLICIT_MODULES = NO;
+				USE_HERMES = true;
 			};
 			name = Debug;
 		};
@@ -472,6 +484,10 @@
 					"\"$(inherited)\"",
 				);
 				MTL_ENABLE_DEBUG_INFO = NO;
+				OTHER_CFLAGS = (
+					"$(inherited)",
+					"-DRCT_REMOVE_LEGACY_ARCH=1",
+				);
 				OTHER_CPLUSPLUSFLAGS = (
 					"$(OTHER_CFLAGS)",
 					"-DFOLLY_NO_CONFIG",
@@ -479,8 +495,13 @@
 					"-DFOLLY_USE_LIBCPP=1",
 					"-DFOLLY_CFG_NO_COROUTINES=1",
 					"-DFOLLY_HAVE_CLOCK_GETTIME=1",
+					"-DRCT_REMOVE_LEGACY_ARCH=1",
 				);
+				PODFILE_DIR = "$(SRCROOT)";
+				REACT_NATIVE_PATH = "${PODS_ROOT}/../../node_modules/react-native";
 				SDKROOT = iphoneos;
+				SWIFT_ENABLE_EXPLICIT_MODULES = NO;
+				USE_HERMES = true;
 				VALIDATE_PRODUCT = YES;
 			};
 			name = Release;
