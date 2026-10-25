@@ -2,6 +2,7 @@ import { useState, useMemo } from "react";
 import { View, Text, ScrollView } from "react-native";
 import { FolderOpen } from "lucide-react-native";
 import { ScreenHeader } from "@/components/shell/ScreenHeader";
+import { SyncPausedBanner } from "@/components/feedback/SyncPausedBanner";
 import { SegmentedControl } from "@/components/common/SegmentedControl";
 import { ProjectCard } from "@/components/project/ProjectCard";
 import { EmptyState } from "@/components/feedback/EmptyState";
@@ -22,6 +23,7 @@ export default function ProjectsScreen() {
     <View className="flex-1 bg-bg">
       <ScreenHeader title="Projects" />
       <ScrollView contentContainerClassName="p-4">
+        <SyncPausedBanner />
         <Text className="mb-3 text-[14px] text-text-muted">
           Track bids in preparation — add checklist items & attach documents. Stored on this device, synced to your account.
         </Text>

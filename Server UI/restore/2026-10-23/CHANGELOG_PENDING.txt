@@ -1,0 +1,15 @@
+- Server API: new PUT /v1/websites/{id} to rename a portal or change its URL / status URL without losing its organizations and tenders (used by the BM Server mobile app).
+Scraper tab: added Edit and Delete for the selected portal (website), wired to the existing PUT/DELETE /v1/websites/{id} backend routes.
+Build fix: Server UI now has its own tailwindcss/autoprefixer/postcss devDependencies instead of importing them from ../frontend/node_modules.
+New nProcure (Gujarat, tender.nprocure.com) scraper in server/scrapers/nprocure.py, selected per website via websites.portal_type ('nic' default); seeded as "nProcure Gujarat". Scrapes selected client orgs, details, corrigenda and documents (no captcha). Status/results not supported yet.
+Scraper tab: portal type select (auto-detect / NIC / nProcure) when adding a website; Archive: Fetch Status disabled for nProcure sites.
+nProcure links: tender links sent to the apps now open the tender on the portal through a new server hand-off page (/portal/nprocure/tender/<id>); organization links point at tender.nprocure.com instead of client subdomains (some don't exist).
+nProcure scraper: logs each tender id with its time (like NIC portals) and fetches tender pages 4 at a time (setting nprocure_parallel_requests), about 4x faster.
+Tender ID is now the only identity of a tender: the scraper matches and dedupes tenders by tender ID only (never by title, URL or dates) and never changes a stored tender's ID. Fixes distinct tenders being merged into one (e.g. 32 missing at MCGM).
+Organisation tender counts in the apps are now the real number of tenders in the database, not the portal's figure.
+User bookmarks are stored by tender ID (reconnect after a database restore); new /client/tenders/resolve looks tenders up by ID; downloaded-file records re-link by tender ID at startup.
+- Server sync: a project added twice for the same tender is now kept once (duplicates merge on every sync; checklist rows follow the kept project).
+The server no longer sends "Download complete" / "New documents" push notifications; each app announces the downloads it requested itself.
+New-tender and tender-change push notifications are never lost to scrape timing: each new tender / change is marked once pushed, so whatever has not been pushed yet goes out on the next pass.
+Accounts can now be individuals or organisations: an org shares its projects, bookmarks and checklists; members join with a join code and the org admin (or operator) approves, sets which sections each member sees, and can de-link them (keep bookmarks or wipe). Existing accounts are individuals with every section on.
+The operator can turn sections (active tenders, archived, bookmarks, projects) off for any user; the server then stops sending that section until it is turned back on.

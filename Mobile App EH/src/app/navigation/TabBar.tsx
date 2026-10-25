@@ -4,10 +4,11 @@ import { BlurView } from '@react-native-community/blur';
 import { BottomTabBarProps } from '@react-navigation/bottom-tabs';
 import { Bell, FileText, FolderOpen, House, Menu } from 'lucide-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { EdgeFade } from '../../components/ui/EdgeFade';
 import { Gradient } from '../../components/ui/Gradient';
 import { useAlerts } from '../../fixtures/alerts';
 import { fonts, useTheme } from '../../theme';
+
+import { TAB_BAR_HEIGHT as TAB_ROW_HEIGHT } from '../../components/ui/Screen';
 
 const ICONS = {
   Dashboard: House,
@@ -32,28 +33,24 @@ export function TabBar({ state, navigation }: BottomTabBarProps) {
   const glass = t.isGlass;
   const barSurface = {
     backgroundColor: glass ? t.glass.fillStrong : t.colors.surface,
-    borderColor: glass ? t.glass.border : 'transparent',
-    borderWidth: glass ? StyleSheet.hairlineWidth * 2 : 0,
+    borderTopColor: glass ? t.glass.border : t.colors.hair,
   };
 
-  const bottomInset = Math.max(insets.bottom, 12);
-  const fadeColor = glass ? t.glass.screenB : t.colors.bg;
-
-  // The bar is fixed to the bottom of the screen and never scrolls; content scrolls
-  // independently behind it and fades out before reaching it.
+  // Docked: the bar is fixed to the bottom edge and spans the full width (the home
+  // indicator area sits inside it). Content scrolls independently behind it.
   return (
     <>
-      <EdgeFade
-        direction="up"
-        color={fadeColor}
-        height={62 + bottomInset + 34}
-        strength={glass ? 0.85 : 0.97}
-      />
-      <View
-        pointerEvents="box-none"
-        style={[styles.wrap, { paddingBottom: bottomInset }]}
-      >
-        <View style={[styles.bar, barSurface, t.shadow.md]}>
+      <View pointerEvents="box-none" style={styles.wrap}>
+        <View
+          style={[
+            styles.bar,
+            barSurface,
+            {
+              height: TAB_ROW_HEIGHT + insets.bottom,
+              paddingBottom: insets.bottom,
+            },
+          ]}
+        >
           {glass ? (
             <BlurView
               style={StyleSheet.absoluteFill}
@@ -84,40 +81,39 @@ export function TabBar({ state, navigation }: BottomTabBarProps) {
                 onPress={onPress}
                 style={styles.tab}
               >
-                {focused ? (
-                  <Gradient
-                    colors={[t.colors.accent, t.colors.accent2]}
-                    style={styles.pill}
-                  >
+                <View style={styles.slot}>
+                  {focused ? (
+                    <Gradient
+                      colors={[t.colors.accent, t.colors.accent2]}
+                      style={styles.pillBg}
+                    />
+                  ) : null}
+                  <View style={styles.iconBox}>
                     <Icon
                       size={20}
-                      color={t.colors.onAccent}
-                      strokeWidth={2.2}
+                      color={focused ? t.colors.onAccent : t.colors.muted}
+                      strokeWidth={focused ? 2.2 : 2}
                     />
-                  </Gradient>
-                ) : (
-                  <View style={styles.pill}>
-                    <Icon size={20} color={t.colors.muted} strokeWidth={2} />
+                    {name === 'Alerts' && unread > 0 ? (
+                      <View
+                        accessibilityLabel={`${unread} unread alerts`}
+                        style={[
+                          styles.badge,
+                          {
+                            backgroundColor: t.colors.crit,
+                            borderColor: glass
+                              ? t.glass.fillStrong
+                              : t.colors.surface,
+                          },
+                        ]}
+                      >
+                        <Text style={styles.badgeText}>
+                          {unread > 9 ? '9+' : unread}
+                        </Text>
+                      </View>
+                    ) : null}
                   </View>
-                )}
-                {name === 'Alerts' && unread > 0 ? (
-                  <View
-                    accessibilityLabel={`${unread} unread alerts`}
-                    style={[
-                      styles.badge,
-                      {
-                        backgroundColor: t.colors.crit,
-                        borderColor: t.isGlass
-                          ? t.glass.fillStrong
-                          : t.colors.surface,
-                      },
-                    ]}
-                  >
-                    <Text style={styles.badgeText}>
-                      {unread > 9 ? '9+' : unread}
-                    </Text>
-                  </View>
-                ) : null}
+                </View>
               </Pressable>
             );
           })}
@@ -128,20 +124,40 @@ export function TabBar({ state, navigation }: BottomTabBarProps) {
 }
 
 const styles = StyleSheet.create({
-  wrap: { position: 'absolute', left: 16, right: 16, bottom: 0 },
+  wrap: { position: 'absolute', left: 0, right: 0, bottom: 0 },
   bar: {
-    height: 62,
-    borderRadius: 22,
+    borderTopWidth: StyleSheet.hairlineWidth * 2,
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 8,
     overflow: 'hidden',
   },
   tab: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  // Narrow highlight behind the active icon; the badge is anchored to the icon itself.
+  slot: {
+    width: 52,
+    height: 46,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  pillBg: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    borderRadius: 16,
+  },
+  iconBox: {
+    width: 22,
+    height: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   badge: {
     position: 'absolute',
-    top: 2,
-    right: 6,
+    top: -8,
+    right: -10,
     minWidth: 16,
     height: 16,
     paddingHorizontal: 3,
@@ -151,12 +167,4 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   badgeText: { color: '#ffffff', fontFamily: fonts.extrabold, fontSize: 8.5 },
-  pill: {
-    height: 46,
-    alignSelf: 'stretch',
-    marginHorizontal: 2,
-    borderRadius: 16,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
 });

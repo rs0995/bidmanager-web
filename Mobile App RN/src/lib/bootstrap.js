@@ -7,20 +7,23 @@ import { rehydrateOrgRequests } from "./orgRequests.js";
 import { rehydrateTenderUpdates } from "./tenderUpdates.js";
 import { rehydrateDocuments } from "./documents.js";
 import { rehydrateSync } from "./sync.js";
+import { rehydrateTenderStatus } from "./tenderStatus.js";
+import { configureNotifications } from "./notifications.js";
+import { configureBackgroundSync } from "./backgroundSync.js";
 
 // The full list of AsyncStorage keys the kv.js mirror needs loaded before any
 // module reading through it is trustworthy. Kept in one place since kv.js
 // itself does not know which modules use which keys.
 const KV_KEYS = [
-  "bm.bookmarks", "bm.bookmarkedOrgs", "bm.orgIdByName", "bm.settings",
+  "bm.bookmarks", "bm.bookmarkTenderIds", "bm.bookmarkedOrgs", "bm.orgIdByName", "bm.settings",
   "bm.alerts",
   "bm.projects", "bm.checklist",
   "bm.pendingOrgRequests",
-  "bm.pendingTenderUpdates", "bm.tenderUpdateState",
+  "bm.pendingTenderUpdates", "bm.tenderUpdateState", "bm.pendingTenderStatus", "bm.archiveLastView",
   "bm.documents",
   "bm.syncBlob", "bm.syncBase", "bm.syncDirty", "bm.tenderSnapshot", "bm.lastChangesAt",
-  "bm.remindersFired",
-  "bm.tendersLastWebsiteId", "bm.tendersLastView",
+  "bm.remindersFired", "bm.closingRemindersFired", "bm.notificationEngineLastRun", "bm.lastRegisteredPushToken",
+  "bm.tendersLastWebsiteId", "bm.tendersLastView", "bm.syncPaused",
 ];
 
 // Call once at app startup, before rendering anything that reads from these
@@ -28,12 +31,15 @@ const KV_KEYS = [
 // AsyncStorage mirror and auth.js expo-secure-store mirror) in parallel,
 // then re-primes every module cache from the now-populated data.
 export async function bootstrapApp() {
+  configureNotifications();
+  configureBackgroundSync();
   await Promise.all([hydrateKV(KV_KEYS), hydrateAuth()]);
   rehydrateStore();
   rehydrateAlerts();
   rehydrateProjects();
   rehydrateOrgRequests();
   rehydrateTenderUpdates();
+  rehydrateTenderStatus();
   rehydrateDocuments();
   rehydrateSync();
 }

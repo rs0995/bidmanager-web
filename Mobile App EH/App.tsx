@@ -8,8 +8,10 @@ import {
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { RootNavigator } from './src/app/navigation/RootNavigator';
 import { ToastProvider } from './src/components/ui';
+import { AccountProvider } from './src/fixtures/account';
 import { AlertsProvider } from './src/fixtures/alerts';
 import { BookmarksProvider } from './src/fixtures/bookmarks';
+import { DownloadsProvider } from './src/fixtures/downloads';
 import { ProjectsProvider } from './src/fixtures/projects';
 import { ThemeProvider, useTheme } from './src/theme';
 
@@ -39,9 +41,13 @@ export default function App({ insetsOverride, overlay }: Props) {
         <ToastProvider>
           <BookmarksProvider>
             <ProjectsProvider>
-              <AlertsProvider>
-                <RootNavigator />
-              </AlertsProvider>
+              <AccountProvider>
+                <AlertsProvider>
+                  <DownloadsProvider>
+                    <RootNavigator />
+                  </DownloadsProvider>
+                </AlertsProvider>
+              </AccountProvider>
             </ProjectsProvider>
           </BookmarksProvider>
         </ToastProvider>

@@ -2,6 +2,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import app_core as core
 
@@ -26,6 +27,65 @@ class TenderIntegrityTests(unittest.TestCase):
             "21-Aug-2026", "https://example.test/tender?id=1&session=abc", "Pune",
             "Works", "N/A", "16-Aug-2026", "Road improvements",
         )
+
+    def test_tenders_sharing_org_title_and_closing_date_stay_separate(self):
+        conn = core.sqlite3.connect(core.DB_FILE)
+        first = self._tender(tender_id="2026_MCGM_1345164_1")
+        second = self._tender(tender_id="2026_MCGM_1345165_1")
+        # Two scrape passes, as the scheduler runs them: neither tender may
+        # take over the other's row.
+        results = [core.ScraperBackend.upsert_tender_row(conn, row) for row in (first, second, first, second)]
+        conn.commit()
+        ids = sorted(r[0] for r in conn.execute("SELECT tender_id FROM tenders").fetchall())
+        conn.close()
+        self.assertEqual(results, ["inserted", "inserted", "unchanged", "unchanged"])
+        self.assertEqual(ids, ["2026_MCGM_1345164_1", "2026_MCGM_1345165_1"])
+
+    def test_a_tender_without_a_tender_id_is_skipped(self):
+        conn = core.sqlite3.connect(core.DB_FILE)
+        result = core.ScraperBackend.upsert_tender_row(conn, self._tender(tender_id="  "))
+        conn.commit()
+        count = conn.execute("SELECT COUNT(*) FROM tenders").fetchone()[0]
+        conn.close()
+        self.assertEqual((result, count), ("skipped", 0))
+
+    def test_a_rows_tender_id_never_changes(self):
+        conn = core.sqlite3.connect(core.DB_FILE)
+        core.ScraperBackend.upsert_tender_row(conn, self._tender(tender_id="2026_A_1_1"))
+        first_row = conn.execute("SELECT id FROM tenders").fetchone()[0]
+        core.ScraperBackend.upsert_tender_row(conn, self._tender(tender_id="2026_A_1_2"))
+        conn.commit()
+        rows = dict(conn.execute("SELECT id, tender_id FROM tenders").fetchall())
+        conn.close()
+        self.assertEqual(rows[first_row], "2026_A_1_1")
+        self.assertEqual(sorted(rows.values()), ["2026_A_1_1", "2026_A_1_2"])
+
+    def test_startup_stores_row_id_bookmarks_as_tender_ids(self):
+        conn = core.sqlite3.connect(core.DB_FILE)
+        core.ScraperBackend.upsert_tender_row(conn, self._tender(tender_id="2026_MCGM_1345164_1"))
+        row_id = conn.execute("SELECT id FROM tenders").fetchone()[0]
+        conn.execute(
+            "INSERT INTO client_user_sync (user_id, data_json, updated_at) VALUES (1, ?, 0)",
+            ('{"bookmarks": [%d, 999]}' % row_id,),
+        )
+        conn.commit()
+        conn.close()
+        core.init_db()
+        conn = core.sqlite3.connect(core.DB_FILE)
+        blob = core.json.loads(conn.execute("SELECT data_json FROM client_user_sync").fetchone()[0])
+        conn.close()
+        self.assertEqual(blob["bookmarkTenderIds"], ["2026_MCGM_1345164_1"])
+
+    def test_dedupe_never_merges_different_tender_ids(self):
+        # Same org, title, closing date and URL: still two tenders.
+        conn = core.sqlite3.connect(core.DB_FILE)
+        for tender_id in ("2026_DMA_1344663_1", "2026_DMA_1344663_2", "2026_DMA_1344663_3"):
+            core.ScraperBackend.upsert_tender_row(conn, self._tender(tender_id=tender_id))
+        removed = core.ScraperBackend.dedupe_tenders_for_website(conn, 1)
+        conn.commit()
+        count = conn.execute("SELECT COUNT(*) FROM tenders").fetchone()[0]
+        conn.close()
+        self.assertEqual((removed, count), (0, 3))
 
     def test_canonical_upsert_tracks_only_real_changes(self):
         conn = core.sqlite3.connect(core.DB_FILE)
@@ -76,6 +136,119 @@ class TenderIntegrityTests(unittest.TestCase):
         self.assertAlmostEqual(float(row[1]) - float(row[0]), 1800, delta=2)
         self.assertFalse(core.ScraperBackend.tender_scrape_due(tender_db_id, float(row[1]) - 1))
         self.assertTrue(core.ScraperBackend.tender_scrape_due(tender_db_id, float(row[1])))
+
+    def test_redownload_flag_disables_skip_for_files_already_logged_complete(self):
+        conn = core.sqlite3.connect(core.DB_FILE)
+        core.ScraperBackend.upsert_tender_row(conn, self._tender())
+        conn.commit()
+        conn.close()
+        file_path = os.path.join(self._temp_dir.name, "notice.pdf")
+        with open(file_path, "wb") as handle:
+            handle.write(b"x")
+        core.ScraperBackend.log_downloaded_file(
+            "NIC/2026/001", "notice.pdf", file_type="notice",
+            source_url="https://example.test/n?doc=1", local_path=file_path,
+        )
+        args = ("NIC/2026/001", "notice.pdf", file_path)
+        kwargs = {"source_url": "https://example.test/n?doc=1", "file_type": "notice"}
+        self.assertTrue(core.ScraperBackend.should_skip_file(*args, **kwargs))
+        core._job_runtime.force_redownload = True
+        try:
+            self.assertFalse(core.ScraperBackend.should_skip_file(*args, **kwargs))
+        finally:
+            core._job_runtime.force_redownload = False
+        self.assertTrue(core.ScraperBackend.should_skip_file(*args, **kwargs))
+
+    def test_new_portal_files_available_compares_against_last_completed_run(self):
+        conn = core.sqlite3.connect(core.DB_FILE)
+        core.ScraperBackend.upsert_tender_row(conn, self._tender())
+        conn.commit()
+        tender_db_id = conn.execute("SELECT id FROM tenders").fetchone()[0]
+        conn.close()
+
+        def set_counts(prebid, corrigendum, last_prebid, last_corrigendum):
+            c = core.sqlite3.connect(core.DB_FILE)
+            c.execute(
+                "UPDATE tenders SET prebid_count=?, corrigendum_count=?, "
+                "last_dl_prebid_count=?, last_dl_corrigendum_count=? WHERE id=?",
+                (prebid, corrigendum, last_prebid, last_corrigendum, tender_db_id),
+            )
+            c.commit()
+            c.close()
+
+        set_counts(1, 2, 1, 2)
+        self.assertEqual(core.ScraperBackend.new_portal_files_available(tender_db_id), (False, 3, 3))
+        set_counts(1, 3, 1, 2)
+        self.assertEqual(core.ScraperBackend.new_portal_files_available(tender_db_id), (True, 4, 3))
+        # No recorded run yet: falls back to corrigendum/pre-bid files actually stored.
+        set_counts(0, 1, None, None)
+        self.assertEqual(core.ScraperBackend.new_portal_files_available(tender_db_id), (True, 1, 0))
+
+    def test_update_mode_skips_browser_download_when_portal_has_nothing_new(self):
+        conn = core.sqlite3.connect(core.DB_FILE)
+        core.ScraperBackend.upsert_tender_row(conn, self._tender())
+        conn.execute("UPDATE tenders SET prebid_count=1, corrigendum_count=1, "
+                     "last_dl_prebid_count=1, last_dl_corrigendum_count=1")
+        conn.commit()
+        tender_db_id = conn.execute("SELECT id FROM tenders").fetchone()[0]
+        conn.close()
+        with mock.patch.object(core.ScraperBackend, "refresh_tender_counts", return_value=True),                 mock.patch.object(core.ScraperBackend, "download_tenders_logic") as download:
+            self.assertTrue(core.ScraperBackend.download_single_tender_logic(tender_db_id, "update"))
+        download.assert_not_called()
+        conn = core.sqlite3.connect(core.DB_FILE)
+        checked = conn.execute("SELECT last_update_checked_at FROM tenders WHERE id=?", (tender_db_id,)).fetchone()[0]
+        conn.close()
+        self.assertGreater(float(checked or 0), 0)
+
+    def test_update_mode_downloads_when_new_files_or_counts_unreadable_and_redownload_forces(self):
+        conn = core.sqlite3.connect(core.DB_FILE)
+        core.ScraperBackend.upsert_tender_row(conn, self._tender())
+        conn.execute("UPDATE tenders SET prebid_count=1, corrigendum_count=2, "
+                     "last_dl_prebid_count=1, last_dl_corrigendum_count=1")
+        conn.commit()
+        tender_db_id = conn.execute("SELECT id FROM tenders").fetchone()[0]
+        conn.close()
+        with mock.patch.object(core.ScraperBackend, "download_tenders_logic", return_value=True) as download:
+            with mock.patch.object(core.ScraperBackend, "refresh_tender_counts", return_value=True):
+                core.ScraperBackend.download_single_tender_logic(tender_db_id, "update")
+            self.assertEqual(download.call_args.kwargs["forced_mode"], "update")
+            with mock.patch.object(core.ScraperBackend, "refresh_tender_counts", return_value=False):
+                core.ScraperBackend.download_single_tender_logic(tender_db_id, "update")
+            self.assertEqual(download.call_count, 2)
+
+            seen = {}
+            def capture(*args, **kwargs):
+                seen["forced"] = getattr(core._job_runtime, "force_redownload", False)
+                seen["mode"] = kwargs.get("forced_mode")
+                return True
+            download.side_effect = capture
+            core.ScraperBackend.download_single_tender_logic(tender_db_id, "redownload")
+        self.assertEqual(seen, {"forced": True, "mode": "full"})
+        self.assertFalse(getattr(core._job_runtime, "force_redownload", False))
+
+    def test_status_fetch_for_client_counts_saved_status_as_success_and_stamps_time(self):
+        conn = core.sqlite3.connect(core.DB_FILE)
+        core.ScraperBackend.upsert_tender_row(conn, self._tender())
+        conn.execute("UPDATE websites SET status_url='https://example.test/status' WHERE id=1")
+        conn.commit()
+        tender_db_id = conn.execute("SELECT id FROM tenders").fetchone()[0]
+        conn.close()
+
+        class FakeDriver:
+            def get(self, *_): pass
+            def quit(self): pass
+
+        fake_wait = mock.Mock()
+        with mock.patch.object(core, "ensure_scraper_dependencies", return_value=True),                 mock.patch.object(core.storage_runtime, "require_durable_cloud_storage"),                 mock.patch.object(core, "create_browser_driver", return_value=FakeDriver()),                 mock.patch.object(core, "WebDriverWait", return_value=fake_wait), mock.patch.object(core, "EC", mock.Mock()), mock.patch.object(core, "By", mock.Mock()),                 mock.patch.object(core.ScraperBackend, "handle_captcha_interaction", return_value=True),                 mock.patch.object(core.ScraperBackend, "_extract_status_and_row", return_value=("Technical Evaluation", None)):
+            self.assertFalse(core.ScraperBackend.fetch_tender_status_single_logic(tender_db_id))
+            self.assertTrue(core.ScraperBackend.fetch_tender_status_single_logic(tender_db_id, client_source=True))
+        conn = core.sqlite3.connect(core.DB_FILE)
+        status, checked = conn.execute(
+            "SELECT status,last_status_checked_at FROM tenders WHERE id=?", (tender_db_id,)
+        ).fetchone()
+        conn.close()
+        self.assertEqual(status, "Technical Evaluation")
+        self.assertGreater(float(checked or 0), 0)
 
     def test_download_ledger_tracks_hash_and_ignores_session_token_changes(self):
         conn = core.sqlite3.connect(core.DB_FILE)

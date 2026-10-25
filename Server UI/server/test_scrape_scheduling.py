@@ -95,6 +95,38 @@ class SchedulerDowntimeTests(unittest.TestCase):
             self.assertEqual(api_server._run_consolidated_scrape_pass(), 0)
 
 
+class SavedJobRunDaysTests(unittest.TestCase):
+    MON_SAT = ["mon", "tue", "wed", "thu", "fri", "sat"]  # 2026-08-22 = Sat, 23 = Sun, 24 = Mon
+
+    def _settings(self, days=""):
+        return mock.patch.object(
+            api_server.core.ScraperBackend, "get_setting",
+            side_effect=lambda k, d=None: {"scheduler_downtime_days": days}.get(k, d),
+        )
+
+    def test_run_days_from_text_defaults_and_canonical_order(self):
+        self.assertEqual(api_server._run_days_from_text(None), self.MON_SAT)
+        self.assertEqual(api_server._run_days_from_text("garbage"), self.MON_SAT)
+        self.assertEqual(api_server._run_days_from_text("sun,Mon"), ["mon", "sun"])
+        self.assertEqual(api_server._run_days_from_text(["fri", "TUE"]), ["tue", "fri"])
+
+    def test_next_allowed_run_day_skips_sunday_keeping_time_of_day(self):
+        moved = api_server._next_allowed_run_day(_epoch_at(2, 0, day=23), self.MON_SAT)
+        self.assertEqual(moved, _epoch_at(2, 0, day=24))
+        unchanged = api_server._next_allowed_run_day(_epoch_at(9, 30, day=22), self.MON_SAT)
+        self.assertEqual(unchanged, _epoch_at(9, 30, day=22))
+
+    def test_schedule_slot_short_interval_rolls_past_sunday(self):
+        with self._settings():
+            saturday_late_plus_3h = _epoch_at(23, 0, day=22) + 3 * 3600  # Sunday 02:00
+            self.assertEqual(api_server._schedule_slot(saturday_late_plus_3h, self.MON_SAT), _epoch_at(2, 0, day=24))
+
+    def test_global_pause_days_supersede_job_run_days(self):
+        with self._settings(days="mon"):
+            slot = api_server._schedule_slot(_epoch_at(10, 0, day=23), self.MON_SAT)  # Sunday
+            self.assertEqual(slot, _epoch_at(0, 0, day=25))  # Monday is globally paused -> Tuesday 00:00
+
+
 class JobDedupeKeyTests(unittest.TestCase):
     def test_consolidated_schedule_source_dedupes_by_website_only(self):
         key_a = api_server._job_dedupe_key(

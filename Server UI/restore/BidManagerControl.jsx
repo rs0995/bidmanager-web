@@ -2023,17 +2023,24 @@ function ArchivePanel({ toast, base, adminKey }) {
             <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}><tr style={{ background: c.paper }}>
               {['Tender ID', 'Organization / title', 'Status', 'Last scrape', ''].map((th) => <th key={th} className="text-left px-3 py-2" style={{ fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60, borderBottom: `1px solid ${c.rule}`, fontWeight: 500 }}>{th}</th>)}
             </tr></thead>
-            <tbody>{tenders.map((tender) => (
+            <tbody>{tenders.map((tender) => {
+              const isPending = Object.prototype.hasOwnProperty.call(pendingJobs, tender.id);
+              return (
               <tr key={tender.id} style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
                 <td className="px-3 py-2"><Mono style={{ fontSize: 11.5, color: c.ink }}>{tender.tender_id || '—'}</Mono></td>
                 <td className="px-3 py-2" style={{ minWidth: 260 }}><div style={{ fontSize: 12, color: c.ink }}>{tender.org_chain || '—'}</div><div style={{ fontSize: 11.5, color: c.ink60, marginTop: 2 }}>{tender.title || '—'}</div></td>
-                <td className="px-3 py-2"><Pill state={tender.status ? 'info' : 'neutral'}>{tender.status || 'unknown'}</Pill></td>
+                <td className="px-3 py-2">
+                  {isPending
+                    ? <Pill state="info"><Loader2 size={11} className="animate-spin" style={{ marginRight: 4, verticalAlign: -2 }} />Checking…</Pill>
+                    : <Pill state={tender.status ? 'info' : 'neutral'}>{tender.status || 'Not Fetched'}</Pill>}
+                </td>
                 <td className="px-3 py-2"><Mono style={{ fontSize: 11, color: c.ink60 }}>{tender.last_scraped_at ? fmtDateTime(tender.last_scraped_at * 1000) : '—'}</Mono></td>
                 <td className="px-3 py-2 text-right whitespace-nowrap">
-                  <Btn size="sm" variant="primary" icon={Search} busy={busyId === tender.id} disabled={!tender.tender_id} onClick={() => fetchStatus(tender)}>Fetch Status</Btn>
+                  <Btn size="sm" variant="primary" icon={Search} busy={busyId === tender.id} disabled={!tender.tender_id || isPending} onClick={() => fetchStatus(tender)}>{isPending ? 'Checking…' : 'Fetch Status'}</Btn>
                 </td>
               </tr>
-            ))}</tbody>
+              );
+            })}</tbody>
           </table>
           {!loading && tenders.length === 0 && <Empty icon={Archive} title="No archived tenders for this website." />}
         </div>

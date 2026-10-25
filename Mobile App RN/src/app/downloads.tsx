@@ -1,10 +1,16 @@
+import { useState } from "react";
 import { View, Text, ScrollView, Pressable } from "react-native";
 import { router } from "expo-router";
-import { Loader2, CheckCircle2, TriangleAlert, DownloadCloud } from "lucide-react-native";
+import { Loader2, CheckCircle2, TriangleAlert, DownloadCloud, RefreshCw } from "lucide-react-native";
 import { ScreenHeader } from "@/components/shell/ScreenHeader";
 import { EmptyState } from "@/components/feedback/EmptyState";
 import { SpinningIcon } from "@/components/common/SpinningIcon";
 import { useAllDownloads, isPdfDoc, isZipDoc } from "@/lib/documents";
+import { requestTenderUpdate } from "@/lib/tenderUpdates";
+import { getBookmarks } from "@/lib/store";
+import { getProjects } from "@/lib/projects";
+import { canonTenderId, resolveTenderIds } from "@/lib/tenderKey";
+import { useToast } from "@/components/feedback/ToastProvider";
 import { useThemeColors } from "@/constants/colors";
 import { cn } from "@/lib/cn";
 
@@ -28,10 +34,67 @@ function relativeTime(iso?: string) {
 export default function DownloadsScreen() {
   const rows = useAllDownloads();
   const colors = useThemeColors();
+  const toast = useToast();
+  const [syncing, setSyncing] = useState(false);
+
+  // Re-checks every bookmarked/project tender for new corrigendum or pre-bid
+  // minutes right now, bypassing tenderUpdates.js 24h cooldown gate (this
+  // is an explicit user action, not the passive background check) so a
+  // tender whose corrigendum was issued before it was ever auto-checked
+  // still gets picked up.
+  const handleSync = async () => {
+    setSyncing(true);
+    try {
+      // By portal tender id, resolved to the current rows in one call.
+      const projectTenderIds = getProjects().map((p: any) => canonTenderId(p.source_tender_id)).filter(Boolean);
+      const ids = [...new Set([...getBookmarks(), ...projectTenderIds])];
+      let ok = 0;
+      let failed = 0;
+      let resolved: Record<string, any> = {};
+      try { resolved = await resolveTenderIds(ids); } catch { failed = ids.length; }
+      for (const id of Object.keys(resolved)) {
+        try {
+          const tender = resolved[id];
+          // The portal no longer serves documents for a closed tender.
+          if (tender.is_archived) continue;
+          await new Promise<void>((resolve) => {
+            requestTenderUpdate(tender, (result: any) => {
+              if (result?.ok) ok += 1; else failed += 1;
+              resolve();
+            }).catch(() => { failed += 1; resolve(); });
+          });
+        } catch {
+          failed += 1;
+        }
+      }
+      if (ids.length === 0) {
+        toast?.push({ title: "Nothing to sync", body: "Bookmark a tender or start a project first." });
+      } else if (ok + failed === 0) {
+        toast?.push({ title: "Nothing to check", body: "All bookmarked and project tenders are closed." });
+      } else if (failed === 0) {
+        toast?.push({ title: `Checked ${ok} tender${ok === 1 ? "" : "s"}`, body: "Any new corrigendum or pre-bid minutes have been downloaded." });
+      } else {
+        toast?.push({ title: `Checked ${ok + failed} tenders`, body: `${failed} failed.`, type: "error" });
+      }
+    } finally {
+      setSyncing(false);
+    }
+  };
 
   return (
     <View className="flex-1 bg-bg">
-      <ScreenHeader title="Downloads" back />
+      <ScreenHeader
+        title="Downloads"
+        back
+        actions={(
+          <Pressable className="flex-row items-center gap-1.5 p-1.5" onPress={handleSync} disabled={syncing}>
+            <SpinningIcon spinning={syncing}>
+              <RefreshCw size={15} color={colors.accent} />
+            </SpinningIcon>
+            <Text className="text-xs font-semibold text-accent">{syncing ? "Syncing…" : "Sync"}</Text>
+          </Pressable>
+        )}
+      />
       <ScrollView contentContainerClassName="p-4">
         {rows.length === 0 ? (
           <EmptyState icon={DownloadCloud} title="No downloads yet" body="Request or download tender documents and they will show up here." />

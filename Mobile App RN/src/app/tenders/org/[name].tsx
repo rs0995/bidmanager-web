@@ -1,9 +1,10 @@
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { View, Pressable } from "react-native";
 import { useLocalSearchParams } from "expo-router";
 import { RefreshCw, Globe } from "lucide-react-native";
 import { ScreenHeader } from "@/components/shell/ScreenHeader";
 import { TenderList } from "@/components/tender/TenderList";
+import { SearchField } from "@/components/tender/SearchField";
 import { EmptyState } from "@/components/feedback/EmptyState";
 import { Button } from "@/components/common/Button";
 import { SpinningIcon } from "@/components/common/SpinningIcon";
@@ -16,14 +17,18 @@ import { useThemeColors } from "@/constants/colors";
 const COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 export default function OrganizationTendersScreen() {
-  const { name, website_id: websiteId, org_id: orgId, sort_by: sortBy, sort_order: sortOrder, last_scraped_at } =
-    useLocalSearchParams<{ name: string; website_id?: string; org_id?: string; sort_by?: string; sort_order?: string; last_scraped_at?: string }>();
+  const { name, website_id: websiteId, org_id: orgId, sort_by: sortBy, sort_order: sortOrder, last_scraped_at, archived } =
+    useLocalSearchParams<{ name: string; website_id?: string; org_id?: string; sort_by?: string; sort_order?: string; last_scraped_at?: string; archived?: string }>();
+  const [search, setSearch] = useState("");
   const orgName = decodeURIComponent(name);
   const lastScrapedAt = Number(last_scraped_at) || 0;
   const toast = useToast();
   const colors = useThemeColors();
 
-  const query = useTenders({ organization: orgName, website_id: websiteId, sort_by: sortBy, sort_order: sortOrder });
+  const query = useTenders({
+    organization: orgName, website_id: websiteId, sort_by: sortBy, sort_order: sortOrder,
+    q: search, archived: archived === "1" ? "true" : "false",
+  });
   // Client-side safety net for the sort the server was already asked for —
   // guarantees correct order even if the server doesn't apply sort_by/sort_order.
   const sortFn = useCallback((a: any, b: any) => {
@@ -66,6 +71,9 @@ export default function OrganizationTendersScreen() {
   return (
     <View className="flex-1 bg-bg">
       <ScreenHeader title={orgName} back actions={headerRequestButton} />
+      <View className="flex-row px-4 pt-3 pb-2 bg-surface-0 border-b border-border">
+        <SearchField value={search} onSearch={setSearch} placeholder="Search tenders in this organisation" />
+      </View>
       <TenderList
         query={query}
         sortFn={sortFn}

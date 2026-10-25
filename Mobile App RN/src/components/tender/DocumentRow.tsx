@@ -5,7 +5,7 @@ import Animated, { useAnimatedStyle, useSharedValue, withRepeat, withTiming, Eas
 import { FileText, Download, Loader2, CheckCircle2, TriangleAlert } from "lucide-react-native";
 import { formatBytes, formatDate } from "@/lib/format";
 import { useDocumentDownload } from "@/hooks/useDownload";
-import { useDocumentsForTender, isPdfDoc, isZipDoc } from "@/lib/documents";
+import { useDocumentsForTender, isPdfDoc, isZipDoc, isCorruptDownload } from "@/lib/documents";
 import { useToast } from "@/components/feedback/ToastProvider";
 import { useThemeColors } from "@/constants/colors";
 
@@ -22,15 +22,20 @@ function SpinningLoader({ color }: { color: string }) {
   );
 }
 
-export function DocumentRow({ tenderId, doc }: { tenderId: number; doc: any }) {
+// `tender` is the live tender (row id for the API, tender_id groups the local rows).
+export function DocumentRow({ tender, doc }: { tender: any; doc: any }) {
   const toast = useToast();
   const colors = useThemeColors();
   const { download, pendingId } = useDocumentDownload(
     (e: any) => toast?.push({ title: "Download failed", body: e?.message, type: "error" }),
   );
-  const cacheRows = useDocumentsForTender(tenderId);
+  const cacheRows = useDocumentsForTender(tender);
   const cached = cacheRows.find((r: any) => r.id === doc.id);
-  const status = pendingId === doc.id ? "downloading" : (cached?.client_status || "synced");
+  const corrupt = pendingId !== doc.id && isCorruptDownload(cached);
+  // Present a corrupt-but-"downloaded" row the same way a failed one already
+  // renders (warning icon + message) -- the file exists locally but isn't
+  // usable, same as an outright failed download from the user's point of view.
+  const status = pendingId === doc.id ? "downloading" : corrupt ? "failed" : (cached?.client_status || "synced");
 
   const disabled = doc.downloadable === false || status === "downloading";
   const fileLike = { file_name: doc.name };
@@ -58,7 +63,9 @@ export function DocumentRow({ tenderId, doc }: { tenderId: number; doc: any }) {
       <View className="flex-1">
         <Text className="text-sm text-text" numberOfLines={1}>{doc.name}</Text>
         <Text className="text-xs" style={{ color: status === "failed" ? colors.danger : colors.textMuted }}>
-          {status === "failed" && cached?.error
+          {corrupt
+            ? "File looks incomplete or corrupted — tap to retry"
+            : status === "failed" && cached?.error
             ? cached.error
             : `${doc.type} · ${formatBytes(doc.size_bytes)} · ${formatDate(doc.downloaded_at)}`}
         </Text>
@@ -66,7 +73,7 @@ export function DocumentRow({ tenderId, doc }: { tenderId: number; doc: any }) {
       <Pressable
         className="p-2"
         disabled={disabled}
-        onPress={() => download(tenderId, doc)}
+        onPress={() => download(tender, doc)}
         accessibilityLabel={status === "failed" ? "Retry download" : status === "downloaded" ? "Download again" : "Download"}
       >
         {status === "downloading" ? (

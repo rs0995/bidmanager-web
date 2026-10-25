@@ -583,6 +583,189 @@ function CaptchaPage() {
   );
 }
 
+// ── Portal Search page ────────────────────────────────────────────────────
+// Search a tender ID directly on a NIC portal's Tender Status page — the
+// portal_search section (Server UI/server/API_CHANGES.md §2). Off by
+// default; only reachable when the sidebar/page-gate already let the user
+// in, so no permission check needed here.
+function portalSearchResultLabel(entry) {
+  if (!entry) return '';
+  if (entry.status === 'pending') return 'Searching…';
+  if (entry.status === 'not_found') return 'Not found on the portal';
+  if (entry.status === 'failed') return entry.error || 'Search failed';
+  if (entry.status === 'found') {
+    if (!entry.created) return 'Updated';
+    return entry.is_archived ? 'Added to archive' : 'Added to current';
+  }
+  return entry.status || '';
+}
+function PortalSearchResultBadge({ entry }) {
+  if (!entry) return null;
+  if (entry.status === 'pending') return <Badge variant="info"><Spinner size={10} />Searching…</Badge>;
+  if (entry.status === 'not_found') return <Badge variant="muted">Not found</Badge>;
+  if (entry.status === 'failed') return <Badge variant="danger">Failed</Badge>;
+  if (entry.status === 'found') return <Badge variant="success">{portalSearchResultLabel(entry)}</Badge>;
+  return <Badge variant="muted">{entry.status}</Badge>;
+}
+
+function PortalSearchPage({ onOpenTender }) {
+  const qc = useQueryClient();
+  const [websiteId, setWebsiteId] = useState('');
+  const [tenderId, setTenderId] = useState('');
+  const [activeSearchId, setActiveSearchId] = useState(null);
+  const [formError, setFormError] = useState('');
+
+  const { data: portalsResult, isLoading: portalsLoading } = useQuery({ queryKey: ['portal-search-portals'], queryFn: () => api.getPortalSearchPortals() });
+  const portals = portalsResult?.items || [];
+  useEffect(() => {
+    if (!websiteId && portals.length) setWebsiteId(String(portals[0].id));
+  }, [portals, websiteId]);
+
+  const { data: historyResult, isLoading: historyLoading } = useQuery({ queryKey: ['portal-search-history'], queryFn: () => api.getPortalSearchHistory(50) });
+  const history = historyResult?.items || [];
+
+  // Background completions (e.g. the app was restarted mid-search) notify
+  // here via the same cross-module bus api.js uses for tender changes.
+  useEffect(() => api.onPortalSearchChanged(() => qc.invalidateQueries({ queryKey: ['portal-search-history'] })), [qc]);
+
+  const { data: activeSearchResult } = useQuery({
+    queryKey: ['portal-search', activeSearchId],
+    queryFn: () => api.getPortalSearch(activeSearchId),
+    enabled: activeSearchId != null,
+    refetchInterval: (query) => (query.state.data?.search?.status === 'pending' ? 3000 : false),
+  });
+  const activeSearch = activeSearchResult?.search;
+  const isPending = activeSearch?.status === 'pending';
+  useEffect(() => {
+    if (activeSearch && activeSearch.status !== 'pending') qc.invalidateQueries({ queryKey: ['portal-search-history'] });
+  }, [activeSearch?.status, qc]);
+
+  // While our own search is pending, surface the same captcha signal the
+  // Captcha tab/header badge already poll — no new server concept, just a
+  // local hint so the user knows to go solve it.
+  const { data: pendingCaptcha } = useQuery({
+    queryKey: ['captcha-pending'],
+    queryFn: () => api.getPendingCaptcha(),
+    enabled: isPending,
+    refetchInterval: isPending ? 5000 : false,
+  });
+
+  const searchMut = useMutation({
+    mutationFn: () => api.requestPortalSearch(Number(websiteId), tenderId.trim()),
+    onSuccess: (result) => {
+      setFormError('');
+      setActiveSearchId(result?.search?.id ?? null);
+      qc.invalidateQueries({ queryKey: ['portal-search-history'] });
+    },
+    onError: (err) => setFormError(err instanceof Error ? err.message : String(err)),
+  });
+  const deleteMut = useMutation({
+    mutationFn: (id) => api.deletePortalSearchHistoryItem(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['portal-search-history'] }),
+  });
+  const clearMut = useMutation({
+    mutationFn: () => api.clearPortalSearchHistory(),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['portal-search-history'] }),
+  });
+
+  const handleSubmit = (event) => {
+    event.preventDefault();
+    if (!websiteId || !tenderId.trim()) { setFormError('Pick a portal and enter a tender ID.'); return; }
+    searchMut.mutate();
+  };
+
+  if (!portalsLoading && portalsResult && !portalsResult.allowed) {
+    return (
+      <div className="h-full overflow-y-auto p-6">
+        <EmptyState icon={Search} title="Portal Search" description="Your account doesn't have access to this section." />
+      </div>
+    );
+  }
+
+  return (
+    <div className="h-full overflow-y-auto p-6">
+      <div className="mx-auto max-w-2xl">
+        <h1 className="text-lg font-semibold text-[var(--text)]">Portal Search</h1>
+        <p className="mt-1 text-sm text-[var(--text-muted)]">Search a tender ID directly on a NIC portal. A tender already in the system is updated for everyone; a new one is added.</p>
+
+        <form onSubmit={handleSubmit} className="card mt-4 flex flex-wrap items-end gap-2 p-4">
+          <div className="min-w-[160px]">
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Portal</label>
+            <select value={websiteId} onChange={(e) => setWebsiteId(e.target.value)} className="input-field h-9 w-full text-sm">
+              {portals.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </div>
+          <div className="min-w-[200px] flex-1">
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Tender ID</label>
+            <input value={tenderId} onChange={(e) => setTenderId(e.target.value)} className="input-field h-9 w-full text-sm" placeholder="e.g. 2026_XYZ_123456_1" />
+          </div>
+          <button type="submit" disabled={searchMut.isPending || isPending} className="btn-primary h-9 gap-1.5 text-sm">
+            {searchMut.isPending || isPending ? <Spinner size={14} /> : <Search size={14} />}
+            {isPending ? 'Searching…' : 'Search'}
+          </button>
+        </form>
+        {formError && <p className="mt-2 text-xs text-rose-400">{formError}</p>}
+        {isPending && pendingCaptcha && (
+          <p className="mt-2 text-xs text-amber-400">A CAPTCHA needs solving to continue this search — go to the Captcha tab.</p>
+        )}
+        {activeSearch && activeSearch.status !== 'pending' && (
+          <div className="card mt-3 flex items-center justify-between p-3">
+            <div>
+              <p className="text-sm text-[var(--text)]">{activeSearch.tender_id} <span className="text-[var(--text-muted)]">on {activeSearch.website_name}</span></p>
+              <p className="text-xs text-[var(--text-muted)]">{portalSearchResultLabel(activeSearch)}{activeSearch.stage ? ` — ${activeSearch.stage}` : ''}</p>
+            </div>
+            {activeSearch.tender_db_id && (
+              <button onClick={() => onOpenTender?.(activeSearch.tender_db_id)} className="btn-secondary text-xs gap-1.5">
+                <ExternalLink size={13} />Open Tender
+              </button>
+            )}
+          </div>
+        )}
+
+        <div className="mt-6 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-[var(--text)]">History</h2>
+          {history.length > 0 && (
+            <button onClick={() => clearMut.mutate()} disabled={clearMut.isPending} className="btn-ghost text-xs gap-1.5">
+              <Trash2 size={12} />Clear
+            </button>
+          )}
+        </div>
+        {historyLoading && <div className="flex justify-center py-10"><Spinner size={20} className="text-[var(--accent)]" /></div>}
+        {!historyLoading && history.length === 0 && (
+          <EmptyState icon={Search} title="No searches yet" description="Search a tender ID on a portal to see it here." />
+        )}
+        {!historyLoading && history.length > 0 && (
+          <div className="mt-2 space-y-2">
+            {history.map((entry) => (
+              <div
+                key={entry.id}
+                onClick={() => entry.tender_db_id && onOpenTender?.(entry.tender_db_id)}
+                className={cn('card flex items-center justify-between gap-3 p-3', entry.tender_db_id && 'cursor-pointer hover:bg-[var(--surface-1)]')}
+              >
+                <div className="min-w-0">
+                  <p className="truncate text-sm text-[var(--text)]">{entry.tender_id} <span className="text-[var(--text-muted)]">on {entry.website_name}</span></p>
+                  <p className="text-xs text-[var(--text-muted)]">{new Date(entry.created_at * 1000).toLocaleString()}{entry.stage ? ` — ${entry.stage}` : ''}</p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <PortalSearchResultBadge entry={entry} />
+                  <button
+                    onClick={(event) => { event.stopPropagation(); deleteMut.mutate(entry.id); }}
+                    disabled={deleteMut.isPending}
+                    className="rounded p-1 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]"
+                    title="Remove"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Sidebar ────────────────────────────────────────────────────────────────
 // Which sidebar tabs a set of org-account permissions (active/archived/
 // bookmarks/projects — see Server UI/server/org_access.py) hides. An
@@ -592,6 +775,10 @@ function CaptchaPage() {
 // page itself narrows to whichever sub-tab is still permitted (same
 // server-side scope rule _tender_scope uses: no filter when both are on).
 function sidebarKeyGatedOff(key, permissions) {
+  // portal_search defaults OFF (unlike the other four, which default on) —
+  // while permissions haven't loaded yet, keep it hidden rather than
+  // flashing a tab most accounts don't actually have.
+  if (key === 'portal_search') return permissions?.portal_search !== true;
   if (!permissions) return false;
   if (key === 'tenders') return permissions.active === false && permissions.archived === false;
   if (key === 'organizations') return permissions.active === false && permissions.archived === false && permissions.bookmarks === false;
@@ -608,6 +795,7 @@ function Sidebar({ active, onNavigate, collapsed, onToggle, badges = {}, permiss
     { key: 'bookmarks', label: 'Bookmarks', icon: Star },
     { key: 'projects', label: 'Projects', icon: FolderOpen },
     { key: 'templates', label: 'Templates', icon: FileText },
+    { key: 'portal_search', label: 'Portal Search', icon: Search },
   ].filter((item) => !sidebarKeyGatedOff(item.key, permissions));
   const bottomItems = [
     { key: 'archived_projects', label: 'Archived Projects', icon: FolderOpen },
@@ -4310,10 +4498,12 @@ const SETTINGS_TABS = [
 // member's permissions. Mirrors Server UI's own SectionToggles component
 // so admins see the same control in the admin console and here.
 const ACCOUNT_SECTIONS = [
-  { key: 'active', label: 'Active Tenders' },
-  { key: 'archived', label: 'Archived' },
-  { key: 'bookmarks', label: 'Bookmarks' },
-  { key: 'projects', label: 'Projects' },
+  { key: 'active', label: 'Active Tenders', defaultOn: true },
+  { key: 'archived', label: 'Archived', defaultOn: true },
+  { key: 'bookmarks', label: 'Bookmarks', defaultOn: true },
+  { key: 'projects', label: 'Projects', defaultOn: true },
+  // Off by default — must be explicitly granted, unlike the other four.
+  { key: 'portal_search', label: 'Portal Search', defaultOn: false },
 ];
 function SectionToggles({ permissions, onChange, disabled }) {
   return (
@@ -4322,7 +4512,7 @@ function SectionToggles({ permissions, onChange, disabled }) {
         <label key={s.key} className={cn('flex items-center gap-1.5 text-xs', disabled ? 'text-[var(--text-muted)] opacity-60' : 'text-[var(--text-muted)]')}>
           <input
             type="checkbox"
-            checked={permissions?.[s.key] !== false}
+            checked={s.defaultOn ? permissions?.[s.key] !== false : permissions?.[s.key] === true}
             disabled={disabled}
             onChange={(e) => onChange(s.key, e.target.checked)}
             className="accent-[var(--accent)]"
@@ -4525,7 +4715,7 @@ function OrganisationCard({ settings }) {
                       </div>
                     </div>
                     <SectionToggles
-                      permissions={{ ...{ active: true, archived: true, bookmarks: true, projects: true }, ...approvePerms[req.id] }}
+                      permissions={{ ...{ active: true, archived: true, bookmarks: true, projects: true, portal_search: false }, ...approvePerms[req.id] }}
                       onChange={(key, value) => setApprovePerms((p) => ({ ...p, [req.id]: { ...p[req.id], [key]: value } }))}
                     />
                   </div>
@@ -5046,7 +5236,7 @@ export default function App() {
     retry: false,
   });
   const [page, setPage] = useState(() => {
-    const allowed = ['dashboard', 'tenders', 'organizations', 'bookmarks', 'projects', 'templates', 'archived_projects', 'captcha', 'files', 'settings'];
+    const allowed = ['dashboard', 'tenders', 'organizations', 'bookmarks', 'projects', 'templates', 'archived_projects', 'captcha', 'files', 'settings', 'portal_search'];
     const startupPage = readClientPrefs().startupPage;
     if (startupPage && startupPage !== 'resume' && allowed.includes(startupPage)) return startupPage;
     const saved = localStorage.getItem('bm-client-last-page');
@@ -5135,6 +5325,13 @@ export default function App() {
   useEffect(() => {
     if (!authSettings?.auth_token) return;
     api.resumePendingOrgRequests().catch(() => {});
+  }, [authSettings?.auth_token]);
+
+  // Same reattachment, for an in-flight portal tender search — see
+  // api.resumePendingPortalSearches.
+  useEffect(() => {
+    if (!authSettings?.auth_token) return;
+    api.resumePendingPortalSearches().catch(() => {});
   }, [authSettings?.auth_token]);
 
   // Heal a stale/dead Backend URL left in an old install's app data: while
@@ -5252,6 +5449,7 @@ export default function App() {
     templates: <TemplatesPage />,
     files: <FilesPage />,
     settings: <SettingsPage />,
+    portal_search: <PortalSearchPage onOpenTender={openTenderDetails} />,
   };
 
   return (

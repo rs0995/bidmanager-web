@@ -9,8 +9,12 @@ export interface Notification {
   read: boolean;
   // Optional navigation target — clicking the notification jumps to this
   // tender (preferred) or, failing that, this org's tender list. Mirrors
-  // Mobile App's alert shape (lib/alerts.js: tenderId/orgName).
-  tenderId?: number;
+  // Mobile App's alert shape (lib/alerts.js: tenderId/orgName). tenderId is
+  // the canonical portal tender id (a number only on notifications saved
+  // before that — treated as a row-id hint); tenderDbId is an optional
+  // row-id hint, used only when there's no tender id.
+  tenderId?: string | number;
+  tenderDbId?: number;
   orgName?: string;
 }
 

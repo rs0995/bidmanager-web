@@ -76,6 +76,15 @@ if "%OLD_VERSION%"=="" (
 node -e "const fs=require('fs');for(const f of ['electron/package.json','package.json']){const p=JSON.parse(fs.readFileSync(f));p.version='%NEW_VERSION%';fs.writeFileSync(f, JSON.stringify(p,null,2)+'\n');}"
 echo Bumping version: %OLD_VERSION% -^> %NEW_VERSION%
 
+rem --- electron\ has its own node_modules (electron, electron-builder); install
+rem     them on a fresh checkout.
+if not exist "electron\node_modules\electron-builder" (
+    echo Installing Electron packaging dependencies...
+    pushd electron
+    call npm install --no-audit --no-fund
+    popd
+)
+
 echo [4/4] Building Electron installer (NSIS)...
 rem Clean stale packaging dir - electron-builder renames win-unpacked.tmp ->
 rem win-unpacked and fails with EPERM when the old one is locked.

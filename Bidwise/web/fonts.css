@@ -1,0 +1,40 @@
+@font-face {
+  font-family: 'IBMPlexMono_500Medium';
+  src: url('../assets/fonts/IBMPlexMono_500Medium.ttf');
+}
+@font-face {
+  font-family: 'IBMPlexMono_600SemiBold';
+  src: url('../assets/fonts/IBMPlexMono_600SemiBold.ttf');
+}
+@font-face {
+  font-family: 'Inter_400Regular';
+  src: url('../assets/fonts/Inter_400Regular.ttf');
+}
+@font-face {
+  font-family: 'Inter_500Medium';
+  src: url('../assets/fonts/Inter_500Medium.ttf');
+}
+@font-face {
+  font-family: 'Inter_600SemiBold';
+  src: url('../assets/fonts/Inter_600SemiBold.ttf');
+}
+@font-face {
+  font-family: 'Inter_700Bold';
+  src: url('../assets/fonts/Inter_700Bold.ttf');
+}
+@font-face {
+  font-family: 'Inter_800ExtraBold';
+  src: url('../assets/fonts/Inter_800ExtraBold.ttf');
+}
+@font-face {
+  font-family: 'SpaceGrotesk_500Medium';
+  src: url('../assets/fonts/SpaceGrotesk_500Medium.ttf');
+}
+@font-face {
+  font-family: 'SpaceGrotesk_600SemiBold';
+  src: url('../assets/fonts/SpaceGrotesk_600SemiBold.ttf');
+}
+@font-face {
+  font-family: 'SpaceGrotesk_700Bold';
+  src: url('../assets/fonts/SpaceGrotesk_700Bold.ttf');
+}

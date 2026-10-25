@@ -14,6 +14,8 @@ datas = [
     (os.path.join(base_dir, "admin_providers.py"), "."),
     (os.path.join(base_dir, "db_compat.py"), "."),
     (os.path.join(base_dir, "drive_storage.py"), "."),
+    # Portal scrapers for non-NIC sites (nProcure) incl. their bundled CA certs.
+    (os.path.join(base_dir, "scrapers"), "scrapers"),
     (console_ui_dist, os.path.join("frontend", "dist")),
 ]
 

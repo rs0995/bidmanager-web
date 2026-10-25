@@ -4,6 +4,7 @@ import { Clock, TriangleAlert, CheckCircle2, Info, Activity, Calendar, Zap, Chev
 import { ScreenHeader } from "@/components/shell/ScreenHeader";
 import { EmptyState } from "@/components/feedback/EmptyState";
 import { useAlerts, markRead, markAllRead } from "@/lib/alerts";
+import { resolveTenderIds } from "@/lib/tenderKey";
 import { useThemeColors, hexToRgba } from "@/constants/colors";
 import { cn } from "@/lib/cn";
 
@@ -32,13 +33,22 @@ export default function AlertsScreen() {
   const colors = useThemeColors();
   const hasUnread = alerts.some((a: any) => !a.read);
 
-  const openAlert = (a: any) => {
+  // A tender alert opens by its portal tender id, looked up to the tender's
+  // current row (row ids change if the server DB is restored). Alerts saved
+  // by older builds only have the row id and still open through it.
+  const openAlert = async (a: any) => {
     markRead(a.id);
+    if (a.tenderKey) {
+      const tender = await resolveTenderIds([a.tenderKey]).then((m: any) => m[a.tenderKey]).catch(() => null);
+      if (tender) { router.push(`/tenders/${tender.id}` as any); return; }
+      if (a.orgName) router.push(`/tenders/org/${encodeURIComponent(a.orgName)}?sort_by=published_date&sort_order=desc` as any);
+      return;
+    }
     if (a.tenderId) router.push(`/tenders/${a.tenderId}` as any);
     // Bulk "N new tenders" alerts carry the ids the server reported as new —
     // open a screen with exactly those. Alerts created before that field
     // existed have no ids and fall through to the org's tender list.
-    else if (a.newTenderIds?.length) router.push(`/new-tenders/${a.id}` as any);
+    else if (a.newTenderKeys?.length || a.newTenderIds?.length) router.push(`/new-tenders/${a.id}` as any);
     else if (a.orgName) router.push(`/tenders/org/${encodeURIComponent(a.orgName)}?sort_by=published_date&sort_order=desc` as any);
   };
 
@@ -60,7 +70,7 @@ export default function AlertsScreen() {
             {alerts.map((a: any, i: number) => {
               const meta = ICON_KEYS[a.kind] || ICON_KEYS.sync;
               const Icon = meta.icon;
-              const navigable = Boolean(a.tenderId || a.orgName);
+              const navigable = Boolean(a.tenderKey || a.tenderId || a.orgName);
               const bgColor = meta.bg === "dangerBg" ? colors.dangerBg : colors.accentBg;
               const iconColor = colors[meta.color];
               const isLast = i === alerts.length - 1;

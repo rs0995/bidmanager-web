@@ -23,12 +23,12 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Optional, List
 from contextlib import contextmanager
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from starlette.routing import Route
 from pydantic import BaseModel
 
@@ -42,6 +42,8 @@ import admin_providers
 import db_compat
 import security
 import client_api
+import org_access
+import apns_push
 
 # -- Initialise --
 
@@ -274,8 +276,15 @@ class WebsiteOut(BaseModel):
     name: str
     url: str
     status_url: str
+    portal_type: str = "nic"
 
 class WebsiteCreate(BaseModel):
+    name: str
+    url: str
+    status_url: str = ""
+    portal_type: Optional[str] = None  # 'nic' | 'nprocure'; detected from the URL when omitted
+
+class WebsiteUpdate(BaseModel):
     name: str
     url: str
     status_url: str = ""
@@ -517,6 +526,9 @@ class SavedCustomJobRequest(BaseModel):
     schedule_mode: str = ""
     interval_minutes: int = 0
     scheduled_for_at: float = 0
+    # Weekday keys (mon..sun, IST) a repeating job may run on. None = default
+    # Mon-Sat on create, unchanged on update.
+    run_days: Optional[List[str]] = None
 
 
 class RestoreProjectsResponse(BaseModel):
@@ -573,6 +585,18 @@ class ClearSavedDataRequest(BaseModel):
     clear_archived: bool = False
 
 
+# -- Portal links --
+
+@app.get("/portal/nprocure/tender/{tender_id}", response_class=HTMLResponse, include_in_schema=False)
+def open_nprocure_tender(tender_id: str):
+    """Public hand-off page: nProcure only shows a tender to its own form POST, so this
+    page submits that form in the viewer's browser. It carries no server data."""
+    if not tender_id.isdigit() or len(tender_id) > 12:
+        raise HTTPException(404, "Unknown tender")
+    from scrapers import nprocure
+    return HTMLResponse(nprocure.open_tender_page(tender_id), headers={"Cache-Control": "public, max-age=86400"})
+
+
 # -- Websites --
 
 @app.get("/v1/websites", response_model=List[WebsiteOut])
@@ -582,7 +606,9 @@ def list_websites():
     except Exception:
         pass
     with get_db() as conn:
-        rows = conn.execute("SELECT id, name, url, status_url FROM websites").fetchall()
+        rows = conn.execute(
+            "SELECT id, name, url, status_url, COALESCE(portal_type, 'nic') AS portal_type FROM websites"
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -593,16 +619,53 @@ def create_website(body: WebsiteCreate):
     su = str(body.status_url or "").strip()
     if not nm or not u:
         raise HTTPException(400, "Name and URL are required")
-    ok = core.ScraperBackend.add_website_logic(body.name, body.url, body.status_url)
+    portal_type = str(body.portal_type or "").strip().lower()
+    if not portal_type:
+        host = (urlparse(u if "://" in u else f"https://{u}").hostname or "").lower()
+        portal_type = core.PORTAL_NPROCURE if host.endswith("nprocure.com") else core.PORTAL_NIC
+    if portal_type not in core.PORTAL_TYPES:
+        raise HTTPException(400, f"Unknown portal type '{portal_type}'")
+    ok = core.ScraperBackend.add_website_logic(body.name, body.url, body.status_url, portal_type)
     if not ok:
         raise HTTPException(400, "Failed to add website (duplicate name/url or DB error)")
     with get_db() as conn:
         row = conn.execute(
-            "SELECT id, name, url, status_url FROM websites WHERE TRIM(name)=?",
+            "SELECT id, name, url, status_url, COALESCE(portal_type, 'nic') AS portal_type "
+            "FROM websites WHERE TRIM(name)=?",
             (nm,),
         ).fetchone()
     if not row:
         raise HTTPException(500, "Website insert did not return a row")
+    return dict(row)
+
+
+@app.put("/v1/websites/{website_id}", response_model=WebsiteOut)
+def update_website(website_id: int, body: WebsiteUpdate):
+    """Rename a portal and/or change its URLs in place. Its organizations, tenders
+    and download records stay attached (unlike delete + re-add)."""
+    nm = str(body.name or "").strip()
+    u = str(body.url or "").strip()
+    su = str(body.status_url or "").strip()
+    if not nm or not u:
+        raise HTTPException(400, "Name and URL are required")
+    with get_db() as conn:
+        if not conn.execute("SELECT id FROM websites WHERE id=?", (website_id,)).fetchone():
+            raise HTTPException(404, "Website not found")
+        clash = conn.execute(
+            "SELECT id FROM websites WHERE TRIM(name)=? AND id<>?", (nm, website_id)
+        ).fetchone()
+        if clash:
+            raise HTTPException(409, "Another website already uses that name")
+        conn.execute(
+            "UPDATE websites SET name=?, url=?, status_url=? WHERE id=?",
+            (nm, u, su, website_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT id, name, url, status_url, COALESCE(portal_type, 'nic') AS portal_type "
+            "FROM websites WHERE id=?",
+            (website_id,),
+        ).fetchone()
     return dict(row)
 
 
@@ -1990,6 +2053,10 @@ def _job_dedupe_key(action: str, payload: dict) -> str:
     if payload.get("saved_custom_job_id") is not None:
         website_id = int(payload.get("website_id") or 0)
         return f"{action_name}:saved:{int(payload.get('saved_custom_job_id'))}:website:{website_id}"
+    if action_name == "portal_search_tender":
+        # One search per portal + tender id at a time; a second user joins it.
+        tender_key = core.ScraperBackend.canonical_tender_id(payload.get("tender_id"))
+        return f"{action_name}:website:{int(payload.get('website_id') or 0)}:tid:{tender_key}"
     tender_db_id = payload.get("tender_db_id")
     if tender_db_id is not None and core.setting_bool("dedupe_by_tender_id", True):
         return f"{action_name}:tender:{int(tender_db_id)}"
@@ -2231,7 +2298,13 @@ def _job_callable(action: str, payload: dict):
     if action == "download_single_tender":
         return core.ScraperBackend.download_single_tender_logic(payload.get("tender_db_id"), payload.get("mode", "full"))
     if action == "fetch_tender_status_single":
-        return core.ScraperBackend.fetch_tender_status_single_logic(payload.get("tender_db_id"))
+        return core.ScraperBackend.fetch_tender_status_single_logic(
+            payload.get("tender_db_id"), client_source=(payload.get("source") == "client")
+        )
+    if action == "portal_search_tender":
+        return core.ScraperBackend.portal_search_tender_logic(
+            payload.get("website_id"), payload.get("tender_id"), client_source=(payload.get("source") == "client")
+        )
     raise RuntimeError(f"Unsupported durable job action: {action}")
 
 
@@ -2312,6 +2385,29 @@ def _requeue_or_fail_job(job_id: str, error_message: str, logs: list[str]) -> bo
     return False
 
 
+def _push_captcha_needed(user_id: int, request_id: str) -> None:
+    """Real APNs push the moment a CAPTCHA request row is created for a
+    client-initiated job -- deliberately NOT routed through addAlert()'s
+    client-side path (no push-received listener anywhere calls addAlert, so
+    this never shows up in the Alerts tab/feed, by construction, not by a
+    special-case filter). Best-effort."""
+    try:
+        with get_db() as conn:
+            tokens = conn.execute(
+                "SELECT token, app, apns_env FROM client_push_tokens WHERE user_id=?", (user_id,)
+            ).fetchall()
+        for token, app, apns_env in tokens:
+            apns_push.send(
+                token, title="CAPTCHA needed",
+                body="One of your jobs needs a CAPTCHA solved to continue.",
+                thread_id="captcha", extra={"captchaId": request_id},
+                badge=_bump_badge(token),
+                app=app, environment=apns_env,
+            )
+    except Exception:
+        pass
+
+
 def _run_job(job_id: str):
     logs: list[str] = []
     requeue_requested = False
@@ -2347,6 +2443,9 @@ def _run_job(job_id: str):
             ),
         )
         core.check_job_cancelled()
+        # An "update" job only checks the portal for new corrigendum/pre-bid
+        # files and completes either way, so the before/after count is what
+        # says whether there is anything to tell the user about.
         result = _job_callable(action, payload)
         core.check_job_cancelled()
 
@@ -2406,6 +2505,16 @@ def _run_job(job_id: str):
         )
     except core.JobRequeueError as exc:
         requeue_requested = _requeue_or_fail_job(job_id, str(exc), logs)
+    except core.PortalActionUnsupported as exc:
+        # Retrying can't help: this portal type has no implementation for the action.
+        _update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            logs=logs + [str(exc)],
+            finished_at=time.time(),
+            heartbeat_at=time.time(),
+        )
     except Exception as e:
         requeue_requested = _requeue_or_fail_job(job_id, str(e), logs)
     finally:
@@ -2463,6 +2572,12 @@ def _cleanup_expired_jobs() -> int:
     return len(expired_ids)
 
 
+_NPROCURE_UNSUPPORTED_ACTIONS = {
+    "check_status", "check_status_archived", "download_tender_results", "fetch_tender_status_single",
+    "portal_search_tender",
+}
+
+
 def _enqueue_job(action: str, payload: Optional[dict] = None) -> dict:
     payload = dict(payload or {})
     _cleanup_expired_jobs()
@@ -2470,6 +2585,13 @@ def _enqueue_job(action: str, payload: Optional[dict] = None) -> dict:
         raise HTTPException(423, "The backend is in read-only mode.")
     if core.setting_bool("drain_mode", False):
         raise HTTPException(423, "The scraper is in drain mode and is not accepting new jobs.")
+    if action in _NPROCURE_UNSUPPORTED_ACTIONS:
+        if payload.get("tender_db_id") is not None:
+            portal = core.ScraperBackend.tender_portal_type(payload.get("tender_db_id"))
+        else:
+            portal = core.ScraperBackend.website_portal_type(payload.get("website_id"))
+        if portal == core.PORTAL_NPROCURE:
+            raise HTTPException(409, "Status checks and results are not supported for nProcure yet.")
     download_after = payload.get("download_after")
     if action in {"fetch_tenders", "fetch_tenders_selected"} and (
         bool(download_after) if download_after is not None else True
@@ -2752,6 +2874,43 @@ def _defer_past_downtime(next_epoch: float) -> float:
     return epoch
 
 
+_DEFAULT_RUN_DAYS = ("mon", "tue", "wed", "thu", "fri", "sat")
+
+
+def _run_days_from_text(raw) -> list[str]:
+    """Parse a stored/posted run-days value (comma text or list) into canonical
+    Mon->Sun order. Unset/invalid -> the default (Mon-Sat)."""
+    parts = raw if isinstance(raw, (list, tuple, set)) else str(raw or "").split(",")
+    wanted = {str(part).strip().lower()[:3] for part in parts}
+    days = [day for day in _WEEKDAY_KEYS if day in wanted]
+    return days or list(_DEFAULT_RUN_DAYS)
+
+
+def _next_allowed_run_day(next_epoch: float, run_days) -> float:
+    """Push next_epoch (IST) forward by whole days, keeping its time of day,
+    until it lands on one of run_days."""
+    allowed = set(run_days or _WEEKDAY_KEYS)
+    epoch = next_epoch
+    for _ in range(8):
+        moment = datetime.fromtimestamp(epoch, _IST)
+        if _WEEKDAY_KEYS[moment.weekday()] in allowed:
+            return epoch
+        epoch = (moment + timedelta(days=1)).timestamp()
+    return epoch
+
+
+def _schedule_slot(next_epoch: float, run_days) -> float:
+    """Earliest time >= next_epoch that is outside the global downtime AND on an
+    allowed run day. The global pause days/window always win over run_days."""
+    epoch = next_epoch
+    for _ in range(8):
+        adjusted = _next_allowed_run_day(_defer_past_downtime(epoch), run_days)
+        if adjusted == epoch:
+            return epoch
+        epoch = adjusted
+    return epoch
+
+
 def _claim_scheduler_lease(now: float, interval_seconds: int, name: str = "default") -> bool:
     with get_db() as conn:
         conn.execute(
@@ -2796,6 +2955,7 @@ def _saved_custom_job_from_row(row) -> dict:
         "created_at": float(row[17] or 0),
         "updated_at": float(row[18] or 0),
         "created_by": "user" if str(row[19] or "admin").strip().lower() == "user" else "admin",
+        "run_days": _run_days_from_text(row[20]),
     }
 
 
@@ -2803,7 +2963,8 @@ _SAVED_CUSTOM_JOB_SELECT = (
     "SELECT id,owner_name,name,website_id,job_type,org_ids_json,tender_ids_json,"
     "all_organizations,all_tenders,download_mode,schedule_enabled,schedule_mode,interval_minutes,"
     "scheduled_for_at,next_run_at,last_run_at,last_job_id,created_at,updated_at,"
-    "COALESCE(created_by,'admin') AS created_by FROM saved_custom_jobs "
+    "COALESCE(created_by,'admin') AS created_by,"
+    "COALESCE(run_days,'mon,tue,wed,thu,fri,sat') AS run_days FROM saved_custom_jobs "
 )
 
 
@@ -2941,12 +3102,12 @@ def _advance_saved_custom_job_schedule(
     # this — a hand-run leaves the scheduled time untouched.
     with get_db() as conn:
         row = conn.execute(
-            "SELECT schedule_mode,interval_minutes,next_run_at FROM saved_custom_jobs WHERE id=?",
+            "SELECT schedule_mode,interval_minutes,next_run_at,run_days FROM saved_custom_jobs WHERE id=?",
             (int(saved_job_id),),
         ).fetchone()
         if not row:
             return
-        schedule_mode, interval_minutes, next_run_at = row
+        schedule_mode, interval_minutes, next_run_at, run_days_text = row
         # last_run_at is NOT set here — it is stamped with the real completion
         # time by _touch_saved_job_last_run() when the queued job terminates.
         if schedule_mode == "once":
@@ -2960,7 +3121,7 @@ def _advance_saved_custom_job_schedule(
             previous_next = float(next_run_at or now)
             elapsed_intervals = max(1, int((now - previous_next) // interval_seconds) + 1)
             next_run = previous_next + elapsed_intervals * interval_seconds
-            next_run = _defer_past_downtime(next_run)
+            next_run = _schedule_slot(next_run, _run_days_from_text(run_days_text))
             conn.execute(
                 "UPDATE saved_custom_jobs SET last_job_id=?,next_run_at=?,updated_at=? WHERE id=?",
                 (job_id, next_run, now, int(saved_job_id)),
@@ -3030,13 +3191,27 @@ def _run_consolidated_scrape_pass() -> int:
                     website_scrape_orgs.setdefault(int(website_id), set()).add(int(org_id))
             if include_saved:
                 saved_rows = conn.execute(
-                    "SELECT id,website_id,job_type,org_ids_json,tender_ids_json,all_organizations "
+                    "SELECT id,website_id,job_type,org_ids_json,tender_ids_json,all_organizations,"
+                    "schedule_mode,run_days "
                     "FROM saved_custom_jobs WHERE schedule_enabled=1 "
                     "AND schedule_mode IN ('once','interval') AND COALESCE(next_run_at,0)>0 "
                     "AND COALESCE(next_run_at,0)<=? ORDER BY next_run_at,id",
                     (now,),
                 ).fetchall()
-                for saved_id, website_id, job_type, org_ids_json, tender_ids_json, all_orgs in saved_rows:
+                rolled_forward = False
+                for (saved_id, website_id, job_type, org_ids_json, tender_ids_json, all_orgs,
+                     schedule_mode, run_days_text) in saved_rows:
+                    if schedule_mode == "interval":
+                        run_days = _run_days_from_text(run_days_text)
+                        if _WEEKDAY_KEYS[datetime.fromtimestamp(now, _IST).weekday()] not in run_days:
+                            # Today isn't an allowed run day for this job: skip it
+                            # and move its next run to the next allowed day.
+                            conn.execute(
+                                "UPDATE saved_custom_jobs SET next_run_at=?,updated_at=? WHERE id=?",
+                                (_schedule_slot(now, run_days), now, int(saved_id)),
+                            )
+                            rolled_forward = True
+                            continue
                     website_id = int(website_id)
                     if job_type == "scrape":
                         saved_scrape_ids_by_website.setdefault(website_id, []).append(int(saved_id))
@@ -3059,6 +3234,8 @@ def _run_consolidated_scrape_pass() -> int:
                             tender_ids = []
                         website_download_tenders.setdefault(website_id, set()).update(int(x) for x in tender_ids)
                         saved_download_ids_by_website.setdefault(website_id, []).append(int(saved_id))
+                if rolled_forward:
+                    conn.commit()
 
         for website_id in set(website_scrape_orgs) | website_all_orgs:
             planned: list[tuple[str, dict]] = []
@@ -3130,8 +3307,9 @@ def _run_expired_tender_sweep() -> int:
     target_hour = core.setting_int("archive_daily_hour", 20, minimum=0, maximum=23)
     if datetime.now(_IST).hour < target_hour:
         return 0
-    if _within_downtime():
-        return 0
+    # No _within_downtime() check: the downtime window pauses portal scraping,
+    # and this is a database-only update. With the default 21:30-10:00 window
+    # and a 22:00 archive hour, honouring it meant the sweep never ran.
     lease_name = "expired-tender-sweep"
     # 20h lease guard + the hour gate above => one run per day anchored to target_hour.
     if not _claim_scheduler_lease(time.time(), 20 * 3600, lease_name):
@@ -3154,11 +3332,324 @@ def _run_expired_tender_sweep() -> int:
     return archived
 
 
+_CLOSING_REMINDER_DAYS = (1, 2, 3, 5)
+_CLOSING_REMINDER_WINDOW_START_HOUR = 10
+_CLOSING_REMINDER_WINDOW_END_HOUR = 21  # exclusive
+
+
+def _tender_change_push_text(t: dict) -> tuple[str, str]:
+    """title/body for one tenders_changed entry from
+    client_api._compute_user_changes -- a tender can carry more than one
+    changed field in the same window (e.g. status and closing_date both
+    moved since the last pass), so this builds one clause per field actually
+    present rather than assuming a single kind, the way the old
+    closing-date-only hardcoded text did."""
+    fields = set(t.get("changed_fields") or [])
+    title = t.get("title") or f"Tender #{t.get('id')}"
+    clauses = []
+    if "status" in fields:
+        status = t.get("status") or ""
+        clauses.append(f'status changed to "{status}"' if status else "status changed")
+    if "closing_date" in fields:
+        clauses.append("has a new closing date")
+    if "prebid_count" in fields or "corrigendum_count" in fields:
+        clauses.append("has a new pre-bid or corrigendum")
+    if not clauses:
+        clauses.append("was updated")
+    push_title = "Status update" if "status" in fields and len(fields) == 1 else "Tender update"
+    return push_title, f'"{title}" {", ".join(clauses)}.'
+
+
+def _run_push_notification_pass() -> int:
+    """Server-side counterpart to the mobile app's local notification engine
+    (backgroundSync.js / closingReminders.js): pushes directly via APNs
+    (apns_push.py) so delivery survives the app being force-quit or the
+    device being in Low Power Mode, neither of which local background-fetch
+    can do.
+
+    New tenders and tender changes go by row, not by time: each pass takes the
+    recent tenders / tender_history rows not yet in push_handled_events
+    (client_api._unhandled_push_events), pushes them to the devices whose user
+    follows them, then marks them handled. A scrape stamps a row when it writes
+    it but commits the page later, so a time cursor could pass a row before it
+    was visible and skip it for good; this can't. A device's last_pushed_at is
+    now only its floor (set when it registered): nothing older reaches it.
+    """
+    lease_name = "push-notifications"
+    # 30s, not the scrape passes' much longer intervals: a push is only
+    # useful close to the event it's about, and each pass here is a handful
+    # of lightweight indexed queries per device, not a scrape -- cheap enough
+    # to run often. This is the main knob on end-to-end "scrape finishes" ->
+    # "phone buzzes" latency; the 15s _scheduler_loop() poll underneath adds
+    # at most another ~15s on top of whatever this is set to.
+    if not _claim_scheduler_lease(time.time(), 30, lease_name):
+        return 0
+    sent = 0
+    failed = 0
+    try:
+        now = time.time()
+        in_reminder_window = (
+            _CLOSING_REMINDER_WINDOW_START_HOUR
+            <= datetime.now(_IST).hour
+            < _CLOSING_REMINDER_WINDOW_END_HOUR
+        )
+        today_str = datetime.now(_IST).strftime("%Y-%m-%d")
+        with get_db() as conn:
+            devices = conn.execute(
+                "SELECT id, user_id, token, last_pushed_at, last_reminder_date, app, apns_env, "
+                "pending_orgs, created_at FROM client_push_tokens"
+            ).fetchall()
+            if not devices:
+                return 0
+            # Each user's blob as their apps see it: an org member's bookmarks
+            # are the org's, and a user without the bookmarks section has none.
+            user_blobs = {
+                uid: org_access.effective_blob(conn, uid)[0]
+                for uid in {int(d[1]) for d in devices}
+            }
+            new_events, change_events = client_api._unhandled_push_events(conn, now)
+        for (device_id, user_id, token, last_pushed_at, last_reminder_date, app, apns_env,
+             pending_raw, created_at) in devices:
+            blob = user_blobs.get(int(user_id)) or {}
+            prefs = blob.get("notificationPrefs") or {}
+            org_on = bool(prefs.get("notifyOrgAlertsOn"))
+            tender_on = bool(prefs.get("notifyTenderAlertsOn"))
+            reminder_days = [d for d in (prefs.get("reminderDays") or []) if d in _CLOSING_REMINDER_DAYS]
+            if not (org_on or tender_on or reminder_days):
+                continue
+
+            if (org_on or tender_on) and (new_events or change_events):
+                floor = float(last_pushed_at or created_at or 0)
+                with get_db() as conn:
+                    tenders_changed, new_by_org = client_api._user_push_changes(
+                        conn, blob, floor, new_events, change_events
+                    )
+                if tender_on:
+                    for t in tenders_changed:
+                        title, body = _tender_change_push_text(t)
+                        result = apns_push.send(
+                            token, title=title, body=body,
+                            thread_id="tender", extra={"tenderId": t["id"]},
+                            badge=_bump_badge(token),
+                            app=app, environment=apns_env,
+                        )
+                        if result.ok:
+                            sent += 1
+                        elif result.should_delete_token:
+                            _append_live_log(f"Push notifications: dropping dead token ({result.error}).")
+                            _delete_push_token(token)
+                            break
+                        else:
+                            failed += 1
+                            _append_live_log(f"Push notifications: send failed ({result.error}).")
+                if org_on and app == "bidwise":
+                    # One notification per organisation until it's read: later
+                    # tenders join the pending one (same collapse id, so iOS
+                    # replaces it) and the badge doesn't go up again.
+                    try:
+                        pending = json.loads(pending_raw or "{}")
+                    except (TypeError, ValueError):
+                        pending = {}
+                    pending_changed = False
+                    for org, items in new_by_org.items():
+                        if not items:
+                            continue
+                        prior = pending.get(org) or []
+                        seen = {str(p.get("id")) for p in prior}
+                        merged = prior + [
+                            {"id": i["id"], "title": i.get("title") or i.get("tender_id") or f"Tender #{i['id']}"}
+                            for i in items if str(i["id"]) not in seen
+                        ]
+                        merged = merged[-200:]
+                        title, body = _org_push_text(org, merged)
+                        result = apns_push.send(
+                            token, title=title, body=body, thread_id="org",
+                            extra={"orgName": org},
+                            badge=_current_badge(token) if prior else _bump_badge(token),
+                            app=app, environment=apns_env,
+                            collapse_id=_org_collapse_id(org),
+                        )
+                        if result.ok:
+                            sent += 1
+                            pending[org] = merged
+                            pending_changed = True
+                        elif result.should_delete_token:
+                            _append_live_log(f"Push notifications: dropping dead token ({result.error}).")
+                            _delete_push_token(token)
+                            break
+                        else:
+                            failed += 1
+                            _append_live_log(f"Push notifications: send failed ({result.error}).")
+                    if pending_changed:
+                        with get_db() as conn:
+                            conn.execute(
+                                "UPDATE client_push_tokens SET pending_orgs=? WHERE id=?",
+                                (json.dumps(pending), device_id),
+                            )
+                            conn.commit()
+                elif org_on:
+                    for org, items in new_by_org.items():
+                        if not items:
+                            continue
+                        body = (
+                            f'"{items[0]["title"]}" added under {org}.' if len(items) == 1
+                            else f"{len(items)} new tenders added under {org}."
+                        )
+                        result = apns_push.send(
+                            token, title="New tender" if len(items) == 1 else "New tenders",
+                            body=body, thread_id="org", extra={"orgName": org},
+                            badge=_bump_badge(token),
+                            app=app, environment=apns_env,
+                        )
+                        if result.ok:
+                            sent += 1
+                        elif result.should_delete_token:
+                            _append_live_log(f"Push notifications: dropping dead token ({result.error}).")
+                            _delete_push_token(token)
+                            break
+                        else:
+                            failed += 1
+                            _append_live_log(f"Push notifications: send failed ({result.error}).")
+
+            new_reminder_date = last_reminder_date
+            if reminder_days and in_reminder_window and last_reminder_date != today_str:
+                hits = _closing_reminder_hits(int(user_id), reminder_days)
+                for tender_id, title, day in hits:
+                    result = apns_push.send(
+                        token, title="Closing soon",
+                        body=(
+                            f'"{title}" closes today.' if day == 0
+                            else f'"{title}" closes in {day} day{"s" if day != 1 else ""}.'
+                        ),
+                        thread_id="closing", extra={"tenderId": tender_id},
+                        badge=_bump_badge(token),
+                        app=app, environment=apns_env,
+                    )
+                    if result.ok:
+                        sent += 1
+                    elif result.should_delete_token:
+                        _append_live_log(f"Push notifications: dropping dead token ({result.error}).")
+                        _delete_push_token(token)
+                        break
+                    else:
+                        failed += 1
+                        _append_live_log(f"Push notifications: send failed ({result.error}).")
+                new_reminder_date = today_str
+
+            if new_reminder_date != last_reminder_date:
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE client_push_tokens SET last_reminder_date=? WHERE id=?",
+                        (new_reminder_date, device_id),
+                    )
+                    conn.commit()
+        # Every device has had its share: these events are never pushed again.
+        with get_db() as conn:
+            client_api._mark_push_events_handled(conn, new_events, change_events, now)
+        if sent or failed:
+            _append_live_log(f"Push notifications: sent {sent}, failed {failed}.")
+    finally:
+        now = time.time()
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE scheduler_leases SET lease_until=0,last_run_at=?,worker_id=? WHERE name=?",
+                (now, _JOB_WORKER_ID, lease_name),
+            )
+            conn.commit()
+    return sent
+
+
+def _delete_push_token(token: str) -> None:
+    with get_db() as conn:
+        conn.execute("DELETE FROM client_push_tokens WHERE token=?", (token,))
+        conn.commit()
+
+
+def _bump_badge(token: str) -> int:
+    """+1 to this device's server-tracked badge_count and returns the new
+    value, for passing straight into apns_push.send(badge=...) -- without an
+    explicit numeric badge in the payload, iOS leaves the home-screen icon's
+    badge exactly as it was, so the icon never updates while the app is
+    closed/backgrounded no matter how many pushes arrive (see client_sync_badge
+    in client_api.py for how the client resets this back to the true count)."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT badge_count FROM client_push_tokens WHERE token=?", (token,)
+        ).fetchone()
+        new_value = int(row[0] or 0) + 1 if row else 1
+        conn.execute(
+            "UPDATE client_push_tokens SET badge_count=? WHERE token=?", (new_value, token)
+        )
+        conn.commit()
+    return new_value
+
+
+_NAMED_NEW_TENDERS = 3
+
+
+def _org_push_text(org: str, items: list) -> tuple[str, str]:
+    """Bidwise's grouped "new tenders" push: up to 3 tenders by name, otherwise
+    the count. Matches the app's alert text (Bidwise src/lib/alerts.ts)."""
+    if len(items) > _NAMED_NEW_TENDERS:
+        return "New tenders", f"{len(items)} new tenders added under {org}."
+    names = [f'"{i["title"]}"' for i in items]
+    if len(names) == 1:
+        return "New tender", f"{names[0]} added under {org}."
+    return "New tenders", f'{", ".join(names[:-1])} and {names[-1]} added under {org}.'
+
+
+def _org_collapse_id(org: str) -> str:
+    import hashlib
+
+    return "org-" + hashlib.sha1(org.strip().lower().encode("utf-8")).hexdigest()[:32]
+
+
+def _current_badge(token: str) -> int:
+    """The device's badge as it stands (a grouped push adds no new alert)."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT badge_count FROM client_push_tokens WHERE token=?", (token,)
+        ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def _closing_reminder_hits(user_id: int, reminder_days: list) -> list:
+    """(tender_id, title, days_left) for this user's bookmarked, non-archived
+    tenders whose closing_date lands on exactly one of the selected
+    thresholds, measured as whole calendar days from "now" in IST -- mirrors
+    Mobile App RN/src/lib/closingReminders.js's own totalDays math so the
+    server and client would agree if both ran."""
+    with get_db() as conn:
+        blob, _updated_at, _found = org_access.effective_blob(conn, user_id)
+        tender_ids = sorted(
+            client_api._rows_for_tender_ids(conn, client_api._blob_bookmark_tender_ids(conn, blob)).values()
+        )
+        if not tender_ids:
+            return []
+        placeholders = ",".join("?" for _ in tender_ids)
+        rows = conn.execute(
+            f"SELECT id, title, closing_date FROM tenders "
+            f"WHERE id IN ({placeholders}) AND COALESCE(is_archived,0)=0",
+            tuple(tender_ids),
+        ).fetchall()
+    today = datetime.now(_IST).date()
+    hits = []
+    for tender_id, title, closing_date in rows:
+        parsed = core.ScraperBackend.parse_closing_datetime(closing_date)
+        if not parsed:
+            continue
+        days_left = (parsed.date() - today).days
+        if days_left in reminder_days:
+            hits.append((int(tender_id), str(title or ""), days_left))
+    return hits
+
+
 def _scheduler_loop() -> None:
     while not _scheduler_stop.is_set():
         try:
             _run_consolidated_scrape_pass()
             _run_expired_tender_sweep()
+            _run_push_notification_pass()
             core.ScraperBackend.close_idle_download_session()
         except Exception as exc:
             _append_live_log(f"Scheduler error: {exc}")
@@ -3402,14 +3893,30 @@ def _create_and_wait_for_captcha(job_id: str, image_data, context: str, timeout:
     created = time.time()
     expires = created + max(1.0, float(timeout or _CAPTCHA_TTL_SECONDS))
     encoded = base64.b64encode(image_data).decode("ascii")
+    # Resolve which mobile user (if any) requested the job this CAPTCHA
+    # belongs to, from the job payload's requested_by_user_id -- a job
+    # triggered from the admin console has none and this is just None
+    # (best-effort: no push).
+    user_id = None
+    try:
+        with get_db() as conn:
+            payload_row = conn.execute(
+                "SELECT payload_json FROM background_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+        if payload_row and payload_row[0]:
+            user_id = json.loads(payload_row[0]).get("requested_by_user_id")
+    except Exception:
+        user_id = None
     with get_db() as conn:
         conn.execute(
             "INSERT INTO captcha_requests "
-            "(id,job_id,context,image_base64,status,created_at,expires_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (request_id, job_id, str(context or "captcha"), encoded, "pending", created, expires),
+            "(id,job_id,context,image_base64,status,created_at,expires_at,user_id) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (request_id, job_id, str(context or "captcha"), encoded, "pending", created, expires, user_id),
         )
         conn.commit()
+    if user_id:
+        _push_captcha_needed(int(user_id), request_id)
 
     while time.time() < expires:
         core.check_job_cancelled()
@@ -5382,7 +5889,14 @@ def _validated_saved_custom_job(body: SavedCustomJobRequest) -> dict:
         raise HTTPException(400, "Select at least one organization, or choose to scrape the entire website")
     if job_type == "download" and not tender_ids:
         raise HTTPException(400, "Select at least one tender")
+    run_days = None
+    if body.run_days is not None:
+        picked = {str(day).strip().lower()[:3] for day in body.run_days}
+        run_days = [day for day in _WEEKDAY_KEYS if day in picked]
+        if not run_days:
+            raise HTTPException(400, "Pick at least one run day")
     return {
+        "run_days": run_days,
         "owner_name": owner, "name": name, "website_id": int(body.website_id),
         "job_type": job_type, "org_ids": org_ids, "tender_ids": tender_ids,
         "all_organizations": all_organizations, "all_tenders": False,
@@ -5460,10 +5974,14 @@ def set_saved_custom_job_schedule(
             raise HTTPException(404, "Saved custom job not found")
         if body.enabled:
             interval = int((dict(row).get("interval_minutes") if hasattr(row, "get") else row[0]) or 0) or 1440
+            days_row = conn.execute(
+                "SELECT run_days FROM saved_custom_jobs WHERE id=?", (int(saved_job_id),)
+            ).fetchone()
+            resume_at = _schedule_slot(now + interval * 60, _run_days_from_text(days_row[0] if days_row else None))
             conn.execute(
                 "UPDATE saved_custom_jobs SET schedule_enabled=1,schedule_mode='interval',"
                 "interval_minutes=?,next_run_at=?,scheduled_for_at=?,updated_at=? WHERE id=?",
-                (interval, now + interval * 60, now + interval * 60, now, int(saved_job_id)),
+                (interval, resume_at, now + interval * 60, now, int(saved_job_id)),
             )
         else:
             conn.execute(
@@ -5478,7 +5996,10 @@ def set_saved_custom_job_schedule(
 def create_saved_custom_job(body: SavedCustomJobRequest, _auth: None = Depends(require_admin_key)):
     value = _validated_saved_custom_job(body)
     now = time.time()
+    run_days = value["run_days"] or list(_DEFAULT_RUN_DAYS)
     next_run = value["scheduled_for_at"] if value["schedule_enabled"] else 0
+    if next_run and value["schedule_mode"] == "interval":
+        next_run = _schedule_slot(next_run, run_days)
     try:
         with get_db() as conn:
             # Auto-suffix _1, _2, … on a same-owner name collision instead of
@@ -5499,13 +6020,13 @@ def create_saved_custom_job(body: SavedCustomJobRequest, _auth: None = Depends(r
                 "INSERT INTO saved_custom_jobs "
                 "(owner_name,name,website_id,job_type,org_ids_json,tender_ids_json,all_organizations,"
                 "all_tenders,download_mode,schedule_enabled,schedule_mode,interval_minutes,scheduled_for_at,"
-                "next_run_at,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "next_run_at,created_by,created_at,updated_at,run_days) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     value["owner_name"], name, value["website_id"], value["job_type"],
                     _json_dump(value["org_ids"]), _json_dump(value["tender_ids"]),
                     int(value["all_organizations"]), int(value["all_tenders"]), value["download_mode"],
                     int(value["schedule_enabled"]), value["schedule_mode"], value["interval_minutes"],
-                    value["scheduled_for_at"], next_run, "admin", now, now,
+                    value["scheduled_for_at"], next_run, "admin", now, now, ",".join(run_days),
                 ),
             )
             _ = int(cur.lastrowid)
@@ -5526,17 +6047,27 @@ def create_saved_custom_job(body: SavedCustomJobRequest, _auth: None = Depends(r
 def update_saved_custom_job(saved_job_id: int, body: SavedCustomJobRequest, _auth: None = Depends(require_admin_key)):
     value = _validated_saved_custom_job(body)
     now = time.time()
-    next_run = value["scheduled_for_at"] if value["schedule_enabled"] else 0
     with get_db() as conn:
+        run_days = value["run_days"]
+        if run_days is None:
+            existing = conn.execute(
+                "SELECT run_days FROM saved_custom_jobs WHERE id=? AND owner_name=?",
+                (int(saved_job_id), value["owner_name"]),
+            ).fetchone()
+            run_days = _run_days_from_text(existing[0] if existing else None)
+        next_run = value["scheduled_for_at"] if value["schedule_enabled"] else 0
+        if next_run and value["schedule_mode"] == "interval":
+            next_run = _schedule_slot(next_run, run_days)
         cur = conn.execute(
             "UPDATE saved_custom_jobs SET name=?,website_id=?,job_type=?,org_ids_json=?,tender_ids_json=?,"
             "all_organizations=?,all_tenders=?,download_mode=?,schedule_enabled=?,interval_minutes=?,"
-            "schedule_mode=?,scheduled_for_at=?,next_run_at=?,updated_at=? WHERE id=? AND owner_name=?",
+            "schedule_mode=?,scheduled_for_at=?,next_run_at=?,updated_at=?,run_days=? "
+            "WHERE id=? AND owner_name=?",
             (
                 value["name"], value["website_id"], value["job_type"], _json_dump(value["org_ids"]),
                 _json_dump(value["tender_ids"]), int(value["all_organizations"]), int(value["all_tenders"]),
                 value["download_mode"], int(value["schedule_enabled"]), value["interval_minutes"],
-                value["schedule_mode"], value["scheduled_for_at"], next_run, now,
+                value["schedule_mode"], value["scheduled_for_at"], next_run, now, ",".join(run_days),
                 int(saved_job_id), value["owner_name"],
             ),
         )
@@ -5740,6 +6271,7 @@ _JOB_KIND_BY_ACTION = {
     "download_tender_results": "download",
     "download_single_tender": "download",
     "fetch_tender_status_single": "fetch",
+    "portal_search_tender": "fetch",
 }
 
 
@@ -5849,6 +6381,8 @@ def _admin_job_payload(
         "progress": 100 if status == "done" else 0,
         "error": job.get("error", ""),
         "logs": job.get("logs", []),
+        "mode": str(job.get("mode") or ""),
+        "source": str((job.get("payload") or {}).get("source") or ""),
         "provider": admin_providers.active_compute_provider().metadata()["provider"],
     }
 
@@ -5885,9 +6419,22 @@ def admin_push_to_cloud(_auth: None = Depends(require_admin_key)):
     return _enqueue_job("push_to_cloud", {})
 
 
-def _public_client_user(row: Any, activity_count: int = 0) -> dict[str, Any]:
+def _public_client_user(
+    row: Any, activity_count: int = 0, membership: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     data = dict(row)
+    role = (membership or {}).get("role")
     return {
+        # Individual, or a member/admin of an organisation (org_access.py).
+        "account_type": "organisation" if membership else "individual",
+        "org": (
+            {"id": membership["org_id"], "name": membership["org_name"], "role": role}
+            if membership else None
+        ),
+        "permissions": (
+            org_access.all_sections() if role == "admin"
+            else org_access.parse_permissions(data.get("permissions_json"))
+        ),
         "id": int(data["id"]),
         "email": str(data.get("email") or ""),
         "display_name": str(data.get("display_name") or ""),
@@ -5907,10 +6454,17 @@ def admin_list_users(_auth: None = Depends(require_admin_key)):
     with get_db() as conn:
         rows = conn.execute(
             "SELECT u.id,u.email,u.display_name,u.status,u.created_at,u.last_login_at,u.last_seen_at,u.password_enc,"
+            "u.permissions_json,"
             "(SELECT COUNT(*) FROM client_activity_log a WHERE a.user_id=u.id) AS activity_count "
             "FROM client_users u ORDER BY u.created_at DESC"
         ).fetchall()
-    return {"items": [_public_client_user(row, int(dict(row).get("activity_count") or 0)) for row in rows]}
+        members = org_access.membership_map(conn)
+    return {"items": [
+        _public_client_user(
+            row, int(dict(row).get("activity_count") or 0), members.get(int(dict(row)["id"]))
+        )
+        for row in rows
+    ]}
 
 
 def _client_user_sync_view(conn, user_id: int) -> dict[str, Any]:
@@ -5926,21 +6480,25 @@ def _client_user_sync_view(conn, user_id: int) -> dict[str, Any]:
         blob = {}
     if not isinstance(blob, dict):
         blob = {}
+    return _sync_view_from_blob(conn, blob, float(dict(row).get("updated_at") or 0) if row else 0)
 
-    bookmark_ids = []
-    for value in (blob.get("bookmarks") or [])[:1000]:
-        try:
-            bookmark_ids.append(int(value))
-        except (TypeError, ValueError):
-            continue
+
+def _sync_view_from_blob(conn, blob: dict, synced_at: float) -> dict[str, Any]:
+
+    # Bookmarks are stored by tender id; blobs from before that hold row ids.
+    tender_keys = sorted(client_api._coerce_tender_id_set(blob.get("bookmarkTenderIds")))[:1000]
+    if isinstance(blob.get("bookmarkTenderIds"), list):
+        where_sql, lookup = client_api._T_TENDER_KEY_SQL, tender_keys
+    else:
+        where_sql, lookup = "t.id", sorted(client_api._coerce_id_set(blob.get("bookmarks")))[:1000]
     bookmarks = []
-    if bookmark_ids:
-        placeholders = ",".join("?" for _ in bookmark_ids)
+    if lookup:
+        placeholders = ",".join("?" for _ in lookup)
         for t in conn.execute(
             "SELECT t.id,COALESCE(t.tender_id,'') AS tender_id,COALESCE(t.title,'') AS title,"
             "COALESCE(t.org_chain,'') AS org_chain,COALESCE(w.name,'') AS website_name "
-            f"FROM tenders t LEFT JOIN websites w ON w.id=t.website_id WHERE t.id IN ({placeholders})",
-            tuple(bookmark_ids),
+            f"FROM tenders t LEFT JOIN websites w ON w.id=t.website_id WHERE {where_sql} IN ({placeholders})",
+            tuple(lookup),
         ).fetchall():
             bookmarks.append(dict(t))
 
@@ -5952,9 +6510,10 @@ def _client_user_sync_view(conn, user_id: int) -> dict[str, Any]:
     column_prefs = blob.get("tenderColumnPrefs") if isinstance(blob.get("tenderColumnPrefs"), dict) else {}
 
     return {
-        "synced_at": float(dict(row).get("updated_at") or 0) if row else 0,
+        "synced_at": synced_at,
         "counts": {
-            "bookmarks": len(blob.get("bookmarks") or []),
+            "bookmarks": len(tender_keys) if isinstance(blob.get("bookmarkTenderIds"), list)
+            else len(blob.get("bookmarks") or []),
             "bookmarked_orgs": len(bookmarked_orgs),
             "projects": len(projects),
             "templates": len(templates),
@@ -6012,10 +6571,181 @@ def admin_get_user(user_id: int, _auth: None = Depends(require_admin_key)):
             (user_id,),
         ).fetchall()
         sync_view = _client_user_sync_view(conn, user_id)
-    user = _public_client_user(row, len(activity_rows))
+        membership = org_access.membership_map(conn).get(user_id)
+        if membership:
+            # An org member's projects/bookmarks live in the org's pool: show
+            # what their apps see (every section, whatever their permissions).
+            blob, synced_at, _found = org_access.effective_blob(conn, user_id, apply_permissions=False)
+            sync_view = _sync_view_from_blob(conn, blob, synced_at)
+        permissions_row = conn.execute(
+            "SELECT permissions_json FROM client_users WHERE id=?", (user_id,)
+        ).fetchone()
+    data = dict(row)
+    data["permissions_json"] = permissions_row[0] if permissions_row else None
+    user = _public_client_user(data, len(activity_rows), membership)
     user["recent_activity"] = [dict(item) for item in activity_rows]
     user["sync"] = sync_view
     return user
+
+
+class AdminSectionPermissions(BaseModel):
+    active: Optional[bool] = None
+    archived: Optional[bool] = None
+    bookmarks: Optional[bool] = None
+    projects: Optional[bool] = None
+    portal_search: Optional[bool] = None
+
+
+class AdminCreateOrgRequest(BaseModel):
+    name: str
+    admin_user_id: int
+
+
+class AdminRenameOrgRequest(BaseModel):
+    name: str
+
+
+class AdminAddMemberRequest(BaseModel):
+    user_id: int
+    role: str = "member"
+    permissions: Optional[AdminSectionPermissions] = None
+
+
+class AdminApproveRequest(BaseModel):
+    permissions: Optional[AdminSectionPermissions] = None
+
+
+class AdminRoleRequest(BaseModel):
+    role: str
+
+
+class AdminDelinkRequest(BaseModel):
+    retain: bool
+
+
+def _admin_org_op(fn) -> Any:
+    with get_db() as conn:
+        try:
+            result = fn(conn)
+        except org_access.OrgError as exc:
+            raise HTTPException(exc.status, exc.message)
+        conn.commit()
+    return result
+
+
+def _admin_permission_changes(body: Optional[AdminSectionPermissions]) -> Optional[dict[str, Any]]:
+    return body.model_dump(exclude_none=True) if body is not None else None
+
+
+@app.put("/admin/users/{user_id}/permissions")
+def admin_set_user_permissions(
+    user_id: int, body: AdminSectionPermissions, _auth: None = Depends(require_admin_key),
+):
+    """Sections for any user, individual or org member. A section turned off
+    stops the server sending that section's data until it's turned back on;
+    nothing stored is deleted."""
+    perms = _admin_org_op(
+        lambda conn: org_access.set_permissions(conn, user_id, _admin_permission_changes(body))
+    )
+    return {"user_id": user_id, "permissions": perms}
+
+
+@app.get("/admin/orgs")
+def admin_list_orgs(_auth: None = Depends(require_admin_key)):
+    return {"items": _admin_org_op(org_access.list_orgs)}
+
+
+@app.post("/admin/orgs")
+def admin_create_org(body: AdminCreateOrgRequest, _auth: None = Depends(require_admin_key)):
+    """Make an existing user the admin of a new organisation (their data
+    becomes the organisation's)."""
+    return _admin_org_op(lambda conn: org_access.org_detail(
+        conn, org_access.create_org(conn, body.admin_user_id, body.name)
+    ))
+
+
+@app.get("/admin/orgs/{org_id}")
+def admin_get_org(org_id: int, _auth: None = Depends(require_admin_key)):
+    def run(conn):
+        detail = org_access.org_detail(conn, org_id)
+        blob, synced_at, _found = org_access.read_org_blob(conn, org_id)
+        detail["sync"] = _sync_view_from_blob(conn, blob, synced_at)
+        return detail
+    return _admin_org_op(run)
+
+
+@app.put("/admin/orgs/{org_id}")
+def admin_rename_org(org_id: int, body: AdminRenameOrgRequest, _auth: None = Depends(require_admin_key)):
+    def run(conn):
+        org_access.rename_org(conn, org_id, body.name)
+        return org_access.org_detail(conn, org_id)
+    return _admin_org_op(run)
+
+
+@app.delete("/admin/orgs/{org_id}")
+def admin_dissolve_org(org_id: int, retain: bool = True, _auth: None = Depends(require_admin_key)):
+    """Every member becomes an individual (retain: keeps the org's bookmarks,
+    else wiped) and the organisation's shared data is deleted."""
+    count = _admin_org_op(lambda conn: org_access.dissolve_org(conn, org_id, retain))
+    return {"ok": True, "members_released": count, "retained": retain}
+
+
+@app.post("/admin/orgs/{org_id}/join-code/regenerate")
+def admin_regenerate_join_code(org_id: int, _auth: None = Depends(require_admin_key)):
+    return {"join_code": _admin_org_op(lambda conn: org_access.regenerate_join_code(conn, org_id))}
+
+
+@app.post("/admin/orgs/{org_id}/members")
+def admin_add_org_member(org_id: int, body: AdminAddMemberRequest, _auth: None = Depends(require_admin_key)):
+    """Link a user directly. As with an approved request, their own data is
+    discarded and their devices are signed out."""
+    _admin_org_op(lambda conn: org_access.add_member(
+        conn, org_id, body.user_id, body.role, _admin_permission_changes(body.permissions)
+    ))
+    return {"ok": True}
+
+
+@app.post("/admin/orgs/{org_id}/join-requests/{request_id}/approve")
+def admin_approve_join_request(
+    org_id: int, request_id: int, body: AdminApproveRequest = AdminApproveRequest(),
+    _auth: None = Depends(require_admin_key),
+):
+    return {"request": _admin_org_op(lambda conn: org_access.decide_request(
+        conn, org_id, request_id, True, "operator", _admin_permission_changes(body.permissions)
+    ))}
+
+
+@app.post("/admin/orgs/{org_id}/join-requests/{request_id}/reject")
+def admin_reject_join_request(org_id: int, request_id: int, _auth: None = Depends(require_admin_key)):
+    return {"request": _admin_org_op(lambda conn: org_access.decide_request(
+        conn, org_id, request_id, False, "operator"
+    ))}
+
+
+@app.put("/admin/orgs/{org_id}/members/{user_id}/permissions")
+def admin_set_member_permissions(
+    org_id: int, user_id: int, body: AdminSectionPermissions, _auth: None = Depends(require_admin_key),
+):
+    perms = _admin_org_op(lambda conn: org_access.set_permissions(
+        conn, user_id, _admin_permission_changes(body), org_id=org_id
+    ))
+    return {"user_id": user_id, "permissions": perms}
+
+
+@app.put("/admin/orgs/{org_id}/members/{user_id}/role")
+def admin_set_member_role(
+    org_id: int, user_id: int, body: AdminRoleRequest, _auth: None = Depends(require_admin_key),
+):
+    _admin_org_op(lambda conn: org_access.set_role(conn, org_id, user_id, body.role))
+    return {"user_id": user_id, "role": body.role}
+
+
+@app.post("/admin/orgs/{org_id}/members/{user_id}/delink")
+def admin_delink_member(
+    org_id: int, user_id: int, body: AdminDelinkRequest, _auth: None = Depends(require_admin_key),
+):
+    _admin_org_op(lambda conn: org_access.delink(conn, org_id, user_id, body.retain))
+    return {"ok": True, "user_id": user_id, "retained": body.retain}
 
 
 @app.post("/admin/users/{user_id}/reset-sync")

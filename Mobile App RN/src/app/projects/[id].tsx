@@ -1,9 +1,8 @@
 import { useState, useMemo, useEffect } from "react";
 import { View, Text, Pressable, ScrollView } from "react-native";
 import { useLocalSearchParams, router } from "expo-router";
-import { Plus, DownloadCloud, FolderOpen, Archive, ArchiveRestore } from "lucide-react-native";
+import { Plus, DownloadCloud, FolderOpen, Archive, ArchiveRestore, Trash2 } from "lucide-react-native";
 import { ScreenHeader } from "@/components/shell/ScreenHeader";
-import { FieldRow } from "@/components/tender/FieldRow";
 import { DocumentRow } from "@/components/tender/DocumentRow";
 import { RequestDownloadPanel } from "@/components/tender/RequestDownloadPanel";
 import { ChecklistItem } from "@/components/project/ChecklistItem";
@@ -12,9 +11,11 @@ import { FilePreview } from "@/components/project/FilePreview";
 import { EmptyState } from "@/components/feedback/EmptyState";
 import { Sheet } from "@/components/common/Sheet";
 import { Button } from "@/components/common/Button";
-import { fmtINR, formatDate, timeRemaining, urgency } from "@/lib/format";
-import { useProject, useChecklist, folderNames, addChecklistItem, getAttachedFile, archiveProject, updateProject } from "@/lib/projects";
+import { fmtINR, formatDate, formatDateTime, timeRemaining, urgency } from "@/lib/format";
+import { useProject, useChecklist, folderNames, addChecklistItem, getAttachedFile, archiveProject, deleteProject, updateProject } from "@/lib/projects";
 import { useTenderDocuments } from "@/hooks/useTenderDocuments";
+import { useLinkedTender } from "@/hooks/useLinkedTender";
+import { useTenderDocActions } from "@/hooks/useTenderDocActions";
 import { syncTenderDocuments, downloadAllForTender } from "@/lib/documents";
 import { useToast } from "@/components/feedback/ToastProvider";
 import { useThemeColors, urgencyColor, hexToRgba } from "@/constants/colors";
@@ -27,13 +28,20 @@ export default function ProjectDetailScreen() {
   const [previewItem, setPreviewItem] = useState<any>(null);
   const [downloadingAll, setDownloadingAll] = useState(false);
   const [confirmArchive, setConfirmArchive] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const toast = useToast();
   const colors = useThemeColors();
 
-  const sourceTender = project?.source_tender_db_id
-    ? { id: project.source_tender_db_id, tender_id: project.source_tender_id, title: project.title }
-    : null;
-  const { data: docsPage } = useTenderDocuments(project?.source_tender_db_id);
+  // Live tender behind this project (null if unlinked / not loaded yet): its
+  // deadline, pre-bid, corrigenda and documents override the creation-time
+  // snapshot so changes show up here automatically.
+  // Resolved by the project's portal tender id (source_tender_id); the stored
+  // source_tender_db_id is not used as a fallback since it can be stale.
+  const liveTender = useLinkedTender(project);
+  const linkedId = liveTender?.id ?? null;
+  const sourceTender = liveTender;
+  const { data: docsPage } = useTenderDocuments(linkedId);
+  const { syncButton, reDownloadBanner } = useTenderDocActions(liveTender, docsPage?.items || []);
 
   useEffect(() => {
     if (sourceTender && docsPage?.items?.length) syncTenderDocuments(sourceTender, docsPage.items);
@@ -64,7 +72,19 @@ export default function ProjectDetailScreen() {
   const done = checklist.filter((i: any) => i.status === "Completed").length;
   const total = checklist.length;
   const pct = total ? Math.round((done / total) * 100) : 0;
-  const { totalDays, label, expired } = timeRemaining(project.deadline);
+  // A field follows the live tender unless it was edited by hand on the
+  // desktop (it no longer equals what was copied from the tender).
+  const snapshot = project.tender_snapshot || null;
+  const norm = (v: any) => String(v ?? "").replace(/[,\s]/g, "").trim();
+  const followTender = (field: string, tenderKey: string) => {
+    const live = liveTender?.[tenderKey];
+    if (!live) return project[field];
+    if (snapshot && norm(project[field]) !== norm(snapshot[tenderKey])) return project[field];
+    return live;
+  };
+  const deadline = followTender("deadline", "closing_date");
+  const prebid = followTender("prebid", "pre_bid_meeting_date");
+  const { totalDays, label, expired } = timeRemaining(deadline);
   const u = urgency(totalDays);
   const color = urgencyColor(u.key, colors);
   const documents = docsPage?.items || [];
@@ -96,11 +116,41 @@ export default function ProjectDetailScreen() {
     router.replace("/projects" as any);
   };
 
+  const handleDelete = () => {
+    setConfirmDelete(false);
+    router.replace("/projects" as any);
+    deleteProject(project.id);
+    toast?.push({ title: "Project deleted" });
+  };
+
   const archiveButton = (
+    <>
+    {syncButton}
     <Pressable className="p-1.5" onPress={() => (archived ? handleUnarchive() : setConfirmArchive(true))}>
       {archived ? <ArchiveRestore size={18} color={colors.accent} /> : <Archive size={18} color={colors.textMuted} />}
     </Pressable>
+    {archived && (
+      <Pressable className="p-1.5" onPress={() => setConfirmDelete(true)}>
+        <Trash2 size={18} color={colors.danger} />
+      </Pressable>
+    )}
+    </>
   );
+
+  const detailCells: { label: string; value: any }[] = [
+    { label: "Client", value: liveTender?.organization || project.client_name },
+    { label: "Project value", value: fmtINR(followTender("project_value", "tender_value")) },
+    { label: "EMD", value: fmtINR(liveTender?.emd || project.emd) },
+    { label: "Deadline", value: formatDate(deadline) },
+    { label: "Status", value: project.status },
+    { label: "Documents ready", value: `${done} / ${total}` },
+    ...(liveTender ? [
+      { label: "Corrigenda", value: String(liveTender.corrigendum_count ?? 0) },
+      { label: "Pre-bid meeting", value: formatDateTime(prebid) },
+    ] : []),
+  ];
+  const detailRows: { label: string; value: any }[][] = [];
+  for (let i = 0; i < detailCells.length; i += 2) detailRows.push(detailCells.slice(i, i + 2));
 
   return (
     <View className="flex-1 bg-bg">
@@ -120,20 +170,30 @@ export default function ProjectDetailScreen() {
               Due {expired ? "past" : label}
             </Text>
           </View>
-          {project.prebid && (
+          {prebid && (
             <View className="px-2.5 py-1 rounded-full bg-surface-2">
-              <Text className="text-[14px] font-medium text-text-muted">Pre-bid {formatDate(project.prebid)}</Text>
+              <Text className="text-[14px] font-medium text-text-muted">Pre-bid {formatDateTime(prebid)}</Text>
             </View>
           )}
         </View>
 
-        <View className="bg-surface-0 border border-border rounded-[14px] p-3 mb-4 flex-row flex-wrap">
-          <View className="w-1/2 pr-2"><FieldRow stacked label="Client" value={project.client_name} /></View>
-          <View className="w-1/2 pl-2"><FieldRow stacked label="Project value" value={fmtINR(project.project_value)} /></View>
-          <View className="w-1/2 pr-2"><FieldRow stacked label="EMD" value={fmtINR(project.emd)} /></View>
-          <View className="w-1/2 pl-2"><FieldRow stacked label="Deadline" value={formatDate(project.deadline)} /></View>
-          <View className="w-1/2 pr-2"><FieldRow stacked label="Status" value={project.status} /></View>
-          <View className="w-1/2 pl-2"><FieldRow stacked label="Documents ready" value={`${done} / ${total}`} /></View>
+        {/* The row owns the divider, so it sits at one height across both
+            columns even when one cell wraps to more lines than the other. */}
+        <View className="bg-surface-0 border border-border rounded-[14px] mb-4 overflow-hidden">
+          {detailRows.map((pair, rowIndex) => (
+            <View
+              key={pair[0].label}
+              className={`flex-row${rowIndex === detailRows.length - 1 ? "" : " border-b border-border"}`}
+            >
+              {pair.map((cell, i) => (
+                <View key={cell.label} className={`w-1/2 py-2.5 px-3${i === 0 ? " border-r border-border" : ""}`}>
+                  <Text className="text-[14px] text-text-muted">{cell.label}</Text>
+                  <Text className="mt-1 text-sm font-medium text-text">{cell.value == null || cell.value === "" ? "—" : cell.value}</Text>
+                </View>
+              ))}
+              {pair.length === 1 && <View className="w-1/2" />}
+            </View>
+          ))}
         </View>
         {project.description && (
           <View className="bg-surface-0 border border-border rounded-[14px] p-3 mb-4">
@@ -144,6 +204,7 @@ export default function ProjectDetailScreen() {
 
         {sourceTender && (
           <>
+            {reDownloadBanner}
             <View className="flex-row items-center justify-between mb-2">
               <Text className="text-sm font-semibold text-text">
                 Published documents{documents.length ? ` (${documents.length})` : ""}
@@ -161,7 +222,7 @@ export default function ProjectDetailScreen() {
             </View>
             {documents.length > 0 ? (
               <View className="bg-surface-0 border border-border rounded-[14px] p-3 mb-4">
-                {documents.map((doc: any) => <DocumentRow key={doc.id} tenderId={sourceTender.id} doc={doc} />)}
+                {documents.map((doc: any) => <DocumentRow key={doc.id} tender={sourceTender} doc={doc} />)}
               </View>
             ) : (
               <View className="mb-4"><RequestDownloadPanel tender={sourceTender} /></View>
@@ -217,6 +278,22 @@ export default function ProjectDetailScreen() {
       >
         <Text className="text-[14px] text-text-muted">
           "{project.title}" will move to the Archived tab in Projects. You can restore it from there at any time.
+        </Text>
+      </Sheet>
+
+      <Sheet
+        open={confirmDelete}
+        onClose={() => setConfirmDelete(false)}
+        title="Delete this project?"
+        footer={(
+          <>
+            <Button variant="secondary" className="flex-1" onPress={() => setConfirmDelete(false)}>Cancel</Button>
+            <Button variant="danger" className="flex-1" onPress={handleDelete}>Delete</Button>
+          </>
+        )}
+      >
+        <Text className="text-[14px] text-text-muted">
+          "{project.title}" and its checklist will be removed from your account on every device. This can't be undone.
         </Text>
       </Sheet>
     </View>

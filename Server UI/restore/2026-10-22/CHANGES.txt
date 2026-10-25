@@ -1,0 +1,65 @@
+Change log — 2026-10-22
+Files in this folder are the ORIGINAL (pre-change) copies, same paths relative to "Server UI/". Restore by copying back.
+
+Request: "the alert should be per device, not per id" -- a document download's "Download complete" /
+"New documents" push goes only to the device that requested it, not every device of the account.
+
+Files backed up (pre-change, 114259) and intended change:
+ - server/client_api.py : POST /client/tenders/{id}/request-download accepts optional push_token (the
+   requesting device's APNs token); stored in the job payload as requested_by_push_token.
+ - server/api_server.py : _push_download_complete sends only to that token (when it belongs to the
+   requesting user); without one (BM Pro, older Bidwise) it keeps notifying every device of the user.
+ - server/test_push_notification_pass.py, server/test_client_api.py : tests.
+Status: code + tests done 2026-10-22; test_push_notification_pass.py + test_client_api.py 98/99 in one run
+(the 1 failure is the known timing-sensitive changes-feed test, passes alone). Not yet deployed.
+
+2026-10-22 14:22:08 Request: tapping a grouped "new tenders" push opened an empty page (the app's own alert
+wasn't built yet). Pre-change copies saved as server/<file>.142208.
+ - server/api_server.py : Bidwise org pushes carry extra.tenderIds (the grouped tenders, last 50) so the
+   app can open them directly.
+ - server/test_push_notification_pass.py : test.
+Status: code + tests done; test_push_notification_pass.py 28/28. Not yet deployed.
+
+2026-10-22 14:39:22 Both changes above REVERTED (neither was deployed); copies of the edited versions kept as
+server/<file>.143922. server/api_server.py, client_api.py, test_client_api.py and test_push_notification_pass.py
+were restored from the originals in this folder, then:
+Request: download alerts come from the device that downloaded (lock screen, badge, in-app), for all
+apps -- the server no longer sends any "Download complete" / "New documents" push.
+ - server/api_server.py : removed _notify_download_finished, _push_download_complete and
+   _tender_document_count (only used to word that push), and their call in _run_job. CAPTCHA push and
+   requested_by_user_id unchanged.
+ - server/test_push_notification_pass.py : removed the tests for those functions.
+Status: code + tests done; test_push_notification_pass.py 19/19; full suite 251 passed. Deployed 2026-10-22 from the PC (full rebuild), health OK.
+
+2026-10-22 18:38:25 Request: a grouped "new tenders" push for MCGM (10 tenders, first seen 18:01:52 IST) was
+never sent. Cause: the scraper stamps first_seen_at / scraped_at when it writes a row but commits the page
+seconds later (db=3.4s here); a push pass running in that gap saw nothing, then moved its cursor to `now`,
+past the stamp, so later passes skipped the tenders for good.
+Backups of the pre-change files: server/<file>.183825
+ - server/client_api.py : _compute_user_changes(..., until=None) -- optional upper bound on first_seen_at
+   and tender_history.scraped_at (/client/changes unchanged).
+ - server/api_server.py : _PUSH_SETTLE_SECONDS = 120; the push pass looks only up to now-120s and moves
+   its cursor to there (never backwards), so rows still being committed are picked up next pass, once.
+ - server/test_push_notification_pass.py : existing push tests stamp rows older than the settle window;
+   new test_tenders_still_being_saved_are_pushed_on_a_later_pass.
+Status: push tests 20/20; full suite 252 passed. Deployed 2026-10-22 from the PC (full rebuild), health OK.
+
+2026-10-22 18:56:38 Request: push new tenders / tender changes by row ("mark the rows that need a push"), so
+nothing depends on scan timing. Replaces the 18:38:25 settle-window change (deployed) above.
+Backups of the pre-change files: server/<file>.185638 (app_core.py had no earlier copy today).
+ - server/app_core.py : new table push_handled_events (kind 'new' = tenders.id, 'change' =
+   tender_history.id; PRIMARY KEY (kind, ref_id), handled_at) + indexes on tenders.first_seen_at and
+   tender_history.scraped_at. client_push_tokens comment: last_pushed_at is now the device's floor.
+   Scraper code untouched.
+ - server/client_api.py : _compute_user_changes back to its original form (no `until`);
+   new _unhandled_push_events (rows of the last 48 h not yet handled), _user_push_changes (one user's
+   share, same shape as before), _mark_push_events_handled (insert ON CONFLICT DO NOTHING; prune > 96 h).
+ - server/api_server.py : _PUSH_SETTLE_SECONDS removed. The pass loads unhandled events once, gives
+   each device its share above its floor (last_pushed_at, else created_at), then marks every event
+   handled. last_pushed_at is no longer advanced; closing reminders unchanged.
+ - server/test_push_notification_pass.py : settle test replaced by: a row committed after a pass but
+   stamped before it is pushed next pass, once; a tender change is pushed once; a device gets nothing
+   from before it registered.
+Postgres check (live DB, inside a rolled-back transaction): DDL, both candidate queries (<5 ms; 335 new
++ 456 change rows in 48 h, none pushed on first pass since every device floor is newer), ON CONFLICT.
+Status: push tests 22/22; full suite 254 passed. Deployed 2026-10-22 from the PC (full rebuild), health OK; first pass 19:18:54 IST marked 335 new + 456 change rows handled, sent nothing, no errors.

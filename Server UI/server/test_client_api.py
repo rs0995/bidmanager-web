@@ -83,6 +83,21 @@ class ClientApiTests(unittest.TestCase):
                 data_json TEXT NOT NULL DEFAULT '{}',
                 updated_at REAL NOT NULL DEFAULT 0
             );
+            CREATE TABLE client_push_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT 'ios',
+                created_at REAL NOT NULL,
+                last_seen_at REAL NOT NULL,
+                last_pushed_at REAL NOT NULL DEFAULT 0,
+                last_reminder_date TEXT NOT NULL DEFAULT '',
+                badge_count INTEGER NOT NULL DEFAULT 0,
+                app TEXT NOT NULL DEFAULT 'bmpro',
+                apns_env TEXT NOT NULL DEFAULT 'production',
+                pending_orgs TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE UNIQUE INDEX idx_client_push_tokens_token ON client_push_tokens(token);
             CREATE TABLE background_jobs (
                 id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
@@ -100,6 +115,18 @@ class ClientApiTests(unittest.TestCase):
                 attempt_count INTEGER DEFAULT 0,
                 worker_id TEXT,
                 dedupe_key TEXT
+            );
+            CREATE TABLE captcha_requests (
+                id TEXT PRIMARY KEY,
+                job_id TEXT,
+                context TEXT,
+                image_base64 TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                response_text TEXT,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                answered_at REAL,
+                user_id INTEGER
             );
             CREATE TABLE saved_custom_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,6 +177,16 @@ class ClientApiTests(unittest.TestCase):
         conn.execute(
             "INSERT INTO downloaded_files VALUES (1,'T-100',1,'spec.pdf','notice',13,'2026-08-18','complete',?,NULL)",
             (str(self.file_path),),
+        )
+        conn.execute("ALTER TABLE tenders ADD COLUMN last_update_checked_at REAL")
+        conn.execute("ALTER TABLE tenders ADD COLUMN last_status_checked_at REAL")
+        # The scraper keeps normalized_tender_id = canonical tender id; mirror it
+        # here for the fixture rows and any a test inserts later.
+        conn.execute("ALTER TABLE tenders ADD COLUMN normalized_tender_id TEXT")
+        conn.execute("UPDATE tenders SET normalized_tender_id=UPPER(TRIM(tender_id))")
+        conn.execute(
+            "CREATE TRIGGER tenders_normalize AFTER INSERT ON tenders BEGIN "
+            "UPDATE tenders SET normalized_tender_id=UPPER(TRIM(NEW.tender_id)) WHERE id=NEW.id; END"
         )
         conn.commit()
         conn.close()
@@ -326,16 +363,51 @@ class ClientApiTests(unittest.TestCase):
 
     # ── async tender download job ──────────────────────────────────────
 
+    def test_request_download_redownload_mode_is_passed_through_and_logged(self):
+        fake_api_server = types.ModuleType("api_server")
+        fake_api_server._enqueue_job = mock.Mock(return_value={"job_id": "job-9", "status": "running", "created": False})
+        fake_api_server._append_live_log = mock.Mock()
+        with mock.patch.dict(sys.modules, {"api_server": fake_api_server}):
+            response = self.client.post(
+                "/client/tenders/1/request-download", headers=self.headers, json={"mode": "redownload"}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(), {"job_id": "job-9", "status": "running", "created": False, "mode": "redownload"}
+        )
+        fake_api_server._enqueue_job.assert_called_once_with(
+            "download_single_tender",
+            {"tender_db_id": 1, "mode": "redownload", "source": "client", "requested_by_user_id": 1},
+        )
+        self.assertIn("joined existing in-flight job", fake_api_server._append_live_log.call_args[0][0])
+
+
+    def test_request_download_for_archived_tender_is_refused_without_queueing(self):
+        fake_api_server = types.ModuleType("api_server")
+        fake_api_server._enqueue_job = mock.Mock()
+        fake_api_server._append_live_log = mock.Mock()
+        with mock.patch.dict(sys.modules, {"api_server": fake_api_server}):
+            response = self.client.post(
+                "/client/tenders/2/request-download", headers=self.headers, json={"mode": "update"}
+            )
+        self.assertEqual(response.status_code, 409)
+        fake_api_server._enqueue_job.assert_not_called()
+
     def test_request_download_enqueues_a_job_and_status_can_be_polled(self):
         fake_api_server = types.ModuleType("api_server")
-        fake_api_server._enqueue_job = mock.Mock(return_value={"job_id": "job-1", "status": "queued"})
+        fake_api_server._enqueue_job = mock.Mock(return_value={"job_id": "job-1", "status": "queued", "created": True})
+        fake_api_server._append_live_log = mock.Mock()
         with mock.patch.dict(sys.modules, {"api_server": fake_api_server}):
             response = self.client.post("/client/tenders/1/request-download", headers=self.headers)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"job_id": "job-1", "status": "queued"})
+        self.assertEqual(response.json(), {"job_id": "job-1", "status": "queued", "created": True, "mode": "full"})
         fake_api_server._enqueue_job.assert_called_once_with(
-            "download_single_tender", {"tender_db_id": 1, "mode": "full", "source": "client"}
+            "download_single_tender",
+            {"tender_db_id": 1, "mode": "full", "source": "client", "requested_by_user_id": 1},
         )
+        logged = fake_api_server._append_live_log.call_args[0][0]
+        self.assertIn("'full'", logged)
+        self.assertIn("queued new job", logged)
 
         conn = sqlite3.connect(self.db_path)
         conn.execute(
@@ -374,6 +446,73 @@ class ClientApiTests(unittest.TestCase):
         self.assertIn("scrape_enabled", first)
         self.assertIn("website_name", first)
 
+    def test_organizations_archived_filter_lists_only_orgs_with_archived_tenders(self):
+        response = self.client.get("/client/organizations?archived=true", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        items = response.json()["items"]
+        self.assertEqual([i["name"] for i in items], ["Water Authority"])
+        self.assertEqual(items[0]["tender_count"], 1)
+        everything = self.client.get("/client/organizations", headers=self.headers).json()["items"]
+        self.assertEqual(len(everything), 2)
+
+    def test_organization_tender_count_is_the_database_count_not_the_portal_figure(self):
+        conn = sqlite3.connect(self.db_path)
+        # The portal claims 507; the database holds two active tenders (one
+        # with different case/spacing in the org chain) and one archived.
+        conn.execute("UPDATE organizations SET tender_count=507 WHERE id=1")
+        conn.execute(
+            "INSERT INTO tenders (id,website_id,org_chain,tender_id,title,is_archived) "
+            "VALUES (60,1,'  road AUTHORITY ','T-600','Second road job',0)"
+        )
+        conn.execute(
+            "INSERT INTO tenders (id,website_id,org_chain,tender_id,title,is_archived) "
+            "VALUES (61,1,'Road Authority','T-610','Old road job',1)"
+        )
+        conn.execute(
+            "INSERT INTO organizations VALUES (3,1,'Empty Board','https://example.test/org/3',12,1,0,0,0,NULL,1,NULL)"
+        )
+        conn.commit()
+        conn.close()
+        active = {
+            o["name"]: o["tender_count"]
+            for o in self.client.get("/client/organizations?page_size=100", headers=self.headers).json()["items"]
+        }
+        self.assertEqual(active["Road Authority"], 2)
+        self.assertEqual(active["Water Authority"], 0)  # its only tender is archived
+        self.assertEqual(active["Empty Board"], 0)
+        archived = {
+            o["name"]: o["tender_count"]
+            for o in self.client.get(
+                "/client/organizations?archived=true&page_size=100", headers=self.headers
+            ).json()["items"]
+        }
+        self.assertEqual(archived, {"Road Authority": 1, "Water Authority": 1})
+
+    def test_fetch_status_enqueues_client_job_and_is_logged(self):
+        self.assertEqual(self.client.post("/client/tenders/2/fetch-status").status_code, 401)
+        fake_api_server = types.ModuleType("api_server")
+        fake_api_server._enqueue_job = mock.Mock(return_value={"job_id": "job-77", "status": "queued", "created": True})
+        fake_api_server._append_live_log = mock.Mock()
+        with mock.patch.dict(sys.modules, {"api_server": fake_api_server}):
+            response = self.client.post("/client/tenders/2/fetch-status", headers=self.headers)
+            missing = self.client.post("/client/tenders/999/fetch-status", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"job_id": "job-77", "status": "queued", "created": True, "mode": "status"})
+        fake_api_server._enqueue_job.assert_called_once_with(
+            "fetch_tender_status_single", {"tender_db_id": 2, "source": "client", "requested_by_user_id": 1}
+        )
+        self.assertIn("status fetch", fake_api_server._append_live_log.call_args[0][0])
+        self.assertEqual(missing.status_code, 404)
+
+    def test_tender_payload_exposes_last_status_checked_at(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE tenders SET last_status_checked_at=1700000000 WHERE id=2")
+        conn.commit()
+        conn.close()
+        body = self.client.get("/client/tenders/2", headers=self.headers).json()
+        self.assertEqual(body["last_status_checked_at"], 1700000000.0)
+        self.assertIsNone(self.client.get("/client/tenders/1", headers=self.headers).json()["last_status_checked_at"])
+
     def test_organizations_list_filters_by_query(self):
         response = self.client.get("/client/organizations?q=road", headers=self.headers)
         self.assertEqual(response.status_code, 200)
@@ -392,8 +531,66 @@ class ClientApiTests(unittest.TestCase):
         self.assertEqual(pushed.status_code, 200, pushed.text)
         pulled = self.client.get("/client/sync", headers=self.headers)
         self.assertEqual(pulled.status_code, 200)
-        self.assertEqual(pulled.json()["data"], blob)
+        self.assertEqual(pulled.json()["data"], {**blob, "bookmarkTenderIds": []})
         self.assertGreater(pulled.json()["updated_at"], 0)
+
+    # ── tender id is the stored identity ──────────────────────────────
+
+    def test_row_id_bookmarks_from_older_builds_are_stored_as_tender_ids(self):
+        self.client.put("/client/sync", json={"data": {"bookmarks": [1]}}, headers=self.headers)
+        data = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(data["bookmarkTenderIds"], ["T-100"])
+        self.assertEqual(data["bookmarks"], [1])
+        # A newer build sends tender ids; removals travel as tender ids too.
+        self.client.put(
+            "/client/sync", json={"data": {"bookmarkTenderIds": ["t-200"]}}, headers=self.headers
+        )
+        self.assertEqual(
+            self.client.get("/client/sync", headers=self.headers).json()["data"]["bookmarkTenderIds"],
+            ["T-100", "T-200"],
+        )
+        self.client.put(
+            "/client/sync",
+            json={"data": {"bookmarkTenderIds": ["T-200"]}, "removed": {"bookmarkTenderIds": ["T-100"]}},
+            headers=self.headers,
+        )
+        data = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual((data["bookmarkTenderIds"], data["bookmarks"]), (["T-200"], [2]))
+
+    def test_bookmarks_and_projects_reconnect_after_the_tenders_table_is_rebuilt(self):
+        self.client.put(
+            "/client/sync",
+            json={"data": {
+                "bookmarkTenderIds": ["T-100", "T-GONE"],
+                "projects": [{"id": 7, "name": "Bridge", "source_tender_id": "T-100", "source_tender_db_id": 1}],
+            }},
+            headers=self.headers,
+        )
+        data = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        # T-GONE isn't in the database: kept as a tender id, no row handle.
+        self.assertEqual((data["bookmarkTenderIds"], data["bookmarks"]), (["T-100", "T-GONE"], [1]))
+        # Clear and restore the tenders under new row ids.
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE tenders SET id=id+500")
+        conn.execute(
+            "INSERT INTO tenders (id,website_id,org_chain,tender_id,title,is_archived) "
+            "VALUES (900,1,'Road Authority','T-GONE','Came back',0)"
+        )
+        conn.commit()
+        conn.close()
+        data = self.client.get("/client/sync", headers=self.headers).json()["data"]
+        self.assertEqual(data["bookmarks"], [501, 900])
+        self.assertEqual(data["projects"][0]["source_tender_db_id"], 501)
+
+    def test_resolve_maps_tender_ids_to_current_tenders(self):
+        response = self.client.post(
+            "/client/tenders/resolve", json={"tender_ids": [" t-100 ", "T-NOPE"]}, headers=self.headers
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        tenders = response.json()["tenders"]
+        self.assertEqual(list(tenders), ["T-100"])
+        self.assertEqual(tenders["T-100"]["id"], 1)
+        self.assertEqual(self.client.post("/client/tenders/resolve", json={"tender_ids": []}).status_code, 401)
 
     def test_sync_push_preserves_keys_the_client_omitted(self):
         # A thin/stale push (e.g. the mobile app on a fresh origin) must not
@@ -419,6 +616,49 @@ class ClientApiTests(unittest.TestCase):
         after = self.client.get("/client/sync", headers=self.headers).json()["data"]
         self.assertEqual(after["templates"], [])
         self.assertEqual(after["bookmarks"], [1, 2])
+
+    def test_websites_lists_every_portal_including_empty_ones(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("INSERT INTO websites VALUES (7, 'Empty Portal', 'https://empty.test')")
+        conn.commit()
+        conn.close()
+        response = self.client.get("/client/websites", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        names = [w["name"] for w in response.json()]
+        self.assertIn("MahaTenders", names)
+        self.assertIn("Empty Portal", names)
+        self.assertEqual(self.client.get("/client/websites").status_code, 401)
+
+    def test_rows_of_a_deleted_portal_are_hidden(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO tenders (id,website_id,org_chain,tender_id,title,is_archived) "
+            "VALUES (50,99,'Ghost Org','T-GHOST','Ghost tender',0)"
+        )
+        conn.execute(
+            "INSERT INTO organizations VALUES (50,99,'Ghost Org','https://ghost.test',1,1,0,0,0,NULL,1,NULL)"
+        )
+        conn.commit()
+        conn.close()
+        tenders = self.client.get("/client/tenders?page_size=100", headers=self.headers).json()["items"]
+        self.assertNotIn(50, [t["id"] for t in tenders])
+        orgs = self.client.get("/client/organizations?page_size=100", headers=self.headers).json()["items"]
+        self.assertNotIn("Ghost Org", [o["name"] for o in orgs])
+
+    def test_sync_keeps_newer_notification_prefs(self):
+        on = {"notifyOrgAlertsOn": True, "notifyTenderAlertsOn": True, "reminderDays": [1], "updatedAt": 2000}
+        self.client.put("/client/sync", json={"data": {"notificationPrefs": on}}, headers=self.headers)
+        # A fresh install pushes its "off" defaults without a stamp: ignored.
+        stale = {"notifyOrgAlertsOn": False, "notifyTenderAlertsOn": False, "reminderDays": []}
+        self.client.put("/client/sync", json={"data": {"notificationPrefs": stale}}, headers=self.headers)
+        self.assertEqual(self.client.get("/client/sync", headers=self.headers).json()["data"]["notificationPrefs"], on)
+        # An older stamp loses too; a newer one wins.
+        older = dict(stale, updatedAt=1000)
+        self.client.put("/client/sync", json={"data": {"notificationPrefs": older}}, headers=self.headers)
+        self.assertEqual(self.client.get("/client/sync", headers=self.headers).json()["data"]["notificationPrefs"], on)
+        newer = dict(stale, updatedAt=3000)
+        self.client.put("/client/sync", json={"data": {"notificationPrefs": newer}}, headers=self.headers)
+        self.assertEqual(self.client.get("/client/sync", headers=self.headers).json()["data"]["notificationPrefs"], newer)
 
     def test_sync_push_unions_bookmark_sets_across_devices(self):
         # Device A bookmarks tender 1; device B (which only knows about 2)
@@ -691,6 +931,184 @@ class ClientApiTests(unittest.TestCase):
         self.assertEqual([t["id"] for t in out["tenders"]], [1])
         self.assertEqual(out["tenders"][0]["changed_fields"], ["closing_date"])
         self.assertEqual([t["id"] for t in out["new_by_org"]["Road Authority"]], [3])
+
+    # ── push token registration ────────────────────────────────────────
+
+    def test_register_push_token_requires_auth(self):
+        response = self.client.post("/client/push-token", json={"token": "abc123deadbeef"})
+        self.assertEqual(response.status_code, 401)
+
+    def test_register_push_token_then_lookup(self):
+        response = self.client.post(
+            "/client/push-token", json={"token": "abc123deadbeef", "platform": "ios"}, headers=self.headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        row = self._row(
+            "SELECT user_id, platform FROM client_push_tokens WHERE token=?", ("abc123deadbeef",)
+        )
+        self.assertEqual(row[0], self.user_id)
+        self.assertEqual(row[1], "ios")
+
+    def test_register_push_token_defaults_to_bm_pro(self):
+        self.client.post("/client/push-token", json={"token": "bmpro-device-1"}, headers=self.headers)
+        row = self._row("SELECT app, apns_env FROM client_push_tokens WHERE token=?", ("bmpro-device-1",))
+        self.assertEqual(tuple(row), ("bmpro", "production"))
+
+    def test_register_push_token_for_bidwise_in_sandbox(self):
+        response = self.client.post(
+            "/client/push-token",
+            json={"token": "bidwise-device-1", "platform": "ios", "app": "bidwise", "environment": "sandbox"},
+            headers=self.headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        row = self._row("SELECT app, apns_env FROM client_push_tokens WHERE token=?", ("bidwise-device-1",))
+        self.assertEqual(tuple(row), ("bidwise", "sandbox"))
+
+    def test_register_push_token_rejects_unknown_app(self):
+        response = self.client.post(
+            "/client/push-token", json={"token": "x-device-123", "app": "other"}, headers=self.headers,
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_badge_unread_orgs_keeps_only_those_pending_groups(self):
+        self.client.post(
+            "/client/push-token", json={"token": "bidwise-dev-9", "app": "bidwise"}, headers=self.headers,
+        )
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "UPDATE client_push_tokens SET pending_orgs=? WHERE token=?",
+            (json.dumps({"PWD": [{"id": 1, "title": "A"}], "MJP": [{"id": 2, "title": "B"}]}), "bidwise-dev-9"),
+        )
+        conn.commit()
+        conn.close()
+        self.client.put("/client/badge", json={"count": 1, "unread_orgs": ["PWD"]}, headers=self.headers)
+        raw = self._row("SELECT pending_orgs, badge_count FROM client_push_tokens WHERE token=?", ("bidwise-dev-9",))
+        self.assertEqual(list(json.loads(raw[0]).keys()), ["PWD"])
+        self.assertEqual(raw[1], 1)
+        # Everything read: nothing pending.
+        self.client.put("/client/badge", json={"count": 0, "unread_orgs": []}, headers=self.headers)
+        raw = self._row("SELECT pending_orgs FROM client_push_tokens WHERE token=?", ("bidwise-dev-9",))
+        self.assertEqual(json.loads(raw[0]), {})
+
+    def test_badge_without_unread_orgs_leaves_pending_alone(self):
+        self.client.post("/client/push-token", json={"token": "bmpro-dev-9"}, headers=self.headers)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "UPDATE client_push_tokens SET pending_orgs=? WHERE token=?",
+            (json.dumps({"PWD": [{"id": 1, "title": "A"}]}), "bmpro-dev-9"),
+        )
+        conn.commit()
+        conn.close()
+        self.client.put("/client/badge", json={"count": 3}, headers=self.headers)
+        raw = self._row("SELECT pending_orgs FROM client_push_tokens WHERE token=?", ("bmpro-dev-9",))
+        self.assertEqual(list(json.loads(raw[0]).keys()), ["PWD"])
+
+    def test_register_push_token_reassigns_token_to_new_user(self):
+        self.client.post("/client/push-token", json={"token": "shared-device-token"}, headers=self.headers)
+        other_headers = self._register_second_user()
+        self.client.post("/client/push-token", json={"token": "shared-device-token"}, headers=other_headers)
+        count = self._row("SELECT COUNT(*) FROM client_push_tokens WHERE token=?", ("shared-device-token",))[0]
+        self.assertEqual(count, 1)
+
+    def test_unregister_push_token_only_deletes_own_row(self):
+        self.client.post("/client/push-token", json={"token": "tok-1-abcdef"}, headers=self.headers)
+        other_headers = self._register_second_user()
+        # A different user's delete call for someone else's token must not remove it.
+        self.client.request("DELETE", "/client/push-token", json={"token": "tok-1-abcdef"}, headers=other_headers)
+        self.assertIsNotNone(self._row("SELECT id FROM client_push_tokens WHERE token=?", ("tok-1-abcdef",)))
+        self.client.request("DELETE", "/client/push-token", json={"token": "tok-1-abcdef"}, headers=self.headers)
+        self.assertIsNone(self._row("SELECT id FROM client_push_tokens WHERE token=?", ("tok-1-abcdef",)))
+
+    def _register_second_user(self):
+        response = self.client.post(
+            "/client/auth/register",
+            json={"email": "second@example.test", "password": "password123", "display_name": "Second"},
+        )
+        token = response.json()["token"]
+        return {"X-Client-Key": token}
+
+    # ── badge sync ────────────────────────────────────────────────────
+
+    def test_sync_badge_requires_auth(self):
+        response = self.client.put("/client/badge", json={"count": 3})
+        self.assertEqual(response.status_code, 401)
+
+    def test_sync_badge_updates_registered_device(self):
+        self.client.post("/client/push-token", json={"token": "badge-device-1"}, headers=self.headers)
+        response = self.client.put("/client/badge", json={"count": 5}, headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        row = self._row("SELECT badge_count FROM client_push_tokens WHERE token=?", ("badge-device-1",))
+        self.assertEqual(row[0], 5)
+
+    def test_sync_badge_updates_every_device_for_the_user(self):
+        self.client.post("/client/push-token", json={"token": "badge-device-a"}, headers=self.headers)
+        self.client.post("/client/push-token", json={"token": "badge-device-b"}, headers=self.headers)
+        self.client.put("/client/badge", json={"count": 2}, headers=self.headers)
+        row_a = self._row("SELECT badge_count FROM client_push_tokens WHERE token=?", ("badge-device-a",))
+        row_b = self._row("SELECT badge_count FROM client_push_tokens WHERE token=?", ("badge-device-b",))
+        self.assertEqual(row_a[0], 2)
+        self.assertEqual(row_b[0], 2)
+
+    def test_sync_badge_does_not_touch_another_users_device(self):
+        self.client.post("/client/push-token", json={"token": "badge-device-mine"}, headers=self.headers)
+        other_headers = self._register_second_user()
+        self.client.post("/client/push-token", json={"token": "badge-device-theirs"}, headers=other_headers)
+        self.client.put("/client/badge", json={"count": 9}, headers=self.headers)
+        theirs = self._row("SELECT badge_count FROM client_push_tokens WHERE token=?", ("badge-device-theirs",))
+        self.assertEqual(theirs[0], 0)
+
+    def test_sync_badge_rejects_negative_count(self):
+        response = self.client.put("/client/badge", json={"count": -1}, headers=self.headers)
+        self.assertEqual(response.status_code, 422)
+
+    # ── captcha ───────────────────────────────────────────────────────
+
+    def _insert_captcha(self, captcha_id, user_id, status="pending"):
+        now = time.time()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO captcha_requests (id,job_id,context,image_base64,status,created_at,expires_at,user_id) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (captcha_id, "job-1", "captcha", "aGVsbG8=", status, now, now + 120, user_id),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_captcha_pending_returns_null_when_none(self):
+        response = self.client.get("/client/captcha/pending", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json())
+
+    def test_captcha_pending_returns_only_this_users_row(self):
+        self._insert_captcha("cap-mine", self.user_id)
+        other_headers = self._register_second_user()
+        other_user_id = self._row("SELECT id FROM client_users WHERE email=?", ("second@example.test",))[0]
+        self._insert_captcha("cap-theirs", other_user_id)
+
+        mine = self.client.get("/client/captcha/pending", headers=self.headers).json()
+        self.assertEqual(mine["request_id"], "cap-mine")
+        self.assertEqual(mine["image_base64"], "aGVsbG8=")
+
+        theirs = self.client.get("/client/captcha/pending", headers=other_headers).json()
+        self.assertEqual(theirs["request_id"], "cap-theirs")
+
+    # test_answer_captcha_succeeds_for_owner lives in test_push_notification_pass.py
+    # instead -- it needs api_server.submit_captcha's real atomic CAS to actually
+    # run, which needs the full production schema (core.init_db()), not this
+    # file's hand-rolled minimal fixture.
+
+    def test_answer_captcha_404s_for_a_different_users_row(self):
+        other_headers = self._register_second_user()
+        self._insert_captcha("cap-not-yours", self.user_id)
+        response = self.client.post("/client/captcha/cap-not-yours/answer", json={"text": "ABC123"}, headers=other_headers)
+        self.assertEqual(response.status_code, 404)
+        row = self._row("SELECT status FROM captcha_requests WHERE id=?", ("cap-not-yours",))
+        self.assertEqual(row[0], "pending")
+
+    def test_answer_captcha_404s_when_already_answered(self):
+        self._insert_captcha("cap-raced", self.user_id, status="answered")
+        response = self.client.post("/client/captcha/cap-raced/answer", json={"text": "ABC123"}, headers=self.headers)
+        self.assertEqual(response.status_code, 404)
 
 
 if __name__ == "__main__":

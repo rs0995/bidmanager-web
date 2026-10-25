@@ -22,10 +22,20 @@ describe('Dashboard', () => {
       'RI',
       'Dashboard',
       'Rakshit Infra',
+      'Needs attention',
+      'Tenders synced',
+      'Active projects',
+      'Orgs',
+      'Closing this week',
       'Pipeline Snapshot',
-      'Next Deadline',
-      'Sync',
-      'Closing Soon',
+      'Across bookmarked tenders',
+      'NEXT DEADLINE',
+      'Closing soon',
+      'Sync tenders',
+      'Sync now',
+      'Upcoming deadlines',
+      'CRITICAL',
+      'SOON',
     ].forEach(s => expect(out).toContain(s));
   });
 
@@ -54,7 +64,6 @@ describe('Dashboard', () => {
     await ReactTestRenderer.act(async () => {
       bell.props.onPress();
     });
-    expect(textOf(r)).toContain('Deadline reminders');
     expect(textOf(r)).toContain('3 unread');
 
     const markAll = r.root.findAll(

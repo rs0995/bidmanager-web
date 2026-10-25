@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { Platform } from "react-native";
 import * as SecureStore from "expo-secure-store";
 
 // Per-device session token, issued by POST /client/auth/login|register and
@@ -14,6 +15,25 @@ import * as SecureStore from "expo-secure-store";
 const TOKEN_KEY = "bm.token";
 const USER_KEY = "bm.user";
 
+// expo-secure-store's web target is an empty stub (no native module exists
+// in a browser), so SecureStore.*Async calls throw there. The web build is
+// a real, intentionally-supported target (see package.json's "web" script),
+// so this falls back to localStorage on web instead of crashing app boot.
+const isWeb = Platform.OS === "web";
+
+async function storageGet(key) {
+  if (!isWeb) return SecureStore.getItemAsync(key);
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+async function storageSet(key, value) {
+  if (!isWeb) return SecureStore.setItemAsync(key, value);
+  try { localStorage.setItem(key, value); } catch {}
+}
+async function storageDelete(key) {
+  if (!isWeb) return SecureStore.deleteItemAsync(key);
+  try { localStorage.removeItem(key); } catch {}
+}
+
 let tokenCache = "";
 let userCache = null;
 
@@ -24,8 +44,8 @@ function emit() {
 
 export async function hydrateAuth() {
   const [token, userRaw] = await Promise.all([
-    SecureStore.getItemAsync(TOKEN_KEY),
-    SecureStore.getItemAsync(USER_KEY),
+    storageGet(TOKEN_KEY),
+    storageGet(USER_KEY),
   ]);
   tokenCache = token || "";
   try {
@@ -46,16 +66,16 @@ export function getUser() {
 export function setSession({ token, user_id, email, display_name }) {
   tokenCache = token || "";
   userCache = { user_id, email, display_name: display_name || "" };
-  SecureStore.setItemAsync(TOKEN_KEY, tokenCache).catch(() => {});
-  SecureStore.setItemAsync(USER_KEY, JSON.stringify(userCache)).catch(() => {});
+  storageSet(TOKEN_KEY, tokenCache).catch(() => {});
+  storageSet(USER_KEY, JSON.stringify(userCache)).catch(() => {});
   emit();
 }
 
 export function clearSession() {
   tokenCache = "";
   userCache = null;
-  SecureStore.deleteItemAsync(TOKEN_KEY).catch(() => {});
-  SecureStore.deleteItemAsync(USER_KEY).catch(() => {});
+  storageDelete(TOKEN_KEY).catch(() => {});
+  storageDelete(USER_KEY).catch(() => {});
   emit();
 }
 

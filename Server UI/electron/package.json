@@ -1,12 +1,19 @@
 {
   "name": "bidmanager-control-shell",
-  "version": "1.0.13",
+  "version": "1.0.16",
   "private": true,
   "description": "Electron wrapper for the BidManager Control admin console",
   "main": "main.cjs",
   "scripts": {
-    "electron:dev": "node ../../node_modules/concurrently/dist/bin/concurrently.js -k \"npm --prefix .. run dev\" \"node ../../node_modules/wait-on/bin/wait-on http-get://127.0.0.1:5174 && node ../../node_modules/cross-env/src/bin/cross-env.js ELECTRON_DEV=1 ELECTRON_RENDERER_URL=http://127.0.0.1:5174 BIDMANAGER_PORT=8090 node ../../node_modules/electron/cli.js .\"",
-    "electron:dist": "node ../../node_modules/electron-builder/cli.js --win nsis"
+    "electron:dev": "concurrently -k \"npm --prefix .. run dev\" \"wait-on http-get://127.0.0.1:5174 && cross-env ELECTRON_DEV=1 ELECTRON_RENDERER_URL=http://127.0.0.1:5174 BIDMANAGER_PORT=8090 electron .\"",
+    "electron:dist": "electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "concurrently": "9.2.1",
+    "cross-env": "7.0.3",
+    "electron": "33.4.11",
+    "electron-builder": "26.8.1",
+    "wait-on": "8.0.5"
   },
   "build": {
     "appId": "com.bidmanager.control",

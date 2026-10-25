@@ -69,7 +69,7 @@ class SavedCustomJobTests(unittest.TestCase):
                     api.update_saved_custom_job(saved_id, api.SavedCustomJobRequest(
                         owner_name='Alice', name='Morning scrape', website_id=1,
                         job_type='scrape', org_ids=[org_id], schedule_enabled=True,
-                        interval_minutes=30,
+                        interval_minutes=30, run_days=['mon','tue','wed','thu','fri','sat','sun'],
                     ), None)
                     updated = api.list_saved_custom_jobs('Alice', None)['jobs'][0]
                     assert updated['schedule_enabled'] is True
@@ -153,6 +153,7 @@ class SavedCustomJobTests(unittest.TestCase):
                         owner_name='Alice', name='Anchored repeat', website_id=1,
                         job_type='scrape', org_ids=[org_id], schedule_mode='interval',
                         schedule_enabled=True, scheduled_for_at=repeat_at, interval_minutes=120,
+                        run_days=['mon','tue','wed','thu','fri','sat','sun'],
                     ), None)
                     repeating_before = next(
                         job for job in api.list_saved_custom_jobs('Alice', None)['jobs']
@@ -237,6 +238,7 @@ class SavedCustomJobTests(unittest.TestCase):
                         owner_name='Bob', name='Bob scrape', website_id=1,
                         job_type='scrape', org_ids=[org_b], schedule_enabled=True,
                         schedule_mode='interval', interval_minutes=60,
+                        run_days=['mon','tue','wed','thu','fri','sat','sun'],
                     ), None)
                     saved_id = saved['id']
                     with api.get_db() as conn:
@@ -337,11 +339,13 @@ class SavedCustomJobTests(unittest.TestCase):
                         owner_name='Carol', name='Whole-site scrape', website_id=1,
                         job_type='scrape', all_organizations=True, schedule_enabled=True,
                         schedule_mode='interval', interval_minutes=60,
+                        run_days=['mon','tue','wed','thu','fri','sat','sun'],
                     ), None)
                     explicit = api.create_saved_custom_job(api.SavedCustomJobRequest(
                         owner_name='Dave', name='Just Org A', website_id=1,
                         job_type='scrape', org_ids=[org_a], schedule_enabled=True,
                         schedule_mode='interval', interval_minutes=60,
+                        run_days=['mon','tue','wed','thu','fri','sat','sun'],
                     ), None)
                     with api.get_db() as conn:
                         conn.execute(
@@ -449,6 +453,7 @@ class SavedCustomJobTests(unittest.TestCase):
                         owner_name='Frank', name='Whole-site scrape (scheduled)', website_id=1,
                         job_type='scrape', all_organizations=True, schedule_enabled=True,
                         schedule_mode='interval', interval_minutes=60,
+                        run_days=['mon','tue','wed','thu','fri','sat','sun'],
                     ), None)
                     with api.get_db() as conn:
                         conn.execute('UPDATE saved_custom_jobs SET next_run_at=? WHERE id=?', (time.time() - 1, scheduled['id']))
@@ -543,6 +548,7 @@ class SavedCustomJobTests(unittest.TestCase):
                         owner_name='Hank', name='Whole-site refresh+scrape (scheduled)', website_id=1,
                         job_type='scrape', all_organizations=True, org_ids=org_ids,
                         schedule_enabled=True, schedule_mode='interval', interval_minutes=60,
+                        run_days=['mon','tue','wed','thu','fri','sat','sun'],
                     ), None)
                     with api.get_db() as conn:
                         conn.execute('UPDATE saved_custom_jobs SET next_run_at=? WHERE id=?', (time.time() - 1, scheduled['id']))
@@ -608,6 +614,7 @@ class SavedCustomJobTests(unittest.TestCase):
                         owner_name='Ivy', name='Interval scrape', website_id=1,
                         job_type='scrape', org_ids=[org_id], schedule_enabled=True,
                         schedule_mode='interval', interval_minutes=60,
+                        run_days=['mon','tue','wed','thu','fri','sat','sun'],
                     ), None)
 
                     enqueue_now = time.time()
@@ -626,6 +633,79 @@ class SavedCustomJobTests(unittest.TestCase):
                     assert row['next_run_at'] > enqueue_now, row  # schedule untouched
 
                     api.delete_saved_custom_job(job['id'], 'Ivy', None)
+                """)],
+                cwd=root,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_run_days_default_explicit_update_and_validation(self):
+        with tempfile.TemporaryDirectory(prefix="bidmanager-rundays-") as tmp:
+            root = Path(tmp)
+            for source in SOURCE_DIR.glob("*.py"):
+                if not source.name.startswith("test_"):
+                    shutil.copy2(source, root / source.name)
+            env = os.environ.copy()
+            for key in ("K_SERVICE", "DATABASE_URL", "POSTGRES_URL", "POSTGRES_CONNECTION_STRING"):
+                env.pop(key, None)
+            env["BIDMANAGER_ENV"] = "local"
+            result = subprocess.run(
+                [sys.executable, "-c", textwrap.dedent("""
+                    from datetime import datetime
+                    from zoneinfo import ZoneInfo
+                    from fastapi import HTTPException
+                    import api_server as api
+                    api._scheduler_stop.set()
+                    if getattr(api, "_scheduler_thread", None):
+                        api._scheduler_thread.join(timeout=10)
+                    with api.get_db() as conn:
+                        conn.execute(
+                            "INSERT INTO organizations (website_id,name,tender_count,tenders_url) "
+                            "VALUES (1,'Org A',1,'https://example.test/a')"
+                        )
+                        org_id = conn.execute("SELECT id FROM organizations WHERE name='Org A'").fetchone()[0]
+                        conn.commit()
+
+                    def weekday_of(ts):
+                        return datetime.fromtimestamp(ts, ZoneInfo('Asia/Kolkata')).weekday()
+
+                    job = api.create_saved_custom_job(api.SavedCustomJobRequest(
+                        owner_name='Rae', name='Default days', website_id=1,
+                        job_type='scrape', org_ids=[org_id], schedule_mode='interval',
+                        schedule_enabled=True, interval_minutes=60,
+                    ), None)
+                    row = api.list_saved_custom_jobs('Rae', None)['jobs'][0]
+                    assert row['run_days'] == ['mon','tue','wed','thu','fri','sat'], row
+                    assert weekday_of(row['next_run_at']) != 6, row
+
+                    # Update without run_days keeps the stored days.
+                    api.update_saved_custom_job(job['id'], api.SavedCustomJobRequest(
+                        owner_name='Rae', name='Default days', website_id=1,
+                        job_type='scrape', org_ids=[org_id], schedule_mode='interval',
+                        schedule_enabled=True, interval_minutes=60, run_days=['tue','thu'],
+                    ), None)
+                    api.update_saved_custom_job(job['id'], api.SavedCustomJobRequest(
+                        owner_name='Rae', name='Default days', website_id=1,
+                        job_type='scrape', org_ids=[org_id], schedule_mode='interval',
+                        schedule_enabled=True, interval_minutes=60,
+                    ), None)
+                    row = api.list_saved_custom_jobs('Rae', None)['jobs'][0]
+                    assert row['run_days'] == ['tue','thu'], row
+                    assert weekday_of(row['next_run_at']) in (1, 3), row
+
+                    try:
+                        api.create_saved_custom_job(api.SavedCustomJobRequest(
+                            owner_name='Rae', name='No days', website_id=1,
+                            job_type='scrape', org_ids=[org_id], schedule_mode='interval',
+                            schedule_enabled=True, interval_minutes=60, run_days=[],
+                        ), None)
+                        raise AssertionError('empty run_days should be rejected')
+                    except HTTPException as exc:
+                        assert exc.status_code == 400, exc
                 """)],
                 cwd=root,
                 env=env,

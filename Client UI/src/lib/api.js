@@ -115,7 +115,10 @@ async function requestClient(route, options = {}, overrides = {}, { requireAuth 
       body: options.body,
     });
     if (!result?.ok) {
-      if (result?.status === 401 || result?.status === 403) throw new AuthError(result?.message || 'Sign in again.', result?.reason);
+      // Only 401 means "bad/expired token" — a 403 here is always a
+      // permission problem (section_forbidden, org-admin-only, ...) with a
+      // perfectly valid token, and must not force a global sign-out.
+      if (result?.status === 401) throw new AuthError(result?.message || 'Sign in again.', result?.reason);
       const error = new Error(result?.message || 'Could not reach the client API.');
       error.status = result?.status;
       error.detail = result?.detail;
@@ -138,7 +141,9 @@ async function requestClient(route, options = {}, overrides = {}, { requireAuth 
       ? detail.map((d) => d.msg || d.type).join('; ')
       : (detail && typeof detail === 'object' ? detail.message : detail)
         || `Client API returned HTTP ${response.status}.`;
-    if (response.status === 401 || response.status === 403) throw new AuthError(message, detail?.reason);
+    // Same reasoning as the Electron-bridge branch above — 403 is a
+    // permission problem, not a bad token, and must not sign the user out.
+    if (response.status === 401) throw new AuthError(message, detail?.reason);
     const error = new Error(message);
     error.status = response.status;
     error.detail = detail;
@@ -383,6 +388,14 @@ function notifyTendersChanged() {
   _tendersChangedListeners.forEach((fn) => { try { fn(); } catch { /* listener's problem, not ours */ } });
 }
 
+// Same idea, for the Portal Search page's history list — a background-
+// resumed poll (app restarted mid-search) can resolve while that page isn't
+// mounted to notice on its own refetchInterval.
+const _portalSearchChangedListeners = new Set();
+function notifyPortalSearchChanged() {
+  _portalSearchChangedListeners.forEach((fn) => { try { fn(); } catch { /* listener's problem, not ours */ } });
+}
+
 // Maps the server's `account` block (identical shape from login/register's
 // `response.account` and GET /client/me) onto the local settings fields —
 // see db.js initialState().settings and Server UI/server/org_access.py
@@ -399,6 +412,8 @@ function accountSettingsPatch(account) {
       archived: account.permissions?.archived !== false,
       bookmarks: account.permissions?.bookmarks !== false,
       projects: account.permissions?.projects !== false,
+      // Closed by default (unlike the other four) — must be explicitly true.
+      portal_search: account.permissions?.portal_search === true,
     },
     pending_request: account.pending_request || null,
   };
@@ -413,6 +428,10 @@ export const api = {
   onTendersChanged: (fn) => {
     _tendersChangedListeners.add(fn);
     return () => _tendersChangedListeners.delete(fn);
+  },
+  onPortalSearchChanged: (fn) => {
+    _portalSearchChangedListeners.add(fn);
+    return () => _portalSearchChangedListeners.delete(fn);
   },
 
   // Call once at app startup: retries any edit left unconfirmed by a
@@ -469,7 +488,7 @@ export const api = {
     await api.updateSettings({
       auth_token: '', user_email: '', user_id: null, display_name: '',
       account_type: 'individual', org: null,
-      permissions: { active: true, archived: true, bookmarks: true, projects: true },
+      permissions: { active: true, archived: true, bookmarks: true, projects: true, portal_search: false },
       pending_request: null,
     });
   },
@@ -921,6 +940,78 @@ export const api = {
     }
   },
   getPendingOrgRequestIds: async () => Object.keys((await getState()).settings.pendingOrgRequests || {}).map(Number),
+
+  // ── Portal tender search (portal_search section — Server UI/server/
+  // API_CHANGES.md §2) ───────────────────────────────────────────────
+  getPortalSearchPortals: (overrides = {}) => requestClient('/client/portal-search/portals', {}, overrides),
+  requestPortalSearch: async (websiteId, tenderId, overrides = {}) => {
+    const result = await requestClient(
+      '/client/portal-search',
+      { method: 'POST', body: { website_id: Number(websiteId), tender_id: tenderId } },
+      overrides,
+    );
+    const searchId = result?.search?.id;
+    if (searchId != null) {
+      await updateState((state) => {
+        state.settings = { ...state.settings, pendingPortalSearches: { ...(state.settings.pendingPortalSearches || {}), [searchId]: true } };
+        return state;
+      });
+      api.pollPortalSearch(searchId, 0);
+    }
+    return result;
+  },
+  getPortalSearch: (searchId, overrides = {}) => requestClient(`/client/portal-search/${Number(searchId)}`, {}, overrides),
+  getPortalSearchHistory: (limit = 50, overrides = {}) => requestClient(`/client/portal-search/history?limit=${Number(limit) || 50}`, {}, overrides),
+  deletePortalSearchHistoryItem: (searchId, overrides = {}) => requestClient(`/client/portal-search/history/${Number(searchId)}`, { method: 'DELETE' }, overrides),
+  clearPortalSearchHistory: (overrides = {}) => requestClient('/client/portal-search/history', { method: 'DELETE' }, overrides),
+  // Fire-and-forget: polls a running portal search every ~3s (API_CHANGES.md
+  // says 2-3s — the scrape+captcha can take a while, so this is capped
+  // generously, same resilience shape as pollOrgTendersJob) until it leaves
+  // "pending", then clears the local marker and — only when the tender was
+  // actually found — refreshes the tender caches so it shows up everywhere.
+  pollPortalSearch: async (searchId, attempt = 0, consecutiveErrors = 0) => {
+    const MAX_ATTEMPTS = 400; // ~20 min at 3s
+    const MAX_CONSECUTIVE_ERRORS = 3;
+    const clearPending = () => updateState((state) => {
+      const next = { ...(state.settings.pendingPortalSearches || {}) };
+      delete next[searchId];
+      state.settings = { ...state.settings, pendingPortalSearches: next };
+      return state;
+    });
+    try {
+      const { search } = await api.getPortalSearch(searchId);
+      if (search?.status && search.status !== 'pending') {
+        await clearPending();
+        if (search.status === 'found') {
+          await api.syncFromServer().catch(() => {});
+          notifyTendersChanged();
+        }
+        notifyPortalSearchChanged();
+        return;
+      }
+      if (attempt >= MAX_ATTEMPTS) {
+        await clearPending();
+        notifyPortalSearchChanged();
+        return;
+      }
+      setTimeout(() => api.pollPortalSearch(searchId, attempt + 1, 0), 3000);
+    } catch {
+      if (consecutiveErrors + 1 >= MAX_CONSECUTIVE_ERRORS) {
+        await clearPending();
+        notifyPortalSearchChanged();
+        return;
+      }
+      setTimeout(() => api.pollPortalSearch(searchId, attempt + 1, consecutiveErrors + 1), 3000);
+    }
+  },
+  // Call once at app startup — same rationale as resumePendingOrgRequests.
+  resumePendingPortalSearches: async () => {
+    const settings = (await getState()).settings;
+    const pending = settings.pendingPortalSearches || {};
+    for (const searchId of Object.keys(pending)) {
+      api.pollPortalSearch(Number(searchId), 0);
+    }
+  },
 
   // "Download" — mint a signed URL for an already-available document, then
   // save it to disk via the Electron IPC bridge (or fall back to a plain

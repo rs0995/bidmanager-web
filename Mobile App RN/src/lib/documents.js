@@ -4,6 +4,9 @@ import { unzipSync } from "fflate";
 import * as Sharing from "expo-sharing";
 import { getRaw, setRaw } from "./kv.js";
 import { api } from "./api.js";
+import { queryClient } from "./queryClient.js";
+import { addAlert } from "./alerts.js";
+import { canonTenderId, tenderKeyOf } from "./tenderKey.js";
 
 const DOCUMENTS_DIR_NAME = "documents";
 const ZIP_EXTRACTED_DIR_NAME = "zip-extracted";
@@ -22,8 +25,13 @@ export function isZipDoc(doc) {
 // Row shape:
 //   { id, tender_db_id, tender_id, tender_title, file_name, file_type,
 //     size_bytes, downloadable, client_status, job_id,
-//     requested_at, downloaded_at, updated_at, error }
+//     requested_at, downloaded_at, updated_at, error, local_uri, local_doc_id }
 //   client_status: "synced" | "requested" | "downloading" | "downloaded" | "failed"
+//
+// Rows belong to a tender by its canonical portal tender_id (lib/tenderKey.js).
+// tender_db_id and the document `id` are server row ids: handles for API
+// calls only, refreshed from the live tender/document list -- both change if
+// the server DB is restored (see syncTenderDocuments()).
 const DOCS_KEY = "bm.documents";
 const MAX_ROWS = 400;
 const POLL_INTERVAL_MS = 15_000;
@@ -38,7 +46,20 @@ function readJSON(key, fallback) {
 }
 function writeJSON(key, value) { setRaw(key, JSON.stringify(value)); }
 
-let docsCache = readJSON(DOCS_KEY, []);
+// Rows saved by older builds may lack tender_id (they were grouped by
+// tender_db_id); fill it from a sibling row of the same tender where one has it.
+function normalizeDocs(rows) {
+  const keyByDbId = new Map();
+  rows.forEach((r) => { if (r.tender_id && r.tender_db_id != null) keyByDbId.set(Number(r.tender_db_id), r.tender_id); });
+  return rows.map((r) => (r.tender_id || !keyByDbId.has(Number(r.tender_db_id))
+    ? r
+    : { ...r, tender_id: keyByDbId.get(Number(r.tender_db_id)) }));
+}
+
+const EMPTY = [];
+function docKey(row) { return canonTenderId(row?.tender_id); }
+
+let docsCache = normalizeDocs(readJSON(DOCS_KEY, []));
 let viewCache = new Map();
 let activeSnap = computeActive();
 let historySnap = computeHistory();
@@ -55,7 +76,7 @@ function computeHistory() {
 }
 
 export function rehydrateDocuments() {
-  docsCache = readJSON(DOCS_KEY, []);
+  docsCache = normalizeDocs(readJSON(DOCS_KEY, []));
   viewCache = new Map();
   activeSnap = computeActive();
   historySnap = computeHistory();
@@ -79,10 +100,12 @@ export function getDocuments() {
   return docsCache;
 }
 
-export function getDocumentsForTender(tenderDbId) {
-  const key = Number(tenderDbId);
+// `t` is a tender object or a tender_id string.
+export function getDocumentsForTender(t) {
+  const key = tenderKeyOf(t);
+  if (!key) return EMPTY;
   if (!viewCache.has(key)) {
-    viewCache.set(key, docsCache.filter((r) => Number(r.tender_db_id) === key));
+    viewCache.set(key, docsCache.filter((r) => docKey(r) === key));
   }
   return viewCache.get(key);
 }
@@ -122,16 +145,33 @@ export function removeDocument(id) {
 }
 
 export function syncTenderDocuments(tender, serverItems) {
+  const key = tenderKeyOf(tender);
   const tenderDbId = Number(tender.id);
   const serverRows = Array.isArray(serverItems) ? serverItems : [];
-  if (serverRows.length === 0) return serverRows;
-  const existingById = new Map(
-    docsCache.filter((r) => Number(r.tender_db_id) === tenderDbId).map((r) => [r.id, r]),
+  if (serverRows.length === 0 || !key) return serverRows;
+  const mine = docsCache.filter((r) => docKey(r) === key);
+  const existingById = new Map(mine.map((r) => [r.id, r]));
+  // After a server DB restore every document id changes: a saved row whose
+  // id is no longer listed is matched to the server document by file name, so
+  // its downloaded file carries over (local_doc_id remembers the folder it was
+  // saved under -- see getLocalFile()).
+  const serverIds = new Set(serverRows.map((r) => r.id));
+  const byName = new Map(
+    mine.filter((r) => r.id > 0 && !serverIds.has(r.id) && r.file_name).map((r) => [r.file_name, r]),
   );
-  const others = docsCache.filter((r) => Number(r.tender_db_id) !== tenderDbId);
+  const others = docsCache.filter((r) => docKey(r) !== key);
   const merged = serverRows.map((row) => {
-    const existing = existingById.get(row.id);
+    let existing = existingById.get(row.id);
+    if (!existing && byName.has(row.name)) {
+      const old = byName.get(row.name);
+      byName.delete(row.name);
+      existing = { ...old, local_doc_id: old.local_doc_id ?? old.id };
+    }
+    // Spread the existing row first so fields this merge doesn't own
+    // (local_uri of a saved file, etc.) survive -- dropping local_uri made every
+    // downloaded document look "missing" (corrupt) after the next server sync.
     return {
+      ...existing,
       id: row.id,
       tender_db_id: tenderDbId,
       tender_id: tender.tender_id || existing?.tender_id || "",
@@ -153,8 +193,12 @@ export function syncTenderDocuments(tender, serverItems) {
   return serverRows;
 }
 
-export async function requestTenderDownload(tender) {
-  const { job_id: jobId } = await api.requestDownloadJob(tender.id);
+// mode: undefined ("full", first-time request) | "redownload" (re-fetch even
+// files the server already has stored). Resolves to the placeholder row plus
+// `created` -- false when the server joined an already in-flight job for this
+// tender instead of queuing a new one.
+export async function requestTenderDownload(tender, mode) {
+  const { job_id: jobId, created } = await api.requestDownloadJob(tender.id, mode);
   const placeholder = upsertDocument({
     id: -Number(tender.id),
     tender_db_id: Number(tender.id),
@@ -163,21 +207,81 @@ export async function requestTenderDownload(tender) {
     file_name: "", file_type: "", size_bytes: 0, downloadable: false,
     client_status: "requested",
     job_id: jobId,
+    job_mode: mode || null,
     requested_at: new Date().toISOString(),
     downloaded_at: null,
     error: null,
   });
-  pollTenderDownloadJob(tender, jobId, 0);
-  return placeholder;
+  pollTenderDownloadJob(tender, jobId, 0, mode);
+  return { ...placeholder, created: created !== false };
 }
 
-export async function pollTenderDownloadJob(tender, jobId, attempt = 0) {
+// After a "redownload" job the server holds good copies, but the phone still
+// has the old empty/corrupt files: drop them and fetch fresh ones.
+async function refetchCorruptLocalDocs(tender) {
+  const tenderDbId = Number(tender.id);
+  const bad = getDocumentsForTender(tender).filter((r) => r.id > 0 && isCorruptDownload(r));
+  for (const row of bad) {
+    try { getLocalFile(row)?.delete(); } catch { /* already gone */ }
+    upsertDocument({ id: row.id, client_status: "synced", local_uri: null, downloaded_at: null, error: null });
+  }
+  for (const row of bad) {
+    try {
+      await downloadDocument({
+        id: row.id, tender_db_id: tenderDbId, tender_id: row.tender_id, file_name: row.file_name,
+      });
+    } catch {
+      // Left as "failed"; the document row shows a retry.
+    }
+  }
+}
+
+// Saves every listed document that isn't on the phone yet, so a finished
+// server job shows up on the Downloads page. No share sheet: this runs
+// without the user watching.
+export async function saveDocsToDevice(tender, serverItems) {
+  const tenderDbId = Number(tender.id);
+  let saved = 0;
+  for (const it of getUndownloadedDocs(tender, serverItems)) {
+    try {
+      await downloadDocument(
+        { id: it.id, tender_db_id: tenderDbId, tender_id: tender.tender_id, file_name: it.name },
+        { share: false },
+      );
+      saved += 1;
+    } catch {
+      // Left as "failed"; the document row shows a retry.
+    }
+  }
+  return saved;
+}
+
+export async function pollTenderDownloadJob(tender, jobId, attempt = 0, mode) {
   try {
     const { status, error } = await api.downloadStatus(tender.id, jobId);
     if (status === "completed") {
       removeDocument(-Number(tender.id));
       const page = await api.tenderDocuments(tender.id).catch(() => null);
       if (page) syncTenderDocuments(tender, page.items || []);
+      queryClient.invalidateQueries({ queryKey: ["tenderDocuments", Number(tender.id)] });
+      queryClient.invalidateQueries({ queryKey: ["tender", Number(tender.id)] });
+      if (mode === "redownload") await refetchCorruptLocalDocs(tender);
+      if (page) await saveDocsToDevice(tender, page.items || []);
+      // Local-only, same as the status/prebid alerts above in sync.js -- the
+      // job itself runs server-side, but completion is only noticed once
+      // something on the device actually polls it (here, or
+      // resumePendingDownloadJobs() on next app open if the app was closed
+      // mid-job), so this can arrive late rather than never, not instantly
+      // while fully closed. That gap only closes with a server-side push
+      // tied to this specific job + device, which is a separate piece of
+      // work (apns_push.py has no notion of "this job belongs to this
+      // user's device" today).
+      addAlert({
+        kind: "download",
+        message: `Documents for "${tender.title || tender.tender_id || `Tender #${tender.id}`}" finished downloading.`,
+        tenderId: tender.id,
+        tenderKey: tender.tender_id,
+      });
       return;
     }
     if (status === "failed") {
@@ -188,7 +292,7 @@ export async function pollTenderDownloadJob(tender, jobId, attempt = 0) {
       upsertDocument({ id: -Number(tender.id), client_status: "failed", error: "Timed out waiting for the server." });
       return;
     }
-    setTimeout(() => pollTenderDownloadJob(tender, jobId, attempt + 1), POLL_INTERVAL_MS);
+    setTimeout(() => pollTenderDownloadJob(tender, jobId, attempt + 1, mode), POLL_INTERVAL_MS);
   } catch (e) {
     upsertDocument({ id: -Number(tender.id), client_status: "failed", error: e?.message || String(e) });
   }
@@ -201,6 +305,7 @@ export function resumePendingDownloadJobs() {
       { id: row.tender_db_id, tender_id: row.tender_id, title: row.tender_title },
       row.job_id,
       0,
+      row.job_mode || undefined,
     );
   }
 }
@@ -211,22 +316,31 @@ export function resumePendingDownloadJobs() {
 // in the app (see documents/[id]/view.tsx and archive.tsx), so those are just
 // saved. Everything else (Word/Excel/etc.) still gets handed to the OS share
 // sheet (expo-sharing) immediately, same as before.
-// doc: { id, tender_db_id, tender_id, file_name }
-export async function downloadDocument(doc) {
-  upsertDocument({ id: doc.id, client_status: "downloading", error: null });
+// doc: { id, tender_db_id, tender_id, file_name } -- tender_db_id must come
+// from the live tender (it is only the API handle; tender_id groups the row).
+export async function downloadDocument(doc, options = {}) {
+  upsertDocument({
+    id: doc.id,
+    ...(doc.tender_db_id != null && { tender_db_id: Number(doc.tender_db_id) }),
+    ...(doc.tender_id && { tender_id: doc.tender_id }),
+    ...(doc.file_name && { file_name: doc.file_name }),
+    client_status: "downloading",
+    error: null,
+  });
   try {
     const { url } = await api.downloadRequest(doc.tender_db_id, doc.id);
     const destDir = new Directory(Paths.document, DOCUMENTS_DIR_NAME, String(doc.id));
     destDir.create({ intermediates: true, idempotent: true });
     const dest = new File(destDir, doc.file_name || `document-${doc.id}`);
     const file = await File.downloadFileAsync(url, dest, { idempotent: true });
-    if (!isPdfDoc(doc) && !isZipDoc(doc) && (await Sharing.isAvailableAsync())) {
+    if (options.share !== false && !isPdfDoc(doc) && !isZipDoc(doc) && (await Sharing.isAvailableAsync())) {
       await Sharing.shareAsync(file.uri);
     }
     return upsertDocument({
       id: doc.id,
       client_status: "downloaded",
       local_uri: file.uri,
+      local_doc_id: null,
       downloaded_at: new Date().toISOString(),
       error: null,
     });
@@ -240,9 +354,55 @@ export async function downloadDocument(doc) {
 // hasn't been downloaded (or was removed by Clear Cache).
 export function getLocalFile(doc) {
   const row = getDocument(doc?.id) ?? doc;
-  if (!row?.local_uri) return null;
-  const file = new File(row.local_uri);
-  return file.exists ? file : null;
+  if (!row || row.id == null) return null;
+  // The stored absolute URI embeds the app container path, which iOS can change
+  // across app updates/reinstalls -- so also look at the deterministic spot
+  // downloadDocument() writes to, or every saved file would suddenly look missing.
+  const candidates = [];
+  if (row.local_uri) candidates.push(new File(row.local_uri));
+  if (row.file_name) {
+    candidates.push(new File(new Directory(Paths.document, DOCUMENTS_DIR_NAME, String(row.id)), row.file_name));
+    // Saved before a server DB restore re-numbered the document.
+    if (row.local_doc_id != null) {
+      candidates.push(new File(new Directory(Paths.document, DOCUMENTS_DIR_NAME, String(row.local_doc_id)), row.file_name));
+    }
+  }
+  for (const file of candidates) {
+    try { if (file.exists) return file; } catch { /* try the next location */ }
+  }
+  return null;
+}
+
+// A file that "downloaded" but is empty or far smaller than the server said
+// it should be almost always means the scrape produced something other than
+// the real document (e.g. a captcha page) instead of failing outright --
+// downloadDocument() below only checks that the HTTP request succeeded, not
+// that the bytes it got back are plausible.
+export function isCorruptDownload(doc) {
+  const row = getDocument(doc?.id) ?? doc;
+  if (row?.client_status !== "downloaded") return false;
+  const file = getLocalFile(row);
+  if (!file) return true; // marked downloaded but the file is gone/missing
+  const actual = file.size ?? 0;
+  if (actual === 0) return true;
+  const expected = Number(row.size_bytes) || 0;
+  return expected > 0 && actual < expected * 0.5;
+}
+
+// Server documents for a tender that still need fetching to this device: not
+// downloaded yet, or downloaded but empty/corrupt. Drives which of the
+// "Download all" / sync controls make sense on the tender and project screens.
+// `t` is the tender (or its tender_id).
+export function getUndownloadedDocs(t, serverItems) {
+  const rows = getDocumentsForTender(t).filter((r) => r.id > 0);
+  const local = new Map(rows.map((r) => [r.id, r]));
+  // Same tender + file name = same document when ids were re-numbered.
+  const byName = new Map(rows.filter((r) => r.file_name).map((r) => [r.file_name, r]));
+  return (serverItems || []).filter((d) => {
+    if (d.downloadable === false) return false;
+    const row = local.get(d.id) ?? byName.get(d.name);
+    return !row || row.client_status !== "downloaded" || isCorruptDownload(row);
+  });
 }
 
 // Extracts a downloaded ZIP into its own folder (once — subsequent calls
@@ -326,11 +486,13 @@ export async function downloadAllForTender(tender) {
 
 function subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); }
 
-export function useDocumentsForTender(tenderDbId) {
+// `t` is a tender object or a tender_id string.
+export function useDocumentsForTender(t) {
+  const key = tenderKeyOf(t);
   return useSyncExternalStore(
     subscribe,
-    () => getDocumentsForTender(tenderDbId),
-    () => getDocumentsForTender(tenderDbId),
+    () => getDocumentsForTender(key),
+    () => getDocumentsForTender(key),
   );
 }
 export function useActiveDownloads() {

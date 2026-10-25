@@ -9,13 +9,7 @@ import {
   Plus,
   TriangleAlert,
 } from 'lucide-react-native';
-import {
-  Card,
-  EmptyState,
-  Screen,
-  ScreenHeader,
-  Toggle,
-} from '../../components/ui';
+import { Card, EmptyState, Screen, ScreenHeader } from '../../components/ui';
 import { AlertItem, AlertKind, useAlerts } from '../../fixtures/alerts';
 import { fonts, useTheme } from '../../theme';
 import type { RootStackParamList } from '../navigation/types';
@@ -24,8 +18,7 @@ export function AlertsScreen() {
   const t = useTheme();
   const navigation =
     useNavigation<NativeStackNavigationProp<RootStackParamList>>();
-  const { alerts, unread, markRead, markAllRead, remindersOn, setRemindersOn } =
-    useAlerts();
+  const { alerts, unread, markRead, markAllRead } = useAlerts();
 
   const look = (kind: AlertKind) =>
     ({
@@ -37,7 +30,10 @@ export function AlertsScreen() {
 
   const open = (a: AlertItem) => {
     markRead(a.id);
-    if (a.tenderId) navigation.navigate('TenderDetail', { id: a.tenderId });
+    if (a.newTenderIds?.length)
+      navigation.navigate('NewTenders', { alertId: a.id });
+    else if (a.tenderId)
+      navigation.navigate('TenderDetail', { id: a.tenderId });
     else if (a.projectId)
       navigation.navigate('ProjectDetail', { id: a.projectId });
   };
@@ -62,24 +58,6 @@ export function AlertsScreen() {
           ) : undefined
         }
       />
-
-      <Card padding={14} elevation="sm" style={styles.reminder}>
-        <View style={styles.reminderRow}>
-          <View style={styles.reminderText}>
-            <Text style={[styles.reminderTitle, { color: t.colors.ink }]}>
-              Deadline reminders
-            </Text>
-            <Text style={[styles.reminderSub, { color: t.colors.muted }]}>
-              Notifications 72h, 24h and 3h before a tender closes
-            </Text>
-          </View>
-          <Toggle
-            value={remindersOn}
-            onValueChange={setRemindersOn}
-            accessibilityLabel="Deadline reminders"
-          />
-        </View>
-      </Card>
 
       {alerts.length === 0 ? (
         <EmptyState
@@ -128,11 +106,6 @@ export function AlertsScreen() {
 
 const styles = StyleSheet.create({
   markAll: { fontFamily: fonts.bold, fontSize: 12 },
-  reminder: { marginBottom: 16 },
-  reminderRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  reminderText: { flex: 1 },
-  reminderTitle: { fontFamily: fonts.bold, fontSize: 13.5 },
-  reminderSub: { fontFamily: fonts.regular, fontSize: 12, marginTop: 2 },
   press: { marginBottom: 10 },
   row: { flexDirection: 'row', alignItems: 'flex-start', gap: 12 },
   icon: {

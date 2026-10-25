@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
+import { File, Directory, Paths } from "expo-file-system";
 import { getRaw, setRaw } from "./kv.js";
-import { schedulePush } from "./sync.js";
+import { schedulePush } from "./pushQueue.js";
 import { addAlert } from "./alerts.js";
 
 // Local-first projects + checklist. Field names are made to match the
@@ -94,6 +95,13 @@ export function createProjectFromTender(tender) {
     prebid: tender.pre_bid_meeting_date || null,
     status: "Active",
     description: tender.work_description || "",
+    // What was copied from the tender: a field still equal to this follows
+    // the tender; one that differs was edited by hand and is kept.
+    tender_snapshot: {
+      closing_date: tender.closing_date || null,
+      pre_bid_meeting_date: tender.pre_bid_meeting_date || null,
+      tender_value: tender.tender_value || 0,
+    },
   };
   projectsCache = [...projectsCache, project];
   persist();
@@ -109,9 +117,26 @@ export function archiveProject(id) {
   updateProject(id, { status: "Archived" });
 }
 
+// sync.js reports ids that were in the last server blob and are no longer
+// local as `removed`, so dropping the rows here is all the server needs.
+export function deleteProject(id) {
+  const projectId = Number(id);
+  checklistCache.filter((row) => row.project_id === projectId).forEach((row) => {
+    fileObjects.delete(row.id);
+    deleteAttachmentCopy(row.id);
+  });
+  checklistCache = checklistCache.filter((row) => row.project_id !== projectId);
+  projectsCache = projectsCache.filter((row) => row.id !== projectId);
+  persist();
+}
+
+// checklist_folders is written by the desktop client (its Manage Folders), so
+// folders created there show here even before they hold any item.
 export function folderNames(projectId) {
   const used = getChecklist(projectId).map((row) => row.subfolder);
-  return [...new Set([...DEFAULT_FOLDERS, ...used])];
+  const project = getProject(projectId);
+  const synced = Array.isArray(project?.checklist_folders) ? project.checklist_folders.filter(Boolean) : [];
+  return [...new Set([...DEFAULT_FOLDERS, ...synced, ...used])];
 }
 
 export function addChecklistItem(projectId, { req_file_name, subfolder, description }) {
@@ -152,12 +177,46 @@ function maybeNotifyProjectComplete(itemId) {
   }
 }
 
+// Attached files are copied into the app's permanent documents folder (the
+// picker's copy lives in a cache iOS may clear), so they still open after a
+// restart. The stored uri is only meaningful on this phone; device: "phone"
+// tells other clients not to try to open it.
+export const ATTACHMENTS_DIR_NAME = "attachments";
+
+function attachmentDir(itemId) {
+  return new Directory(Paths.document, ATTACHMENTS_DIR_NAME, String(itemId));
+}
+
+function deleteAttachmentCopy(itemId) {
+  try {
+    const dir = attachmentDir(itemId);
+    if (dir.exists) dir.delete();
+  } catch {
+    // already gone
+  }
+}
+
+function saveAttachmentCopy(itemId, asset) {
+  try {
+    deleteAttachmentCopy(itemId);
+    const dir = attachmentDir(itemId);
+    dir.create({ intermediates: true, idempotent: true });
+    const dest = new File(dir, asset.name || `attachment-${itemId}`);
+    new File(asset.uri).copy(dest);
+    return dest.uri;
+  } catch {
+    return asset.uri;
+  }
+}
+
 // asset: a document-picker result shaped { name, size, mimeType, uri }.
 export function attachFile(itemId, asset) {
-  fileObjects.set(Number(itemId), asset);
+  const uri = saveAttachmentCopy(itemId, asset);
+  const saved = { ...asset, uri };
+  fileObjects.set(Number(itemId), saved);
   checklistCache = checklistCache.map((row) => (
     row.id === Number(itemId)
-      ? { ...row, attachment: { name: asset.name, size: asset.size, type: asset.mimeType, uri: asset.uri }, status: "Completed" }
+      ? { ...row, attachment: { name: asset.name, size: asset.size, type: asset.mimeType, uri, device: "phone" }, status: "Completed" }
       : row
   ));
   persist();
@@ -166,18 +225,32 @@ export function attachFile(itemId, asset) {
 
 export function removeAttachment(itemId) {
   fileObjects.delete(Number(itemId));
+  deleteAttachmentCopy(itemId);
   checklistCache = checklistCache.map((row) => (
     row.id === Number(itemId) ? { ...row, attachment: null, status: "Pending" } : row
   ));
   persist();
 }
 
+// The file to preview, if it exists on this phone (attached this session, or
+// saved here by an earlier one); null when it was attached on another device.
 export function getAttachedFile(itemId) {
-  return fileObjects.get(Number(itemId)) || null;
+  const live = fileObjects.get(Number(itemId));
+  if (live) return live;
+  const row = checklistCache.find((r) => r.id === Number(itemId));
+  const a = row?.attachment;
+  if (!a || a.device !== "phone" || !a.uri) return null;
+  try {
+    if (!new File(a.uri).exists) return null;
+  } catch {
+    return null;
+  }
+  return { name: a.name, size: a.size, mimeType: a.type, uri: a.uri };
 }
 
 export function deleteChecklistItem(itemId) {
   fileObjects.delete(Number(itemId));
+  deleteAttachmentCopy(itemId);
   checklistCache = checklistCache.filter((row) => row.id !== Number(itemId));
   persist();
 }

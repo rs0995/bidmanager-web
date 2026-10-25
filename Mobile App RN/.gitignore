@@ -39,5 +39,5 @@ yarn-error.*
 example
 
 # generated native folders
-/ios
+# /ios is tracked: it carries hand-made native changes (push entitlement, build number, signing)
 /android

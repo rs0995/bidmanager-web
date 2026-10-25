@@ -25,6 +25,7 @@ import urllib.error
 from urllib.parse import urlparse, urljoin, parse_qs, parse_qsl, urlencode, urlunparse
 
 import db_compat
+import org_access
 import storage_runtime
 
 db_compat.patch_sqlite3(sqlite3)
@@ -783,6 +784,15 @@ class JobRequeueError(Exception):
     """Raised when recoverable scraper work should return to the durable queue."""
 
 
+class PortalActionUnsupported(Exception):
+    """Raised when a website's portal type does not support the requested action."""
+
+
+PORTAL_NIC = "nic"
+PORTAL_NPROCURE = "nprocure"
+PORTAL_TYPES = (PORTAL_NIC, PORTAL_NPROCURE)
+
+
 _job_runtime = threading.local()
 
 
@@ -1078,6 +1088,11 @@ def _init_db_schema(conn):
         ("prebid_count", "INTEGER DEFAULT 0"),
         ("corrigendum_count", "INTEGER DEFAULT 0"),
         ("pushed_to_cloud_at", "REAL"),
+        # Portal prebid/corrigendum counts as of the last completed download/
+        # update run -- what "new files exist on the portal" is measured against.
+        ("last_dl_prebid_count", "INTEGER"),
+        ("last_dl_corrigendum_count", "INTEGER"),
+        ("last_status_checked_at", "REAL"),
     ]
     for col, ddl in tender_tracking_migrations:
         try:
@@ -1085,19 +1100,38 @@ def _init_db_schema(conn):
         except sqlite3.OperationalError:
             pass
     now_epoch = time.time()
-    c.execute(
-        "UPDATE tenders SET normalized_tender_id=UPPER(TRIM(COALESCE(tender_id,''))) "
-        "WHERE COALESCE(normalized_tender_id,'')=''"
-    )
+    # Same normaliser as the scraper (canonical_tender_id), so a backfilled id
+    # always equals the one a later scrape looks up.
+    for row_id, raw_id in c.execute(
+        "SELECT id, tender_id FROM tenders WHERE COALESCE(normalized_tender_id,'')=''"
+    ).fetchall():
+        c.execute(
+            "UPDATE tenders SET normalized_tender_id=? WHERE id=?",
+            (ScraperBackend.canonical_tender_id(raw_id), row_id),
+        )
     c.execute(
         "UPDATE tenders SET tender_key=CAST(website_id AS TEXT) || ':' || normalized_tender_id "
         "WHERE COALESCE(tender_key,'')='' AND COALESCE(normalized_tender_id,'')!=''"
     )
+    # A tender's first_seen_at must reflect when it actually first existed, not
+    # when this backfill happened to run -- /client/changes's "new tenders"
+    # alert filters on first_seen_at > since, so stamping every pre-existing
+    # row with "now" here made them all look freshly created to any client
+    # whose cursor predates this migration. published_date is scraped from
+    # the portal and is a real historical anchor; only fall back to "now"
+    # when it can't be parsed at all (better than nothing, but rare).
+    rows_needing_first_seen = c.execute(
+        "SELECT id, published_date FROM tenders WHERE first_seen_at IS NULL"
+    ).fetchall()
+    for row_id, published_date in rows_needing_first_seen:
+        parsed = ScraperBackend.parse_closing_datetime(published_date)
+        epoch = parsed.timestamp() if parsed else now_epoch
+        c.execute("UPDATE tenders SET first_seen_at=? WHERE id=?", (epoch, row_id))
     c.execute(
-        "UPDATE tenders SET first_seen_at=COALESCE(first_seen_at, ?), "
+        "UPDATE tenders SET "
         "last_seen_at=COALESCE(last_seen_at, first_seen_at, ?), "
         "last_scraped_at=COALESCE(last_scraped_at, last_seen_at, first_seen_at, ?)",
-        (now_epoch, now_epoch, now_epoch),
+        (now_epoch, now_epoch),
     )
     # Merge any legacy case/whitespace duplicates before enforcing the canonical key.
     canonical_rows = c.execute(
@@ -1231,7 +1265,11 @@ def _init_db_schema(conn):
         "UPDATE downloaded_files SET tender_db_id=(SELECT id FROM tenders "
         "WHERE UPPER(TRIM(COALESCE(tenders.tender_id,'')))="
         "UPPER(TRIM(COALESCE(downloaded_files.tender_id,''))) ORDER BY id DESC LIMIT 1) "
-        "WHERE tender_db_id IS NULL"
+        # Re-point by tender id whenever the linked row isn't that tender
+        # (e.g. after the tenders table was cleared and restored).
+        "WHERE COALESCE(TRIM(downloaded_files.tender_id),'')!='' AND (tender_db_id IS NULL OR NOT EXISTS ("
+        "SELECT 1 FROM tenders t WHERE t.id=downloaded_files.tender_db_id "
+        "AND UPPER(TRIM(COALESCE(t.tender_id,'')))=UPPER(TRIM(COALESCE(downloaded_files.tender_id,'')))))"
     )
     c.execute(
         "UPDATE downloaded_files SET first_downloaded_at=COALESCE(first_downloaded_at, ?), "
@@ -1270,6 +1308,26 @@ def _init_db_schema(conn):
         key TEXT PRIMARY KEY,
         value TEXT
     )''')
+    # Portal architecture per website: 'nic' (GePNIC, ScraperBackend) or
+    # 'nprocure' (scrapers/nprocure.py). Existing sites stay 'nic'.
+    try:
+        c.execute(f"ALTER TABLE websites ADD COLUMN portal_type TEXT DEFAULT '{PORTAL_NIC}'")
+    except sqlite3.OperationalError:
+        pass
+    c.execute(
+        "UPDATE websites SET portal_type=? WHERE COALESCE(TRIM(portal_type),'')=''", (PORTAL_NIC,)
+    )
+    # One-time nProcure seed; the settings flag keeps an admin-deleted site deleted.
+    if not c.execute("SELECT 1 FROM app_settings WHERE key='seed_nprocure_v1'").fetchone():
+        if not c.execute(
+            # Pattern passed as a parameter: a literal '%n' breaks psycopg on Postgres.
+            "SELECT 1 FROM websites WHERE portal_type=? OR url LIKE ?", (PORTAL_NPROCURE, "%nprocure.com%")
+        ).fetchone():
+            c.execute(
+                "INSERT OR IGNORE INTO websites (name, url, status_url, portal_type) VALUES (?, ?, ?, ?)",
+                ("nProcure Gujarat", "https://tender.nprocure.com", "", PORTAL_NPROCURE),
+            )
+        c.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('seed_nprocure_v1', '1')")
     c.execute('''CREATE TABLE IF NOT EXISTS background_jobs (
         id TEXT PRIMARY KEY,
         status TEXT NOT NULL,
@@ -1341,6 +1399,9 @@ def _init_db_schema(conn):
         # 'admin' = hand-built in the console · 'user' = auto-managed from the
         # union of client-app bookmarks (client_api._reconcile_bookmark_jobs).
         ("created_by", "TEXT DEFAULT 'admin'"),
+        # Weekdays (IST, comma list) an interval job may run on; the default
+        # backfills every existing job to Mon-Sat (Sunday off).
+        ("run_days", "TEXT DEFAULT 'mon,tue,wed,thu,fri,sat'"),
     ]:
         try:
             c.execute(f"ALTER TABLE saved_custom_jobs ADD COLUMN {col} {ddl}")
@@ -1379,9 +1440,20 @@ def _init_db_schema(conn):
         created_at REAL NOT NULL,
         expires_at REAL NOT NULL,
         answered_at REAL,
+        user_id INTEGER,
         FOREIGN KEY(job_id) REFERENCES background_jobs(id)
     )''')
     c.execute("CREATE INDEX IF NOT EXISTS idx_captcha_requests_status_created ON captcha_requests(status, created_at)")
+    # user_id: the mobile user (if any) whose own client-initiated job hit this
+    # CAPTCHA, resolved from background_jobs.payload's requested_by_user_id at
+    # creation time -- lets /client/captcha/pending scope to just this user's
+    # own pending request, and lets api_server.py push them a notification the
+    # moment it's created, same idea as _push_download_complete.
+    try:
+        c.execute("ALTER TABLE captcha_requests ADD COLUMN user_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    c.execute("CREATE INDEX IF NOT EXISTS idx_captcha_requests_user_status ON captcha_requests(user_id, status)")
     c.execute('''CREATE TABLE IF NOT EXISTS scheduler_leases (
         name TEXT PRIMARY KEY,
         lease_until REAL NOT NULL DEFAULT 0,
@@ -1459,6 +1531,99 @@ def _init_db_schema(conn):
         updated_at REAL NOT NULL DEFAULT 0,
         FOREIGN KEY(user_id) REFERENCES client_users(id)
     )''')
+    # Organisations, memberships, join requests, the org's shared sync blob and
+    # client_users.permissions_json (see org_access.py).
+    org_access.create_schema(c)
+    # Tender bookmarks are stored by tender id (bookmarkTenderIds), the one
+    # identity that survives the tenders table being rebuilt. Convert blobs
+    # that still hold only row ids while those rows exist.
+    tender_id_by_row = None
+    for sync_user_id, data_json in c.execute("SELECT user_id, data_json FROM client_user_sync").fetchall():
+        try:
+            blob = json.loads(data_json or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(blob, dict) or "bookmarkTenderIds" in blob or not blob.get("bookmarks"):
+            continue
+        if tender_id_by_row is None:
+            tender_id_by_row = {
+                int(r[0]): ScraperBackend.canonical_tender_id(r[1])
+                for r in c.execute("SELECT id, tender_id FROM tenders").fetchall()
+            }
+        converted = set()
+        for value in blob.get("bookmarks") or []:
+            try:
+                key = tender_id_by_row.get(int(value))
+            except (TypeError, ValueError):
+                key = None
+            if key:
+                converted.add(key)
+        blob["bookmarkTenderIds"] = sorted(converted)
+        c.execute(
+            "UPDATE client_user_sync SET data_json=? WHERE user_id=?",
+            (json.dumps(blob, ensure_ascii=False), sync_user_id),
+        )
+    # One row per registered device (a user may have more than one). `token` is
+    # the raw APNs device token (hex string) -- the server talks to APNs
+    # directly, not through Expo's push relay. `last_pushed_at` is this
+    # device's floor: set when it registered, no event older than it is pushed
+    # to it (push_handled_events below keeps a push from being sent twice).
+    # `last_reminder_date` is a 'YYYY-MM-DD' string: the last date
+    # this device's closing-reminder pass actually ran, so a restart mid-day
+    # can't re-send a reminder that already went out earlier that day.
+    c.execute('''CREATE TABLE IF NOT EXISTS client_push_tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        token TEXT NOT NULL,
+        platform TEXT NOT NULL DEFAULT 'ios',
+        created_at REAL NOT NULL,
+        last_seen_at REAL NOT NULL,
+        last_pushed_at REAL NOT NULL DEFAULT 0,
+        last_reminder_date TEXT NOT NULL DEFAULT '',
+        badge_count INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY(user_id) REFERENCES client_users(id)
+    )''')
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_client_push_tokens_token ON client_push_tokens(token)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_client_push_tokens_user ON client_push_tokens(user_id)")
+    # badge_count: server-tracked running APNs badge number per device (see
+    # apns_push.py's `badge` kwarg) -- without the iOS app icon badge never
+    # updates while the app is closed/backgrounded, since apns_push.send()
+    # only sets aps.badge when explicitly told to, and nothing else does.
+    try:
+        c.execute("ALTER TABLE client_push_tokens ADD COLUMN badge_count INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    # app / apns_env: which iOS app a token belongs to ('bmpro' or 'bidwise')
+    # and which APNs environment issued it, so apns_push.send() uses the right
+    # topic and host per token. Rows from before this (all BM Pro) take the
+    # defaults.
+    for ddl in (
+        "ALTER TABLE client_push_tokens ADD COLUMN app TEXT NOT NULL DEFAULT 'bmpro'",
+        "ALTER TABLE client_push_tokens ADD COLUMN apns_env TEXT NOT NULL DEFAULT 'production'",
+        # pending_orgs: JSON {org: [{id, title}]} -- the tenders in a Bidwise
+        # "new tenders under ORG" push that hasn't been read on that device yet.
+        # Later tenders join it (one notification, one badge) until the app
+        # reports it read via PUT /client/badge's unread_orgs.
+        "ALTER TABLE client_push_tokens ADD COLUMN pending_orgs TEXT NOT NULL DEFAULT '{}'",
+    ):
+        try:
+            c.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
+    # push_handled_events: the tenders rows (kind 'new') and tender_history rows
+    # (kind 'change') the push pass has already handled. A scrape stamps a row
+    # when it writes it but commits the page later, so the pass can't go by
+    # time; it takes every recent row not listed here, pushes it, then lists it.
+    c.execute('''CREATE TABLE IF NOT EXISTS push_handled_events (
+        kind TEXT NOT NULL,
+        ref_id INTEGER NOT NULL,
+        handled_at REAL NOT NULL,
+        PRIMARY KEY (kind, ref_id)
+    )''')
+    c.execute("CREATE INDEX IF NOT EXISTS idx_push_handled_events_at ON push_handled_events(handled_at)")
+    # The pass reads the recent rows of each every 30 s.
+    c.execute("CREATE INDEX IF NOT EXISTS idx_tenders_first_seen_at ON tenders(first_seen_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_tender_history_scraped_at ON tender_history(scraped_at)")
 
     # The client_* tables above were added after the Postgres repair block near
     # the top of this function, so they never got the same treatment. On the
@@ -1488,6 +1653,12 @@ def _init_db_schema(conn):
                 "client_tokens": ("created_at", "revoked_at"),
                 "client_activity_log": ("created_at",),
                 "client_user_sync": ("updated_at",),
+                "client_push_tokens": ("created_at", "last_seen_at", "last_pushed_at"),
+                "client_orgs": ("created_at",),
+                "client_org_members": ("joined_at",),
+                "client_org_join_requests": ("created_at", "decided_at"),
+                "client_org_sync": ("updated_at",),
+                "client_portal_searches": ("created_at", "finished_at"),
             }.items():
                 for column in columns:
                     type_row = c.execute(
@@ -1638,10 +1809,13 @@ class ScraperBackend:
     _settings_lock = threading.Lock()
 
     @staticmethod
-    def add_website_logic(name, url, status_url):
+    def add_website_logic(name, url, status_url, portal_type=PORTAL_NIC):
         conn = sqlite3.connect(DB_FILE)
         try:
-            conn.execute("INSERT INTO websites (name, url, status_url) VALUES (?, ?, ?)", (name, url, status_url))
+            conn.execute(
+                "INSERT INTO websites (name, url, status_url, portal_type) VALUES (?, ?, ?, ?)",
+                (name, url, status_url, portal_type or PORTAL_NIC),
+            )
             conn.commit()
             return True
         except Exception as e:
@@ -1732,10 +1906,48 @@ class ScraperBackend:
     def get_websites():
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT id, name, url, status_url FROM websites")
+        c.execute("SELECT id, name, url, status_url, COALESCE(portal_type, 'nic') FROM websites")
         rows = c.fetchall()
         conn.close()
-        return {row[0]: {"name": row[1], "url": row[2], "status_url": row[3]} for row in rows}
+        return {
+            row[0]: {"name": row[1], "url": row[2], "status_url": row[3], "portal_type": row[4]}
+            for row in rows
+        }
+
+    @staticmethod
+    def website_portal_type(website_id):
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            try:
+                row = conn.execute(
+                    "SELECT COALESCE(portal_type, 'nic') FROM websites WHERE id=?", (int(website_id),)
+                ).fetchone()
+            finally:
+                conn.close()
+        except Exception:
+            return PORTAL_NIC
+        return str(row[0] or PORTAL_NIC) if row else PORTAL_NIC
+
+    @staticmethod
+    def tender_portal_type(tender_db_id):
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            try:
+                row = conn.execute(
+                    "SELECT COALESCE(w.portal_type, 'nic') FROM tenders t JOIN websites w ON w.id=t.website_id "
+                    "WHERE t.id=?",
+                    (int(tender_db_id),),
+                ).fetchone()
+            finally:
+                conn.close()
+        except Exception:
+            return PORTAL_NIC
+        return str(row[0] or PORTAL_NIC) if row else PORTAL_NIC
+
+    @staticmethod
+    def _nprocure():
+        from scrapers import nprocure
+        return nprocure
 
     @staticmethod
     def safe_request(url):
@@ -2005,10 +2217,18 @@ class ScraperBackend:
             return None
 
     @staticmethod
-    def handle_captcha_interaction(driver, context, submit_id="Submit", is_download=False):
+    def handle_captcha_interaction(driver, context, submit_id="Submit", is_download=False, accept_no_records=False):
         if not ensure_scraper_dependencies():
             return False
+        submitted = [False]
+
         def _status_table_visible():
+            # accept_no_records (portal search by tender ID): a "no records"
+            # answer also means the captcha was accepted -- the tender just
+            # isn't on this portal.
+            # Only after a submit: the blank search page may already say so.
+            if accept_no_records and submitted[0] and ScraperBackend._portal_says_no_records(driver):
+                return True
             try:
                 table = driver.find_element(By.ID, "tabList")
                 if not table.is_displayed():
@@ -2022,6 +2242,7 @@ class ScraperBackend:
         if ScraperBackend.captcha_solved_in_session:
             try:
                 btn = driver.find_element(By.ID, submit_id)
+                submitted[0] = True
                 driver.execute_script("arguments[0].click();", btn)
                 time.sleep(2)
                 if _status_table_visible():
@@ -2061,6 +2282,7 @@ class ScraperBackend:
 
                 captcha_input.clear()
                 captcha_input.send_keys(solution)
+                submitted[0] = True
                 driver.execute_script("arguments[0].click();", btn)
                 time.sleep(3)
                 
@@ -2106,6 +2328,7 @@ class ScraperBackend:
 
                 captcha_input.clear()
                 captcha_input.send_keys(solution)
+                submitted[0] = True
                 driver.execute_script("arguments[0].click();", btn)
                 time.sleep(3)
                 if _status_table_visible() or len(driver.find_elements(By.ID, "captchaImage")) == 0:
@@ -2304,6 +2527,11 @@ class ScraperBackend:
 
     @staticmethod
     def should_skip_file(tender_id, file_name, file_path, source_url=None, file_type="document"):
+        # A client "redownload" job: files already logged complete may still be
+        # empty/corrupt (e.g. saved while a captcha was unsolved), so nothing is
+        # skipped. log_downloaded_file overwrites the existing rows on success.
+        if getattr(_job_runtime, "force_redownload", False):
+            return False
         file_name = str(file_name)
         conn = sqlite3.connect(DB_FILE)
         row = conn.execute(
@@ -2400,6 +2628,8 @@ class ScraperBackend:
 
     @staticmethod
     def fetch_organisations_logic(website_id):
+        if ScraperBackend.website_portal_type(website_id) == PORTAL_NPROCURE:
+            return ScraperBackend._nprocure().fetch_organisations(website_id)
         if not ensure_scraper_dependencies():
             log_to_gui(scraper_dependency_message())
             return False
@@ -2745,6 +2975,29 @@ class ScraperBackend:
         )
 
     @staticmethod
+    def _record_field_change_if_different(conn, tender_db_id, field, old_value, new_value):
+        """Writes a tender_history row with changed_fields=[field] when old_value
+        != new_value -- for fields (status, prebid_count, corrigendum_count) that
+        live outside the main scrape snapshot/content-hash diff above (status is
+        explicitly preserved rather than overwritten by that block; the counts
+        are written via their own separate UPDATE regardless of whether the hash
+        changed), so nothing else ever notices or records a change to them.
+        Without this, client_api.py's /changes feed and api_server.py's
+        push-notification pass -- both of which read tender_history -- have no
+        way to see these changes at all, even though the mobile app's own local
+        snapshot diff (sync.js) already alerts on them when the app is open.
+        Call with the OLD value read before the UPDATE that sets the new one."""
+        old_str = str(old_value if old_value is not None else "")
+        new_str = str(new_value if new_value is not None else "")
+        if old_str == new_str:
+            return
+        row = conn.execute("SELECT tender_key FROM tenders WHERE id=?", (int(tender_db_id),)).fetchone()
+        tender_key = str(row[0] or "") if row else ""
+        ScraperBackend._record_tender_history(
+            conn, tender_db_id, tender_key, time.time(), "", [field], {},
+        )
+
+    @staticmethod
     def set_tender_scrape_schedule(tender_db_id, interval_minutes, enabled=True):
         interval = max(0, int(interval_minutes or 0))
         active = bool(enabled and interval > 0)
@@ -2826,6 +3079,13 @@ class ScraperBackend:
         content_hash = ScraperBackend.tender_content_hash(snapshot)
         c = conn.cursor()
 
+        # The tender id is a tender's only identity. Title, URL, org, dates and
+        # values all repeat across different tenders (e.g. 2026_MCGM_1345164_1 /
+        # _1345165_1, or lots _1.._17), so nothing else may match a row: doing
+        # so merged distinct tenders into one row that flipped between ids.
+        if not normalized_tender_id:
+            log_to_gui(f"Skipped a tender with no tender id: {str(title or '')[:80]!r}")
+            return "skipped"
         existing = c.execute(
             """SELECT id
                FROM tenders
@@ -2833,22 +3093,6 @@ class ScraperBackend:
                ORDER BY id DESC LIMIT 1""",
             (website_id, normalized_tender_id)
         ).fetchone()
-        if not existing and norm_url:
-            existing = c.execute(
-                """SELECT id
-                   FROM tenders
-                   WHERE website_id=? AND normalized_tender_url=?
-                   ORDER BY id DESC LIMIT 1""",
-                (website_id, norm_url)
-            ).fetchone()
-        if not existing:
-            existing = c.execute(
-                """SELECT id
-                   FROM tenders
-                   WHERE website_id=? AND org_chain=? AND title=? AND closing_date=?
-                   ORDER BY id DESC LIMIT 1""",
-                (website_id, org_chain, title, closing_date)
-            ).fetchone()
 
         if existing:
             row_id = int(existing[0])
@@ -2871,32 +3115,44 @@ class ScraperBackend:
             changed_fields = [name for name in tracked_columns if old_snapshot.get(name) != snapshot.get(name)]
             changed = old_hash != content_hash
             next_scrape_at = now_epoch + interval_minutes * 60 if scrape_enabled and interval_minutes > 0 else 0
+            # The row was found by its tender id, so its id columns are never rewritten.
             c.execute(
                 """UPDATE tenders
-                   SET org_chain=?, tender_id=?, title=?, tender_value=?, emd=?, closing_date=?, opening_date=?,
+                   SET org_chain=?, title=?, tender_value=?, emd=?, closing_date=?, opening_date=?,
                        tender_url=?, location=?, tender_category=?, pre_bid_meeting_date=?, published_date=?, normalized_tender_url=?,
                        work_description=?, status=CASE WHEN COALESCE(status,'')='Archived' THEN '' ELSE COALESCE(status,'') END,
-                       is_archived=0, normalized_tender_id=?, tender_key=?, content_hash=?,
+                       is_archived=0, tender_key=COALESCE(NULLIF(tender_key,''),?), content_hash=?,
                        last_seen_at=?, last_scraped_at=?,
                        scrape_count=COALESCE(scrape_count,0)+1,
                        last_changed_at=CASE WHEN ?=1 THEN ? ELSE last_changed_at END,
                        next_scrape_at=?
                    WHERE id=?""",
                 (
-                    org_chain, tender_id, title, tender_value, emd, closing_date, opening_date,
+                    org_chain, title, tender_value, emd, closing_date, opening_date,
                     tender_url, location, tender_category, pre_bid_meeting_date, published_date, norm_url, work_description,
-                    normalized_tender_id, tender_key, content_hash, now_epoch, now_epoch,
+                    tender_key, content_hash, now_epoch, now_epoch,
                     1 if changed else 0, now_epoch, next_scrape_at, row_id
                 )
             )
             # Counts aren't part of the change-hash snapshot above, so persist them
             # separately; COALESCE keeps the existing value when this cycle didn't
             # produce a fresh read (e.g. the detail-page fetch failed).
+            old_counts = c.execute(
+                "SELECT prebid_count, corrigendum_count FROM tenders WHERE id=?", (row_id,)
+            ).fetchone()
             c.execute(
                 "UPDATE tenders SET prebid_count=COALESCE(?,prebid_count), "
                 "corrigendum_count=COALESCE(?,corrigendum_count) WHERE id=?",
                 (prebid_count, corrigendum_count, row_id),
             )
+            if prebid_count is not None:
+                ScraperBackend._record_field_change_if_different(
+                    conn, row_id, "prebid_count", old_counts[0] if old_counts else None, prebid_count,
+                )
+            if corrigendum_count is not None:
+                ScraperBackend._record_field_change_if_different(
+                    conn, row_id, "corrigendum_count", old_counts[1] if old_counts else None, corrigendum_count,
+                )
             if changed:
                 ScraperBackend._record_tender_history(
                     conn, row_id, tender_key, now_epoch, content_hash,
@@ -2953,17 +3209,14 @@ class ScraperBackend:
         keep_for_key = {}
         to_delete = []
 
-        def key_of(r):
-            # Prefer normalized URL (most stable for same tender across runs)
-            if r[3]:
-                return ("url", r[3])
-            if r[1]:
-                return ("id", r[1])
-            return ("meta", f"{r[4]}|{r[5]}")
-
+        # Only rows with the same tender id are the same tender. URL, title and
+        # dates repeat across different tenders and must never merge (or delete)
+        # them; a row without an id is left alone.
         for r in rows:
             rid = r[0]
-            key = key_of(r)
+            key = ScraperBackend.canonical_tender_id(r[1])
+            if not key:
+                continue
             if key not in keep_for_key:
                 keep_for_key[key] = r
             else:
@@ -2985,6 +3238,8 @@ class ScraperBackend:
 
     @staticmethod
     def fetch_tenders_logic(website_id, org_ids=None):
+        if ScraperBackend.website_portal_type(website_id) == PORTAL_NPROCURE:
+            return ScraperBackend._nprocure().fetch_tenders(website_id, org_ids)
         if not ensure_scraper_dependencies():
             log_to_gui(scraper_dependency_message())
             return
@@ -3496,6 +3751,8 @@ class ScraperBackend:
             "initial_download_completed_at=CASE WHEN ?=1 THEN COALESCE(initial_download_completed_at,?) "
             "ELSE initial_download_completed_at END, last_update_checked_at=?, "
             "last_downloaded_at=CASE WHEN ?=1 OR ?=1 THEN ? ELSE last_downloaded_at END, "
+            "last_dl_prebid_count=COALESCE(prebid_count,0), "
+            "last_dl_corrigendum_count=COALESCE(corrigendum_count,0), "
             "last_download_error='' WHERE id=?",
             (
                 durable_folder, "complete" if main_complete else "partial", 1 if main_complete else 0,
@@ -3710,6 +3967,9 @@ class ScraperBackend:
 
     @staticmethod
     def check_tender_status_logic(website_id, archived_only=False):
+        if ScraperBackend.website_portal_type(website_id) == PORTAL_NPROCURE:
+            log_to_gui("Status check is not supported for nProcure yet; skipped.")
+            return 0
         if not ensure_scraper_dependencies():
             log_to_gui(scraper_dependency_message())
             return 0
@@ -3782,7 +4042,11 @@ class ScraperBackend:
                         new_status, _ = ScraperBackend._extract_status_and_row(driver)
                         if new_status:
                             conn = sqlite3.connect(DB_FILE)
+                            old_status = conn.execute("SELECT status FROM tenders WHERE id=?", (db_id,)).fetchone()
                             conn.execute("UPDATE tenders SET status=? WHERE id=?", (new_status, db_id))
+                            ScraperBackend._record_field_change_if_different(
+                                conn, db_id, "status", old_status[0] if old_status else None, new_status,
+                            )
                             conn.commit()
                             conn.close()
                             updated_count += 1
@@ -3801,6 +4065,9 @@ class ScraperBackend:
 
     @staticmethod
     def download_tender_results_logic(website_id):
+        if ScraperBackend.website_portal_type(website_id) == PORTAL_NPROCURE:
+            log_to_gui("Result download is not supported for nProcure yet; skipped.")
+            return None
         if not ensure_scraper_dependencies():
             log_to_gui(scraper_dependency_message())
             return
@@ -3841,7 +4108,11 @@ class ScraperBackend:
                     status, row = ScraperBackend._extract_status_and_row(driver)
                     if status:
                         conn = sqlite3.connect(DB_FILE)
+                        old_status = conn.execute("SELECT status FROM tenders WHERE id=?", (db_id,)).fetchone()
                         conn.execute("UPDATE tenders SET status=? WHERE id=?", (status, db_id))
+                        ScraperBackend._record_field_change_if_different(
+                            conn, db_id, "status", old_status[0] if old_status else None, status,
+                        )
                         conn.commit()
                         conn.close()
                     if status not in target_statuses:
@@ -3891,8 +4162,252 @@ class ScraperBackend:
                 driver.quit()
         log_to_gui("Result file check complete.")
 
+    # Tender stages that have result documents (Fetch Status downloads them).
+    RESULT_STAGES = {"Financial Bid Opening", "Financial Evaluation", "AOC", "Concluded"}
+    # A tender found by portal search that isn't in the DB yet goes to the
+    # archive when its stage is past bidding, else to the current list.
+    PORTAL_SEARCH_ARCHIVE_STAGES = {
+        "technical bid opening", "technical evaluation", "financial bid opening",
+        "financial evaluation", "aoc", "concluded", "cancelled", "retender",
+    }
+    _NO_RECORD_MARKERS = ("no record", "no tender", "no data found", "no results found")
+
     @staticmethod
-    def fetch_tender_status_single_logic(tender_db_id):
+    def _portal_says_no_records(driver):
+        try:
+            text = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+        except Exception:
+            return False
+        return any(marker in text for marker in ScraperBackend._NO_RECORD_MARKERS)
+
+    @staticmethod
+    def _extract_status_fields(driver):
+        """The first row of the Tender Status result table as
+        (stage, {header: cell text}, row element); (None, {}, None) if the
+        table has no rows."""
+        if not ensure_scraper_dependencies():
+            return None, {}, None
+        try:
+            table = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "tabList")))
+        except Exception:
+            return None, {}, None
+        headers = [c.text.strip() for c in table.find_elements(By.CSS_SELECTOR, "tr.list_header td")]
+        if not headers:
+            headers = [c.text.strip() for c in table.find_elements(By.XPATH, ".//tbody/tr[1]/td")]
+        rows = table.find_elements(By.XPATH, ".//tbody/tr[contains(@class, 'even') or contains(@class, 'odd')]")
+        if not rows:
+            return None, {}, None
+        cells = [c.text.strip() for c in rows[0].find_elements(By.TAG_NAME, "td")]
+        fields = {h: cells[i] for i, h in enumerate(headers) if h and i < len(cells)}
+        log_to_gui(f"  Status table headers: {headers}")
+        return fields.get("Tender Stage") or None, fields, rows[0]
+
+    @staticmethod
+    def _status_search(driver, status_url, tender_id, accept_no_records=False):
+        """Search one tender ID on a NIC Tender Status page. Returns
+        (captcha_ok, stage, fields, row element).
+
+        The captcha is handled exactly like a tender document download's:
+        the AI provider first (captcha_handover_after_attempts tries), then a
+        manual captcha with the download's 5 tries. A manual captcha goes to
+        the user who asked for the search (job payload requested_by_user_id ->
+        captcha_requests.user_id, "CAPTCHA needed" push, their Captcha
+        screen), or to the operator console for a job without a user."""
+        ScraperBackend.captcha_solved_in_session = False
+        driver.get(status_url)
+        inp = WebDriverWait(driver, 12).until(EC.presence_of_element_located((By.ID, "tenderId")))
+        inp.clear()
+        inp.send_keys(tender_id)
+        if not ScraperBackend.handle_captcha_interaction(
+            driver, f"Portal search {tender_id}", submit_id="Search",
+            is_download=True, accept_no_records=accept_no_records,
+        ):
+            return False, None, {}, None
+        stage, fields, row_el = ScraperBackend._extract_status_fields(driver)
+        return True, stage, fields, row_el
+
+    @staticmethod
+    def _save_result_docs(driver, row_el, target_id, tender_id, folder_path):
+        """Open the row's view link and store the result documents in the
+        tender's 'Results' folder. Returns (downloaded_any, scratch folder)."""
+        view_links = row_el.find_elements(By.XPATH, ".//a[img[contains(@src, 'view.png')]]") if row_el else []
+        if not view_links and row_el:
+            view_links = row_el.find_elements(By.TAG_NAME, "a")
+        if not view_links:
+            log_to_gui("  Result view link not found.")
+            return False, ""
+        driver.execute_script("arguments[0].click();", view_links[0])
+
+        safe_id = re.sub(r'[\\/*?:"<>|]', "", str(tender_id))
+        storage = storage_runtime.active_document_storage()
+        existing_folder = (folder_path or "").strip()
+        if not storage.remote and existing_folder and os.path.isdir(existing_folder):
+            tender_folder = existing_folder
+        else:
+            tender_folder = os.path.join(BASE_DOWNLOAD_DIRECTORY, safe_id)
+            os.makedirs(tender_folder, exist_ok=True)
+
+        got = ScraperBackend._download_result_docs_from_popup(
+            driver, tender_id, tender_folder, folder_name="Results"
+        )
+        if got:
+            durable_folder = storage.folder_reference(
+                tender_folder,
+                str(tender_id or ""),
+                ScraperBackend.get_setting("storage_prefix", "tenders/"),
+            )
+            now_iso = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            conn = sqlite3.connect(DB_FILE)
+            conn.execute(
+                "UPDATE tenders SET folder_path=?, last_downloaded_at=? WHERE id=?",
+                (durable_folder, now_iso, target_id),
+            )
+            conn.commit()
+            conn.close()
+            log_to_gui(f"Downloaded status document(s) for {tender_id} into 'Results'.")
+        else:
+            log_to_gui(f"  No result document available yet for {tender_id}.")
+        return got, tender_folder
+
+    @staticmethod
+    def _apply_portal_search_result(website_id, tender_id, stage, fields, status_url):
+        """Save a portal search hit. An existing tender (same tender id; this
+        portal first, then any) is updated in place and keeps its current /
+        archive placement; a new one is added to the archive when its stage is
+        past bidding, else to the current list. Returns (tender_db_id, created,
+        is_archived)."""
+        def pick(*needles):
+            for header, value in fields.items():
+                low = header.lower()
+                if value and any(n in low for n in needles):
+                    return value
+            return ""
+
+        canonical = ScraperBackend.canonical_tender_id(tender_id)
+        title = pick("title", "work")
+        org_chain = pick("organisation", "organization", "department")
+        ref_no = pick("ref")
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            row = conn.execute(
+                "SELECT id, is_archived, status, title, org_chain, work_description FROM tenders "
+                "WHERE normalized_tender_id=? ORDER BY CASE WHEN website_id=? THEN 0 ELSE 1 END, id LIMIT 1",
+                (canonical, website_id),
+            ).fetchone()
+            now = time.time()
+            if row:
+                tender_db_id, is_archived, old_status, old_title, old_org, old_desc = row
+                conn.execute(
+                    "UPDATE tenders SET status=?, last_status_checked_at=?, "
+                    "title=CASE WHEN COALESCE(title,'')='' THEN ? ELSE title END, "
+                    "org_chain=CASE WHEN COALESCE(org_chain,'')='' THEN ? ELSE org_chain END, "
+                    "work_description=CASE WHEN COALESCE(work_description,'')='' THEN ? ELSE work_description END "
+                    "WHERE id=?",
+                    (stage, now, title, org_chain, ref_no, tender_db_id),
+                )
+                ScraperBackend._record_field_change_if_different(conn, tender_db_id, "status", old_status, stage)
+                conn.commit()
+                return int(tender_db_id), False, bool(is_archived)
+            tender_row = (
+                website_id, org_chain, str(tender_id).strip(), title, "", "", "", "",
+                status_url, "", "", "", "", ref_no,
+            )
+            ScraperBackend.upsert_tender_row(conn, tender_row)
+            new_row = conn.execute(
+                "SELECT id FROM tenders WHERE website_id=? AND normalized_tender_id=?",
+                (website_id, canonical),
+            ).fetchone()
+            if not new_row:
+                conn.commit()
+                raise RuntimeError(f"Portal search: could not save tender {tender_id}.")
+            archived = 1 if str(stage or "").strip().lower() in ScraperBackend.PORTAL_SEARCH_ARCHIVE_STAGES else 0
+            conn.execute(
+                "UPDATE tenders SET status=?, is_archived=?, last_status_checked_at=? WHERE id=?",
+                (stage, archived, now, new_row[0]),
+            )
+            conn.commit()
+            return int(new_row[0]), True, bool(archived)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def portal_search_tender_logic(website_id, tender_id, client_source=False):
+        """Search a tender ID on a NIC portal's Tender Status page (a client
+        request) and save what it finds (see _apply_portal_search_result).
+        A tender the portal doesn't know is a completed search with
+        found=False, not a failure, so the job isn't retried."""
+        tender_id = " ".join(str(tender_id or "").split())
+        try:
+            website_id = int(website_id)
+        except Exception:
+            raise PortalActionUnsupported("Choose a portal to search.")
+        if not tender_id:
+            raise PortalActionUnsupported("Enter a tender ID to search.")
+        if ScraperBackend.website_portal_type(website_id) == PORTAL_NPROCURE:
+            raise PortalActionUnsupported("Portal search is not supported for nProcure.")
+        conn = sqlite3.connect(DB_FILE)
+        site_row = conn.execute("SELECT status_url FROM websites WHERE id=?", (website_id,)).fetchone()
+        conn.close()
+        if not site_row or not str(site_row[0] or "").strip():
+            raise PortalActionUnsupported("This portal has no tender status page configured.")
+        status_url = str(site_row[0]).strip()
+        if not ensure_scraper_dependencies():
+            log_to_gui(scraper_dependency_message())
+            return False
+        storage_runtime.require_durable_cloud_storage()
+
+        driver = None
+        tender_folder = ""
+        try:
+            driver = create_browser_driver()
+            log_to_gui(f"Portal search: {tender_id}")
+            captcha_ok, stage, fields, row_el = ScraperBackend._status_search(
+                driver, status_url, tender_id, accept_no_records=True,
+            )
+            if not captcha_ok:
+                log_to_gui(f"  CAPTCHA failed for {tender_id}.")
+                return False
+            if not stage:
+                log_to_gui(f"Portal search: {tender_id} not found on this portal.")
+                return {"found": False, "tender_id": tender_id, "website_id": website_id}
+            tender_db_id, created, is_archived = ScraperBackend._apply_portal_search_result(
+                website_id, tender_id, stage, fields, status_url,
+            )
+            log_to_gui(
+                f"Portal search: {tender_id} -> '{stage}', "
+                f"{'added to' if created else 'updated in'} {'archive' if is_archived else 'current'} (#{tender_db_id})."
+            )
+            result_files = False
+            if stage in ScraperBackend.RESULT_STAGES and row_el is not None:
+                conn = sqlite3.connect(DB_FILE)
+                folder_row = conn.execute("SELECT folder_path FROM tenders WHERE id=?", (tender_db_id,)).fetchone()
+                conn.close()
+                result_files, tender_folder = ScraperBackend._save_result_docs(
+                    driver, row_el, tender_db_id, tender_id, folder_row[0] if folder_row else "",
+                )
+            return {
+                "found": True, "tender_id": tender_id, "website_id": website_id,
+                "tender_db_id": tender_db_id, "created": created, "is_archived": is_archived,
+                "stage": stage, "fields": fields, "result_files": bool(result_files),
+            }
+        except PortalActionUnsupported:
+            raise
+        except Exception as e:
+            log_to_gui(f"Portal search error for {tender_id}: {e}")
+            return False
+        finally:
+            if driver is not None:
+                driver.quit()
+            if tender_folder:
+                storage_runtime.cleanup_scratch_folder(tender_folder)
+
+    @staticmethod
+    def fetch_tender_status_single_logic(tender_db_id, client_source=False):
+        if ScraperBackend.tender_portal_type(tender_db_id) == PORTAL_NPROCURE:
+            raise PortalActionUnsupported("Status checks are not supported for nProcure tenders yet.")
+        # client_source: a mobile-app request. Once the status was read and saved the
+        # job counts as done even if no result documents exist yet -- returning False
+        # made the runner retry (captcha + browser session each time) for nothing.
         try:
             target_id = int(tender_db_id)
         except Exception:
@@ -3943,7 +4458,14 @@ class ScraperBackend:
             status, row_el = ScraperBackend._extract_status_and_row(driver)
             if status:
                 conn = sqlite3.connect(DB_FILE)
-                conn.execute("UPDATE tenders SET status=? WHERE id=?", (status, target_id))
+                old_status = conn.execute("SELECT status FROM tenders WHERE id=?", (target_id,)).fetchone()
+                conn.execute(
+                    "UPDATE tenders SET status=?, last_status_checked_at=? WHERE id=?",
+                    (status, time.time(), target_id),
+                )
+                ScraperBackend._record_field_change_if_different(
+                    conn, target_id, "status", old_status[0] if old_status else None, status,
+                )
                 conn.commit()
                 conn.close()
                 log_to_gui(f"Updated status for {tender_id}: {status}")
@@ -3952,14 +4474,14 @@ class ScraperBackend:
                 return False
             if status not in target_statuses:
                 log_to_gui(f"  Status '{status}' not eligible for result docs yet.")
-                return False
+                return bool(client_source)
 
             view_links = row_el.find_elements(By.XPATH, ".//a[img[contains(@src, 'view.png')]]") if row_el else []
             if not view_links and row_el:
                 view_links = row_el.find_elements(By.TAG_NAME, "a")
             if not view_links:
                 log_to_gui("  Result view link not found.")
-                return False
+                return bool(client_source)
             driver.execute_script("arguments[0].click();", view_links[0])
 
             safe_id = re.sub(r'[\\/*?:"<>|]', "", str(tender_id))
@@ -3991,7 +4513,7 @@ class ScraperBackend:
                 log_to_gui(f"Downloaded status document(s) for {tender_id} into 'Results'.")
             else:
                 log_to_gui(f"  No result document available yet for {tender_id}.")
-            return got
+            return bool(got or client_source)
         except Exception as e:
             log_to_gui(f"Fetch status error for {tender_id}: {e}")
             return False
@@ -4003,6 +4525,8 @@ class ScraperBackend:
 
     @staticmethod
     def refresh_tender_details_logic(website_id, target_db_ids):
+        if ScraperBackend.website_portal_type(website_id) == PORTAL_NPROCURE:
+            return ScraperBackend._nprocure().refresh_details(website_id, target_db_ids)
         if not ensure_scraper_dependencies():
             log_to_gui(scraper_dependency_message())
             return False
@@ -4090,6 +4614,8 @@ class ScraperBackend:
 
     @staticmethod
     def download_tenders_logic(website_id, target_db_ids=None, forced_mode=None, include_all=False):
+        if ScraperBackend.website_portal_type(website_id) == PORTAL_NPROCURE:
+            return ScraperBackend._nprocure().download_tenders(website_id, target_db_ids, forced_mode, include_all)
         if not ensure_scraper_dependencies():
             log_to_gui(scraper_dependency_message())
             return False
@@ -4519,6 +5045,8 @@ class ScraperBackend:
 
     @staticmethod
     def download_single_tender_logic(tender_db_id, mode):
+        if ScraperBackend.tender_portal_type(tender_db_id) == PORTAL_NPROCURE:
+            return ScraperBackend._nprocure().download_single(tender_db_id, mode)
         try:
             target_id = int(tender_db_id)
         except Exception:
@@ -4527,7 +5055,7 @@ class ScraperBackend:
         mode_txt = str(mode or "").strip().lower()
         if mode_txt == "auto":
             mode_txt = ""
-        if mode_txt not in {"full", "update"}:
+        if mode_txt not in {"full", "update", "redownload"}:
             mode_txt = ""
         conn = sqlite3.connect(DB_FILE)
         row = conn.execute(
@@ -4542,16 +5070,118 @@ class ScraperBackend:
         if int(is_archived or 0) != 0:
             log_to_gui("Download: selected tender is archived; only active tenders are allowed.")
             return False
-        result = ScraperBackend.download_tenders_logic(
-            website_id, target_db_ids=[target_id], forced_mode=mode_txt
-        )
+
+        if mode_txt == "update":
+            # Cheap portal check first (plain HTTP, no browser session): only
+            # start the Selenium download when the portal lists more
+            # corrigendum/pre-bid files than the last completed run covered.
+            counts_fresh = ScraperBackend.refresh_tender_counts(target_id)
+            if counts_fresh:
+                available, portal_total, recorded_total = ScraperBackend.new_portal_files_available(target_id)
+                if not available:
+                    conn = sqlite3.connect(DB_FILE)
+                    conn.execute(
+                        "UPDATE tenders SET last_update_checked_at=? WHERE id=?",
+                        (time.time(), target_id),
+                    )
+                    conn.commit()
+                    conn.close()
+                    log_to_gui(
+                        f"No new corrigendum/pre-bid files on the portal for tender #{target_id} "
+                        f"(portal {portal_total}, already covered {recorded_total}). Skipping download."
+                    )
+                    return True
+                log_to_gui(
+                    f"New corrigendum/pre-bid files on the portal for tender #{target_id} "
+                    f"(portal {portal_total}, already covered {recorded_total}). Starting update download."
+                )
+            else:
+                log_to_gui(
+                    f"Could not read portal counts for tender #{target_id}; running the update download anyway."
+                )
+
+        forced = mode_txt == "redownload"
+        if forced:
+            log_to_gui(f"Re-download requested for tender #{target_id}: existing stored files will be fetched again.")
+        _job_runtime.force_redownload = forced
+        try:
+            result = ScraperBackend.download_tenders_logic(
+                website_id, target_db_ids=[target_id],
+                forced_mode="full" if forced else mode_txt,
+            )
+        finally:
+            _job_runtime.force_redownload = False
         return result is not False
+
+    @staticmethod
+    def refresh_tender_counts(tender_db_id):
+        """Re-read one tender's portal page (plain HTTP) and store its current
+        prebid/corrigendum counts. Returns True only if both counts were read
+        and saved, so callers never treat a failed read as "nothing new"."""
+        if not ensure_scraper_dependencies():
+            return False
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            row = conn.execute("SELECT tender_url FROM tenders WHERE id=?", (int(tender_db_id),)).fetchone()
+            conn.close()
+            tender_url = str(row[0] or "").strip() if row else ""
+            if not tender_url:
+                return False
+            d_res = ScraperBackend.safe_request(tender_url)
+            if not d_res:
+                return False
+            d_soup = BeautifulSoup(d_res.text, 'html.parser')
+            prebid_count, corrigendum_count = ScraperBackend.extract_prebid_corrigendum_counts(d_soup)
+            if prebid_count is None or corrigendum_count is None:
+                return False
+            conn = sqlite3.connect(DB_FILE)
+            conn.execute(
+                "UPDATE tenders SET prebid_count=?, corrigendum_count=?, last_scraped_at=? WHERE id=?",
+                (int(prebid_count), int(corrigendum_count), time.time(), int(tender_db_id)),
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            log_to_gui(f"  Error refreshing counts for tender #{tender_db_id}: {e}")
+            return False
+
+    @staticmethod
+    def new_portal_files_available(tender_db_id):
+        """(available, portal_total, recorded_total): whether the portal's
+        prebid+corrigendum count exceeds what the last completed download run
+        covered (or, for tenders with no recorded run, the corrigendum/pre-bid
+        files actually stored)."""
+        conn = sqlite3.connect(DB_FILE)
+        row = conn.execute(
+            "SELECT COALESCE(prebid_count,0), COALESCE(corrigendum_count,0), "
+            "last_dl_prebid_count, last_dl_corrigendum_count, COALESCE(tender_id,'') "
+            "FROM tenders WHERE id=?",
+            (int(tender_db_id),),
+        ).fetchone()
+        if not row:
+            conn.close()
+            return True, 0, 0
+        portal_total = int(row[0]) + int(row[1])
+        if row[2] is not None and row[3] is not None:
+            recorded_total = int(row[2]) + int(row[3])
+        else:
+            recorded_total = int(conn.execute(
+                "SELECT COUNT(*) FROM downloaded_files WHERE file_type IN ('corrigendum','prebid') "
+                "AND COALESCE(download_status,'complete')='complete' AND "
+                "(tender_db_id=? OR (tender_db_id IS NULL AND UPPER(TRIM(COALESCE(tender_id,'')))=?))",
+                (int(tender_db_id), ScraperBackend.canonical_tender_id(row[4])),
+            ).fetchone()[0])
+        conn.close()
+        return portal_total > recorded_total, portal_total, recorded_total
 
     @staticmethod
     def archive_completed_tenders_logic(website_id, emit_log=True):
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        grace_cutoff = datetime.datetime.now() - datetime.timedelta(hours=24)
+        # closing_date is an IST wall-clock time; the server clock may be UTC.
+        ist_now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5, minutes=30))).replace(tzinfo=None)
+        grace_cutoff = ist_now - datetime.timedelta(hours=24)
         overdue_ids = []
         rows = c.execute(
             "SELECT id, closing_date FROM tenders WHERE website_id=? AND COALESCE(is_archived,0)=0",

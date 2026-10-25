@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 import admin_providers
 import app_core as core
+import org_access
 import security
 
 
@@ -127,6 +128,10 @@ class RegisterRequest(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=8, max_length=200)
     display_name: str = Field("", max_length=200)
+    # Optional: an "organisation" signup also creates the org, with this user
+    # as its admin. Older apps send neither field and get an individual account.
+    account_type: Literal["individual", "organisation"] = "individual"
+    org_name: str = Field("", max_length=org_access.MAX_ORG_NAME)
 
 
 class LoginRequest(BaseModel):
@@ -139,12 +144,20 @@ class AuthResponse(BaseModel):
     email: str
     display_name: str
     token: str
+    # Account type, org and section permissions (as GET /client/me).
+    account: Optional[dict[str, Any]] = None
+
+
+def _org_error(exc: org_access.OrgError) -> HTTPException:
+    return HTTPException(exc.status, exc.message)
 
 
 @router.post("/auth/register", response_model=AuthResponse)
 def client_register(body: RegisterRequest) -> dict[str, Any]:
     email = _normalize_email(body.email)
     display_name = body.display_name.strip()
+    if body.account_type == "organisation" and not body.org_name.strip():
+        raise HTTPException(400, "Enter an organisation name.")
     now = time.time()
     with _get_db() as conn:
         existing = conn.execute("SELECT id FROM client_users WHERE LOWER(email)=?", (email,)).fetchone()
@@ -160,8 +173,15 @@ def client_register(body: RegisterRequest) -> dict[str, Any]:
         )
         user_id = int(cur.lastrowid)
         token = _issue_token(conn, user_id)
+        if body.account_type == "organisation":
+            try:
+                org_access.create_org(conn, user_id, body.org_name, now)
+            except org_access.OrgError as exc:
+                raise _org_error(exc)
+        account = org_access.public_account(conn, org_access.get_account(conn, user_id))
         conn.commit()
-    return {"user_id": user_id, "email": email, "display_name": display_name, "token": token}
+    return {"user_id": user_id, "email": email, "display_name": display_name, "token": token,
+            "account": account}
 
 
 @router.post("/auth/login", response_model=AuthResponse)
@@ -185,12 +205,14 @@ def client_login(body: LoginRequest) -> dict[str, Any]:
         conn.execute(
             "UPDATE client_users SET last_login_at=?, last_seen_at=? WHERE id=?", (now, now, user_id)
         )
+        account = org_access.public_account(conn, org_access.get_account(conn, user_id))
         conn.commit()
     return {
         "user_id": user_id,
         "email": email,
         "display_name": str(data.get("display_name") or ""),
         "token": token,
+        "account": account,
     }
 
 
@@ -260,6 +282,181 @@ def _coerce_id_set(values: Any) -> set[int]:
     return result
 
 
+# A row's tender id as stored by the scraper (normalized_tender_id), falling
+# back to the raw id for a row written without it.
+_TENDER_KEY_SQL = "COALESCE(NULLIF(normalized_tender_id,''), UPPER(TRIM(tender_id)))"
+_T_TENDER_KEY_SQL = "COALESCE(NULLIF(t.normalized_tender_id,''), UPPER(TRIM(t.tender_id)))"
+
+
+def _canon_tender_id(value: Any) -> str:
+    # Same normaliser as ScraperBackend.canonical_tender_id.
+    return " ".join(str(value or "").split()).upper()
+
+
+def _coerce_tender_id_set(values: Any) -> set[str]:
+    return {key for key in (_canon_tender_id(v) for v in (values or [])) if key}
+
+
+def _values(row: Any) -> tuple:
+    # Positional values whether the connection returns tuples, Rows or dicts.
+    return tuple(row.values()) if isinstance(row, dict) else tuple(row)
+
+
+def _tender_ids_for_rows(conn, row_ids) -> dict[int, str]:
+    """Row id -> canonical tender id, for the rows that exist."""
+    ids = sorted({int(i) for i in row_ids})
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = [_values(r) for r in conn.execute(
+        f"SELECT id, tender_id FROM tenders WHERE id IN ({placeholders})", tuple(ids)
+    ).fetchall()]
+    return {int(r[0]): _canon_tender_id(r[1]) for r in rows if _canon_tender_id(r[1])}
+
+
+def _rows_for_tender_ids(conn, tender_ids) -> dict[str, int]:
+    """Canonical tender id -> current row id, for the tenders that exist."""
+    keys = sorted(_coerce_tender_id_set(tender_ids))
+    if not keys:
+        return {}
+    placeholders = ",".join("?" for _ in keys)
+    rows = [_values(r) for r in conn.execute(
+        f"SELECT id, {_TENDER_KEY_SQL} FROM tenders WHERE {_TENDER_KEY_SQL} IN ({placeholders})",
+        tuple(keys),
+    ).fetchall()]
+    return {str(r[1]): int(r[0]) for r in rows}
+
+
+def _blob_bookmark_tender_ids(conn, blob: dict) -> set[str]:
+    """A user's bookmarked tenders as tender ids. The tender id is the stored
+    identity (bookmarkTenderIds); a blob from before it existed only has row
+    ids, which are converted while their rows still exist."""
+    if isinstance(blob.get("bookmarkTenderIds"), list):
+        return _coerce_tender_id_set(blob.get("bookmarkTenderIds"))
+    return set(_tender_ids_for_rows(conn, _coerce_id_set(blob.get("bookmarks"))).values())
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip()) or value in ([], {})
+
+
+def _dedupe_projects(blob: dict) -> dict:
+    """A project added twice for the same tender (double tap, two devices,
+    offline re-send) is kept once. Projects are matched by their source
+    tender; ones without a tender are never merged.
+
+    The earliest project id survives. Field values come from the copy changed
+    most recently (the blob's own `_v` stamps), with blanks filled in from the
+    other copies. Checklist rows of dropped copies are moved to the kept one."""
+    projects = blob.get("projects")
+    if not isinstance(projects, list):
+        return blob
+    stamps = (blob.get("_v") or {}).get("projects") or {}
+
+    def _stamp(row: dict) -> float:
+        try:
+            return float(stamps.get(str(_row_id(row))) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    groups: dict[str, list[dict]] = {}
+    for row in projects:
+        key = _canon_tender_id(row.get("source_tender_id")) if isinstance(row, dict) else ""
+        if key:
+            groups.setdefault(key, []).append(row)
+    if all(len(rows) < 2 for rows in groups.values()):
+        return blob
+
+    kept_for: dict[str, dict] = {}
+    remap: dict[Any, Any] = {}
+    for key, rows in groups.items():
+        if len(rows) < 2:
+            continue
+        # Python's sort is stable: equal stamps keep list order (later = newer).
+        newest_first = sorted(rows, key=_stamp, reverse=True)
+        merged = dict(newest_first[0])
+        for other in newest_first[1:]:
+            for field, value in other.items():
+                if _is_blank(merged.get(field)) and not _is_blank(value):
+                    merged[field] = value
+        ids = [_row_id(r) for r in rows]
+        keep_id = min(ids, key=lambda i: (not isinstance(i, int), i if isinstance(i, int) else 0, str(i)))
+        merged["id"] = keep_id
+        kept_for[key] = merged
+        for rid in ids:
+            if rid != keep_id:
+                remap[rid] = keep_id
+
+    out_projects: list = []
+    emitted: set[str] = set()
+    for row in projects:
+        key = _canon_tender_id(row.get("source_tender_id")) if isinstance(row, dict) else ""
+        if key in kept_for:
+            if key not in emitted:
+                out_projects.append(kept_for[key])
+                emitted.add(key)
+            continue
+        out_projects.append(row)
+
+    out = dict(blob)
+    out["projects"] = out_projects
+    checklist = blob.get("checklist")
+    if remap and isinstance(checklist, list):
+        merged_into = set(remap.values())
+        moved: list = []
+        seen: set[tuple] = set()
+        for row in checklist:
+            if isinstance(row, dict):
+                field = "project_id" if "project_id" in row else "projectId" if "projectId" in row else None
+                if field:
+                    pid = row.get(field)
+                    try:
+                        pid = int(pid)
+                    except (TypeError, ValueError):
+                        pass
+                    if pid in remap:
+                        pid = remap[pid]
+                        row = {**row, field: pid}
+                    if pid in merged_into:
+                        # Both copies may have listed the same required file: keep it once.
+                        sig = (pid, str(row.get("req_file_name") or row.get("reqFileName") or ""),
+                               str(row.get("subfolder") or ""))
+                        if sig[1] and sig in seen:
+                            continue
+                        seen.add(sig)
+            moved.append(row)
+        out["checklist"] = moved
+    return out
+
+
+def _with_current_row_ids(conn, blob: dict) -> dict:
+    """Fill the row-id handles in a blob from its tender ids against the
+    current database, so they stay right after the tenders table is rebuilt
+    (and older app builds that still read `bookmarks` keep working).
+    Also collapses projects added twice for the same tender."""
+    out = _dedupe_projects(dict(blob or {}))
+    tender_ids = _blob_bookmark_tender_ids(conn, out)
+    if tender_ids or "bookmarks" in out or "bookmarkTenderIds" in out:
+        rows = _rows_for_tender_ids(conn, tender_ids)
+        out["bookmarkTenderIds"] = sorted(tender_ids)
+        out["bookmarks"] = sorted(rows.values())
+    projects = out.get("projects")
+    if isinstance(projects, list):
+        linked = _rows_for_tender_ids(
+            conn, [p.get("source_tender_id") for p in projects if isinstance(p, dict)]
+        )
+        refreshed = []
+        for project in projects:
+            if isinstance(project, dict) and _canon_tender_id(project.get("source_tender_id")):
+                project = {
+                    **project,
+                    "source_tender_db_id": linked.get(_canon_tender_id(project.get("source_tender_id"))),
+                }
+            refreshed.append(project)
+        out["projects"] = refreshed
+    return out
+
+
 # A bookmark keeps its target fresh with a recurring 24-hour scrape.
 BOOKMARK_SCRAPE_INTERVAL_MINUTES = 1440
 
@@ -284,16 +481,21 @@ def _bookmark_union(conn) -> tuple[dict[int, int], dict[int, int]]:
     Returns (tender_id -> distinct bookmarker count, org_id -> count). Org
     bookmarks stored only by name are resolved to ids here (name->id fallback).
     """
-    tender_users: dict[int, set[int]] = {}
-    org_users_by_id: dict[int, set[int]] = {}
-    org_users_by_name: dict[str, set[int]] = {}
+    tender_users: dict[int, set[Any]] = {}
+    org_users_by_id: dict[int, set[Any]] = {}
+    org_users_by_name: dict[str, set[Any]] = {}
+    blobs: list[tuple[Any, dict]] = []
     for row in conn.execute("SELECT user_id, data_json FROM client_user_sync").fetchall():
-        user_id = int(row[0])
         try:
-            blob = json.loads(row[1] or "{}")
+            blobs.append((int(row[0]), json.loads(row[1] or "{}")))
         except (TypeError, ValueError):
             continue
-        for tid in _coerce_id_set(blob.get("bookmarks")):
+    # An organisation's shared bookmarks count as one more bookmarker.
+    blobs.extend((("org", org_id), blob) for org_id, blob in org_access.all_org_blobs(conn))
+    for user_id, blob in blobs:
+        if not isinstance(blob, dict):
+            continue
+        for tid in _rows_for_tender_ids(conn, _blob_bookmark_tender_ids(conn, blob)).values():
             tender_users.setdefault(tid, set()).add(user_id)
         for oid in _coerce_id_set(blob.get("bookmarkedOrgIds")):
             org_users_by_id.setdefault(oid, set()).add(user_id)
@@ -454,26 +656,24 @@ def _apply_bookmark_schedules(data: dict[str, Any]) -> None:
 
 @router.get("/sync", dependencies=[Depends(require_client_user)])
 def client_pull_sync(user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    # An individual gets their own row; an org member gets the org's shared
+    # data plus their own personal keys. Sections the user may not use are
+    # left out (org_access.effective_blob).
     with _get_db() as conn:
-        row = conn.execute(
-            "SELECT data_json, updated_at FROM client_user_sync WHERE user_id=?", (user_id,)
-        ).fetchone()
-    if not row:
-        return {"data": {}, "updated_at": 0}
-    data = dict(row)
-    try:
-        parsed = json.loads(data.get("data_json") or "{}")
-    except (TypeError, ValueError):
-        parsed = {}
-    return {"data": parsed, "updated_at": float(data.get("updated_at") or 0)}
+        blob, updated_at, found = org_access.effective_blob(conn, user_id)
+        if not found:
+            return {"data": {}, "updated_at": 0}
+        return {"data": _with_current_row_ids(conn, blob), "updated_at": updated_at}
 
 
 # Collections in the sync blob that must merge ADDITIVELY across devices — a
 # client holding only a subset (fresh install, was offline, dev origin) must
 # never be able to shrink them just by pushing. Removals travel as an explicit
 # `removed` delta instead.
-_SYNC_ID_SET_KEYS = ("bookmarks", "bookmarkedOrgIds")   # integer ids
-_SYNC_NAME_SET_KEYS = ("bookmarkedOrgs",)               # strings
+# Tender bookmarks are stored as tender ids (bookmarkTenderIds); `bookmarks`
+# (row ids) is derived from them on every read/write, never merged itself.
+_SYNC_ID_SET_KEYS = ("bookmarkedOrgIds",)                     # integer ids
+_SYNC_NAME_SET_KEYS = ("bookmarkedOrgs", "bookmarkTenderIds")  # strings
 _SYNC_ROW_KEYS = ("projects", "checklist")              # list[dict] keyed by "id"
 
 
@@ -501,6 +701,20 @@ def _prune_version_map(vmap: dict, now: float) -> dict:
     return out
 
 
+def _prefs_newer_or_equal(incoming: Any, stored: Any) -> bool:
+    """notificationPrefs carries its own `updatedAt` (ms, set when the user
+    changes a toggle). Missing counts as 0, so an unstamped write never
+    replaces a stamped one."""
+    def _stamp(value: Any) -> float:
+        try:
+            return float((value or {}).get("updatedAt") or 0) if isinstance(value, dict) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+    if not isinstance(stored, dict):
+        return True
+    return _stamp(incoming) >= _stamp(stored)
+
+
 def _merge_sync_blob(
     stored: dict, incoming: dict, removed: dict, conn,
     base_updated_at: float | None = None, now: float | None = None,
@@ -509,9 +723,27 @@ def _merge_sync_blob(
     # an item stamped by this push has `_v ts == updated_at` and a later push
     # whose `base_updated_at` equals that `updated_at` is NOT treated as stale.
     now = time.time() if now is None else float(now)
-    merged = {k: v for k, v in (stored or {}).items()}
-    removed = removed if isinstance(removed, dict) else {}
-    incoming = incoming if isinstance(incoming, dict) else {}
+    removed = dict(removed) if isinstance(removed, dict) else {}
+    incoming = dict(incoming) if isinstance(incoming, dict) else {}
+    stored = dict(stored or {})
+    # Tender bookmarks travel as tender ids. A blob or an older app build that
+    # only has row ids is converted here, while those rows still exist.
+    if "bookmarkTenderIds" not in stored and "bookmarks" in stored:
+        stored["bookmarkTenderIds"] = sorted(_blob_bookmark_tender_ids(conn, stored))
+    if "bookmarkTenderIds" in incoming:
+        incoming["bookmarkTenderIds"] = sorted(_coerce_tender_id_set(incoming.get("bookmarkTenderIds")))
+    elif "bookmarks" in incoming:
+        incoming["bookmarkTenderIds"] = sorted(
+            _tender_ids_for_rows(conn, _coerce_id_set(incoming.get("bookmarks"))).values()
+        )
+    if "bookmarkTenderIds" in removed:
+        removed["bookmarkTenderIds"] = sorted(_coerce_tender_id_set(removed.get("bookmarkTenderIds")))
+    elif "bookmarks" in removed:
+        removed["bookmarkTenderIds"] = sorted(
+            _tender_ids_for_rows(conn, _coerce_id_set(removed.get("bookmarks"))).values()
+        )
+    incoming.pop("bookmarks", None)
+    merged = {k: v for k, v in stored.items()}
 
     # Per-item "last changed" / "deleted at" clocks live inside the blob.
     versions: dict[str, dict] = {k: dict(v or {}) for k, v in (stored.get("_v") or {}).items()}
@@ -524,7 +756,7 @@ def _merge_sync_blob(
     # can't be trusted to express deltas — the server's copy wins outright.
     meaningful = [k for k in (stored or {}) if not k.startswith("_")]
     if gated and base <= 0 and meaningful:
-        return merged
+        return _with_current_row_ids(conn, merged)
 
     def _mk(x: Any) -> str:
         return str(x)
@@ -614,6 +846,10 @@ def _merge_sync_blob(
             continue
         if key.startswith("_"):
             continue
+        if key == "notificationPrefs" and not _prefs_newer_or_equal(value, merged.get(key)):
+            # A fresh install or older build would otherwise overwrite the
+            # saved preferences with its own defaults (push silently stops).
+            continue
         merged[key] = value  # key-preserving: incoming wins, omitted keys kept
 
     pruned_v = _prune_version_map(versions, now)
@@ -644,66 +880,260 @@ def _merge_sync_blob(
             (_coerce_id_set(merged.get("bookmarkedOrgIds")) | resolved) - gone
         )
 
-    # Phantom cleanup: drop bookmarked tender / org ids that no longer exist here.
-    for key, table in (("bookmarks", "tenders"), ("bookmarkedOrgIds", "organizations")):
-        ids = _coerce_id_set(merged.get(key))
-        if not ids:
-            continue
+    # Phantom cleanup: drop bookmarked org ids that no longer exist here.
+    # Bookmarked tender ids are kept even when the tender isn't in the database
+    # right now, so they reconnect when it returns (restore or re-scrape).
+    ids = _coerce_id_set(merged.get("bookmarkedOrgIds"))
+    if ids:
         placeholders = ",".join("?" for _ in ids)
         real = {
             int(r[0])
             for r in conn.execute(
-                f"SELECT id FROM {table} WHERE id IN ({placeholders})", tuple(ids)
+                f"SELECT id FROM organizations WHERE id IN ({placeholders})", tuple(ids)
             ).fetchall()
         }
         if real != ids:
-            merged[key] = sorted(real)
+            merged["bookmarkedOrgIds"] = sorted(real)
 
-    return merged
+    return _with_current_row_ids(conn, merged)
 
 
 @router.put("/sync", dependencies=[Depends(require_client_user)])
 def client_push_sync(body: SyncPushRequest, user_id: int = Depends(require_client_user)) -> dict[str, Any]:
     now = time.time()
     with _get_db() as conn:
-        row = conn.execute(
-            "SELECT data_json FROM client_user_sync WHERE user_id=?", (user_id,)
-        ).fetchone()
-        stored: dict[str, Any] = {}
-        if row:
-            try:
-                parsed = json.loads(dict(row).get("data_json") or "{}")
-                if isinstance(parsed, dict):
-                    stored = parsed
-            except (TypeError, ValueError):
-                stored = {}
-        incoming = body.data if isinstance(body.data, dict) else {}
+        account = org_access.get_account(conn, user_id)
+        stored, _stored_at, _found = org_access.read_user_blob(conn, user_id)
+        # The server replaced this user's data (joined or left an org) after
+        # this device last pulled: its copy is stale, so the server's wins.
+        reset_at = stored.get(org_access.RESET_KEY)
+        if (
+            isinstance(reset_at, (int, float)) and body.base_updated_at is not None
+            and float(body.base_updated_at) < float(reset_at)
+        ):
+            _blob, current_at, _f = org_access.effective_blob(conn, user_id, account)
+            return {"ok": True, "updated_at": current_at}
+        # Sections the user may not use are never written: the stored data
+        # stays as it was until the section is turned back on.
+        hidden = org_access.hidden_keys(account["permissions"])
+        incoming = {
+            k: v for k, v in (body.data if isinstance(body.data, dict) else {}).items() if k not in hidden
+        }
+        removed = {
+            k: v for k, v in (body.removed if isinstance(body.removed, dict) else {}).items() if k not in hidden
+        }
         # Additive merge with per-item concurrency: bookmark sets union (minus
         # an explicit `removed` delta), projects/checklist merge by id,
         # everything else keeps a key the client omitted. When the client
         # sends `base_updated_at`, an incoming change to an item the server
         # changed after that timestamp is skipped (online beats offline).
-        merged = _merge_sync_blob(
-            stored, incoming, body.removed or {}, conn, body.base_updated_at, now
-        )
-        payload = json.dumps(merged, ensure_ascii=False)
-        if len(payload.encode("utf-8")) > MAX_SYNC_PAYLOAD_BYTES:
-            raise HTTPException(413, "Sync payload is too large.")
-        conn.execute(
-            "INSERT INTO client_user_sync (user_id, data_json, updated_at) VALUES (?,?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET data_json=excluded.data_json, updated_at=excluded.updated_at",
-            (user_id, payload, now),
-        )
+        if account["org_id"] is None:
+            merged = _merge_sync_blob(stored, incoming, removed, conn, body.base_updated_at, now)
+            _check_sync_size(merged)
+            org_access.write_user_blob(conn, user_id, merged, now)
+        else:
+            # Org member: shared keys go to the org's pool, personal keys
+            # (column/notification prefs) to their own row.
+            shared_in = {k: v for k, v in incoming.items() if k in org_access.SHARED_KEYS}
+            shared_rm = {k: v for k, v in removed.items() if k in org_access.SHARED_KEYS}
+            org_stored, _org_at, _org_found = org_access.read_org_blob(conn, account["org_id"])
+            merged = _merge_sync_blob(org_stored, shared_in, shared_rm, conn, body.base_updated_at, now)
+            personal = _merge_sync_blob(
+                stored,
+                {k: v for k, v in incoming.items() if k not in org_access.SHARED_KEYS},
+                {k: v for k, v in removed.items() if k not in org_access.SHARED_KEYS},
+                conn, body.base_updated_at, now,
+            )
+            _check_sync_size(merged)
+            _check_sync_size(personal)
+            org_access.write_org_blob(conn, account["org_id"], merged, now)
+            org_access.write_user_blob(conn, user_id, personal, now)
         conn.commit()
     _apply_bookmark_schedules(merged)
     return {"ok": True, "updated_at": now}
 
 
-# tender_history snapshots (app_core.ScraperBackend.tender_snapshot) don't track
-# `status` / pre-bid / corrigendum, so the change feed can only speak to fields
-# that are in the snapshot. `status` and pre-bid/corrigendum stay covered by the
-# clients' own local snapshot diff.
-_ALERTABLE_CHANGED_FIELDS = {"closing_date"}
+def _check_sync_size(blob: dict) -> None:
+    if len(json.dumps(blob, ensure_ascii=False).encode("utf-8")) > MAX_SYNC_PAYLOAD_BYTES:
+        raise HTTPException(413, "Sync payload is too large.")
+
+
+_ALERTABLE_CHANGED_FIELDS = {"closing_date", "status", "prebid_count", "corrigendum_count"}
+
+
+def _compute_user_changes(
+    conn: Any, user_id: int, since: float
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """Core of the /changes diff, factored out so apns_push.py's scheduler pass
+    can reuse the exact same comparison the polling endpoint below uses,
+    instead of drifting out of sync with a second implementation."""
+    tenders_changed: list[dict[str, Any]] = []
+    new_by_org: dict[str, list[dict[str, Any]]] = {}
+    # The org's bookmarks for a member; none at all without the bookmarks section.
+    blob, _updated_at, _found = org_access.effective_blob(conn, user_id)
+    tender_ids = sorted(_rows_for_tender_ids(conn, _blob_bookmark_tender_ids(conn, blob)).values())
+    org_names = sorted(
+        {str(n).strip() for n in (blob.get("bookmarkedOrgs") or []) if str(n).strip()}
+    )
+
+    if since > 0 and tender_ids:
+        placeholders = ",".join("?" for _ in tender_ids)
+        hist = conn.execute(
+            f"SELECT tender_db_id, changed_fields FROM tender_history "
+            f"WHERE tender_db_id IN ({placeholders}) AND scraped_at > ?",
+            (*tender_ids, since),
+        ).fetchall()
+        fields_by_tender: dict[int, set[str]] = {}
+        for tid, changed_fields in hist:
+            try:
+                names = json.loads(changed_fields or "[]")
+            except (TypeError, ValueError):
+                names = []
+            fields_by_tender.setdefault(int(tid), set()).update(str(n) for n in names)
+        hit_ids = [tid for tid, names in fields_by_tender.items() if names & _ALERTABLE_CHANGED_FIELDS]
+        if hit_ids:
+            ph2 = ",".join("?" for _ in hit_ids)
+            rows = {
+                int(r[0]): (str(r[1] or ""), str(r[2] or ""), str(r[3] or ""))
+                for r in conn.execute(
+                    f"SELECT id, title, status, tender_id FROM tenders WHERE id IN ({ph2})", tuple(hit_ids)
+                ).fetchall()
+            }
+            for tid in hit_ids:
+                title, status, portal_id = rows.get(tid, ("", "", ""))
+                tenders_changed.append({
+                    "id": tid,
+                    "tender_id": portal_id,
+                    "title": title,
+                    "status": status,
+                    "changed_fields": sorted(fields_by_tender[tid] & _ALERTABLE_CHANGED_FIELDS),
+                })
+
+    if since > 0 and org_names:
+        placeholders = ",".join("?" for _ in org_names)
+        rows = conn.execute(
+            f"SELECT id, title, tender_id, org_chain FROM tenders "
+            f"WHERE org_chain IN ({placeholders}) AND COALESCE(is_archived,0)=0 "
+            f"AND COALESCE(first_seen_at,0) > ? ORDER BY COALESCE(first_seen_at,0)",
+            (*org_names, since),
+        ).fetchall()
+        for r in rows:
+            new_by_org.setdefault(str(r[3] or ""), []).append({
+                "id": int(r[0]),
+                "title": str(r[1] or ""),
+                "tender_id": str(r[2] or ""),
+            })
+
+    return tenders_changed, new_by_org
+
+
+# How far back the push pass looks for rows it hasn't handled. Far longer than a
+# scrape takes to commit the rows it stamped; older rows are never pushed.
+PUSH_EVENT_LOOKBACK_SECONDS = 48 * 3600
+
+
+def _unhandled_push_events(
+    conn: Any, now: float
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Recent new tenders (tenders rows) and tender changes (tender_history rows)
+    the push pass hasn't handled yet -- by row, not by time: a row a scrape
+    stamped before the last pass but committed after it is still here."""
+    since = now - PUSH_EVENT_LOOKBACK_SECONDS
+    new_events = [
+        {"ref_id": int(r[0]), "title": str(r[1] or ""), "tender_id": str(r[2] or ""),
+         "org": str(r[3] or ""), "at": float(r[4] or 0)}
+        for r in map(_values, conn.execute(
+            "SELECT t.id, t.title, t.tender_id, t.org_chain, t.first_seen_at FROM tenders t "
+            "WHERE t.first_seen_at > ? AND COALESCE(t.is_archived,0)=0 "
+            "AND NOT EXISTS (SELECT 1 FROM push_handled_events h "
+            "WHERE h.kind='new' AND h.ref_id=t.id) "
+            "ORDER BY t.first_seen_at, t.id",
+            (since,),
+        ).fetchall())
+    ]
+    change_events = []
+    for r in map(_values, conn.execute(
+        "SELECT h.id, h.tender_db_id, h.changed_fields, h.scraped_at FROM tender_history h "
+        "WHERE h.scraped_at > ? AND NOT EXISTS (SELECT 1 FROM push_handled_events p "
+        "WHERE p.kind='change' AND p.ref_id=h.id) "
+        "ORDER BY h.scraped_at, h.id",
+        (since,),
+    ).fetchall()):
+        try:
+            names = json.loads(r[2] or "[]")
+        except (TypeError, ValueError):
+            names = []
+        change_events.append({
+            "ref_id": int(r[0]), "tender_db_id": int(r[1]), "at": float(r[3] or 0),
+            # Every row is handled; only these fields make a push.
+            "fields": {str(n) for n in names} & _ALERTABLE_CHANGED_FIELDS,
+        })
+    return new_events, change_events
+
+
+def _user_push_changes(
+    conn: Any, blob: dict, floor: float,
+    new_events: list[dict[str, Any]], change_events: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """One user's share of the unhandled events (their bookmarked tenders and
+    organisations, after `floor` -- when the device registered), shaped like
+    _compute_user_changes' result."""
+    tender_ids = set(_rows_for_tender_ids(conn, _blob_bookmark_tender_ids(conn, blob)).values())
+    org_names = {str(n).strip() for n in (blob.get("bookmarkedOrgs") or []) if str(n).strip()}
+
+    fields_by_tender: dict[int, set[str]] = {}
+    for e in change_events:
+        if e["fields"] and e["at"] > floor and e["tender_db_id"] in tender_ids:
+            fields_by_tender.setdefault(e["tender_db_id"], set()).update(e["fields"])
+    tenders_changed: list[dict[str, Any]] = []
+    if fields_by_tender:
+        ids = list(fields_by_tender)
+        placeholders = ",".join("?" for _ in ids)
+        rows = {
+            int(r[0]): (str(r[1] or ""), str(r[2] or ""), str(r[3] or ""))
+            for r in map(_values, conn.execute(
+                f"SELECT id, title, status, tender_id FROM tenders WHERE id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall())
+        }
+        for tid in ids:
+            title, status, portal_id = rows.get(tid, ("", "", ""))
+            tenders_changed.append({
+                "id": tid,
+                "tender_id": portal_id,
+                "title": title,
+                "status": status,
+                "changed_fields": sorted(fields_by_tender[tid]),
+            })
+
+    new_by_org: dict[str, list[dict[str, Any]]] = {}
+    for e in new_events:
+        if e["at"] > floor and e["org"] in org_names:
+            new_by_org.setdefault(e["org"], []).append(
+                {"id": e["ref_id"], "title": e["title"], "tender_id": e["tender_id"]}
+            )
+    return tenders_changed, new_by_org
+
+
+def _mark_push_events_handled(
+    conn: Any, new_events: list[dict[str, Any]], change_events: list[dict[str, Any]], now: float
+) -> None:
+    """Records the events as handled (never pushed again) and forgets ones too old
+    to come up again."""
+    rows = [("new", e["ref_id"], now) for e in new_events] + [
+        ("change", e["ref_id"], now) for e in change_events
+    ]
+    if rows:
+        conn.executemany(
+            "INSERT INTO push_handled_events (kind, ref_id, handled_at) VALUES (?,?,?) "
+            "ON CONFLICT(kind, ref_id) DO NOTHING",
+            rows,
+        )
+    conn.execute(
+        "DELETE FROM push_handled_events WHERE handled_at < ?",
+        (now - 2 * PUSH_EVENT_LOOKBACK_SECONDS,),
+    )
+    conn.commit()
 
 
 @router.get("/changes", dependencies=[Depends(require_client_user)])
@@ -718,67 +1148,159 @@ def client_changes(
     don't alert on the whole back-catalogue.
     """
     now = time.time()
-    tenders_changed: list[dict[str, Any]] = []
-    new_by_org: dict[str, list[dict[str, Any]]] = {}
+    with _get_db() as conn:
+        tenders_changed, new_by_org = _compute_user_changes(conn, user_id, since)
+    return {"now": now, "tenders": tenders_changed, "new_by_org": new_by_org}
+
+
+class RegisterPushTokenRequest(BaseModel):
+    token: str = Field(min_length=8, max_length=512)
+    platform: str = "ios"
+    # Which app registered the token: BM Pro sends neither field, so its rows
+    # keep 'bmpro'/'production'. Bidwise sends app='bidwise' and the APNs
+    # environment of the build (a Debug build's token is a sandbox token).
+    app: str = "bmpro"
+    environment: str = "production"
+
+
+@router.post("/push-token")
+def client_register_push_token(
+    body: RegisterPushTokenRequest,
+    user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    # A device token can migrate between accounts (sign out, sign in as someone
+    # else on the same phone) -- UPSERT on the token itself (unique index) so a
+    # stale row under a previous user is reassigned rather than duplicated.
+    now = time.time()
+    token = body.token.strip()
+    app = (body.app or "bmpro").strip().lower()
+    if app not in ("bmpro", "bidwise"):
+        raise HTTPException(status_code=400, detail="Unknown app.")
+    environment = (body.environment or "production").strip().lower()
+    if environment not in ("production", "sandbox"):
+        raise HTTPException(status_code=400, detail="Unknown environment.")
+    with _get_db() as conn:
+        conn.execute(
+            # last_pushed_at starts at `now`, not the column default of 0 --
+            # api_server.py's push pass treats since=0 as "brand new, don't
+            # flood with the whole history" and skips the diff entirely on a
+            # device's first pass. Seeding it with 0 would mean anything that
+            # appears in the few seconds/minutes between registration and
+            # that first pass falls into that same since=0 gap and is
+            # silently never sent, even though it's not history -- it
+            # happened after registration. Only matters on first INSERT
+            # (a re-registration via ON CONFLICT below keeps the existing
+            # cursor, same as today).
+            "INSERT INTO client_push_tokens "
+            "(user_id, token, platform, app, apns_env, created_at, last_seen_at, last_pushed_at) "
+            "VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(token) DO UPDATE SET user_id=excluded.user_id, platform=excluded.platform, "
+            "app=excluded.app, apns_env=excluded.apns_env, last_seen_at=excluded.last_seen_at",
+            (user_id, token, body.platform.strip() or "ios", app, environment, now, now, now),
+        )
+        conn.commit()
+    return {"ok": True}
+
+
+@router.delete("/push-token")
+def client_unregister_push_token(
+    body: RegisterPushTokenRequest,
+    user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    with _get_db() as conn:
+        conn.execute(
+            "DELETE FROM client_push_tokens WHERE token=? AND user_id=?",
+            (body.token.strip(), user_id),
+        )
+        conn.commit()
+    return {"ok": True}
+
+
+class SyncBadgeRequest(BaseModel):
+    count: int = Field(ge=0)
+    # Bidwise: organisations whose "new tenders" alert is still unread. Their
+    # pending grouped pushes are kept; the rest are dropped, so the next new
+    # tender under them starts a fresh notification (and badge). BM Pro omits it.
+    unread_orgs: Optional[list[str]] = None
+
+
+@router.put("/badge")
+def client_sync_badge(
+    body: SyncBadgeRequest,
+    user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    # The app tells the server its real current unread count whenever it
+    # changes locally (see alerts.js) so api_server.py's push pass -- which
+    # otherwise just increments badge_count by 1 on every push it sends --
+    # has an accurate baseline to climb from instead of drifting upward
+    # forever once the user has actually read something. Applies to every
+    # device this user has registered, not just the one making the call, so
+    # a multi-device user sees the same number everywhere.
+    with _get_db() as conn:
+        conn.execute(
+            "UPDATE client_push_tokens SET badge_count=? WHERE user_id=?",
+            (body.count, user_id),
+        )
+        if body.unread_orgs is not None or body.count == 0:
+            keep = set(body.unread_orgs or []) if body.count else set()
+            rows = conn.execute(
+                "SELECT id, pending_orgs FROM client_push_tokens WHERE user_id=?", (user_id,)
+            ).fetchall()
+            for row_id, raw in rows:
+                try:
+                    pending = json.loads(raw or "{}")
+                except (TypeError, ValueError):
+                    pending = {}
+                kept = {org: v for org, v in pending.items() if org in keep}
+                if kept != pending:
+                    conn.execute(
+                        "UPDATE client_push_tokens SET pending_orgs=? WHERE id=?",
+                        (json.dumps(kept), row_id),
+                    )
+        conn.commit()
+    return {"ok": True}
+
+
+class CaptchaAnswerRequest(BaseModel):
+    text: str = Field(max_length=200)
+
+
+@router.get("/captcha/pending")
+def client_captcha_pending(
+    user_id: int = Depends(require_client_user),
+) -> Optional[dict[str, Any]]:
     with _get_db() as conn:
         row = conn.execute(
-            "SELECT data_json FROM client_user_sync WHERE user_id=?", (user_id,)
+            "SELECT id, image_base64, context FROM captcha_requests "
+            "WHERE user_id=? AND status='pending' ORDER BY created_at ASC LIMIT 1",
+            (user_id,),
         ).fetchone()
-        try:
-            blob = json.loads(row[0] or "{}") if row else {}
-        except (TypeError, ValueError):
-            blob = {}
-        tender_ids = sorted(_coerce_id_set(blob.get("bookmarks")))
-        org_names = sorted(
-            {str(n).strip() for n in (blob.get("bookmarkedOrgs") or []) if str(n).strip()}
-        )
+    if not row:
+        return None
+    return {"request_id": str(row[0]), "image_base64": str(row[1] or ""), "context": str(row[2] or "captcha")}
 
-        if since > 0 and tender_ids:
-            placeholders = ",".join("?" for _ in tender_ids)
-            hist = conn.execute(
-                f"SELECT tender_db_id, changed_fields FROM tender_history "
-                f"WHERE tender_db_id IN ({placeholders}) AND scraped_at > ?",
-                (*tender_ids, since),
-            ).fetchall()
-            fields_by_tender: dict[int, set[str]] = {}
-            for tid, changed_fields in hist:
-                try:
-                    names = json.loads(changed_fields or "[]")
-                except (TypeError, ValueError):
-                    names = []
-                fields_by_tender.setdefault(int(tid), set()).update(str(n) for n in names)
-            hit_ids = [tid for tid, names in fields_by_tender.items() if names & _ALERTABLE_CHANGED_FIELDS]
-            if hit_ids:
-                ph2 = ",".join("?" for _ in hit_ids)
-                titles = {
-                    int(r[0]): str(r[1] or "")
-                    for r in conn.execute(
-                        f"SELECT id, title FROM tenders WHERE id IN ({ph2})", tuple(hit_ids)
-                    ).fetchall()
-                }
-                for tid in hit_ids:
-                    tenders_changed.append({
-                        "id": tid,
-                        "title": titles.get(tid, ""),
-                        "changed_fields": sorted(fields_by_tender[tid] & _ALERTABLE_CHANGED_FIELDS),
-                    })
 
-        if since > 0 and org_names:
-            placeholders = ",".join("?" for _ in org_names)
-            rows = conn.execute(
-                f"SELECT id, title, tender_id, org_chain FROM tenders "
-                f"WHERE org_chain IN ({placeholders}) AND COALESCE(is_archived,0)=0 "
-                f"AND COALESCE(first_seen_at,0) > ? ORDER BY COALESCE(first_seen_at,0)",
-                (*org_names, since),
-            ).fetchall()
-            for r in rows:
-                new_by_org.setdefault(str(r[3] or ""), []).append({
-                    "id": int(r[0]),
-                    "title": str(r[1] or ""),
-                    "tender_id": str(r[2] or ""),
-                })
-
-    return {"now": now, "tenders": tenders_changed, "new_by_org": new_by_org}
+@router.post("/captcha/{captcha_id}/answer")
+def client_answer_captcha(
+    captcha_id: str,
+    body: CaptchaAnswerRequest,
+    user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    # Scoped to this user's own row, then handed to the exact same
+    # submit_captcha() the admin console's /admin/captchas/{id}/answer uses --
+    # its atomic "WHERE status='pending'" UPDATE is what makes this safe to
+    # race against the admin desktop console answering the same CAPTCHA:
+    # whichever call executes first wins, the other gets a 404 here same as
+    # it would there.
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT id FROM captcha_requests WHERE id=? AND user_id=? AND status='pending'",
+            (captcha_id, user_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Captcha request not found or already resolved.")
+    import api_server  # deferred: api_server imports this module at load time
+    return api_server.submit_captcha(api_server.CaptchaSubmitRequest(request_id=captcha_id, text=body.text))
 
 
 def _page_meta(page: int, page_size: int, total: int) -> dict[str, int]:
@@ -790,7 +1312,29 @@ def _page_meta(page: int, page_size: int, total: int) -> dict[str, int]:
     }
 
 
-def _public_tender(row: Any) -> dict[str, Any]:
+def _public_base_url(request: Optional[Request]) -> str:
+    """Base URL the client reached us on (honours Caddy's X-Forwarded-Proto)."""
+    if request is None:
+        return ""
+    base = str(request.base_url).rstrip("/")
+    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    if proto in {"http", "https"} and "://" in base:
+        base = f"{proto}://{base.split('://', 1)[1]}"
+    return base
+
+
+def _client_tender_url(tender_url: str, base_url: str) -> str:
+    """nProcure tender pages only open via a form POST, so hand clients the server's
+    hand-off page (/portal/nprocure/tender/<id>) instead of the raw portal URL."""
+    if base_url and "nprocure.com" in tender_url:
+        from scrapers import nprocure
+        path = nprocure.open_link_path(tender_url)
+        if path:
+            return f"{base_url}{path}"
+    return tender_url
+
+
+def _public_tender(row: Any, base_url: str = "") -> dict[str, Any]:
     data = dict(row)
     return {
         "id": int(data["id"]),
@@ -815,7 +1359,9 @@ def _public_tender(row: Any) -> dict[str, Any]:
         "document_count": int(data.get("document_count") or 0),
         "prebid_count": int(data.get("prebid_count") or 0),
         "corrigendum_count": int(data.get("corrigendum_count") or 0),
-        "tender_url": str(data.get("tender_url") or ""),
+        "last_update_checked_at": float(data.get("last_update_checked_at") or 0) or None,
+        "last_status_checked_at": float(data.get("last_status_checked_at") or 0) or None,
+        "tender_url": _client_tender_url(str(data.get("tender_url") or ""), base_url),
     }
 
 
@@ -834,6 +1380,8 @@ def _tender_select() -> str:
         "COALESCE(t.tender_url,'') AS tender_url,"
         "COALESCE(t.prebid_count,0) AS prebid_count,"
         "COALESCE(t.corrigendum_count,0) AS corrigendum_count,"
+        "COALESCE(t.last_update_checked_at,0) AS last_update_checked_at,"
+        "COALESCE(t.last_status_checked_at,0) AS last_status_checked_at,"
         "(SELECT COUNT(*) FROM downloaded_files d WHERE "
         "d.tender_db_id=t.id OR (d.tender_db_id IS NULL AND "
         "UPPER(TRIM(COALESCE(d.tender_id,'')))=UPPER(TRIM(COALESCE(t.tender_id,''))))) "
@@ -851,9 +1399,16 @@ def _tender_filters(
     location: str = "",
     category: str = "",
     has_documents: Optional[bool] = None,
+    scope: Optional[tuple[str, list[Any]]] = None,
 ) -> tuple[list[str], list[Any]]:
-    conditions: list[str] = []
+    # Tenders of a portal that has been deleted are left out, so a removed
+    # portal disappears from the apps even if some rows were left behind.
+    conditions: list[str] = ["t.website_id IN (SELECT id FROM websites)"]
     params: list[Any] = []
+    if scope is not None:
+        # The sections this user may see (_tender_scope).
+        conditions.append(scope[0])
+        params.extend(scope[1])
     if query:
         pattern = f"%{query.strip().lower()}%"
         fields = (
@@ -889,27 +1444,90 @@ def _tender_filters(
     return conditions, params
 
 
+def _tender_scope(conn: Any, user_id: Optional[int], alias: str = "t") -> Optional[tuple[str, list[Any]]]:
+    """SQL (and params) limiting tenders to the sections this user may see:
+    active / archived tenders, their (or their org's) bookmarked tenders and
+    organisations, and the tenders of their projects. None = no limit, which
+    is every user with both tender sections on (every existing account)."""
+    if user_id is None:
+        return None
+    account = org_access.get_account(conn, user_id)
+    perms = account["permissions"]
+    if perms["active"] and perms["archived"]:
+        return None
+    blob, _updated_at, _found = org_access.effective_blob(conn, user_id, account)
+    archived = f"COALESCE({alias}.is_archived,0)"
+    parts: list[str] = []
+    params: list[Any] = []
+    if perms["active"]:
+        parts.append(f"{archived}=0")
+    if perms["archived"]:
+        parts.append(f"{archived}=1")
+    keys: set[str] = set()
+    if perms["bookmarks"]:
+        keys |= _blob_bookmark_tender_ids(conn, blob)
+        names = sorted({str(n).strip() for n in (blob.get("bookmarkedOrgs") or []) if str(n).strip()})
+        if names:
+            parts.append(f"{alias}.org_chain IN ({','.join('?' for _ in names)})")
+            params.extend(names)
+    if perms["projects"]:
+        keys |= {
+            _canon_tender_id(p.get("source_tender_id"))
+            for p in (blob.get("projects") or []) if isinstance(p, dict)
+        } - {""}
+    if keys:
+        key_sql = f"COALESCE(NULLIF({alias}.normalized_tender_id,''), UPPER(TRIM({alias}.tender_id)))"
+        parts.append(f"{key_sql} IN ({','.join('?' for _ in keys)})")
+        params.extend(sorted(keys))
+    if not parts:
+        return "1=0", []
+    return "(" + " OR ".join(parts) + ")", params
+
+
+def _require_tender_access(conn: Any, user_id: int, tender_db_id: int) -> None:
+    """404 (as for a missing tender) when the tender is outside the user's sections."""
+    scope = _tender_scope(conn, user_id)
+    if scope is None:
+        return
+    if not conn.execute(
+        f"SELECT 1 FROM tenders t WHERE t.id=? AND {scope[0]}", (tender_db_id, *scope[1])
+    ).fetchone():
+        raise HTTPException(404, "Tender not found.")
+
+
+def _require_section(user_id: int, section: str) -> None:
+    with _get_db() as conn:
+        allowed = org_access.get_account(conn, user_id)["permissions"].get(section, True)
+    if not allowed:
+        raise HTTPException(403, detail={
+            "reason": "section_forbidden", "section": section,
+            "message": "Your account doesn't have access to this section.",
+        })
+
+
 def _list_tender_payload(
     *,
     page: int,
     page_size: int,
     sort_by: str,
     sort_order: str,
+    base_url: str = "",
+    user_id: Optional[int] = None,
     **filters: Any,
 ) -> dict[str, Any]:
-    conditions, params = _tender_filters(**filters)
-    where_sql = f" WHERE {' AND '.join(conditions)}" if conditions else ""
     sort_column = TENDER_SORT_COLUMNS[sort_by]
     direction = "DESC" if sort_order == "desc" else "ASC"
     offset = (page - 1) * page_size
     with _get_db() as conn:
+        conditions, params = _tender_filters(**filters, scope=_tender_scope(conn, user_id))
+        where_sql = f" WHERE {' AND '.join(conditions)}" if conditions else ""
         total = int(conn.execute(f"SELECT COUNT(*) FROM tenders t{where_sql}", params).fetchone()[0])
         rows = conn.execute(
             f"{_tender_select()}{where_sql} "
             f"ORDER BY {sort_column} {direction},t.id {direction} LIMIT ? OFFSET ?",
             [*params, page_size, offset],
         ).fetchall()
-    return {"items": [_public_tender(row) for row in rows], **_page_meta(page, page_size, total)}
+    return {"items": [_public_tender(row, base_url) for row in rows], **_page_meta(page, page_size, total)}
 
 
 class DownloadRequest(BaseModel):
@@ -928,6 +1546,7 @@ def client_health() -> dict[str, Any]:
 
 @router.get("/tenders", dependencies=[Depends(require_client_user)])
 def client_tenders(
+    request: Request,
     q: str = Query("", max_length=200),
     website_id: Optional[int] = Query(None, gt=0),
     archived: Optional[bool] = None,
@@ -940,17 +1559,19 @@ def client_tenders(
     sort_order: Literal["asc", "desc"] = "asc",
     page: int = Query(1, ge=1),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    user_id: int = Depends(require_client_user),
 ) -> dict[str, Any]:
     return _list_tender_payload(
         query=q, website_id=website_id, archived=archived, status=status,
         organization=organization, location=location, category=category,
         has_documents=has_documents, sort_by=sort_by, sort_order=sort_order,
-        page=page, page_size=page_size,
+        page=page, page_size=page_size, base_url=_public_base_url(request), user_id=user_id,
     )
 
 
 @router.get("/search", dependencies=[Depends(require_client_user)])
 def client_search(
+    request: Request,
     q: str = Query(..., min_length=1, max_length=200),
     website_id: Optional[int] = Query(None, gt=0),
     archived: Optional[bool] = None,
@@ -958,10 +1579,12 @@ def client_search(
     sort_order: Literal["asc", "desc"] = "asc",
     page: int = Query(1, ge=1),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    user_id: int = Depends(require_client_user),
 ) -> dict[str, Any]:
     return _list_tender_payload(
         query=q, website_id=website_id, archived=archived, sort_by=sort_by,
-        sort_order=sort_order, page=page, page_size=page_size,
+        sort_order=sort_order, page=page, page_size=page_size, base_url=_public_base_url(request),
+        user_id=user_id,
     )
 
 
@@ -1028,15 +1651,64 @@ def _org_scrape_coverage(conn: Any, website_ids: list[int]) -> tuple[set[int], s
     return org_ids, full_websites
 
 
+def _org_tender_counts(conn, website_ids, archived: bool) -> dict[tuple[int, str], int]:
+    """Tenders actually in the database per (website_id, lower-cased org name),
+    active or archived. organizations.tender_count is the portal's own figure
+    from its org-list page, so it can't show tenders missing here. Orgs match
+    on the tender's org chain, as the tender list's organization filter does."""
+    website_ids = sorted({int(w) for w in website_ids if w is not None})
+    if not website_ids:
+        return {}
+    placeholders = ",".join("?" for _ in website_ids)
+    rows = conn.execute(
+        "SELECT website_id,LOWER(TRIM(COALESCE(org_chain,''))) AS org_key,COUNT(*) AS n "
+        f"FROM tenders WHERE website_id IN ({placeholders}) AND COALESCE(is_archived,0)=? "
+        "GROUP BY website_id,LOWER(TRIM(COALESCE(org_chain,'')))",
+        [*website_ids, 1 if archived else 0],
+    ).fetchall()
+    return {(int(r[0]), str(r[1])): int(r[2]) for r in rows}
+
+
+def _organization_scope(conn: Any, user_id: int, archived: bool) -> Optional[tuple[str, list[Any]]]:
+    """The organisations list is part of the active (or, with archived=true,
+    the archived) tenders section. Without it, a user only sees their
+    bookmarked organisations (with the bookmarks section) or none."""
+    account = org_access.get_account(conn, user_id)
+    perms = account["permissions"]
+    if perms["archived" if archived else "active"]:
+        return None
+    if perms["bookmarks"]:
+        blob, _updated_at, _found = org_access.effective_blob(conn, user_id, account)
+        names = sorted({str(n).strip() for n in (blob.get("bookmarkedOrgs") or []) if str(n).strip()})
+        if names:
+            return f"o.name IN ({','.join('?' for _ in names)})", names
+    return "1=0", []
+
+
 @router.get("/organizations", dependencies=[Depends(require_client_user)])
 def client_organizations(
     q: str = Query("", max_length=200),
     website_id: Optional[int] = Query(None, gt=0),
+    archived: Optional[bool] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    user_id: int = Depends(require_client_user),
 ) -> dict[str, Any]:
-    conditions: list[str] = []
+    conditions: list[str] = ["o.website_id IN (SELECT id FROM websites)"]
     params: list[Any] = []
+    with _get_db() as conn:
+        org_scope = _organization_scope(conn, user_id, bool(archived))
+    if org_scope is not None:
+        conditions.append(org_scope[0])
+        params.extend(org_scope[1])
+    if archived:
+        # Only organisations that have archived tenders (matched on the tender's
+        # org chain, as the tender list's organization filter does).
+        conditions.append(
+            "EXISTS (SELECT 1 FROM tenders t WHERE t.website_id=o.website_id "
+            "AND COALESCE(t.is_archived,0)=1 "
+            "AND LOWER(TRIM(COALESCE(t.org_chain,'')))=LOWER(TRIM(COALESCE(o.name,''))))"
+        )
     if q:
         conditions.append("LOWER(COALESCE(o.name,'')) LIKE ?")
         params.append(f"%{q.strip().lower()}%")
@@ -1047,7 +1719,7 @@ def client_organizations(
     select_sql = (
         "SELECT o.id,o.website_id,COALESCE(w.name,'') AS website_name,"
         "COALESCE(o.name,'') AS name,COALESCE(o.tenders_url,'') AS tenders_url,"
-        "COALESCE(o.tender_count,0) AS tender_count,COALESCE(o.scrape_enabled,0) AS scrape_enabled,"
+        "COALESCE(o.scrape_enabled,0) AS scrape_enabled,"
         "COALESCE(o.last_scraped_at,0) AS last_scraped_at,"
         "COALESCE(o.is_available,1) AS is_available "
         "FROM organizations o LEFT JOIN websites w ON w.id=o.website_id"
@@ -1060,8 +1732,16 @@ def client_organizations(
             [*params, page_size, offset],
         ).fetchall()
         covered_org_ids, full_websites = _org_scrape_coverage(conn, [dict(r)["website_id"] for r in rows])
+        counts = _org_tender_counts(conn, [dict(r)["website_id"] for r in rows], bool(archived))
+    items = []
+    for row in rows:
+        data = dict(row)
+        data["tender_count"] = counts.get(
+            (int(data["website_id"]), str(data.get("name") or "").strip().lower()), 0
+        )
+        items.append(_public_organization(data, covered_org_ids, full_websites))
     return {
-        "items": [_public_organization(row, covered_org_ids, full_websites) for row in rows],
+        "items": items,
         **_page_meta(page, page_size, total),
     }
 
@@ -1073,10 +1753,45 @@ def _find_tender(conn: Any, tender_db_id: int) -> Any:
     return row
 
 
-@router.get("/tenders/{tender_db_id}", dependencies=[Depends(require_client_user)])
-def client_tender_detail(tender_db_id: int) -> dict[str, Any]:
+class ResolveTendersRequest(BaseModel):
+    tender_ids: list[str] = Field(default_factory=list, max_length=2000)
+
+
+@router.post("/tenders/resolve", dependencies=[Depends(require_client_user)])
+def client_resolve_tenders(
+    body: ResolveTendersRequest, request: Request, user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    """Tender id (the portal's, the one identity the apps store) -> the current
+    tender, including its row `id` handle for the other /tenders/{id} routes.
+    Ids not in the database right now (or outside the user's sections) are
+    simply absent from the result."""
+    keys = sorted(_coerce_tender_id_set(body.tender_ids))
+    if not keys:
+        return {"tenders": {}}
+    base_url = _public_base_url(request)
+    placeholders = ",".join("?" for _ in keys)
     with _get_db() as conn:
-        return _public_tender(_find_tender(conn, tender_db_id))
+        scope = _tender_scope(conn, user_id)
+        scope_sql, scope_params = (f" AND {scope[0]}", scope[1]) if scope else ("", [])
+        rows = conn.execute(
+            f"{_tender_select()} WHERE {_T_TENDER_KEY_SQL} IN ({placeholders}){scope_sql}",
+            (*keys, *scope_params),
+        ).fetchall()
+        out = {}
+        for row in rows:
+            tender = _public_tender(row, base_url)
+            out[_canon_tender_id(tender.get("tender_id"))] = tender
+    return {"tenders": out}
+
+
+@router.get("/tenders/{tender_db_id}", dependencies=[Depends(require_client_user)])
+def client_tender_detail(
+    tender_db_id: int, request: Request, user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    with _get_db() as conn:
+        tender = _find_tender(conn, tender_db_id)
+        _require_tender_access(conn, user_id, tender_db_id)
+        return _public_tender(tender, _public_base_url(request))
 
 
 def _document_condition() -> str:
@@ -1112,11 +1827,13 @@ def client_tender_documents(
     sort_order: Literal["asc", "desc"] = "desc",
     page: int = Query(1, ge=1),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    user_id: int = Depends(require_client_user),
 ) -> dict[str, Any]:
     direction = "DESC" if sort_order == "desc" else "ASC"
     offset = (page - 1) * page_size
     with _get_db() as conn:
         tender = _find_tender(conn, tender_db_id)
+        _require_tender_access(conn, user_id, tender_db_id)
         canonical_id = str(dict(tender).get("tender_id") or "").strip().upper()
         condition = _document_condition()
         params: list[Any] = [tender_db_id, canonical_id]
@@ -1175,9 +1892,13 @@ def _document_token_subject(document_id: int, kind: str, reference: str) -> str:
 
 
 @router.post("/tenders/{tender_db_id}/download-request", dependencies=[Depends(require_client_user)])
-def client_download_request(tender_db_id: int, body: DownloadRequest, request: Request) -> dict[str, Any]:
+def client_download_request(
+    tender_db_id: int, body: DownloadRequest, request: Request,
+    user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
     with _get_db() as conn:
         data = dict(_document_row(conn, tender_db_id, body.document_id))
+        _require_tender_access(conn, user_id, tender_db_id)
     kind, reference = _download_reference(data)
     ttl_minutes = core.setting_int("signed_url_ttl_min", 15, minimum=1, maximum=60)
     subject = _document_token_subject(body.document_id, kind, reference)
@@ -1193,27 +1914,110 @@ def client_download_request(tender_db_id: int, body: DownloadRequest, request: R
 class RequestDownloadResponse(BaseModel):
     job_id: str
     status: str
+    # False when an identical in-flight job for this tender was reused
+    # (the server dedupes per tender regardless of mode) instead of queued.
+    created: bool = True
+    mode: str = "full"
+
+
+class RequestDownloadBody(BaseModel):
+    # "full" (default) downloads everything not already stored, as the
+    # first-ever download for a tender does. "update" is the cheap incremental
+    # mode -- refreshes the portal's corrigendum/pre-bid counts over plain HTTP
+    # and only starts a browser download if something new exists. "redownload"
+    # is "full" with the skip-if-already-stored check disabled, for files that
+    # were saved but are empty/corrupt. Any other value falls back to "full"
+    # rather than erroring, so an old/mismatched client build never breaks
+    # this call.
+    mode: str = "full"
 
 
 @router.post(
     "/tenders/{tender_db_id}/request-download",
-    dependencies=[Depends(require_client_user)],
     response_model=RequestDownloadResponse,
 )
-def client_request_tender_download(tender_db_id: int) -> dict[str, Any]:
+def client_request_tender_download(
+    tender_db_id: int,
+    body: RequestDownloadBody = RequestDownloadBody(),
+    user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
     # A tender may not have any downloaded_files rows yet, so there is nothing
     # for /download-request to sign. This kicks off the same scrape+download
     # job the admin console uses for a single tender (api_server._enqueue_job,
     # action "download_single_tender") and the client polls its status below.
     with _get_db() as conn:
+        tender = _find_tender(conn, tender_db_id)
+        _require_tender_access(conn, user_id, tender_db_id)
+    # The download job itself refuses archived tenders, but only after being
+    # queued and retried three times -- turning every such request into a
+    # failed job. Refuse here instead so nothing is queued.
+    if int(dict(tender).get("is_archived") or 0):
+        raise HTTPException(409, "This tender is archived; its documents can no longer be fetched from the portal.")
+    import api_server  # deferred: api_server imports this module at load time
+
+    mode = body.mode if body.mode in {"update", "redownload"} else "full"
+    result = api_server._enqueue_job(
+        "download_single_tender",
+        # user_id lets the job-completion handler push a real APNs
+        # notification to whoever actually requested this (see _run_job in
+        # api_server.py) -- only set when this call created the job itself;
+        # a second client that joins an existing in-flight job via dedupe
+        # just relies on its own client-side poll instead, same as before.
+        {"tender_db_id": tender_db_id, "mode": mode, "source": "client", "requested_by_user_id": user_id},
+    )
+    created = bool(result.get("created", True))
+    try:
+        api_server._append_live_log(
+            f"[client] user #{user_id} requested '{mode}' download for tender #{tender_db_id} -> "
+            f"job {str(result['job_id'])[:8]} ({'queued new job' if created else 'joined existing in-flight job'})"
+        )
+    except Exception:
+        pass
+    return {
+        "job_id": str(result["job_id"]),
+        "status": str(result["status"]),
+        "created": created,
+        "mode": mode,
+    }
+
+
+@router.post(
+    "/tenders/{tender_db_id}/fetch-status",
+    response_model=RequestDownloadResponse,
+)
+def client_fetch_tender_status(
+    tender_db_id: int,
+    user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    # Same "fetch status" job the admin console runs for an archived tender: reads
+    # the portal's Tender Stage and, for result stages, downloads the result files
+    # (file_type "result"). Progress is polled with /download-status like a
+    # download job; the app then re-reads the tender and its documents.
+    with _get_db() as conn:
         _find_tender(conn, tender_db_id)
+        _require_tender_access(conn, user_id, tender_db_id)
     import api_server  # deferred: api_server imports this module at load time
 
     result = api_server._enqueue_job(
-        "download_single_tender",
-        {"tender_db_id": tender_db_id, "mode": "full", "source": "client"},
+        "fetch_tender_status_single",
+        # requested_by_user_id routes a CAPTCHA this job raises to the user's
+        # own Captcha screen (see _create_and_wait_for_captcha).
+        {"tender_db_id": tender_db_id, "source": "client", "requested_by_user_id": user_id},
     )
-    return {"job_id": str(result["job_id"]), "status": str(result["status"])}
+    created = bool(result.get("created", True))
+    try:
+        api_server._append_live_log(
+            f"[client] user #{user_id} requested status fetch for tender #{tender_db_id} -> "
+            f"job {str(result['job_id'])[:8]} ({'queued new job' if created else 'joined existing in-flight job'})"
+        )
+    except Exception:
+        pass
+    return {
+        "job_id": str(result["job_id"]),
+        "status": str(result["status"]),
+        "created": created,
+        "mode": "status",
+    }
 
 
 def _find_organization(conn: Any, org_id: int) -> Any:
@@ -1231,7 +2035,8 @@ def _find_organization(conn: Any, org_id: int) -> Any:
     dependencies=[Depends(require_client_user)],
     response_model=RequestDownloadResponse,
 )
-def client_request_org_tenders(org_id: int) -> dict[str, Any]:
+def client_request_org_tenders(org_id: int, user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    _require_section(user_id, "active")
     # One-time manual scrape for an org whose tenders haven't been fetched
     # in the last 24h. Goes straight into background_jobs via _enqueue_job
     # (action "fetch_tenders_selected", same as the admin console's one-off
@@ -1289,9 +2094,11 @@ def client_org_request_status(org_id: int, job_id: str = Query(..., min_length=1
 
 @router.get("/tenders/{tender_db_id}/download-status", dependencies=[Depends(require_client_user)])
 def client_tender_download_status(
-    tender_db_id: int, job_id: str = Query(..., min_length=1)
+    tender_db_id: int, job_id: str = Query(..., min_length=1),
+    user_id: int = Depends(require_client_user),
 ) -> dict[str, Any]:
     with _get_db() as conn:
+        _require_tender_access(conn, user_id, tender_db_id)
         row = conn.execute(
             "SELECT status,error,payload_json FROM background_jobs WHERE id=?", (job_id,)
         ).fetchone()
@@ -1345,20 +2152,46 @@ def client_document_download(document_id: int, token: str = Query(..., min_lengt
     )
 
 
-@router.get("/stats", dependencies=[Depends(require_client_user)])
-def client_stats() -> dict[str, Any]:
+@router.get("/websites", dependencies=[Depends(require_client_user)])
+def client_websites() -> list[dict[str, Any]]:
+    """Every portal on the server, straight from the websites table, so the
+    apps show a newly added portal at once (even with nothing scraped yet)
+    and drop a deleted one, instead of inferring portals from fetched rows."""
     with _get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, COALESCE(name,''), COALESCE(url,'') FROM websites ORDER BY LOWER(COALESCE(name,'')), id"
+        ).fetchall()
+    return [{"id": int(r[0]), "name": str(r[1]), "url": str(r[2])} for r in rows]
+
+
+@router.get("/stats", dependencies=[Depends(require_client_user)])
+def client_stats(user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    with _get_db() as conn:
+        # Counts only cover the tenders the user's sections allow.
+        scope = _tender_scope(conn, user_id)
+        scope_where, scope_and, scope_params = (
+            (f" WHERE {scope[0]}", f" AND {scope[0]}", list(scope[1])) if scope else ("", "", [])
+        )
         row = conn.execute(
             "SELECT COUNT(*) AS total,"
             "SUM(CASE WHEN COALESCE(is_archived,0)=0 THEN 1 ELSE 0 END) AS active,"
             "SUM(CASE WHEN COALESCE(is_archived,0)=1 THEN 1 ELSE 0 END) AS archived,"
-            "COUNT(DISTINCT website_id) AS websites FROM tenders"
+            f"COUNT(DISTINCT website_id) AS websites FROM tenders t{scope_where}",
+            scope_params,
         ).fetchone()
-        document_count = int(conn.execute("SELECT COUNT(*) FROM downloaded_files").fetchone()[0])
+        if scope:
+            document_count = int(conn.execute(
+                f"SELECT COUNT(*) FROM downloaded_files d WHERE d.tender_db_id IN "
+                f"(SELECT t.id FROM tenders t WHERE {scope[0]})",
+                scope_params,
+            ).fetchone()[0])
+        else:
+            document_count = int(conn.execute("SELECT COUNT(*) FROM downloaded_files").fetchone()[0])
         categories = conn.execute(
-            "SELECT COALESCE(tender_category,'') AS category,COUNT(*) AS count FROM tenders "
-            "WHERE TRIM(COALESCE(tender_category,''))!='' GROUP BY tender_category "
-            "ORDER BY count DESC,tender_category ASC LIMIT 10"
+            "SELECT COALESCE(tender_category,'') AS category,COUNT(*) AS count FROM tenders t "
+            f"WHERE TRIM(COALESCE(tender_category,''))!=''{scope_and} GROUP BY tender_category "
+            "ORDER BY count DESC,tender_category ASC LIMIT 10",
+            scope_params,
         ).fetchall()
     data = dict(row)
     return {
@@ -1371,3 +2204,392 @@ def client_stats() -> dict[str, Any]:
             {"category": str(item["category"]), "count": int(item["count"])} for item in categories
         ],
     }
+
+
+# ── accounts & organisations ───────────────────────────────────────────
+# Every account is an individual until it creates or joins an organisation
+# (org_access.py). An org's admin manages its members from these routes; the
+# server operator has the same controls under /admin/orgs (api_server.py).
+
+class CreateOrgRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=org_access.MAX_ORG_NAME)
+
+
+class JoinOrgRequest(BaseModel):
+    join_code: str = Field(min_length=4, max_length=32)
+    note: str = Field("", max_length=500)
+
+
+class SectionPermissions(BaseModel):
+    # Omitted sections keep their current setting.
+    active: Optional[bool] = None
+    archived: Optional[bool] = None
+    bookmarks: Optional[bool] = None
+    projects: Optional[bool] = None
+    portal_search: Optional[bool] = None
+
+
+class ApproveJoinRequest(BaseModel):
+    # Sections for the new member; omitted = the defaults (portal_search off).
+    permissions: Optional[SectionPermissions] = None
+
+
+class MemberRoleRequest(BaseModel):
+    role: Literal["admin", "member"]
+
+
+class DelinkRequest(BaseModel):
+    # True: keep the org's bookmarked tenders/organisations in their own
+    # account (projects, checklists and templates stay with the org).
+    # False: their account is wiped completely.
+    retain: bool
+
+
+JOIN_DISCARD_WARNING = (
+    "When an admin approves this request, the projects, bookmarks and checklists "
+    "now in your account are discarded and you use the organisation's data instead."
+)
+
+
+def _org_op(fn) -> Any:
+    """Run an org_access operation on one connection, commit it, and turn its
+    validation errors into HTTP errors."""
+    with _get_db() as conn:
+        try:
+            result = fn(conn)
+        except org_access.OrgError as exc:
+            raise _org_error(exc)
+        conn.commit()
+    return result
+
+
+def _admin_org_id(conn: Any, user_id: int) -> int:
+    account = org_access.get_account(conn, user_id)
+    if account["org_id"] is None or account["role"] != "admin":
+        raise org_access.OrgError(403, "Only an organisation admin can do this.")
+    return int(account["org_id"])
+
+
+def _permission_changes(body: Optional[SectionPermissions]) -> Optional[dict[str, Any]]:
+    return body.model_dump(exclude_none=True) if body is not None else None
+
+
+@router.get("/me")
+def client_me(user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    """The signed-in account: type (individual / organisation), org and role,
+    and which sections the apps should show."""
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT email, display_name FROM client_users WHERE id=?", (user_id,)
+        ).fetchone()
+        account = org_access.public_account(conn, org_access.get_account(conn, user_id))
+    return {
+        "user_id": user_id,
+        "email": str(row[0] or "") if row else "",
+        "display_name": str(row[1] or "") if row else "",
+        **account,
+    }
+
+
+@router.post("/org")
+def client_create_org(body: CreateOrgRequest, user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    """An individual creates an organisation and becomes its admin; their
+    current data becomes the organisation's."""
+    return _org_op(lambda conn: org_access.org_detail(conn, org_access.create_org(conn, user_id, body.name)))
+
+
+@router.post("/org/join-requests")
+def client_request_join(body: JoinOrgRequest, user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    request = _org_op(lambda conn: org_access.request_join(conn, user_id, body.join_code, body.note))
+    return {"request": request, "warning": JOIN_DISCARD_WARNING}
+
+
+@router.get("/org/join-requests/mine")
+def client_my_join_request(user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    with _get_db() as conn:
+        org_access.ensure_schema(conn)
+        return {"request": org_access.pending_request_for_user(conn, user_id)}
+
+
+@router.delete("/org/join-requests/mine")
+def client_cancel_join_request(user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    _org_op(lambda conn: org_access.cancel_request(conn, user_id))
+    return {"ok": True}
+
+
+@router.get("/org")
+def client_org(user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    """Org admin: the organisation, its members and pending join requests."""
+    return _org_op(lambda conn: org_access.org_detail(conn, _admin_org_id(conn, user_id)))
+
+
+@router.put("/org")
+def client_rename_org(body: CreateOrgRequest, user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    def run(conn):
+        org_id = _admin_org_id(conn, user_id)
+        org_access.rename_org(conn, org_id, body.name)
+        return org_access.org_detail(conn, org_id)
+    return _org_op(run)
+
+
+@router.post("/org/join-code/regenerate")
+def client_regenerate_join_code(user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    code = _org_op(lambda conn: org_access.regenerate_join_code(conn, _admin_org_id(conn, user_id)))
+    return {"join_code": code}
+
+
+@router.get("/org/join-requests")
+def client_org_join_requests(user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    items = _org_op(lambda conn: org_access.pending_requests_for_org(conn, _admin_org_id(conn, user_id)))
+    return {"items": items}
+
+
+@router.post("/org/join-requests/{request_id}/approve")
+def client_approve_join_request(
+    request_id: int, body: ApproveJoinRequest = ApproveJoinRequest(),
+    user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    request = _org_op(lambda conn: org_access.decide_request(
+        conn, _admin_org_id(conn, user_id), request_id, True, f"user:{user_id}",
+        _permission_changes(body.permissions),
+    ))
+    return {"request": request}
+
+
+@router.post("/org/join-requests/{request_id}/reject")
+def client_reject_join_request(request_id: int, user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    request = _org_op(lambda conn: org_access.decide_request(
+        conn, _admin_org_id(conn, user_id), request_id, False, f"user:{user_id}",
+    ))
+    return {"request": request}
+
+
+@router.put("/org/members/{member_id}/permissions")
+def client_set_member_permissions(
+    member_id: int, body: SectionPermissions, user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    perms = _org_op(lambda conn: org_access.set_permissions(
+        conn, member_id, _permission_changes(body), org_id=_admin_org_id(conn, user_id),
+    ))
+    return {"user_id": member_id, "permissions": perms}
+
+
+@router.put("/org/members/{member_id}/role")
+def client_set_member_role(
+    member_id: int, body: MemberRoleRequest, user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    _org_op(lambda conn: org_access.set_role(conn, _admin_org_id(conn, user_id), member_id, body.role))
+    return {"user_id": member_id, "role": body.role}
+
+
+@router.post("/org/members/{member_id}/delink")
+def client_delink_member(
+    member_id: int, body: DelinkRequest, user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    _org_op(lambda conn: org_access.delink(conn, _admin_org_id(conn, user_id), member_id, body.retain))
+    return {"ok": True, "user_id": member_id, "retained": body.retain}
+
+
+# ── portal search ──────────────────────────────────────────────────────
+# A user searches a tender ID on a NIC portal's Tender Status page. The server
+# runs it as a background job (app_core.portal_search_tender_logic): a hit
+# updates the tender for everyone (or adds it to the current list / archive by
+# stage). Each user keeps their own search history (client_portal_searches).
+# Needs the user's portal_search section (off by default).
+
+PORTAL_SEARCH_HISTORY_LIMIT = 200
+
+
+class PortalSearchRequest(BaseModel):
+    website_id: int = Field(gt=0)
+    tender_id: str = Field(min_length=3, max_length=120)
+
+
+def _portal_search_portals(conn: Any) -> list[dict[str, Any]]:
+    """NIC portals that have a Tender Status page."""
+    return [
+        {"id": int(r[0]), "name": str(r[1] or ""), "url": str(r[2] or "")}
+        for r in conn.execute(
+            "SELECT id, COALESCE(name,''), COALESCE(url,'') FROM websites "
+            "WHERE TRIM(COALESCE(status_url,''))!='' AND COALESCE(portal_type,'nic')!='nprocure' "
+            "ORDER BY LOWER(COALESCE(name,'')), id"
+        ).fetchall()
+    ]
+
+
+def _finish_portal_search(conn: Any, row: dict[str, Any]) -> dict[str, Any]:
+    """Copy a finished job's outcome into a pending history row."""
+    if row["status"] != "pending" or not row.get("job_id"):
+        return row
+    job = conn.execute(
+        "SELECT status, result_json, error FROM background_jobs WHERE id=?", (row["job_id"],)
+    ).fetchone()
+    if not job:
+        update = {"status": "failed", "error": "The search is no longer available. Try again."}
+    else:
+        job_status = str(job[0] or "")
+        row["job_status"] = job_status
+        if job_status == "completed":
+            try:
+                result = json.loads(job[1] or "{}")
+            except (TypeError, ValueError):
+                result = {}
+            result = result if isinstance(result, dict) else {}
+            if result.get("found"):
+                update = {
+                    "status": "found",
+                    "stage": str(result.get("stage") or ""),
+                    "tender_db_id": result.get("tender_db_id"),
+                    "created": 1 if result.get("created") else 0,
+                    "is_archived": 1 if result.get("is_archived") else 0,
+                }
+            else:
+                update = {"status": "not_found"}
+        elif job_status in ("failed", "cancelled"):
+            update = {"status": "failed", "error": str(job[2] or "The search did not finish.")}
+        else:
+            return row
+    update["finished_at"] = time.time()
+    columns = sorted(update)
+    conn.execute(
+        f"UPDATE client_portal_searches SET {', '.join(f'{c}=?' for c in columns)} WHERE id=?",
+        (*[update[c] for c in columns], row["id"]),
+    )
+    conn.commit()
+    row.update(update)
+    return row
+
+
+_PORTAL_SEARCH_SELECT = (
+    "SELECT s.id, s.website_id, COALESCE(w.name,''), s.tender_id, s.job_id, s.status, s.stage, "
+    "s.tender_db_id, s.created, s.is_archived, s.error, s.created_at, s.finished_at "
+    "FROM client_portal_searches s LEFT JOIN websites w ON w.id=s.website_id"
+)
+_PORTAL_SEARCH_COLUMNS = (
+    "id", "website_id", "website_name", "tender_id", "job_id", "status", "stage",
+    "tender_db_id", "created", "is_archived", "error", "created_at", "finished_at",
+)
+
+
+def _public_portal_search(conn: Any, user_id: int, raw: Any, base_url: str) -> dict[str, Any]:
+    row = _finish_portal_search(conn, dict(zip(_PORTAL_SEARCH_COLUMNS, _values(raw))))
+    tender = None
+    if row["status"] == "found" and row.get("tender_db_id"):
+        try:
+            found = _find_tender(conn, int(row["tender_db_id"]))
+            _require_tender_access(conn, user_id, int(row["tender_db_id"]))
+            tender = _public_tender(found, base_url)
+        except HTTPException:
+            tender = None  # deleted since, or outside the user's sections
+    return {
+        "id": int(row["id"]),
+        "website_id": int(row["website_id"]),
+        "website_name": str(row["website_name"] or ""),
+        "tender_id": str(row["tender_id"] or ""),
+        "job_id": row.get("job_id"),
+        # pending (see job_status: queued / running) / found / not_found / failed
+        "status": row["status"],
+        "job_status": row.get("job_status") or ("completed" if row["status"] != "pending" else "queued"),
+        "stage": row.get("stage") or None,
+        "tender_db_id": int(row["tender_db_id"]) if row.get("tender_db_id") else None,
+        # True: the search added the tender; False: it updated an existing one.
+        "created": None if row.get("created") is None else bool(row["created"]),
+        "is_archived": None if row.get("is_archived") is None else bool(row["is_archived"]),
+        "error": row.get("error") or None,
+        "created_at": float(row["created_at"] or 0),
+        "finished_at": float(row["finished_at"]) if row.get("finished_at") else None,
+        "tender": tender,
+    }
+
+
+@router.get("/portal-search/portals")
+def client_portal_search_portals(user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    with _get_db() as conn:
+        allowed = org_access.get_account(conn, user_id)["permissions"].get("portal_search", False)
+        return {"allowed": bool(allowed), "items": _portal_search_portals(conn) if allowed else []}
+
+
+@router.post("/portal-search")
+def client_portal_search(
+    body: PortalSearchRequest, request: Request, user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    _require_section(user_id, "portal_search")
+    tender_id = " ".join(body.tender_id.split())
+    with _get_db() as conn:
+        if body.website_id not in {p["id"] for p in _portal_search_portals(conn)}:
+            raise HTTPException(400, "This portal can't be searched. Choose a NIC portal.")
+    import api_server  # deferred: api_server imports this module at load time
+
+    result = api_server._enqueue_job(
+        "portal_search_tender",
+        # requested_by_user_id routes a CAPTCHA to this user's Captcha screen.
+        {"website_id": body.website_id, "tender_id": tender_id, "source": "client",
+         "requested_by_user_id": user_id},
+    )
+    with _get_db() as conn:
+        cur = conn.execute(
+            "INSERT INTO client_portal_searches (user_id, website_id, tender_id, job_id, status, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (user_id, body.website_id, tender_id, str(result["job_id"]), "pending", time.time()),
+        )
+        search_id = int(cur.lastrowid)
+        conn.commit()
+        raw = conn.execute(f"{_PORTAL_SEARCH_SELECT} WHERE s.id=?", (search_id,)).fetchone()
+        search = _public_portal_search(conn, user_id, raw, _public_base_url(request))
+    try:
+        api_server._append_live_log(
+            f"[client] user #{user_id} portal search '{tender_id}' on website #{body.website_id} -> "
+            f"job {str(result['job_id'])[:8]}"
+        )
+    except Exception:
+        pass
+    return {"search": search, "job_id": str(result["job_id"]), "created": bool(result.get("created", True))}
+
+
+@router.get("/portal-search/history")
+def client_portal_search_history(
+    request: Request, limit: int = Query(50, ge=1, le=PORTAL_SEARCH_HISTORY_LIMIT),
+    user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    """This user's searches, newest first. Pending ones are brought up to date."""
+    _require_section(user_id, "portal_search")
+    base_url = _public_base_url(request)
+    with _get_db() as conn:
+        rows = conn.execute(
+            f"{_PORTAL_SEARCH_SELECT} WHERE s.user_id=? ORDER BY s.created_at DESC, s.id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        return {"items": [_public_portal_search(conn, user_id, r, base_url) for r in rows]}
+
+
+@router.delete("/portal-search/history")
+def client_clear_portal_search_history(user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    with _get_db() as conn:
+        org_access.ensure_schema(conn)
+        conn.execute("DELETE FROM client_portal_searches WHERE user_id=?", (user_id,))
+        conn.commit()
+    return {"ok": True}
+
+
+@router.delete("/portal-search/history/{search_id}")
+def client_delete_portal_search(search_id: int, user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    with _get_db() as conn:
+        org_access.ensure_schema(conn)
+        conn.execute("DELETE FROM client_portal_searches WHERE id=? AND user_id=?", (search_id, user_id))
+        conn.commit()
+    return {"ok": True}
+
+
+@router.get("/portal-search/{search_id}")
+def client_portal_search_status(
+    search_id: int, request: Request, user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    """Poll one search (the user's own only)."""
+    with _get_db() as conn:
+        org_access.ensure_schema(conn)
+        raw = conn.execute(
+            f"{_PORTAL_SEARCH_SELECT} WHERE s.id=? AND s.user_id=?", (search_id, user_id)
+        ).fetchone()
+        if not raw:
+            raise HTTPException(404, "Search not found.")
+        return {"search": _public_portal_search(conn, user_id, raw, _public_base_url(request))}

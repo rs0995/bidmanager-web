@@ -1,0 +1,19 @@
+Change log — 2026-09-25
+Files in this folder are the ORIGINAL (pre-change) copies, same paths relative to "Server UI/". Restore by copying back.
+
+Request: Scraper tab round 2
+ 1. Hide Existing now also hides orgs/tenders in paused recurring (interval) jobs.
+ 2. Saved custom jobs card: greyed out by default; Add button (Add -> Close/Save) replaces Save; edit flow unchanged.
+ 3. Config "Pause on these days"/downtime-from rows: label text spans the card width, control below.
+ 4. Per-job run days (weekday picker) for Repeat jobs, default Mon-Sat; existing jobs backfilled Mon-Sat; global pause days still supersede.
+
+Files backed up (pre-change) and intended change:
+ - BidManagerControl.jsx            : Hide Existing predicate, disabled inputs, Add/Close/Save flow, WeekdayPicker + run days in job form, Field "stacked" prop.
+ - server/api_server.py             : run_days on saved custom jobs (request model, validation, insert/update, serializer), weekday skip in scheduler.
+ - server/app_core.py               : saved_custom_jobs.run_days column (default mon..sat).
+- server/db_compat.py              : backed up as a precaution; checked, no change needed.
+ - server/test_saved_custom_jobs.py : tests for run_days.
+ - server/test_scrape_scheduling.py : tests for weekday skipping.
+ - CHANGELOG_PENDING.txt            : release note appended.
+
+Status: all edits above completed 2026-09-25. Backend tests (test_scrape_scheduling, test_saved_custom_jobs, test_client_api) pass. Existing interval-job tests now pass run_days=all 7 days so they don't depend on the weekday they run on.

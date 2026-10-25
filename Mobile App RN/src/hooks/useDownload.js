@@ -7,11 +7,12 @@ import {
 
 export function useDocumentDownload(onError) {
   const [pendingId, setPendingId] = useState(null);
-  const download = useCallback(async (tenderId, doc) => {
+  // `tender` is the live tender the server document list came from.
+  const download = useCallback(async (tender, doc) => {
     setPendingId(doc.id);
     try {
       await doDownloadDocument({
-        id: doc.id, tender_db_id: tenderId, tender_id: doc.tender_id, file_name: doc.name,
+        id: doc.id, tender_db_id: tender.id, tender_id: tender.tender_id, file_name: doc.name,
       });
     } catch (e) {
       onError?.(e);
@@ -23,7 +24,7 @@ export function useDocumentDownload(onError) {
 }
 
 export function useRequestDownload(tender) {
-  const rows = useDocumentsForTender(tender.id);
+  const rows = useDocumentsForTender(tender);
   const placeholder = rows.find((r) => r.id === -Number(tender.id)) || null;
   const [starting, setStarting] = useState(false);
 

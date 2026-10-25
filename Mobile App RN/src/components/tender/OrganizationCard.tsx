@@ -6,9 +6,9 @@ import { recordOrgIds } from "@/lib/store";
 import { formatDateTimeIST } from "@/lib/format";
 import { useThemeColors } from "@/constants/colors";
 
-type OrganizationCardProps = { org: any; showWebsite?: boolean };
+type OrganizationCardProps = { org: any; showWebsite?: boolean; archived?: boolean };
 
-export function OrganizationCard({ org, showWebsite = false }: OrganizationCardProps) {
+export function OrganizationCard({ org, showWebsite = false, archived = false }: OrganizationCardProps) {
   const { isOrgBookmarked, toggle } = useOrgBookmarkToggle();
   const bookmarked = isOrgBookmarked(org.name);
   const colors = useThemeColors();
@@ -22,7 +22,7 @@ export function OrganizationCard({ org, showWebsite = false }: OrganizationCardP
   const openOrg = () => {
     if (unavailable) return;
     router.push(
-      `/tenders/org/${encodeURIComponent(org.name)}?website_id=${org.website_id}&org_id=${org.id}&last_scraped_at=${org.last_scraped_at || 0}` as any,
+      `/tenders/org/${encodeURIComponent(org.name)}?website_id=${org.website_id}&org_id=${org.id}&last_scraped_at=${org.last_scraped_at || 0}${archived ? "&archived=1" : ""}` as any,
     );
   };
 

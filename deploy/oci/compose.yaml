@@ -60,8 +60,16 @@ services:
       BIDMANAGER_PROXY_URLS: ${BIDMANAGER_PROXY_URLS:-}
       OCI_REGION: ${OCI_REGION:-}
       OCI_INSTANCE_ID: ${OCI_INSTANCE_ID:-}
+      # Direct APNs push (apns_push.py) -- not Expo's relay, not FCM. Key file is
+      # mounted read-only; team/topic are fixed, key id/environment come from .env.
+      APNS_KEY_PATH: /run/secrets/apns-auth-key.p8
+      APNS_KEY_ID: ${APNS_KEY_ID:?set APNS_KEY_ID in .env}
+      APNS_TEAM_ID: ${APNS_TEAM_ID:?set APNS_TEAM_ID in .env}
+      APNS_TOPIC: ${APNS_TOPIC:?set APNS_TOPIC in .env}
+      APNS_ENVIRONMENT: ${APNS_ENVIRONMENT:-production}
     volumes:
       - ./drive-sa.json:/run/secrets/drive-sa.json:ro
+      - ./secrets/AuthKey_T5JSK43654.p8:/run/secrets/apns-auth-key.p8:ro
       # Scratch only (downloads in flight); durable copies live in Google Drive.
       - bidmanager-data:/var/lib/bidmanager
     expose:
@@ -82,6 +90,25 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+
+  # TEMPORARY anti-idle-reclamation shim -- NOT a real workload.
+  # Oracle reclaims an Always-Free A1 VM whose CPU/network/memory all stay under 20%
+  # utilization (95th percentile) for 7 days straight. This container exists only to
+  # hold memory above that line while real usage is low. Remove this whole service
+  # (and `docker compose up -d` to apply) once any of the following makes it
+  # unnecessary: the app's own real memory usage naturally stays >20% (e.g. more
+  # concurrent scrape workers/Chromium sessions), the VM is upgraded off Always-Free,
+  # or Oracle's reclamation policy/this account's exemption status changes.
+  # oom_score_adj=1000 + bounded restarts: if the VM genuinely needs the RAM (backend/
+  # postgres under real pressure), the kernel OOM-kills THIS container first, and after
+  # a few kills Docker stops respawning it -- so it gets out of the way on its own
+  # instead of starving the real workload, without waiting for a human to notice.
+  keepalive:
+    image: python:3.12-alpine
+    restart: on-failure:5
+    mem_limit: 4200m
+    oom_score_adj: 1000
+    command: ["python3", "-c", "import os,time;SIZE=3500*1024*1024;CHUNK=16*1024*1024;b=bytearray(SIZE);mv=memoryview(b);[mv.__setitem__(slice(i,min(i+CHUNK,SIZE)), os.urandom(min(CHUNK,SIZE-i))) for i in range(0,SIZE,CHUNK)];time.sleep(10**9)"]
 
 volumes:
   bidmanager-data:

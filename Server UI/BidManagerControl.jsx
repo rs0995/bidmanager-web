@@ -4,7 +4,7 @@ import {
   Globe, Key, Search, X, Check, AlertTriangle, RefreshCw, Play, Pause, Trash2,
   Download, Upload, Plus, RotateCcw, Loader2, ChevronRight, ChevronDown, ArrowLeft,
   Copy, ExternalLink, Filter, ShieldCheck, Zap, FileText,
-  Eye, Bell, SkipForward, Timer, Send, Users, Ban, Archive
+  Eye, Bell, SkipForward, Timer, Send, Users, Ban, Archive, Pencil
 } from 'lucide-react';
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -104,6 +104,8 @@ const WEEKDAY_OPTIONS = [
   { key: 'wed', label: 'Wed' }, { key: 'thu', label: 'Thu' }, { key: 'fri', label: 'Fri' },
   { key: 'sat', label: 'Sat' },
 ];
+// New repeating saved jobs run every day except Sunday unless changed.
+const DEFAULT_RUN_DAYS = 'mon,tue,wed,thu,fri,sat';
 
 const LOG_SOURCES = ['api', 'scraper', 'worker', 'storage', 'db'];
 const LOG_FILTERS_KEY = 'bidmanager.admin.log-filters.v1';
@@ -290,10 +292,18 @@ function createApi(base, adminKey) {
     async websites() {
       return apiFetch(base, '/v1/websites', { adminKey });
     },
-    async createWebsite(name, url, statusUrl) {
-      return apiFetch(base, '/v1/websites', {
-        method: 'POST', adminKey, body: { name, url, status_url: statusUrl || '' },
+    async createWebsite(name, url, statusUrl, portalType) {
+      const body = { name, url, status_url: statusUrl || '' };
+      if (portalType) body.portal_type = portalType;
+      return apiFetch(base, '/v1/websites', { method: 'POST', adminKey, body });
+    },
+    async updateWebsite(id, name, url, statusUrl) {
+      return apiFetch(base, `/v1/websites/${Number(id)}`, {
+        method: 'PUT', adminKey, body: { name, url, status_url: statusUrl || '' },
       });
+    },
+    async deleteWebsite(id) {
+      return apiFetch(base, `/v1/websites/${Number(id)}`, { method: 'DELETE', adminKey });
     },
     async startScrape(websiteId, refreshOrganizations = true) {
       return apiFetch(base, '/admin/jobs/scrape', {
@@ -401,6 +411,45 @@ function createApi(base, adminKey) {
     // user's cloud sync blob (bookmarks/projects/templates/checklist).
     async clientUserResetSync(id) {
       return apiFetch(base, `/admin/users/${Number(id)}/reset-sync`, { method: 'POST', adminKey });
+    },
+    // WIRE: PUT /admin/users/{id}/permissions — partial {active, archived, bookmarks, projects}
+    async setUserPermissions(id, changes) {
+      return apiFetch(base, `/admin/users/${Number(id)}/permissions`, { method: 'PUT', adminKey, body: changes });
+    },
+    // Organisations (server/org_access.py)
+    async orgs() {
+      const raw = await apiFetch(base, '/admin/orgs', { adminKey });
+      return raw.items || [];
+    },
+    async org(id) {
+      return apiFetch(base, `/admin/orgs/${Number(id)}`, { adminKey });
+    },
+    async createOrg(name, adminUserId) {
+      return apiFetch(base, '/admin/orgs', { method: 'POST', adminKey, body: { name, admin_user_id: Number(adminUserId) } });
+    },
+    async renameOrg(id, name) {
+      return apiFetch(base, `/admin/orgs/${Number(id)}`, { method: 'PUT', adminKey, body: { name } });
+    },
+    async dissolveOrg(id, retain) {
+      return apiFetch(base, `/admin/orgs/${Number(id)}?retain=${retain ? 'true' : 'false'}`, { method: 'DELETE', adminKey });
+    },
+    async regenerateJoinCode(id) {
+      return apiFetch(base, `/admin/orgs/${Number(id)}/join-code/regenerate`, { method: 'POST', adminKey });
+    },
+    async addOrgMember(id, userId, role) {
+      return apiFetch(base, `/admin/orgs/${Number(id)}/members`, { method: 'POST', adminKey, body: { user_id: Number(userId), role } });
+    },
+    async approveJoinRequest(id, requestId) {
+      return apiFetch(base, `/admin/orgs/${Number(id)}/join-requests/${Number(requestId)}/approve`, { method: 'POST', adminKey, body: {} });
+    },
+    async rejectJoinRequest(id, requestId) {
+      return apiFetch(base, `/admin/orgs/${Number(id)}/join-requests/${Number(requestId)}/reject`, { method: 'POST', adminKey });
+    },
+    async setMemberRole(id, userId, role) {
+      return apiFetch(base, `/admin/orgs/${Number(id)}/members/${Number(userId)}/role`, { method: 'PUT', adminKey, body: { role } });
+    },
+    async delinkMember(id, userId, retain) {
+      return apiFetch(base, `/admin/orgs/${Number(id)}/members/${Number(userId)}/delink`, { method: 'POST', adminKey, body: { retain: Boolean(retain) } });
     },
 
     // WIRE: GET /admin/storage?prefix=
@@ -660,9 +709,9 @@ function Toggle({ checked, onChange, disabled }) {
 
 /* Editable config field — deliberately NOT dot-leadered, to keep the
    read-only register visually distinct from things you can change. */
-function Field({ label, hint, children, dirty }) {
+function Field({ label, hint, children, dirty, stacked = false }) {
   return (
-    <label className="flex items-start justify-between gap-4 py-2" style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
+    <label className={stacked ? 'flex flex-col gap-2 py-2' : 'flex items-start justify-between gap-4 py-2'} style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
       <span className="min-w-0">
         <span className="flex items-center gap-1.5" style={{ fontSize: 13, color: c.ink, fontWeight: 500 }}>
           {label}
@@ -670,16 +719,18 @@ function Field({ label, hint, children, dirty }) {
         </span>
         {hint && <span className="block mt-0.5" style={{ fontSize: 11.5, color: c.ink40, lineHeight: 1.4 }}>{hint}</span>}
       </span>
-      <span className="shrink-0">{children}</span>
+      <span className={stacked ? '' : 'shrink-0'}>{children}</span>
     </label>
   );
 }
 
-function NumIn({ value, onChange, suffix, w = 88, step = 1, min, max }) {
+const DISABLED_STYLE = { opacity: 0.45, cursor: 'not-allowed' };
+
+function NumIn({ value, onChange, suffix, w = 88, step = 1, min, max, disabled = false }) {
   return (
-    <span className="inline-flex items-stretch" style={{ border: `1px solid ${c.rule}`, background: c.card }}>
+    <span className="inline-flex items-stretch" style={{ border: `1px solid ${c.rule}`, background: c.card, ...(disabled ? DISABLED_STYLE : {}) }}>
       <input
-        type="number" value={value} step={step} min={min} max={max}
+        type="number" value={value} step={step} min={min} max={max} disabled={disabled}
         onChange={(e) => onChange(e.target.value === '' ? '' : Number(e.target.value))}
         style={{ width: w, fontFamily: mono, fontSize: 12.5, padding: '5px 8px', outline: 'none', color: c.ink, background: 'transparent', border: 'none', textAlign: 'right' }}
       />
@@ -688,23 +739,46 @@ function NumIn({ value, onChange, suffix, w = 88, step = 1, min, max }) {
   );
 }
 
-function TextIn({ value, onChange, w = 240, placeholder, type = 'text' }) {
+function TextIn({ value, onChange, w = 240, placeholder, type = 'text', disabled = false }) {
   return (
     <input
-      type={type} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)}
-      style={{ width: w, fontFamily: mono, fontSize: 12.5, padding: '5px 8px', outline: 'none', color: c.ink, background: c.card, border: `1px solid ${c.rule}` }}
+      type={type} value={value} placeholder={placeholder} disabled={disabled} onChange={(e) => onChange(e.target.value)}
+      style={{ width: w, fontFamily: mono, fontSize: 12.5, padding: '5px 8px', outline: 'none', color: c.ink, background: c.card, border: `1px solid ${c.rule}`, ...(disabled ? DISABLED_STYLE : {}) }}
     />
   );
 }
 
-function Select({ value, onChange, options, w = 160 }) {
+function Select({ value, onChange, options, w = 160, disabled = false }) {
   return (
     <select
-      value={value} onChange={(e) => onChange(e.target.value)}
-      style={{ width: w, fontFamily: mono, fontSize: 12.5, padding: '5px 8px', color: c.ink, background: c.card, border: `1px solid ${c.rule}`, outline: 'none' }}
+      value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}
+      style={{ width: w, fontFamily: mono, fontSize: 12.5, padding: '5px 8px', color: c.ink, background: c.card, border: `1px solid ${c.rule}`, outline: 'none', ...(disabled ? DISABLED_STYLE : {}) }}
     >
       {options.map((o) => <option key={o.value ?? o} value={o.value ?? o}>{o.label ?? o}</option>)}
     </select>
+  );
+}
+
+// Weekday toggles (SUN..SAT). value / onChange use a comma list of lowercase keys, e.g. "mon,tue".
+function WeekdayPicker({ value, onChange, disabled = false }) {
+  const days = new Set(String(value || '').split(',').map((d) => d.trim()).filter(Boolean));
+  return (
+    <div className="flex flex-wrap gap-1" style={disabled ? DISABLED_STYLE : undefined}>
+      {WEEKDAY_OPTIONS.map(({ key, label }) => {
+        const active = days.has(key);
+        return (
+          <button key={key} type="button" disabled={disabled} onClick={() => {
+            const next = new Set(days);
+            if (active) next.delete(key); else next.add(key);
+            onChange(WEEKDAY_OPTIONS.map((w) => w.key).filter((k) => next.has(k)).join(','));
+          }} style={{
+            fontFamily: mono, fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', padding: '4px 10px',
+            background: active ? c.ink : c.card, color: active ? '#fff' : c.ink40,
+            border: `1px solid ${active ? c.ink : c.rule}`, cursor: disabled ? 'not-allowed' : 'pointer',
+          }}>{label}</button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -1153,30 +1227,14 @@ function ConfigPanel({ toast, env, base, adminKey, setBase, dbUrl, setDbUrl, sto
             <Field label="Archive run time" hint="Hour of day (IST, 0–23) to run the daily archive sweep" dirty={isDirty('archive_daily_hour')}>
               <NumIn value={draft.archive_daily_hour} onChange={(v) => set('archive_daily_hour', v)} min={0} max={23} suffix=":00 IST" />
             </Field>
-            <Field label="Scheduler downtime — From" hint="IST. Daily window in which automatic scraping is paused. Between From and To no jobs run; a job due in that window runs at the To time. Leave blank to run 24/7. The days below are a separate, additional full-day pause." dirty={isDirty('scheduler_downtime_from')}>
+            <Field stacked label="Scheduler downtime — From" hint="IST. Daily window in which automatic scraping is paused. Between From and To no jobs run; a job due in that window runs at the To time. Leave blank to run 24/7. The days below are a separate, additional full-day pause." dirty={isDirty('scheduler_downtime_from')}>
               <TextIn type="time" w={110} value={draft.scheduler_downtime_from} onChange={(v) => set('scheduler_downtime_from', v)} />
             </Field>
             <Field label="Scheduler downtime — To" dirty={isDirty('scheduler_downtime_to')}>
               <TextIn type="time" w={110} value={draft.scheduler_downtime_to} onChange={(v) => set('scheduler_downtime_to', v)} />
             </Field>
-            <Field label="Pause on these days" hint="IST. The scheduler is paused all day on any day picked here, regardless of the time window above." dirty={isDirty('scheduler_downtime_days')}>
-              <div className="flex flex-wrap gap-1">
-                {WEEKDAY_OPTIONS.map(({ key, label }) => {
-                  const days = new Set((draft.scheduler_downtime_days || '').split(',').map((d) => d.trim()).filter(Boolean));
-                  const active = days.has(key);
-                  return (
-                    <button key={key} type="button" onClick={() => {
-                      const next = new Set(days);
-                      if (active) next.delete(key); else next.add(key);
-                      set('scheduler_downtime_days', WEEKDAY_OPTIONS.map((w) => w.key).filter((k) => next.has(k)).join(','));
-                    }} style={{
-                      fontFamily: mono, fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', padding: '4px 10px',
-                      background: active ? c.ink : c.card, color: active ? '#fff' : c.ink40,
-                      border: `1px solid ${active ? c.ink : c.rule}`, cursor: 'pointer',
-                    }}>{label}</button>
-                  );
-                })}
-              </div>
+            <Field stacked label="Pause on these days" hint="IST. The scheduler is paused all day on any day picked here, regardless of the time window above. This also overrides the run days set on individual saved jobs." dirty={isDirty('scheduler_downtime_days')}>
+              <WeekdayPicker value={draft.scheduler_downtime_days} onChange={(v) => set('scheduler_downtime_days', v)} />
             </Field>
           </>)}
 
@@ -1358,19 +1416,21 @@ function ScraperPanel({ toast, base, adminKey }) {
   const [jobScopeLoading, setJobScopeLoading] = useState(null);
   const [jobName, setJobName] = useState('');
   const [jobType, setJobType] = useState('scrape');
-  const [scrapeAllOrgs, setScrapeAllOrgs] = useState(false);
-  // "select all" in the Organizations table is a live set: new orgs from a
-  // refresh auto-join, vanished orgs auto-drop, until a row is unticked.
-  const [allOrgsMode, setAllOrgsMode] = useState(false);
+  const [hideExistingOrgs, setHideExistingOrgs] = useState(false);
+  const [hideExistingTenders, setHideExistingTenders] = useState(false);
   const [addingWebsite, setAddingWebsite] = useState(false);
+  const [editingWebsiteId, setEditingWebsiteId] = useState(null);
   const [newWebsiteName, setNewWebsiteName] = useState('');
   const [newWebsiteUrl, setNewWebsiteUrl] = useState('');
   const [newWebsiteStatusUrl, setNewWebsiteStatusUrl] = useState('');
+  const [newWebsitePortalType, setNewWebsitePortalType] = useState('');
   const [editingJobId, setEditingJobId] = useState(null);
   const [editingJobOwner, setEditingJobOwner] = useState(null);
   const [selectedSavedJobId, setSelectedSavedJobId] = useState(null);
   const [savedJobScheduleMode, setSavedJobScheduleMode] = useState('manual');
   const [savedJobScheduleAt, setSavedJobScheduleAt] = useState(() => toDateTimeLocal());
+  const [addingJob, setAddingJob] = useState(false);
+  const [jobRunDays, setJobRunDays] = useState(DEFAULT_RUN_DAYS);
 
   useEffect(() => {
     api.websites().then((rows) => {
@@ -1405,20 +1465,17 @@ function ScraperPanel({ toast, base, adminKey }) {
   useEffect(() => { loadData(); }, [loadData]);
 
   // Keep the org selection consistent with the current list on every reload
-  // (e.g. after a refresh scrape): drop ids whose row is gone, and when
-  // "select all" is active re-add every current org id. Bails without a
+  // (e.g. after a refresh scrape): drop ids whose row is gone. Bails without a
   // setState when nothing changed so it can't loop.
   useEffect(() => {
-    const orgIds = organizations.map((o) => o.id);
-    const orgIdSet = new Set(orgIds);
+    const orgIdSet = new Set(organizations.map((o) => o.id));
     setSelectedOrgs((current) => {
       const next = new Set();
       current.forEach((id) => { if (orgIdSet.has(id)) next.add(id); });
-      if (allOrgsMode) orgIds.forEach((id) => next.add(id));
-      if (next.size === current.size && [...next].every((id) => current.has(id))) return current;
+      if (next.size === current.size) return current;
       return next;
     });
-  }, [organizations, allOrgsMode]);
+  }, [organizations]);
 
   const loadSavedJobs = useCallback(async () => {
     try {
@@ -1459,22 +1516,57 @@ function ScraperPanel({ toast, base, adminKey }) {
     setWebsiteId(nextWebsiteId);
   };
 
-  const addWebsite = async () => {
+  const closeWebsiteForm = () => {
+    setAddingWebsite(false);
+    setEditingWebsiteId(null);
+    setNewWebsiteName('');
+    setNewWebsiteUrl('');
+    setNewWebsiteStatusUrl('');
+    setNewWebsitePortalType('');
+  };
+
+  const startEditWebsite = () => {
+    const website = websites.find((w) => String(w.id) === String(websiteId));
+    if (!website) return;
+    setEditingWebsiteId(website.id);
+    setNewWebsiteName(website.name || '');
+    setNewWebsiteUrl(website.url || '');
+    setNewWebsiteStatusUrl(website.status_url || '');
+    setAddingWebsite(true);
+  };
+
+  const saveWebsite = async () => {
     const name = newWebsiteName.trim();
     const url = newWebsiteUrl.trim();
     if (!name || !url) return toast('Enter both a name and a tenders-by-organisation URL');
     setBusy('add-website');
     try {
-      const created = await api.createWebsite(name, url, newWebsiteStatusUrl.trim());
+      const saved = editingWebsiteId
+        ? await api.updateWebsite(editingWebsiteId, name, url, newWebsiteStatusUrl.trim())
+        : await api.createWebsite(name, url, newWebsiteStatusUrl.trim(), newWebsitePortalType);
       const rows = await api.websites();
       setWebsites(Array.isArray(rows) ? rows : []);
-      setWebsiteId(String(created.id));
-      setNewWebsiteName('');
-      setNewWebsiteUrl('');
-      setNewWebsiteStatusUrl('');
-      setAddingWebsite(false);
-      toast(`Website "${name}" added`);
-    } catch (err) { toast(err.message || 'Could not add website'); }
+      setWebsiteId(String(saved.id));
+      closeWebsiteForm();
+      toast(editingWebsiteId ? `Website "${name}" updated` : `Website "${name}" added`);
+    } catch (err) { toast(err.message || (editingWebsiteId ? 'Could not update website' : 'Could not add website')); }
+    setBusy('');
+  };
+
+  const deleteWebsite = async () => {
+    const website = websites.find((w) => String(w.id) === String(websiteId));
+    if (!website) return;
+    if (!window.confirm(`Delete "${website.name}"? This removes all its organizations, tenders and downloaded-file records. This cannot be undone.`)) return;
+    setBusy('delete-website');
+    try {
+      await api.deleteWebsite(website.id);
+      const rows = await api.websites();
+      const next = Array.isArray(rows) ? rows : [];
+      setWebsites(next);
+      setWebsiteId(String(next[0]?.id || ''));
+      if (editingWebsiteId === website.id) closeWebsiteForm();
+      toast(`Website "${website.name}" deleted`);
+    } catch (err) { toast(err.message || 'Could not delete website'); }
     setBusy('');
   };
 
@@ -1531,7 +1623,7 @@ function ScraperPanel({ toast, base, adminKey }) {
     const owner = ownerName.trim();
     const name = jobName.trim();
     if (!owner || !name) return toast('Enter both user/owner and job name');
-    if (jobType === 'scrape' && !scrapeAllOrgs && selectedOrgs.size === 0) return toast('Select at least one organization, or check "Website"');
+    if (jobType === 'scrape' && selectedOrgs.size === 0) return toast('Select at least one organization');
     if (jobType === 'download' && selectedTenders.size === 0) return toast('Select at least one tender');
     const scheduledForAt = savedJobScheduleMode === 'manual' ? 0 : new Date(savedJobScheduleAt).getTime() / 1000;
     if (savedJobScheduleMode !== 'manual' && (!Number.isFinite(scheduledForAt) || scheduledForAt <= Date.now() / 1000)) {
@@ -1539,21 +1631,21 @@ function ScraperPanel({ toast, base, adminKey }) {
     }
     const intervalMinutes = (Number(repeatInterval) || 0) * ({ minutes: 1, hours: 60, days: 1440 }[repeatUnit] || 1);
     if (savedJobScheduleMode === 'interval' && intervalMinutes <= 0) return toast('Enter a positive repeat interval');
+    const runDays = jobRunDays.split(',').filter(Boolean);
+    if (savedJobScheduleMode === 'interval' && runDays.length === 0) return toast('Pick at least one run day');
     const useEdit = editingJobId && !asNew;
     setBusy('save-custom');
     try {
       const saved = await api.saveCustomJob({
         owner_name: useEdit ? (editingJobOwner || owner) : owner, name, website_id: Number(websiteId), job_type: jobType,
-        // When "Whole website" is on, a non-empty org_ids is the signal for
-        // "refresh, then scrape every org" — only send it when live select-all
-        // is active, otherwise the job stays refresh-only.
-        org_ids: (jobType === 'scrape' && scrapeAllOrgs && !allOrgsMode) ? [] : [...selectedOrgs],
+        org_ids: [...selectedOrgs],
         tender_ids: [...selectedTenders],
-        all_organizations: jobType === 'scrape' && scrapeAllOrgs,
+        all_organizations: false,
         download_mode: 'auto', schedule_enabled: savedJobScheduleMode !== 'manual',
         schedule_mode: savedJobScheduleMode,
         interval_minutes: savedJobScheduleMode === 'interval' ? intervalMinutes : 0,
         scheduled_for_at: scheduledForAt,
+        run_days: runDays.length ? runDays : undefined,
       }, useEdit ? editingJobId : null);
       const savedId = Number(saved.id || (useEdit ? editingJobId : 0));
       const savedName = saved.name || name;
@@ -1562,7 +1654,7 @@ function ScraperPanel({ toast, base, adminKey }) {
       } else {
         toast(savedName !== name ? `Saved as "${savedName}"` : 'Custom job saved');
         setEditingJobId(null);
-        setJobName(savedName);
+        closeAddForm();
       }
       if (useEdit) setEditingJobId(savedId);
       setSelectedSavedJobId(savedId);
@@ -1572,16 +1664,13 @@ function ScraperPanel({ toast, base, adminKey }) {
   };
 
   const editSavedJob = async (job) => {
+    setAddingJob(false);
     setEditingJobId(job.id);
     setEditingJobOwner(job.owner_name);
     setSelectedSavedJobId(job.id);
     setJobName(job.name);
+    setJobRunDays((job.run_days && job.run_days.length ? job.run_days : DEFAULT_RUN_DAYS.split(',')).join(','));
     setJobType(job.job_type === 'both' ? 'download' : (job.job_type || 'scrape'));
-    setScrapeAllOrgs(Boolean(job.all_organizations));
-    // all_organizations + a stored org list == "refresh, then scrape every org"
-    // (live select-all). all_organizations alone == refresh only.
-    const liveAllOrgs = Boolean(job.all_organizations) && (job.org_ids || []).length > 0;
-    setAllOrgsMode(liveAllOrgs);
     setSavedJobScheduleMode(job.schedule_mode || (job.schedule_enabled ? 'interval' : 'manual'));
     setSavedJobScheduleAt(toDateTimeLocal(job.next_run_at || job.scheduled_for_at || undefined));
     const minutes = Number(job.interval_minutes) || 180;
@@ -1603,7 +1692,7 @@ function ScraperPanel({ toast, base, adminKey }) {
     const { orgs, tenders: tenderRows } = await loadDataFor(wid);
     const orgRowIds = new Set(orgs.map((o) => o.id));
     const tenderRowIds = new Set(tenderRows.map((t) => t.id));
-    setSelectedOrgs(liveAllOrgs ? new Set(orgs.map((o) => o.id)) : new Set((job.org_ids || []).filter((id) => orgRowIds.has(id))));
+    setSelectedOrgs(new Set((job.org_ids || []).filter((id) => orgRowIds.has(id))));
     setSelectedTenders(new Set((job.tender_ids || []).filter((id) => tenderRowIds.has(id))));
   };
 
@@ -1624,7 +1713,7 @@ function ScraperPanel({ toast, base, adminKey }) {
       await api.deleteSavedCustomJob(job.id, job.owner_name || ownerName.trim());
       // Remaining jobs are auto-renumbered on the server, so any cached id
       // (edit target / selection) can now point at a different row — reset.
-      setEditingJobId(null); setEditingJobOwner(null); setJobName(''); setSelectedSavedJobId(null); setAllOrgsMode(false);
+      setEditingJobId(null); setEditingJobOwner(null); setJobName(''); setSelectedSavedJobId(null);
       toast('Saved job deleted');
       await Promise.all([loadSavedJobs(), loadSuppressedSites()]);
     } catch (err) { toast(err.message || 'Could not delete saved job'); }
@@ -1653,17 +1742,57 @@ function ScraperPanel({ toast, base, adminKey }) {
 
   const orgNeedle = orgSearch.trim().toLowerCase();
   const tenderNeedle = tenderSearch.trim().toLowerCase();
-  const shownOrgs = organizations.filter((org) => !orgNeedle || String(org.name || '').toLowerCase().includes(orgNeedle));
-  const shownTenders = tenders.filter((tender) => !tenderNeedle || [tender.tender_id, tender.title, tender.org_chain]
-    .some((value) => String(value || '').toLowerCase().includes(tenderNeedle)));
+  // Which orgs/tenders are already part of another saved job. While editing, the
+  // job being edited doesn't count as "another" job.
+  const { orgJobs, tenderJobs } = useMemo(() => {
+    // Recurring = interval-type job, whether currently running or paused.
+    const isRecurring = (job) => job.schedule_mode === 'interval'
+      || (job.schedule_mode !== 'once' && Number(job.interval_minutes) > 0);
+    const orgMap = new Map();
+    const tenderMap = new Map();
+    const add = (map, id, job) => {
+      const entry = map.get(id) || { names: [], recurring: false };
+      entry.names.push(job.name);
+      entry.recurring = entry.recurring || isRecurring(job);
+      map.set(id, entry);
+    };
+    savedJobs.forEach((job) => {
+      if (job.id === editingJobId) return;
+      (job.org_ids || []).forEach((id) => add(orgMap, id, job));
+      (job.tender_ids || []).forEach((id) => add(tenderMap, id, job));
+    });
+    return { orgJobs: orgMap, tenderJobs: tenderMap };
+  }, [savedJobs, editingJobId]);
+  const shownOrgs = organizations.filter((org) => (!orgNeedle || String(org.name || '').toLowerCase().includes(orgNeedle))
+    && !(hideExistingOrgs && orgJobs.get(org.id)?.recurring && !selectedOrgs.has(org.id)));
+  const shownTenders = tenders.filter((tender) => (!tenderNeedle || [tender.tender_id, tender.title, tender.org_chain]
+    .some((value) => String(value || '').toLowerCase().includes(tenderNeedle)))
+    && !(hideExistingTenders && tenderJobs.get(tender.id)?.recurring && !selectedTenders.has(tender.id)));
   const currentSelectedOrgCount = organizations.filter((org) => selectedOrgs.has(org.id)).length;
   const currentSelectedTenderCount = tenders.filter((tender) => selectedTenders.has(tender.id)).length;
-  const selectionReady = jobType === 'scrape' ? (scrapeAllOrgs || selectedOrgs.size > 0) : selectedTenders.size > 0;
+  const selectionReady = jobType === 'scrape' ? selectedOrgs.size > 0 : selectedTenders.size > 0;
+  const formActive = addingJob || Boolean(editingJobId);
+  const hasAnySelection = selectedOrgs.size > 0 || selectedTenders.size > 0;
+  const closeAddForm = () => {
+    setAddingJob(false);
+    setJobName('');
+    setSelectedOrgs(new Set());
+    setSelectedTenders(new Set());
+    setSavedJobScheduleMode('manual');
+    setJobRunDays(DEFAULT_RUN_DAYS);
+  };
   const repeatLabel = (minutes) => {
     const value = Number(minutes) || 0;
     if (value % 1440 === 0) return `${value / 1440} day${value === 1440 ? '' : 's'}`;
     if (value % 60 === 0) return `${value / 60} hour${value === 60 ? '' : 's'}`;
     return `${value} minute${value === 1 ? '' : 's'}`;
+  };
+  const runDaysLabel = (days) => {
+    const list = Array.isArray(days) ? days : [];
+    if (list.length === 0 || list.length === 7) return '';
+    if (list.join(',') === DEFAULT_RUN_DAYS) return ' · Mon–Sat';
+    const cap = (d) => d.charAt(0).toUpperCase() + d.slice(1);
+    return ` · ${list.map(cap).join(' ')}`;
   };
   const savedJobScheduleLabel = (job) => {
     const mode = job.schedule_mode || (job.schedule_enabled ? 'interval' : 'manual');
@@ -1672,7 +1801,7 @@ function ScraperPanel({ toast, base, adminKey }) {
         ? `once · ${fmtDateTime(job.next_run_at * 1000)}`
         : 'once · completed';
     }
-    if (mode === 'interval' && job.schedule_enabled) return `every ${repeatLabel(job.interval_minutes)}`;
+    if (mode === 'interval' && job.schedule_enabled) return `every ${repeatLabel(job.interval_minutes)}${runDaysLabel(job.run_days)}`;
     return 'run manually';
   };
 
@@ -1690,7 +1819,14 @@ function ScraperPanel({ toast, base, adminKey }) {
           <div className="flex items-center gap-2">
             <Select value={websiteId} onChange={changeWebsite} w={210} options={websites.map((website) => ({ value: String(website.id), label: website.name }))} />
             <Btn variant="primary" icon={Play} busy={starting} disabled={!websiteId} onClick={runPortalScraper}>Run</Btn>
-            <Btn size="sm" variant="ghost" icon={Plus} onClick={() => setAddingWebsite((v) => !v)}>Add website</Btn>
+            <Btn size="sm" variant="ghost" icon={Pencil} disabled={!websiteId} onClick={startEditWebsite}>Edit</Btn>
+            <Btn size="sm" variant="danger" icon={Trash2} busy={busy === 'delete-website'} disabled={!websiteId} onClick={deleteWebsite}>Delete</Btn>
+            <Btn size="sm" variant="ghost" icon={Plus} onClick={() => {
+              if (addingWebsite) { closeWebsiteForm(); return; }
+              setEditingWebsiteId(null);
+              setNewWebsiteName(''); setNewWebsiteUrl(''); setNewWebsiteStatusUrl('');
+              setAddingWebsite(true);
+            }}>Add website</Btn>
           </div>
         </div>
         {addingWebsite && (
@@ -1698,8 +1834,15 @@ function ScraperPanel({ toast, base, adminKey }) {
             <TextIn value={newWebsiteName} onChange={setNewWebsiteName} w={160} placeholder="Website name" />
             <TextIn value={newWebsiteUrl} onChange={setNewWebsiteUrl} w={320} placeholder="Tenders-by-organisation URL" />
             <TextIn value={newWebsiteStatusUrl} onChange={setNewWebsiteStatusUrl} w={260} placeholder="Status-check URL (optional)" />
-            <Btn size="sm" variant="primary" busy={busy === 'add-website'} disabled={!newWebsiteName.trim() || !newWebsiteUrl.trim()} onClick={addWebsite}>Create</Btn>
-            <Btn size="sm" variant="ghost" onClick={() => setAddingWebsite(false)}>Cancel</Btn>
+            {!editingWebsiteId && (
+              <Select value={newWebsitePortalType} onChange={setNewWebsitePortalType} w={170} options={[
+                { value: '', label: 'Portal: auto-detect' },
+                { value: 'nic', label: 'NIC GePNIC' },
+                { value: 'nprocure', label: 'nProcure (Gujarat)' },
+              ]} />
+            )}
+            <Btn size="sm" variant="primary" busy={busy === 'add-website'} disabled={!newWebsiteName.trim() || !newWebsiteUrl.trim()} onClick={saveWebsite}>{editingWebsiteId ? 'Save' : 'Create'}</Btn>
+            <Btn size="sm" variant="ghost" onClick={closeWebsiteForm}>Cancel</Btn>
           </div>
         )}
       </Card>
@@ -1710,37 +1853,43 @@ function ScraperPanel({ toast, base, adminKey }) {
             <div style={{ fontSize: 12, color: c.ink60 }}>Save the current selection, run it manually, or schedule it for a specific time.</div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <TextIn value={ownerName} onChange={setOwnerName} w={150} placeholder="User / owner" />
-            <TextIn value={jobName} onChange={setJobName} w={190} placeholder="Custom job name" />
-            <Select value={jobType} onChange={setJobType} w={120} options={[
+            <TextIn value={ownerName} onChange={setOwnerName} w={150} placeholder="User / owner" disabled={!formActive} />
+            <TextIn value={jobName} onChange={setJobName} w={190} placeholder="Custom job name" disabled={!formActive} />
+            <Select value={jobType} onChange={setJobType} w={120} disabled={!formActive} options={[
               { value: 'scrape', label: 'Scrape' },
               { value: 'download', label: 'Download' },
             ]} />
-            {jobType === 'scrape' && (
-              <label className="flex items-center gap-1.5" style={{ fontSize: 12, color: c.ink60, cursor: 'pointer' }}
-                title="Refreshes the whole website's organization list and per-org tender counts. Also tick 'select all' in the Organizations list and the job will refresh, then scrape every org.">
-                <Toggle checked={scrapeAllOrgs} onChange={setScrapeAllOrgs} />
-                {scrapeAllOrgs && allOrgsMode ? 'Website + scrape all' : 'Website'}
-              </label>
-            )}
-            <Select value={savedJobScheduleMode} onChange={setSavedJobScheduleMode} w={118} options={[
+            <Select value={savedJobScheduleMode} onChange={setSavedJobScheduleMode} w={118} disabled={!formActive} options={[
               { value: 'manual', label: 'Manual' },
               { value: 'once', label: 'Run once at' },
               { value: 'interval', label: 'Repeat' },
             ]} />
-            {savedJobScheduleMode !== 'manual' && <TextIn type="datetime-local" value={savedJobScheduleAt} onChange={setSavedJobScheduleAt} w={178} />}
+            {savedJobScheduleMode !== 'manual' && <TextIn type="datetime-local" value={savedJobScheduleAt} onChange={setSavedJobScheduleAt} w={178} disabled={!formActive} />}
             {savedJobScheduleMode === 'interval' && <>
-              <NumIn value={repeatInterval} onChange={setRepeatInterval} min={1} w={70} />
-              <Select value={repeatUnit} onChange={setRepeatUnit} w={92} options={[
+              <NumIn value={repeatInterval} onChange={setRepeatInterval} min={1} w={70} disabled={!formActive} />
+              <Select value={repeatUnit} onChange={setRepeatUnit} w={92} disabled={!formActive} options={[
                 { value: 'minutes', label: 'Minutes' },
                 { value: 'hours', label: 'Hours' },
                 { value: 'days', label: 'Days' },
               ]} />
+              <span title="Days this job may run (IST). The global 'Pause on these days' setting overrides this.">
+                <WeekdayPicker value={jobRunDays} onChange={setJobRunDays} disabled={!formActive} />
+              </span>
             </>}
-            <Btn size="sm" busy={busy === 'save-custom'} disabled={!jobName.trim() || !selectionReady} onClick={() => saveNamedJob(false)}>{editingJobId ? 'Update' : 'Save'}</Btn>
-            {editingJobId && <Btn size="sm" busy={busy === 'save-custom'} disabled={!jobName.trim() || !selectionReady} onClick={() => saveNamedJob(true)}>Save as new</Btn>}
+            {editingJobId ? (
+              <>
+                <Btn size="sm" busy={busy === 'save-custom'} disabled={!jobName.trim() || !selectionReady} onClick={() => saveNamedJob(false)}>Update</Btn>
+                <Btn size="sm" busy={busy === 'save-custom'} disabled={!jobName.trim() || !selectionReady} onClick={() => saveNamedJob(true)}>Save as new</Btn>
+              </>
+            ) : !addingJob ? (
+              <Btn size="sm" icon={Plus} onClick={() => setAddingJob(true)}>Add</Btn>
+            ) : hasAnySelection ? (
+              <Btn size="sm" variant="primary" busy={busy === 'save-custom'} onClick={() => saveNamedJob(false)}>Save</Btn>
+            ) : (
+              <Btn size="sm" icon={X} onClick={closeAddForm}>Close</Btn>
+            )}
             <Btn size="sm" variant="primary" icon={Play} busy={selectedSavedJobId && busy === `run-${selectedSavedJobId}`} disabled={!selectedSavedJobId} onClick={() => runSavedJob({ id: selectedSavedJobId })}>Run</Btn>
-            {editingJobId && <Btn size="sm" variant="ghost" onClick={() => { setEditingJobId(null); setEditingJobOwner(null); setSelectedSavedJobId(null); setJobName(''); setScrapeAllOrgs(false); }}>Close edit</Btn>}
+            {editingJobId && <Btn size="sm" variant="ghost" onClick={() => { setEditingJobId(null); setEditingJobOwner(null); setSelectedSavedJobId(null); setJobName(''); }}>Close edit</Btn>}
           </div>
         </div>
         {editingJobId && <div className="flex items-center px-3 py-2" style={{ background: c.paper }}><Pill state="info">editing #{editingJobId}</Pill></div>}
@@ -1861,28 +2010,32 @@ function ScraperPanel({ toast, base, adminKey }) {
         <div className="overflow-auto" style={{ maxHeight: 310 }}>
           <table className="w-full" style={{ borderCollapse: 'collapse' }}>
             <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}><tr style={{ background: c.paper }}>
-              <th className="px-3 py-2 text-left" style={{ width: 36, borderBottom: `1px solid ${c.rule}` }}><input type="checkbox" aria-label="Select all organizations" checked={allOrgsMode || (organizations.length > 0 && organizations.every((org) => selectedOrgs.has(org.id)))} onChange={(e) => {
-                if (e.target.checked) {
-                  setAllOrgsMode(true);
-                  setSelectedOrgs(new Set(organizations.map((org) => org.id)));
-                } else {
-                  setAllOrgsMode(false);
-                  setSelectedOrgs((current) => { const next = new Set(current); organizations.forEach((org) => next.delete(org.id)); return next; });
-                }
-              }} style={{ accentColor: c.indigo }} /></th>
-              {['Organization', 'Tenders', 'Last scrape'].map((th) => <th key={th} className="text-left px-3 py-2" style={{ fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60, borderBottom: `1px solid ${c.rule}`, fontWeight: 500 }}>{th}</th>)}
+              <th className="px-3 py-2 text-left" style={{ width: 36, borderBottom: `1px solid ${c.rule}` }}><input type="checkbox" aria-label="Select all shown organizations" checked={shownOrgs.length > 0 && shownOrgs.every((org) => selectedOrgs.has(org.id))} onChange={(e) => setSelectedOrgs((current) => {
+                const next = new Set(current);
+                shownOrgs.forEach((org) => e.target.checked ? next.add(org.id) : next.delete(org.id));
+                return next;
+              })} style={{ accentColor: c.indigo }} /></th>
+              <th className="text-left px-3 py-2" style={{ fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60, borderBottom: `1px solid ${c.rule}`, fontWeight: 500 }}>
+                <span className="inline-flex items-center gap-3">
+                  Organization
+                  <label className="inline-flex items-center gap-1.5" style={{ cursor: 'pointer', textTransform: 'none', letterSpacing: 0, fontFamily: sans, fontSize: 11.5 }}
+                    title="Hide organizations that are already part of another recurring scrape job">
+                    <input type="checkbox" checked={hideExistingOrgs} onChange={(e) => setHideExistingOrgs(e.target.checked)} style={{ accentColor: c.indigo }} />
+                    Hide Existing
+                  </label>
+                </span>
+              </th>
+              {['Tenders', 'Last scrape'].map((th) => <th key={th} className="text-left px-3 py-2" style={{ fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60, borderBottom: `1px solid ${c.rule}`, fontWeight: 500 }}>{th}</th>)}
             </tr></thead>
-            <tbody>{shownOrgs.map((org) => <tr key={org.id} style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
-              <td className="px-3 py-2"><input type="checkbox" checked={selectedOrgs.has(org.id)} onChange={() => {
-                const next = new Set(selectedOrgs);
-                next.has(org.id) ? next.delete(org.id) : next.add(org.id);
-                setSelectedOrgs(next);
-                if (!organizations.every((o) => next.has(o.id))) setAllOrgsMode(false);
-              }} style={{ accentColor: c.indigo }} /></td>
-              <td className="px-3 py-2" style={{ fontSize: 12.5, color: c.ink }}>{org.name}</td>
+            <tbody>{shownOrgs.map((org) => { const existing = orgJobs.get(org.id); return <tr key={org.id} style={{ borderBottom: `1px solid ${c.ruleSoft}`, background: existing ? c.amberSoft : undefined }}>
+              <td className="px-3 py-2"><input type="checkbox" checked={selectedOrgs.has(org.id)} onChange={() => toggle(setSelectedOrgs, org.id)} style={{ accentColor: c.indigo }} /></td>
+              <td className="px-3 py-2" style={{ fontSize: 12.5, color: c.ink }}>
+                {org.name}
+                {existing && <span className="ml-2 align-middle" title={`Already in: ${existing.names.join(', ')}`}><Pill state="warn">{`In job: ${existing.names[0]}${existing.names.length > 1 ? ` +${existing.names.length - 1}` : ''}`}</Pill></span>}
+              </td>
               <td className="px-3 py-2"><Mono style={{ fontSize: 11.5, color: c.ink60 }}>{org.tender_count ?? 0}</Mono></td>
               <td className="px-3 py-2"><Mono style={{ fontSize: 11.5, color: c.ink60 }}>{org.last_scraped_at ? fmtDateTime(org.last_scraped_at * 1000) : '—'}</Mono></td>
-            </tr>)}</tbody>
+            </tr>; })}</tbody>
           </table>
           {!loading && shownOrgs.length === 0 && <Empty icon={Layers} title="No organizations match this search." />}
         </div>
@@ -1904,16 +2057,29 @@ function ScraperPanel({ toast, base, adminKey }) {
           <table className="w-full" style={{ borderCollapse: 'collapse' }}>
             <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}><tr style={{ background: c.paper }}>
               <th className="px-3 py-2 text-left" style={{ width: 36, borderBottom: `1px solid ${c.rule}` }}><input type="checkbox" aria-label="Select shown tenders" checked={shownTenders.length > 0 && shownTenders.every((tender) => selectedTenders.has(tender.id))} onChange={(e) => setSelectedTenders((current) => { const next = new Set(current); shownTenders.forEach((tender) => e.target.checked ? next.add(tender.id) : next.delete(tender.id)); return next; })} style={{ accentColor: c.indigo }} /></th>
-              {['Tender ID', 'Organization / title', 'Last scrape', 'Schedule', 'Download'].map((th) => <th key={th} className="text-left px-3 py-2" style={{ fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60, borderBottom: `1px solid ${c.rule}`, fontWeight: 500 }}>{th}</th>)}
+              <th className="text-left px-3 py-2" style={{ fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60, borderBottom: `1px solid ${c.rule}`, fontWeight: 500 }}>
+                <span className="inline-flex items-center gap-3 whitespace-nowrap">
+                  Tender ID
+                  <label className="inline-flex items-center gap-1.5" style={{ cursor: 'pointer', textTransform: 'none', letterSpacing: 0, fontFamily: sans, fontSize: 11.5 }}
+                    title="Hide tenders that are already part of another recurring job">
+                    <input type="checkbox" checked={hideExistingTenders} onChange={(e) => setHideExistingTenders(e.target.checked)} style={{ accentColor: c.indigo }} />
+                    Hide Existing
+                  </label>
+                </span>
+              </th>
+              {['Organization / title', 'Last scrape', 'Schedule', 'Download'].map((th) => <th key={th} className="text-left px-3 py-2" style={{ fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60, borderBottom: `1px solid ${c.rule}`, fontWeight: 500 }}>{th}</th>)}
             </tr></thead>
-            <tbody>{shownTenders.map((tender) => <tr key={tender.id} style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
+            <tbody>{shownTenders.map((tender) => { const existing = tenderJobs.get(tender.id); return <tr key={tender.id} style={{ borderBottom: `1px solid ${c.ruleSoft}`, background: existing ? c.amberSoft : undefined }}>
               <td className="px-3 py-2"><input type="checkbox" checked={selectedTenders.has(tender.id)} onChange={() => toggle(setSelectedTenders, tender.id)} style={{ accentColor: c.indigo }} /></td>
-              <td className="px-3 py-2"><Mono style={{ fontSize: 11.5, color: c.ink }}>{tender.tender_id || '—'}</Mono></td>
+              <td className="px-3 py-2">
+                <Mono style={{ fontSize: 11.5, color: c.ink }}>{tender.tender_id || '—'}</Mono>
+                {existing && <div className="mt-1" title={`Already in: ${existing.names.join(', ')}`}><Pill state="warn">{`In job: ${existing.names[0]}${existing.names.length > 1 ? ` +${existing.names.length - 1}` : ''}`}</Pill></div>}
+              </td>
               <td className="px-3 py-2" style={{ minWidth: 260 }}><div style={{ fontSize: 12, color: c.ink }}>{tender.org_chain || '—'}</div><div style={{ fontSize: 11.5, color: c.ink60, marginTop: 2 }}>{tender.title || '—'}</div></td>
               <td className="px-3 py-2"><Mono style={{ fontSize: 11, color: c.ink60 }}>{tender.last_scraped_at ? fmtDateTime(tender.last_scraped_at * 1000) : '—'}</Mono></td>
               <td className="px-3 py-2"><Pill state={tender.scrape_enabled ? 'info' : 'neutral'}>{tender.scrape_enabled ? `${tender.scrape_interval_minutes} min` : 'off'}</Pill></td>
               <td className="px-3 py-2"><Pill state={tender.download_status === 'complete' ? 'ok' : tender.download_status === 'failed' ? 'error' : 'neutral'}>{tender.download_status || 'not downloaded'}</Pill></td>
-            </tr>)}</tbody>
+            </tr>; })}</tbody>
           </table>
           {!loading && shownTenders.length === 0 && <Empty icon={FileText} title="No tenders available. Scrape organizations first." />}
         </div>
@@ -1955,6 +2121,9 @@ function ArchivePanel({ toast, base, adminKey }) {
   }, [api, toast, websiteId, search]);
 
   useEffect(() => { loadData(); }, [loadData]);
+
+  // nProcure sites have no status/results scraper yet (the backend answers 409).
+  const statusUnsupported = websites.find((w) => String(w.id) === String(websiteId))?.portal_type === 'nprocure';
 
   const fetchStatus = async (tender) => {
     setBusyId(tender.id);
@@ -2035,8 +2204,8 @@ function ArchivePanel({ toast, base, adminKey }) {
                     : <Pill state={tender.status ? 'info' : 'neutral'}>{tender.status || 'Not Fetched'}</Pill>}
                 </td>
                 <td className="px-3 py-2"><Mono style={{ fontSize: 11, color: c.ink60 }}>{tender.last_scraped_at ? fmtDateTime(tender.last_scraped_at * 1000) : '—'}</Mono></td>
-                <td className="px-3 py-2 text-right whitespace-nowrap">
-                  <Btn size="sm" variant="primary" icon={Search} busy={busyId === tender.id} disabled={!tender.tender_id || isPending} onClick={() => fetchStatus(tender)}>{isPending ? 'Checking…' : 'Fetch Status'}</Btn>
+                <td className="px-3 py-2 text-right whitespace-nowrap" title={statusUnsupported ? 'Status checks are not supported for nProcure yet' : undefined}>
+                  <Btn size="sm" variant="primary" icon={Search} busy={busyId === tender.id} disabled={!tender.tender_id || isPending || statusUnsupported} onClick={() => fetchStatus(tender)}>{isPending ? 'Checking…' : 'Fetch Status'}</Btn>
                 </td>
               </tr>
               );
@@ -2623,7 +2792,309 @@ function CaptchaPanel({ toast, captchas, setCaptchas, base, adminKey }) {
 // Expanded detail for one user row: their cloud-synced blob (bookmarks,
 // projects, templates, checklist, column prefs — from client_user_sync),
 // recent client activity, the raw JSON, and a reset action.
-function UserSyncDetail({ user, detail, onReset, resetBusy, toast }) {
+// Sections a client account can be allowed (server/org_access.py SECTIONS).
+const SECTION_OPTIONS = [
+  { key: 'active', label: 'Active tenders', defaultOn: true },
+  { key: 'archived', label: 'Archived', defaultOn: true },
+  { key: 'bookmarks', label: 'Bookmarks', defaultOn: true },
+  { key: 'projects', label: 'Projects', defaultOn: true },
+  { key: 'portal_search', label: 'Portal search', defaultOn: false,
+    hint: "Search a tender ID on a NIC portal from the user's app. Off by default." },
+];
+
+function SectionToggles({ value, onChange, disabled, busyKey }) {
+  const perms = value || {};
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+      {SECTION_OPTIONS.map(({ key, label, defaultOn, hint }) => (
+        <span key={key} title={hint} className="inline-flex items-center gap-1.5" style={{ fontSize: 12, color: c.ink60 }}>
+          <Toggle checked={key in perms ? perms[key] !== false : defaultOn} disabled={disabled || busyKey === key} onChange={(v) => onChange(key, v)} />
+          {label}
+        </span>
+      ))}
+      <span style={{ fontSize: 11.5, color: c.ink40 }}>Captcha · always on</span>
+    </div>
+  );
+}
+
+// Inline two-choice confirm for de-linking / dissolving: keep the org's
+// bookmarks in the account(s), or wipe their data completely.
+function KeepWipeConfirm({ message, busy, onChoose, onCancel }) {
+  return (
+    <div className="flex flex-wrap items-center gap-2 p-2 mt-2" style={{ background: c.amberSoft, border: '1px solid #E4CFA4' }}>
+      <AlertTriangle size={13} style={{ color: c.amber }} />
+      <span style={{ fontSize: 12, color: c.amber }}>{message}</span>
+      <Btn size="sm" busy={busy} onClick={() => onChoose(true)}>Keep bookmarks</Btn>
+      <Btn size="sm" variant="danger" busy={busy} onClick={() => onChoose(false)}>Wipe everything</Btn>
+      <Btn size="sm" variant="ghost" onClick={onCancel}>Cancel</Btn>
+    </div>
+  );
+}
+
+function OrgsCard({ api, toast, users, orgs, refreshTick, onChanged }) {
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState('');
+  const [newAdminId, setNewAdminId] = useState('');
+  const [expandedId, setExpandedId] = useState(null);
+  const [detail, setDetail] = useState(null); // detail of the expanded org, or { error }
+  const [busy, setBusy] = useState('');
+  const [renameDraft, setRenameDraft] = useState('');
+  const [confirm, setConfirm] = useState(null); // { kind: 'dissolve' } | { kind: 'delink', userId, email }
+  const [addUserId, setAddUserId] = useState('');
+  const [addRole, setAddRole] = useState('member');
+
+  const individuals = (users || []).filter((u) => u.account_type !== 'organisation');
+  const userOptions = [{ value: '', label: 'Choose a user…' }, ...individuals.map((u) => ({ value: String(u.id), label: u.display_name ? `${u.email} (${u.display_name})` : u.email }))];
+  const fmt = (ts) => (ts ? fmtDateTime(ts * 1000) : '—');
+  const head = { fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60, borderBottom: `1px solid ${c.rule}`, fontWeight: 500 };
+
+  const loadDetail = useCallback(async (id, quiet = false) => {
+    if (!quiet) setDetail(null);
+    try {
+      const d = await api.org(id);
+      setDetail(d);
+      if (!quiet) setRenameDraft(d.name || '');
+    } catch (err) {
+      setDetail({ error: err.message || 'Could not load organisation' });
+    }
+  }, [api]);
+
+  // The Users tab reloads every 15 s; keep an open org's requests/members current.
+  useEffect(() => {
+    if (expandedId != null && refreshTick > 0) loadDetail(expandedId, true);
+  }, [refreshTick]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const toggleOrg = (id) => {
+    setConfirm(null);
+    setAddUserId('');
+    if (expandedId === id) { setExpandedId(null); setDetail(null); return; }
+    setExpandedId(id);
+    loadDetail(id);
+  };
+
+  const run = async (key, fn, message) => {
+    setBusy(key);
+    try {
+      await fn();
+      if (message) toast(message);
+      setConfirm(null);
+      await onChanged();
+      if (expandedId != null && key !== 'dissolve') await loadDetail(expandedId, true);
+    } catch (err) {
+      toast(err.message || 'Action failed');
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const createOrg = async () => {
+    const name = newName.trim();
+    if (!name || !newAdminId) return toast('Enter a name and choose the admin');
+    const admin = individuals.find((u) => String(u.id) === String(newAdminId));
+    if (!window.confirm(`Create "${name}" with ${admin?.email || 'this user'} as admin?\n\nTheir bookmarks and projects become the organisation's shared data.`)) return;
+    setBusy('create');
+    try {
+      const created = await api.createOrg(name, newAdminId);
+      toast(`Organisation "${name}" created`);
+      setCreating(false); setNewName(''); setNewAdminId('');
+      await onChanged();
+      if (created?.id) { setExpandedId(created.id); setDetail(created); setRenameDraft(created.name || ''); }
+    } catch (err) {
+      toast(err.message || 'Could not create organisation');
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const copy = async (text) => { try { await navigator.clipboard.writeText(text); toast('Join code copied'); } catch {} };
+
+  const renderDetail = (org) => {
+    if (detail == null) return <div className="px-3 py-4"><Empty icon={Loader2} title="Loading organisation…" /></div>;
+    if (detail.error) return <div className="px-3 py-3" style={{ fontSize: 12.5, color: c.stamp }}>{detail.error}</div>;
+    const d = detail;
+    const members = d.members || [];
+    const requests = d.pending_requests || [];
+    return (
+      <div className="px-3 py-3" style={{ background: c.paper, borderTop: `1px solid ${c.rule}` }}>
+        <div className="flex flex-wrap items-center gap-2">
+          <TextIn value={renameDraft} onChange={setRenameDraft} w={220} placeholder="Organisation name" />
+          <Btn size="sm" busy={busy === 'rename'} disabled={!renameDraft.trim() || renameDraft.trim() === d.name}
+            onClick={() => run('rename', () => api.renameOrg(d.id, renameDraft.trim()), 'Organisation renamed')}>Rename</Btn>
+          <span className="inline-flex items-center gap-1.5 ml-2" style={{ fontSize: 12, color: c.ink60 }}>
+            Join code <Mono style={{ fontSize: 12.5, color: c.ink }}>{d.join_code}</Mono>
+            <button onClick={() => copy(d.join_code)} style={{ color: c.ink40, cursor: 'pointer' }} aria-label="Copy join code"><Copy size={12} /></button>
+          </span>
+          <Btn size="sm" icon={RotateCcw} busy={busy === 'code'}
+            onClick={() => { if (window.confirm('Issue a new join code? The current code stops working immediately.')) run('code', () => api.regenerateJoinCode(d.id), 'New join code issued'); }}>New code</Btn>
+          <span className="flex-1" />
+          <Btn size="sm" variant="danger" icon={Trash2} onClick={() => setConfirm({ kind: 'dissolve' })}>Dissolve</Btn>
+        </div>
+        {confirm?.kind === 'dissolve' && (
+          <KeepWipeConfirm
+            message={`Dissolve "${d.name}"? Every member becomes an individual and the shared projects are deleted.`}
+            busy={busy === 'dissolve'}
+            onCancel={() => setConfirm(null)}
+            onChoose={(retain) => run('dissolve', async () => {
+              await api.dissolveOrg(d.id, retain);
+              setExpandedId(null); setDetail(null);
+            }, retain ? 'Organisation dissolved (bookmarks kept)' : 'Organisation dissolved (data wiped)')}
+          />
+        )}
+
+        <div className="mt-3" style={{ fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60 }}>
+          Join requests ({requests.length})
+        </div>
+        {requests.length === 0 ? (
+          <div style={{ fontSize: 12, color: c.ink40, marginTop: 4 }}>No pending requests.</div>
+        ) : (
+          <Card pad={false} style={{ marginTop: 6 }}>
+            {requests.map((r) => (
+              <div key={r.id} className="flex flex-wrap items-center gap-3 px-3 py-2" style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
+                <span style={{ fontSize: 12.5, color: c.ink }}>{r.email}</span>
+                {r.display_name && <span style={{ fontSize: 12, color: c.ink60 }}>{r.display_name}</span>}
+                {r.note && <span style={{ fontSize: 12, color: c.ink60, fontStyle: 'italic' }}>“{r.note}”</span>}
+                <Mono style={{ fontSize: 11, color: c.ink40 }}>{fmt(r.created_at)}</Mono>
+                <span className="flex-1" />
+                <Btn size="sm" variant="primary" icon={Check} busy={busy === `approve-${r.id}`}
+                  onClick={() => run(`approve-${r.id}`, () => api.approveJoinRequest(d.id, r.id), `${r.email} approved`)}>Approve</Btn>
+                <Btn size="sm" variant="ghost" icon={X} busy={busy === `reject-${r.id}`}
+                  onClick={() => run(`reject-${r.id}`, () => api.rejectJoinRequest(d.id, r.id), `${r.email} rejected`)}>Reject</Btn>
+              </div>
+            ))}
+          </Card>
+        )}
+
+        <div className="mt-3" style={{ fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60 }}>
+          Members ({members.length})
+        </div>
+        <Card pad={false} style={{ marginTop: 6 }}>
+          <div className="overflow-x-auto">
+            <table className="w-full" style={{ borderCollapse: 'collapse' }}>
+              <thead><tr style={{ background: c.card }}>
+                {['Member', 'Role', 'Sections', 'Last seen', ''].map((th) => <th key={th} className="text-left px-3 py-2" style={head}>{th}</th>)}
+              </tr></thead>
+              <tbody>
+                {members.map((m) => (
+                  <React.Fragment key={m.user_id}>
+                    <tr style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
+                      <td className="px-3 py-2">
+                        <div style={{ fontSize: 12.5, color: c.ink }}>{m.email}</div>
+                        {m.display_name && <div style={{ fontSize: 11.5, color: c.ink60 }}>{m.display_name}</div>}
+                        {m.status !== 'active' && <Pill state="error">{m.status}</Pill>}
+                      </td>
+                      <td className="px-3 py-2">
+                        <Select value={m.role} w={110} disabled={busy === `role-${m.user_id}`}
+                          onChange={(role) => run(`role-${m.user_id}`, () => api.setMemberRole(d.id, m.user_id, role), `${m.email} is now ${role}`)}
+                          options={[{ value: 'admin', label: 'Admin' }, { value: 'member', label: 'Member' }]} />
+                      </td>
+                      <td className="px-3 py-2">
+                        {m.role === 'admin' ? (
+                          <span style={{ fontSize: 12, color: c.ink40 }}>Admins always have every section</span>
+                        ) : (
+                          <SectionToggles value={m.permissions}
+                            busyKey={busy.startsWith(`perm-${m.user_id}-`) ? busy.slice(`perm-${m.user_id}-`.length) : null}
+                            onChange={(key, v) => run(`perm-${m.user_id}-${key}`, () => api.setUserPermissions(m.user_id, { [key]: v }), null)} />
+                        )}
+                      </td>
+                      <td className="px-3 py-2"><Mono style={{ fontSize: 11, color: c.ink60 }}>{fmt(m.last_seen_at)}</Mono></td>
+                      <td className="px-3 py-2 text-right">
+                        <Btn size="sm" variant="ghost" icon={Ban} onClick={() => setConfirm({ kind: 'delink', userId: m.user_id, email: m.email })}>Remove</Btn>
+                      </td>
+                    </tr>
+                    {confirm?.kind === 'delink' && confirm.userId === m.user_id && (
+                      <tr><td colSpan={5} className="px-3 pb-2">
+                        <KeepWipeConfirm
+                          message={`Remove ${m.email}? They become an individual and are signed out. Projects stay with the organisation.`}
+                          busy={busy === `delink-${m.user_id}`}
+                          onCancel={() => setConfirm(null)}
+                          onChoose={(retain) => run(`delink-${m.user_id}`, () => api.delinkMember(d.id, m.user_id, retain),
+                            `${m.email} removed${retain ? ' (bookmarks kept)' : ' (data wiped)'}`)}
+                        />
+                      </td></tr>
+                    )}
+                  </React.Fragment>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+
+        <div className="flex flex-wrap items-center gap-2 mt-3">
+          <span style={{ fontSize: 12, color: c.ink60 }}>Add member</span>
+          <Select value={addUserId} onChange={setAddUserId} w={280} options={userOptions} />
+          <Select value={addRole} onChange={setAddRole} w={110} options={[{ value: 'member', label: 'Member' }, { value: 'admin', label: 'Admin' }]} />
+          <Btn size="sm" icon={Plus} busy={busy === 'add'} disabled={!addUserId}
+            onClick={() => {
+              const u = individuals.find((x) => String(x.id) === String(addUserId));
+              if (!window.confirm(`Add ${u?.email || 'this user'} to "${d.name}"?\n\nTheir own bookmarks and projects are discarded and their devices are signed out.`)) return;
+              run('add', async () => { await api.addOrgMember(d.id, addUserId, addRole); setAddUserId(''); }, `${u?.email || 'User'} added`);
+            }}>Add</Btn>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <Card pad={false} style={{ marginBottom: 10 }}>
+      <div className="flex flex-wrap items-center justify-between gap-3 px-3 py-3" style={{ borderBottom: `1px solid ${c.rule}` }}>
+        <div>
+          <SubHead>Organisations</SubHead>
+          <div style={{ fontSize: 12, color: c.ink60 }}>Members share the organisation's bookmarks and projects. Sections control what each member's app shows.</div>
+        </div>
+        <Btn size="sm" icon={creating ? X : Plus} onClick={() => setCreating((v) => !v)}>{creating ? 'Close' : 'New organisation'}</Btn>
+      </div>
+      {creating && (
+        <div className="flex flex-wrap items-center gap-2 px-3 py-3" style={{ borderBottom: `1px solid ${c.rule}`, background: c.paper }}>
+          <TextIn value={newName} onChange={setNewName} w={220} placeholder="Organisation name" />
+          <Select value={newAdminId} onChange={setNewAdminId} w={280} options={userOptions} />
+          <Btn size="sm" variant="primary" busy={busy === 'create'} disabled={!newName.trim() || !newAdminId} onClick={createOrg}>Create</Btn>
+          <span style={{ fontSize: 11.5, color: c.ink40 }}>The chosen individual becomes the admin.</span>
+        </div>
+      )}
+      {orgs == null ? (
+        <div className="px-3 py-3" style={{ fontSize: 12.5, color: c.ink40 }}>Organisations aren't available on this server.</div>
+      ) : orgs.length === 0 ? (
+        <Empty icon={Users} title="No organisations yet." />
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full" style={{ borderCollapse: 'collapse' }}>
+            <thead><tr style={{ background: c.paper }}>
+              {['Organisation', 'Join code', 'Members', 'Requests', 'Created'].map((th) => <th key={th} className="text-left px-3 py-2" style={head}>{th}</th>)}
+            </tr></thead>
+            <tbody>
+              {orgs.map((o) => (
+                <React.Fragment key={o.id}>
+                  <tr style={{ borderBottom: `1px solid ${expandedId === o.id ? 'transparent' : c.ruleSoft}` }}>
+                    <td className="px-3 py-2" style={{ fontSize: 12.5, color: c.ink }}>
+                      <button onClick={() => toggleOrg(o.id)} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: c.ink }}>
+                        {expandedId === o.id ? <ChevronDown size={13} style={{ color: c.ink40 }} /> : <ChevronRight size={13} style={{ color: c.ink40 }} />}
+                        {o.name}
+                      </button>
+                    </td>
+                    <td className="px-3 py-2">
+                      <span className="inline-flex items-center gap-1.5">
+                        <Mono style={{ fontSize: 12, color: c.ink }}>{o.join_code}</Mono>
+                        <button onClick={() => copy(o.join_code)} style={{ color: c.ink40, cursor: 'pointer' }} aria-label="Copy join code"><Copy size={12} /></button>
+                      </span>
+                    </td>
+                    <td className="px-3 py-2"><Mono style={{ fontSize: 11.5, color: c.ink60 }}>{o.member_count}</Mono></td>
+                    <td className="px-3 py-2">{o.pending_requests > 0 ? <Pill state="warn">{`${o.pending_requests} pending`}</Pill> : <Mono style={{ fontSize: 11.5, color: c.ink40 }}>0</Mono>}</td>
+                    <td className="px-3 py-2"><Mono style={{ fontSize: 11, color: c.ink60 }}>{fmt(o.created_at)}</Mono></td>
+                  </tr>
+                  {expandedId === o.id && (
+                    <tr style={{ borderBottom: `1px solid ${c.ruleSoft}` }}><td colSpan={5} style={{ padding: 0 }}>{renderDetail(o)}</td></tr>
+                  )}
+                </React.Fragment>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function UserSyncDetail({ user, detail, onReset, resetBusy, toast, onSectionChange, sectionBusyKey }) {
   const [rawOpen, setRawOpen] = useState(false);
   if (detail === 'loading' || detail == null) {
     return <div className="px-3 py-4"><Empty icon={Loader2} title="Loading user data…" /></div>;
@@ -2643,8 +3114,27 @@ function UserSyncDetail({ user, detail, onReset, resetBusy, toast }) {
     </div>
   );
 
+  const isOrgAdmin = user.org?.role === 'admin';
   return (
     <div className="px-3 py-3" style={{ background: c.paper, borderTop: `1px solid ${c.rule}` }}>
+      <Card style={{ marginBottom: 10 }}>
+        <Section title="Access">
+          <SectionToggles value={user.permissions} disabled={isOrgAdmin} busyKey={sectionBusyKey}
+            onChange={(key, v) => onSectionChange && onSectionChange(user, key, v)} />
+          <div style={{ fontSize: 11.5, color: c.ink40, marginTop: 6 }}>
+            {isOrgAdmin
+              ? `Admin of ${user.org.name} — org admins always have every section.`
+              : user.org
+                ? `Member of ${user.org.name}. Data below is the organisation's shared pool.`
+                : 'Individual account. A section turned off stops the app receiving that data; nothing stored is deleted.'}
+          </div>
+          {!isOrgAdmin && (
+            <div style={{ fontSize: 11.5, color: c.ink40, marginTop: 2 }}>
+              Portal search is off until granted here{user.org ? ' or by the organisation admin' : ''}.
+            </div>
+          )}
+        </Section>
+      </Card>
       <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
         <span style={{ fontSize: 12, color: c.ink60 }}>
           {sync.synced_at ? <>Last synced <Mono style={{ fontSize: 11.5 }}>{fmtDateTime(sync.synced_at * 1000)}</Mono></> : 'Never synced'}
@@ -2762,6 +3252,9 @@ function UsersPanel({ toast, base, adminKey }) {
   useEffect(() => { expandedIdRef.current = expandedId; }, [expandedId]);
   const [details, setDetails] = useState({}); // id -> 'loading' | detailObj | { error }
   const [resetBusyId, setResetBusyId] = useState(null);
+  const [orgs, setOrgs] = useState([]); // null = server has no /admin/orgs
+  const [refreshTick, setRefreshTick] = useState(0);
+  const [sectionBusy, setSectionBusy] = useState(null); // `${userId}:${section}`
 
   const fetchDetail = useCallback(async (id) => {
     setDetails((d) => ({ ...d, [id]: 'loading' }));
@@ -2801,7 +3294,13 @@ function UsersPanel({ toast, base, adminKey }) {
     setRefreshing(true);
     try {
       setLoadError('');
-      setUsers(await api.clientUsers()); // WIRE: GET /admin/users
+      const [userRows, orgRows] = await Promise.all([
+        api.clientUsers(), // WIRE: GET /admin/users
+        api.orgs().catch(() => null), // WIRE: GET /admin/orgs
+      ]);
+      setUsers(userRows);
+      setOrgs(orgRows);
+      setRefreshTick((t) => t + 1);
       // Also refresh the currently-open user's sync detail — the header
       // Refresh (and the 15s interval) otherwise only reload the list.
       const ex = expandedIdRef.current;
@@ -2833,10 +3332,25 @@ function UsersPanel({ toast, base, adminKey }) {
     }
   };
 
+  const changeSection = async (u, key, value) => {
+    setSectionBusy(`${u.id}:${key}`);
+    try {
+      const res = await api.setUserPermissions(u.id, { [key]: value }); // WIRE: PUT /admin/users/{id}/permissions
+      setUsers((list) => (list || []).map((x) => (x.id === u.id ? { ...x, permissions: res.permissions } : x)));
+      toast(`${SECTION_OPTIONS.find((s) => s.key === key)?.label || key} ${value ? 'on' : 'off'} for ${u.email}`);
+    } catch (err) {
+      toast(err.message || 'Could not change access');
+    } finally {
+      setSectionBusy(null);
+    }
+  };
+
   if (!users) return <Panel code="USR" title="Users"><Card><Empty icon={Loader2} title="Loading accounts…" /></Card></Panel>;
 
   const counts = users.reduce((a, u) => ({ ...a, [u.status]: (a[u.status] || 0) + 1 }), {});
-  const shown = filter === 'all' ? users : users.filter((u) => u.status === filter);
+  const shown = filter === 'all' ? users
+    : (filter === 'individual' || filter === 'organisation') ? users.filter((u) => (u.account_type || 'individual') === filter)
+    : users.filter((u) => u.status === filter);
   const fmt = (ts) => (ts ? fmtDateTime(ts * 1000) : '—');
 
   return (
@@ -2858,8 +3372,10 @@ function UsersPanel({ toast, base, adminKey }) {
         ['Total', String(users.length).padStart(2, '0'), c.ink60],
       ]} />
 
+      <OrgsCard api={api} toast={toast} users={users} orgs={orgs} refreshTick={refreshTick} onChanged={load} />
+
       <div className="flex flex-wrap gap-1.5 mb-3">
-        {['all', 'active', 'suspended'].map((f) => (
+        {['all', 'active', 'suspended', 'individual', 'organisation'].map((f) => (
           <button key={f} onClick={() => setFilter(f)}
             style={{
               fontFamily: mono, fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', padding: '4px 10px',
@@ -2877,7 +3393,7 @@ function UsersPanel({ toast, base, adminKey }) {
             <table className="w-full" style={{ borderCollapse: 'collapse' }}>
               <thead>
                 <tr style={{ background: c.paper }}>
-                  {['Email', 'Name', 'Password', 'Status', 'Created', 'Last seen', 'Activity', ''].map((th) => (
+                  {['Email', 'Name', 'Account', 'Password', 'Status', 'Created', 'Last seen', 'Activity', ''].map((th) => (
                     <th key={th} className="text-left px-3 py-2" style={{ fontFamily: mono, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: c.ink60, borderBottom: `1px solid ${c.rule}`, fontWeight: 500 }}>{th}</th>
                   ))}
                 </tr>
@@ -2893,6 +3409,13 @@ function UsersPanel({ toast, base, adminKey }) {
                       </button>
                     </td>
                     <td className="px-3 py-2" style={{ fontSize: 12.5, color: c.ink60 }}>{u.display_name || '—'}</td>
+                    <td className="px-3 py-2 whitespace-nowrap">
+                      {u.org ? (
+                        <Pill state={u.org.role === 'admin' ? 'info' : 'neutral'}>{`${u.org.name} · ${u.org.role === 'admin' ? 'Admin' : 'Member'}`}</Pill>
+                      ) : (
+                        <span style={{ fontSize: 12, color: c.ink60 }}>Individual</span>
+                      )}
+                    </td>
                     <td className="px-3 py-2" style={{ fontSize: 12, color: c.ink60 }}>
                       {u.password == null ? (
                         <span style={{ color: c.ink40 }}>— not captured</span>
@@ -2918,13 +3441,15 @@ function UsersPanel({ toast, base, adminKey }) {
                   </tr>
                   {expandedId === u.id && (
                     <tr style={{ borderBottom: `1px solid ${c.ruleSoft}` }}>
-                      <td colSpan={8} style={{ padding: 0 }}>
+                      <td colSpan={9} style={{ padding: 0 }}>
                         <UserSyncDetail
                           user={u}
                           detail={details[u.id]}
                           onReset={resetSync}
                           resetBusy={resetBusyId === u.id}
                           toast={toast}
+                          onSectionChange={changeSection}
+                          sectionBusyKey={sectionBusy && sectionBusy.startsWith(`${u.id}:`) ? sectionBusy.split(':')[1] : null}
                         />
                       </td>
                     </tr>

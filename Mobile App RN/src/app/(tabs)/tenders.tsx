@@ -2,6 +2,7 @@ import { useState, useMemo, useCallback } from "react";
 import { View } from "react-native";
 import { useLocalSearchParams, router } from "expo-router";
 import { ScreenHeader } from "@/components/shell/ScreenHeader";
+import { SyncPausedBanner } from "@/components/feedback/SyncPausedBanner";
 import { SiteScope } from "@/components/tender/SiteScope";
 import { SegmentedControl } from "@/components/common/SegmentedControl";
 import { TenderFilterBar } from "@/components/tender/TenderFilterBar";
@@ -10,7 +11,7 @@ import { TenderList } from "@/components/tender/TenderList";
 import { OrganizationList } from "@/components/tender/OrganizationList";
 import { useTenders } from "@/hooks/useTenders";
 import { useOrganizations } from "@/hooks/useOrganizations";
-import { useBookmarkToggle } from "@/hooks/useBookmarks";
+import { useBookmarkToggle, useBookmarkedTenders } from "@/hooks/useBookmarks";
 import { timeRemaining } from "@/lib/format";
 import { customFilterPass } from "@/components/tender/CustomFilterMenu";
 import { getRaw, setRaw } from "@/lib/kv";
@@ -49,7 +50,33 @@ export default function TendersScreen() {
   }, [filters, websiteId]);
 
   const tendersQuery = useTenders(apiFilters);
-  const orgsQuery = useOrganizations({ website_id: apiFilters.website_id, q: apiFilters.q });
+  // Bookmarked-only reads the saved bookmarks directly (one fetch per id) rather
+  // than filtering whichever 25-per-page tenders happen to be loaded, so every
+  // bookmark shows immediately no matter where it sorts in the full list.
+  const bookmarked = useBookmarkedTenders();
+  const bookmarkedKey = bookmarked.tenders.map((t: any) => `${t.id}:${t.status}:${t.closing_date}:${t.is_archived}`).join("|");
+  const bookmarkQuery = useMemo(() => ({
+    data: { pages: [{ items: bookmarked.tenders }] },
+    isLoading: bookmarked.isLoading,
+    isError: false,
+    error: null,
+    fetchNextPage: () => {},
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    refetch: () => {},
+  }), // eslint-disable-next-line react-hooks/exhaustive-deps
+  [bookmarkedKey, bookmarked.isLoading]);
+  const listQuery = bookmarkedOnly ? bookmarkQuery : tendersQuery;
+  const bookmarkSort = useCallback((a: any, b: any) => {
+    const at = timeRemaining(a.closing_date).date?.getTime() ?? Infinity;
+    const bt = timeRemaining(b.closing_date).date?.getTime() ?? Infinity;
+    return at - bt;
+  }, []);
+  // Deliberately NOT apiFilters.q here -- that is the Tenders sub-tabs own
+  // search text, and switching sub-tabs never clears it. Sending it through
+  // filtered the org list server-side by that leftover tender search, which
+  // looked like the org list had gone empty.
+  const orgsQuery = useOrganizations({ website_id: apiFilters.website_id });
 
   // router.setParams() merges/patches the given keys into the current route
   // params rather than replacing the whole set — omitting a key (the old
@@ -67,7 +94,14 @@ export default function TendersScreen() {
   }, [filters]);
 
   const filterFn = useCallback((t: any) => {
-    if (bookmarkedOnly && !isBookmarked(t.id)) return false;
+    if (bookmarkedOnly) {
+      if (!isBookmarked(t)) return false;
+      // The bookmark list is not server-filtered, so apply the tab's scope here.
+      if (apiFilters.archived === "true" ? !t.is_archived : Boolean(t.is_archived)) return false;
+      if (apiFilters.website_id && String(t.website_id) !== String(apiFilters.website_id)) return false;
+      const needle = String(apiFilters.q || "").trim().toLowerCase();
+      if (needle && !`${t.title} ${t.tender_id} ${t.organization}`.toLowerCase().includes(needle)) return false;
+    }
     if (closingSoon) {
       const { totalDays, expired } = timeRemaining(t.closing_date);
       if (expired || totalDays == null || totalDays > 5) return false;
@@ -75,11 +109,12 @@ export default function TendersScreen() {
     for (const key of customFilters) if (!customFilterPass(t, key)) return false;
     return true;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bookmarkedOnly, closingSoon, customFilters.join(",")]);
+  }, [bookmarkedOnly, closingSoon, customFilters.join(","), apiFilters.archived, apiFilters.website_id, apiFilters.q]);
 
   return (
     <View className="flex-1 bg-bg">
       <ScreenHeader title="Tenders" />
+      <View className="px-4 pt-3"><SyncPausedBanner /></View>
       <SiteScope
         websiteId={apiFilters.website_id}
         onChange={(id) => {
@@ -112,7 +147,12 @@ export default function TendersScreen() {
             rows={rows}
             onOpenAdvanced={() => setSheetOpen(true)}
           />
-          <TenderList query={tendersQuery} filterFn={filterFn} onRowsChange={setRows} />
+          <TenderList
+            query={listQuery}
+            filterFn={filterFn}
+            sortFn={bookmarkedOnly ? bookmarkSort : undefined}
+            onRowsChange={setRows}
+          />
           <TenderFilterSheet open={sheetOpen} onClose={() => setSheetOpen(false)} filters={filters} onApply={onChange} />
         </View>
       )}

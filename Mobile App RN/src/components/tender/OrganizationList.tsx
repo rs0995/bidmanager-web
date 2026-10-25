@@ -13,9 +13,10 @@ type OrganizationListProps = {
   query: any;
   bookmarkedOnly: boolean;
   onToggleBookmarked: (value: boolean) => void;
+  archived?: boolean;
 };
 
-export function OrganizationList({ query, bookmarkedOnly, onToggleBookmarked }: OrganizationListProps) {
+export function OrganizationList({ query, bookmarkedOnly, onToggleBookmarked, archived = false }: OrganizationListProps) {
   const { data, isLoading, isError, error, refetch } = query;
   const { isOrgBookmarked } = useOrgBookmarkToggle();
   const [search, setSearch] = useState("");
@@ -79,7 +80,7 @@ export function OrganizationList({ query, bookmarkedOnly, onToggleBookmarked }: 
         <FlatList
           data={items}
           keyExtractor={(item: any) => String(item.id)}
-          renderItem={({ item }) => <OrganizationCard org={item} />}
+          renderItem={({ item }) => <OrganizationCard org={item} archived={archived} />}
           contentContainerClassName="gap-2 px-4 pb-4"
         />
       )}
