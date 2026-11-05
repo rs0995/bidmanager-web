@@ -14,6 +14,7 @@ ID_TABLES = {
     "client_activity_log",
     "client_org_join_requests",
     "client_orgs",
+    "client_project_files",
     "client_portal_searches",
     "client_tokens",
     "client_users",

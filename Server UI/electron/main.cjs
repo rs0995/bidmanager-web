@@ -208,6 +208,7 @@ async function createMainWindow() {
     minHeight: 650,
     show: false,
     autoHideMenuBar: true,
+    icon: path.join(__dirname, "assets", "icon.png"),
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,

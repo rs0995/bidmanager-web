@@ -121,10 +121,43 @@ _SCHEMA = (
         finished_at REAL
     )''',
     "CREATE INDEX IF NOT EXISTS idx_client_portal_searches_user ON client_portal_searches(user_id, created_at)",
+    # Files attached to checklist rows (project_files.py). scope = 'org:<id>' or
+    # 'user:<id>'. One live file per row: the first upload wins.
+    '''CREATE TABLE IF NOT EXISTS client_project_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope TEXT NOT NULL,
+        project_id TEXT,
+        checklist_item_id TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        stored_name TEXT,
+        folder_path TEXT,
+        size_bytes INTEGER DEFAULT 0,
+        mime_type TEXT,
+        sha256 TEXT,
+        storage_ref TEXT,
+        uploaded_by INTEGER,
+        uploaded_device TEXT,
+        status TEXT NOT NULL DEFAULT 'uploading',
+        created_at REAL NOT NULL,
+        uploaded_at REAL,
+        trashed_at REAL
+    )''',
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_client_project_files_slot "
+    "ON client_project_files(scope, checklist_item_id) WHERE trashed_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_client_project_files_project ON client_project_files(scope, project_id)",
+)
+# Index on columns that the guarded ALTERs below may add.
+_POST_COLUMN_SCHEMA = (
+    # The name a file is stored under in its project folder (name, name (2), ...).
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_client_project_files_stored_name "
+    "ON client_project_files(scope, project_id, stored_name) WHERE trashed_at IS NULL",
 )
 _COLUMNS = (
     # NULL = the default sections (all existing accounts).
     "ALTER TABLE client_users ADD COLUMN permissions_json TEXT",
+    # Drive layout: project-files/P - <tender>/<owner>/<project>/<stored_name>.
+    "ALTER TABLE client_project_files ADD COLUMN stored_name TEXT",
+    "ALTER TABLE client_project_files ADD COLUMN folder_path TEXT",
 )
 
 _ensured: set = set()
@@ -139,6 +172,8 @@ def create_schema(cursor: Any) -> None:
             cursor.execute(ddl)
         except sqlite3.OperationalError:
             pass
+    for ddl in _POST_COLUMN_SCHEMA:
+        cursor.execute(ddl)
 
 
 def ensure_schema(conn: Any) -> None:
@@ -368,6 +403,37 @@ def strip_hidden(blob: dict, perms: dict[str, bool]) -> dict:
     return _pick(blob, lambda k: k not in hidden)
 
 
+def project_tender_ids(blob: dict) -> set[str]:
+    """Canonical tender ids of every project in the blob (any status)."""
+    out = set()
+    for row in blob.get("projects") or []:
+        if isinstance(row, dict):
+            key = " ".join(str(row.get("source_tender_id") or "").split()).upper()
+            if key:
+                out.add(key)
+    return out
+
+
+def with_project_bookmarks(blob: dict) -> dict:
+    """A tender in a project is always bookmarked: bookmarkTenderIds gains
+    every project's tender. (The apps refuse to un-bookmark these; the sync
+    merge ignores such a removal.)"""
+    wanted = project_tender_ids(blob)
+    if not wanted:
+        return blob
+    if "bookmarkTenderIds" not in blob and "bookmarks" in blob:
+        # An old blob with row-id bookmarks only (converted at startup / on the
+        # next push); adding the key now would hide those bookmarks.
+        return blob
+    current = {" ".join(str(v or "").split()).upper() for v in (blob.get("bookmarkTenderIds") or [])}
+    current.discard("")
+    if wanted <= current and "bookmarkTenderIds" in blob:
+        return blob
+    out = dict(blob)
+    out["bookmarkTenderIds"] = sorted(current | wanted)
+    return out
+
+
 def effective_blob(
     conn: Any, user_id: int, account: Optional[dict[str, Any]] = None, apply_permissions: bool = True,
 ) -> tuple[dict, float, bool]:
@@ -383,6 +449,7 @@ def effective_blob(
         org_blob, org_ts, org_found = read_org_blob(conn, account["org_id"])
         blob = join_blobs(split_blob(user_blob)[1], split_blob(org_blob)[0])
         ts, found = max(user_ts, org_ts), user_found or org_found
+    blob = with_project_bookmarks(blob)
     if apply_permissions:
         blob = strip_hidden(blob, account["permissions"])
     if RESET_KEY in blob:
@@ -464,6 +531,11 @@ def create_org(conn: Any, user_id: int, name: Any, now: Optional[float] = None) 
     user_blob, user_ts, user_found = read_user_blob(conn, user_id)
     shared, personal = split_blob(user_blob)
     write_org_blob(conn, org_id, shared, now)
+    # Their checklist files move with their projects.
+    conn.execute(
+        "UPDATE client_project_files SET scope=? WHERE scope=? AND trashed_at IS NULL",
+        (f"org:{org_id}", f"user:{user_id}"),
+    )
     if user_found:
         write_user_blob(conn, user_id, personal, user_ts)
     return org_id
@@ -570,6 +642,10 @@ def _link_member(
     personal = split_blob(user_blob)[1]
     personal[RESET_KEY] = now
     write_user_blob(conn, user_id, personal, now)
+    # Their own checklist files go with their discarded projects.
+    import project_files  # deferred: project_files imports this module
+
+    project_files.trash_scope(conn, f"user:{user_id}", now)
     _revoke_tokens(conn, user_id, now)
     _cancel_pending_requests(conn, user_id, now, decided_by)
 
@@ -685,6 +761,9 @@ def dissolve_org(conn: Any, org_id: int, retain: bool, now: Optional[float] = No
     for user_id in members:
         _detach(conn, org_id, user_id, retain, now)
     conn.execute("DELETE FROM client_org_sync WHERE org_id=?", (org_id,))
+    import project_files  # deferred: project_files imports this module
+
+    project_files.trash_scope(conn, f"org:{org_id}", now)
     conn.execute(
         "UPDATE client_org_join_requests SET status='cancelled', decided_at=?, decided_by='operator' "
         "WHERE org_id=? AND status='pending'",

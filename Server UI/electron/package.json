@@ -1,6 +1,6 @@
 {
   "name": "bidmanager-control-shell",
-  "version": "1.0.16",
+  "version": "1.0.17",
   "private": true,
   "description": "Electron wrapper for the BidManager Control admin console",
   "main": "main.cjs",
@@ -19,13 +19,15 @@
     "appId": "com.bidmanager.control",
     "productName": "BidManager Control",
     "electronVersion": "33.4.11",
+    "icon": "assets/icon.png",
     "directories": {
       "output": "../installer/current"
     },
     "files": [
       "main.cjs",
       "preload.cjs",
-      "package.json"
+      "package.json",
+      "assets/icon.png"
     ],
     "extraResources": [
       {

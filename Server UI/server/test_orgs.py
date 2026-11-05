@@ -121,7 +121,8 @@ class OrgAccessTests(unittest.TestCase):
         self._push(self.token, data)
         pulled = self._pull(self.token)["data"]
         self.assertEqual(pulled["projects"][0]["title"], "Bridge bid")
-        self.assertEqual(pulled["bookmarkTenderIds"], ["T-200"])
+        # T-100 is the project's tender, so it is bookmarked too (always).
+        self.assertEqual(pulled["bookmarkTenderIds"], ["T-100", "T-200"])
         self.assertEqual(pulled["tenderColumnPrefs"], {"title": 200})
         self.assertEqual(self._tender_ids(self.token), ["T-100", "T-200", "T-300"])
         stats = self.client.get("/client/stats", headers=self.headers).json()

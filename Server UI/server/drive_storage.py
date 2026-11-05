@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from functools import lru_cache
 from typing import Any, Iterator, Optional
 from urllib.parse import quote
@@ -72,7 +73,7 @@ def _list_files(
         result = service.files().list(
             q=" and ".join(query_parts),
             spaces="drive",
-            fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,webViewLink)",
+            fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,createdTime,webViewLink)",
             pageSize=1000,
             pageToken=page_token,
             supportsAllDrives=True,
@@ -98,23 +99,32 @@ def _find_child_folder(parent_id: str, name: str) -> Optional[str]:
     return str(match["id"]) if match else None
 
 
+# Drive allows two folders with the same name side by side, so "look, then
+# create" must not run twice at once for the same folder (concurrent uploads).
+_folder_lock = threading.Lock()
+
+
 def _ensure_child_folder(parent_id: str, name: str) -> str:
     name = normalize_relative_path(name)
     if not name or "/" in name:
         raise ValueError("Invalid Drive folder name.")
-    existing = _find_child_folder(parent_id, name)
-    if existing:
-        return existing
-    service = _drive_service()
-    metadata = {
-        "name": name,
-        "mimeType": DRIVE_FOLDER_MIME,
-        "parents": [parent_id],
-    }
-    created = service.files().create(
-        body=metadata, fields="id", supportsAllDrives=True
-    ).execute()
-    return created["id"]
+    with _folder_lock:
+        matches = _list_files(parent_id, name=name, folder_only=True)
+        if matches:
+            # Duplicates made before this lock existed: always use the oldest,
+            # so every caller lands in the same folder instead of failing.
+            matches.sort(key=lambda item: (str(item.get("createdTime") or ""), str(item.get("id") or "")))
+            return str(matches[0]["id"])
+        service = _drive_service()
+        metadata = {
+            "name": name,
+            "mimeType": DRIVE_FOLDER_MIME,
+            "parents": [parent_id],
+        }
+        created = service.files().create(
+            body=metadata, fields="id", supportsAllDrives=True
+        ).execute()
+        return created["id"]
 
 
 def trash(file_id: str) -> None:
@@ -275,13 +285,29 @@ def copy_folder_contents(source_reference: str, destination_reference: str) -> i
     return copied
 
 
+# Drive limits each file property to 124 bytes (key + value, UTF-8).
+_PROPERTY_LIMIT_BYTES = 124
+
+
+def _fit_property(key: str, value: str) -> str:
+    room = _PROPERTY_LIMIT_BYTES - len(key.encode("utf-8"))
+    data = str(value or "").encode("utf-8")
+    if len(data) <= room:
+        return str(value or "")
+    return data[:room].decode("utf-8", errors="ignore")
+
+
 def upload_file(
     local_path: str,
     tender_id: str = "",
     file_type: str = "document",
     prefix: str = "",
     folder_id: str = "",
+    tag: Optional[str] = None,
 ) -> str:
+    """Upload to <root or folder_id>/<prefix>/<tender_id>/<file name>. The file
+    is labelled with bidmanager_tender_id = tag (default: tender_id), cut to
+    Drive's 124-byte property limit."""
     root_folder_id = str(folder_id or "").strip() or os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
     if not root_folder_id:
         raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is not configured.")
@@ -298,8 +324,10 @@ def upload_file(
         "name": file_name,
         "parents": [parent_id],
         "appProperties": {
-            "bidmanager_tender_id": tender_folder,
-            "bidmanager_file_type": str(file_type or "document"),
+            "bidmanager_tender_id": _fit_property(
+                "bidmanager_tender_id", tender_folder if tag is None else tag
+            ),
+            "bidmanager_file_type": _fit_property("bidmanager_file_type", str(file_type or "document")),
         },
     }
     media = MediaFileUpload(local_path, resumable=True)

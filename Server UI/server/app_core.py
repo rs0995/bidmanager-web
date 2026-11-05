@@ -1092,6 +1092,12 @@ def _init_db_schema(conn):
         # update run -- what "new files exist on the portal" is measured against.
         ("last_dl_prebid_count", "INTEGER"),
         ("last_dl_corrigendum_count", "INTEGER"),
+        # The detail page's "Latest Corrigendum List" as text ("CSD | Other; ...").
+        # It shows only the latest corrigenda, so a new one can replace the old
+        # row with the count unchanged; this catches that. last_dl_* is the list
+        # as of the last completed download (see new_portal_files_available).
+        ("corrigendum_latest", "TEXT"),
+        ("last_dl_corrigendum_latest", "TEXT"),
         ("last_status_checked_at", "REAL"),
     ]
     for col, ddl in tender_tracking_migrations:
@@ -1659,6 +1665,7 @@ def _init_db_schema(conn):
                 "client_org_join_requests": ("created_at", "decided_at"),
                 "client_org_sync": ("updated_at",),
                 "client_portal_searches": ("created_at", "finished_at"),
+                "client_project_files": ("created_at", "uploaded_at", "trashed_at"),
             }.items():
                 for column in columns:
                     type_row = c.execute(
@@ -2771,6 +2778,45 @@ class ScraperBackend:
         return count
 
     @staticmethod
+    def extract_latest_corrigenda(soup):
+        """The detail page's Latest Corrigendum List as "title | type" rows
+        joined by "; " (the S.No and View cells dropped). None when the page
+        couldn't be read, "" when the tender has no corrigendum table."""
+        if soup is None:
+            return None
+        table = soup.find('table', id='corrigendumDocumenttable')
+        if not table:
+            return ""
+        rows = []
+        for tr in table.find_all('tr'):
+            cells = [" ".join(td.get_text(" ", strip=True).split()) for td in tr.find_all('td')]
+            if not cells or not cells[0].isdigit():
+                continue
+            rows.append(" | ".join(cell for cell in cells[1:3] if cell))
+        return "; ".join(rows)[:500]
+
+    @staticmethod
+    def _store_corrigendum_latest(conn, tender_db_id, new_value):
+        """Save the Latest Corrigendum List text. A change from a known
+        previous value is recorded in tender_history (field
+        "corrigendum_latest") so the changes feed and push alerts report it;
+        the first value seen is only a baseline. None (page not read) changes
+        nothing."""
+        if new_value is None:
+            return
+        row = conn.execute(
+            "SELECT corrigendum_latest FROM tenders WHERE id=?", (int(tender_db_id),)
+        ).fetchone()
+        old_value = row[0] if row else None
+        conn.execute(
+            "UPDATE tenders SET corrigendum_latest=? WHERE id=?", (str(new_value), int(tender_db_id))
+        )
+        if old_value is not None:
+            ScraperBackend._record_field_change_if_different(
+                conn, tender_db_id, "corrigendum_latest", old_value, new_value,
+            )
+
+    @staticmethod
     def extract_prebid_corrigendum_counts(soup):
         # None means "couldn't check this cycle" (detail page fetch failed) —
         # distinct from a confirmed 0 (page loaded, table just isn't there).
@@ -3071,6 +3117,7 @@ class ScraperBackend:
         ) = tender_row
         prebid_count = _rest[0] if len(_rest) > 0 else None
         corrigendum_count = _rest[1] if len(_rest) > 1 else None
+        corrigendum_latest = _rest[2] if len(_rest) > 2 else None
         now_epoch = time.time()
         norm_url = ScraperBackend.normalize_tender_url(tender_url)
         normalized_tender_id = ScraperBackend.canonical_tender_id(tender_id)
@@ -3153,6 +3200,7 @@ class ScraperBackend:
                 ScraperBackend._record_field_change_if_different(
                     conn, row_id, "corrigendum_count", old_counts[1] if old_counts else None, corrigendum_count,
                 )
+            ScraperBackend._store_corrigendum_latest(conn, row_id, corrigendum_latest)
             if changed:
                 ScraperBackend._record_tender_history(
                     conn, row_id, tender_key, now_epoch, content_hash,
@@ -3183,6 +3231,7 @@ class ScraperBackend:
             ScraperBackend._record_tender_history(
                 conn, row_id, tender_key, now_epoch, content_hash, ["created"], snapshot,
             )
+            ScraperBackend._store_corrigendum_latest(conn, row_id, corrigendum_latest)
             return "inserted"
         except sqlite3.IntegrityError:
             # A concurrent worker may have inserted the canonical tender first.
@@ -3427,6 +3476,7 @@ class ScraperBackend:
                                 except:
                                     page_parse += time.perf_counter() - _ts
                                 prebid_count, corrigendum_count = ScraperBackend.extract_prebid_corrigendum_counts(d_soup)
+                                corrigendum_latest = ScraperBackend.extract_latest_corrigenda(d_soup)
 
                                 title_text = ScraperBackend.derive_tender_title(listing_title_text, d_soup)
                                 t_id = ScraperBackend.derive_tender_id(listing_title_text, d_soup, full_link)
@@ -3445,7 +3495,8 @@ class ScraperBackend:
                                 # which never overrides closing_date/opening_date this way either.
                                 tenders_to_save.append((
                                     website_id, org_name, t_id, title_text, val, emd, closing_date, opening_date,
-                                    full_link, loc, cat, prebid, published_date, work_desc, prebid_count, corrigendum_count
+                                    full_link, loc, cat, prebid, published_date, work_desc, prebid_count, corrigendum_count,
+                                    corrigendum_latest,
                                 ))
 
                     # Save batch
@@ -3753,6 +3804,7 @@ class ScraperBackend:
             "last_downloaded_at=CASE WHEN ?=1 OR ?=1 THEN ? ELSE last_downloaded_at END, "
             "last_dl_prebid_count=COALESCE(prebid_count,0), "
             "last_dl_corrigendum_count=COALESCE(corrigendum_count,0), "
+            "last_dl_corrigendum_latest=corrigendum_latest, "
             "last_download_error='' WHERE id=?",
             (
                 durable_folder, "complete" if main_complete else "partial", 1 if main_complete else 0,
@@ -4604,6 +4656,9 @@ class ScraperBackend:
                     f"UPDATE tenders SET {set_clause},last_scraped_at=? WHERE id=?",
                     (*updates.values(), time.time(), db_id),
                 )
+                ScraperBackend._store_corrigendum_latest(
+                    conn, db_id, ScraperBackend.extract_latest_corrigenda(d_soup)
+                )
                 conn.commit()
                 conn.close()
                 log_to_gui(f"  Refreshed {', '.join(updates.keys())} for id {db_id}.")
@@ -5135,9 +5190,21 @@ class ScraperBackend:
             if prebid_count is None or corrigendum_count is None:
                 return False
             conn = sqlite3.connect(DB_FILE)
+            old_counts = conn.execute(
+                "SELECT prebid_count, corrigendum_count FROM tenders WHERE id=?", (int(tender_db_id),)
+            ).fetchone()
             conn.execute(
                 "UPDATE tenders SET prebid_count=?, corrigendum_count=?, last_scraped_at=? WHERE id=?",
                 (int(prebid_count), int(corrigendum_count), time.time(), int(tender_db_id)),
+            )
+            ScraperBackend._record_field_change_if_different(
+                conn, tender_db_id, "prebid_count", old_counts[0] if old_counts else None, int(prebid_count),
+            )
+            ScraperBackend._record_field_change_if_different(
+                conn, tender_db_id, "corrigendum_count", old_counts[1] if old_counts else None, int(corrigendum_count),
+            )
+            ScraperBackend._store_corrigendum_latest(
+                conn, tender_db_id, ScraperBackend.extract_latest_corrigenda(d_soup)
             )
             conn.commit()
             conn.close()
@@ -5155,13 +5222,29 @@ class ScraperBackend:
         conn = sqlite3.connect(DB_FILE)
         row = conn.execute(
             "SELECT COALESCE(prebid_count,0), COALESCE(corrigendum_count,0), "
-            "last_dl_prebid_count, last_dl_corrigendum_count, COALESCE(tender_id,'') "
+            "last_dl_prebid_count, last_dl_corrigendum_count, COALESCE(tender_id,''), "
+            "corrigendum_latest, last_dl_corrigendum_latest "
             "FROM tenders WHERE id=?",
             (int(tender_db_id),),
         ).fetchone()
         if not row:
             conn.close()
             return True, 0, 0
+        # The Latest Corrigendum List shows only the newest corrigenda, so a new
+        # one can replace an old row with the count unchanged: a different list
+        # than at the last download also means new files.
+        latest, downloaded_latest = row[5], row[6]
+        if latest is not None and downloaded_latest is None:
+            # Downloaded before the list was tracked: today's list is the baseline.
+            conn.execute(
+                "UPDATE tenders SET last_dl_corrigendum_latest=? WHERE id=?", (latest, int(tender_db_id))
+            )
+            conn.commit()
+        elif latest is not None and latest != downloaded_latest:
+            portal_total = int(row[0]) + int(row[1])
+            conn.close()
+            log_to_gui(f"  Corrigendum list changed on the portal: '{downloaded_latest}' -> '{latest}'.")
+            return True, portal_total, portal_total
         portal_total = int(row[0]) + int(row[1])
         if row[2] is not None and row[3] is not None:
             recorded_total = int(row[2]) + int(row[3])

@@ -1,0 +1,36 @@
+Change log — 2026-10-27
+Files in this folder are the ORIGINAL (pre-change) copies, same paths relative to "Server UI/". Restore by copying back.
+
+Request: client app "Attached PO.pdf on this device only — could not share it: Upload failed with HTTP 500".
+Cause (server log): POST /client/project-files -> DriveDocumentStorage.persist -> drive_storage.upload_file ->
+HttpError 403 propertyLengthLimitExceeded. upload_file uses tender_id both for the Drive folder path and the
+appProperties label bidmanager_tender_id (key + value <= 124 bytes); since the 2026-10-26 layout change the upload
+passed the whole "P - <tender>/<owner>/<project>" path there. The test mocked upload_file, so it never saw the limit.
+
+Changes:
+ - server/drive_storage.py : upload_file(tag=None) labels the file with `tag` when given; every label is cut to
+   Drive's 124-byte limit (_fit_property). _ensure_child_folder runs look-then-create under a process lock (no more
+   duplicate sibling folders from concurrent uploads) and, if duplicates already exist, uses the oldest instead of
+   failing every later upload with "Drive path is ambiguous". _list_files also returns createdTime.
+ - server/storage_runtime.py : persist(..., tag=None) passes tag to Drive only when set (tender documents unchanged).
+ - server/client_api.py : project-file upload labels the file with its "P - <tender>" folder; persist retried 3x
+   (2 s apart, like tender documents); on failure the reason is logged (stdout + live log) BEFORE the reservation
+   and scratch copy are removed; a storage failure returns 502 {reason: "storage_failed"} instead of a bare 500;
+   the stale-reservation clean-up is committed on its own before the insert (on Postgres a unique-index clash rolls
+   back the whole connection, which used to undo it and wedge the row on 409 upload_in_progress).
+ - server/test_project_files.py : layout test also checks the tag; +3 tests (real Drive request labels within
+   124 bytes for a long MMRDA title, retry-then-502 with log and freed row, duplicate folders -> oldest / create).
+Note: a helper (_fit_property) was briefly added to drive_storage.py before this pass was agreed; it is now used.
+
+----------------------------------------------------------------------------------------------------------------
+2026-10-27 — Request: restore change logs were losing entries. Cause: two sessions log into the same day's
+restore/<date>/CHANGES.txt and whichever CREATED it overwrote the other (2026-10-24: this session's `cat >` wiped
+the console session's electron-builder entry; 2026-10-26: the icon change recreated the file at 14:29 and wiped the
+storage-layout entry). No hook involved (.claude has none). Fix:
+ - CLAUDE.md (Server UI) : new rule -- CHANGES.txt / CHANGELOG_PENDING.txt are append-only; never create or rewrite;
+   backups with cp -n only. (Backed up to restore/2026-10-27/CLAUDE.md.)
+ - restore/2026-10-26/CHANGES.txt : lost storage-layout entry re-added (appended) with its deploy status.
+ - Memory note server-ui-restore-backups updated with the same rule.
+
+----
+2026-10-27 — Status: upload fix (Drive label limit, retries, 502 storage_failed, failure log, folder lock, separate stale-reservation commit): full suite 324 passed. Deployed 2026-10-27 from the PC (full rebuild), health OK.

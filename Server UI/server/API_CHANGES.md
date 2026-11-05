@@ -42,6 +42,10 @@ Status key: **LIVE** = deployed; **READY** = coded and tested on the server, dep
 - **De-link with `retain: true`** keeps only the org's bookmarked tenders and organisations. **`retain: false`** wipes the account. Either way the user's devices are signed out, and the user becomes an individual with the default sections.
 - Devices that are signed out get 401 and must sign in again. Client UI already does this.
 
+- **Project tenders are always bookmarked** (LIVE since 2026-10-26). The server adds every project's `source_tender_id` to `bookmarkTenderIds` (on push and on pull), and ignores a removal of that bookmark while the project exists. Deleting the project frees the bookmark. As bookmarks, these tenders get the 24-hour update jobs and bookmark alerts. **Apps:**
+  - when creating a project, bookmark its tender locally too;
+  - when un-bookmarking a tender that is in any project (match the canonical `source_tender_id`), block it and show: "Tenders in projects can't be removed from bookmarks. Remove the project first."
+
 ### Client routes (`x-client-key`)
 
 | Method & path | Body → response |
@@ -140,7 +144,49 @@ There are no operator search routes: searches come from users. The operator only
 
 ---
 
-## 3. To-do per app
+## 3. Project checklist files (LIVE since 2026-10-26)
+
+### Concepts
+- A file attached to a checklist row is **uploaded to the server**, and every platform of the same account (or every member of the same org) can open it. Today only the row text syncs: the desktop's `linked_file_path` and the phones' `attachment.uri` are device-local.
+- The row's file is described by **`server_file`** on the checklist row in `/client/sync`:
+  `{id, name, size, type, sha256, uploaded_at, uploaded_by, device}`.
+  - **The server owns this field.** A sync push can't set, change or clear it; the server ignores whatever a device sends. Only the upload and delete routes change it.
+  - Keep sending rows as usual; you don't need to strip it.
+- **One file per row, and the first upload wins.** If another platform already uploaded a file for the row, an upload gets **409** with that file. The losing platform must **download the server's file and replace its own local copy**, so every platform ends up with the same file.
+- **To replace a file on purpose:** delete it, then upload the new one.
+- **Removing a checklist row** (a sync `removed` delta) also removes its file.
+- **Joining an org** discards the user's own files along with their own projects. **Creating an org** keeps them as the org's files.
+- **Access:** the `projects` section. Org members share the org's files.
+- **Size cap:** the server setting `max_file_size_mb` (default 80 MB) → 413.
+- **Where files are stored** (server-side only; the apps never see the path): `project-files/P - <tender id>/<Owner (org N | user N)>/<Project title (project id)>/<name>`.
+  - Projects with no tender go under `project-files/P - No tender/…`, beside the tender folders.
+  - All projects for one tender, from any user, sit under that tender's `P - <tender id>` folder. Each user, or each org (one folder for all its members), has its own folder inside it.
+  - A second file with the same name in a project is stored as `name (2).ext`, but the apps still show and download it under the user's original `name`.
+  - Archiving a tender or a project doesn't move files.
+
+### Client routes (`x-client-key`; 403 `section_forbidden` without `projects`)
+
+| Method & path | Body → response |
+|---|---|
+| `POST /client/project-files` | **multipart**: `checklist_item_id` (the row id), `project_id` (optional), `device` (`"desktop"` / `"phone"`), `file`. → `{file}`. Errors: **404 `{detail:{reason:"row_not_found"}}`** = the row isn't on the server yet (push `/client/sync`, then retry); **409 `{detail:{reason:"file_exists", file}}`** = the first-wins file, so download it and use it; **409 `upload_in_progress`** = retry in a few seconds; 413 = too large; 400 = empty file. |
+| `GET /client/project-files?project_id=` | → `{items: [file, …]}` |
+| `POST /client/project-files/{id}/download-request` | → `{file, url, expires_at}` (a signed URL valid for about 15 min; it needs no auth header, same as tender documents) |
+| `GET <url>` | The file bytes (attachment) |
+| `DELETE /client/project-files/{id}` | Removes the file and clears `server_file` |
+
+`file` = `{id, project_id, checklist_item_id, name, size, type, sha256, uploaded_at, uploaded_by, device}`.
+
+### Flow every app should follow
+1. **On attach:** save locally as today, push the sync data so the row exists on the server, then upload. **On 409 `file_exists`:** download the returned file, replace the local copy, and show "Another device attached a file to this row first — using that one."
+2. **After a pull:** for each row with `server_file` whose file isn't on this device, or whose local file differs (compare `sha256` or the name), show the file name with a **Download** or open action. Download through the signed URL into:
+   - the desktop: the project folder or subfolder, and set `linked_file_path`;
+   - a phone: `attachments/<itemId>/`, and set the `attachment` uri.
+3. **Remove file** → `DELETE`, then clear the local copy.
+4. **Existing attachments (one-off backfill):** after updating, upload every locally attached file whose row has no `server_file`. If two platforms attached different files before this change, the first to upload wins and the other gets 409 and follows step 1.
+
+---
+
+## 4. To-do per app
 
 ### Client UI (`Client UI/src/`)
 - [ ] `lib/api.js`: `getAccount()` → `GET /client/me` (cache it in settings or the store and refresh it after login); org routes; portal search routes (§2).
@@ -153,6 +199,8 @@ There are no operator search routes: searches come from users. The operator only
   - `portal_search` → new "Portal Search" page
 - [ ] An org admin page (Settings or a new page): members (role and section toggles), join code (copy, regenerate), pending requests (approve with sections, reject), de-link (retain or clear).
 - [ ] A "Portal Search" page with search and history (§2), using the existing job/captcha patterns (`fetchTenderStatus` / poller / captcha in `lib/api.js`).
+- [ ] Checklist files (§3): `attachFile` (`App.jsx` ~L3542) uploads after the local copy. `pullUserData` (`api.js` ~L1567) keeps `linked_file_path`, but rows with a `server_file` that isn't on disk get a Download action. The checklist table and preview show `server_file.name`. Delete File calls `DELETE`. Add the one-off backfill of existing `linked_file_path` files. Uploads need a multipart `fetch` (`FormData`) from the Electron renderer.
+- [ ] Project tenders stay bookmarked (§1): bookmark the tender locally when a project is created; block un-bookmarking a project's tender with the warning "Tenders in projects can't be removed from bookmarks. Remove the project first."
 
 ### Bidwise (`Bidwise/src/`)
 - [ ] `lib/api.ts`: `me()`, org routes, portal search routes.
@@ -160,6 +208,16 @@ There are no operator search routes: searches come from users. The operator only
 - [ ] `TabNavigator` / `RootNavigator` / `MoreScreen`: hide screens by `permissions` (same mapping as Client UI).
 - [ ] A new **PortalSearch** screen (search and history), reached from Tenders or More, using `CaptchaScreen` for manual captchas.
 - [ ] Sign-in/More: organisation sign-up, join by code, and an org admin screen (optional on mobile; can be phase 2).
+- [ ] Checklist files (§3):
+  - `attachToItem` (`lib/sharedProjects.ts` ~L224) uploads after the local copy, as a multipart POST through `react-native-blob-util`.
+  - `attachmentPath` and `ReadyChecklist` use `server_file`. "On another device" becomes a Download action, using the existing signed-URL `files.download`.
+  - `removeAttachment` calls `DELETE`.
+  - Add the one-off backfill of existing `attachment` files.
+- [ ] Project tenders stay bookmarked (§1): bookmark the tender locally when a project is created; block un-bookmarking a project's tender with the warning "Tenders in projects can't be removed from bookmarks. Remove the project first."
+
+### BM Pro (`Mobile App RN/src/`)
+- [ ] Checklist files (§3): the same as Bidwise, in `lib/projects.js` (`attachFile`, `getAttachedFile`, `mergeFromServer`) and `ChecklistItem.tsx`.
+- [ ] Project tenders stay bookmarked (§1): bookmark the tender locally when a project is created; block un-bookmarking a project's tender with the warning "Tenders in projects can't be removed from bookmarks. Remove the project first."
 
 ### Server UI console (`Server UI/BidManagerControl.jsx`)
 - [ ] `UsersPanel`: show org and role; **section toggles** (5, including Portal search) → `PUT /admin/users/{id}/permissions`.

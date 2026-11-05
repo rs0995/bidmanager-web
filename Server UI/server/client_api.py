@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import hashlib
+import shutil
 import json
 import re
 import time
@@ -18,14 +19,16 @@ from pathlib import Path
 from typing import Any, Iterator, Literal, Optional
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 import admin_providers
 import app_core as core
 import org_access
+import project_files
 import security
+import storage_runtime
 
 
 router = APIRouter(prefix="/client", tags=["client"])
@@ -492,6 +495,9 @@ def _bookmark_union(conn) -> tuple[dict[int, int], dict[int, int]]:
             continue
     # An organisation's shared bookmarks count as one more bookmarker.
     blobs.extend((("org", org_id), blob) for org_id, blob in org_access.all_org_blobs(conn))
+    # Project tenders are always bookmarked, even before the owner's next push.
+    blobs = [(owner, org_access.with_project_bookmarks(blob) if isinstance(blob, dict) else blob)
+             for owner, blob in blobs]
     for user_id, blob in blobs:
         if not isinstance(blob, dict):
             continue
@@ -715,6 +721,16 @@ def _prefs_newer_or_equal(incoming: Any, stored: Any) -> bool:
     return _stamp(incoming) >= _stamp(stored)
 
 
+def _keep_server_file(incoming_row: dict, stored_row: Any) -> dict:
+    """A checklist row's server_file (its uploaded file, project_files.py) is
+    the server's: whatever a pushing device sends for it is replaced by the
+    stored value, so a stale or older app can neither drop nor fake it."""
+    row = {k: v for k, v in incoming_row.items() if k != "server_file"}
+    if isinstance(stored_row, dict) and stored_row.get("server_file"):
+        row["server_file"] = stored_row["server_file"]
+    return row
+
+
 def _merge_sync_blob(
     stored: dict, incoming: dict, removed: dict, conn,
     base_updated_at: float | None = None, now: float | None = None,
@@ -830,6 +846,8 @@ def _merge_sync_blob(
             rid = _row_id(row)
             if rid is None or _online_changed(key, rid):
                 continue
+            if key == "checklist" and isinstance(row, dict):
+                row = _keep_server_file(row, by_id.get(rid))
             if rid not in by_id:
                 order.append(rid)
             by_id[rid] = row
@@ -851,6 +869,15 @@ def _merge_sync_blob(
             # saved preferences with its own defaults (push silently stops).
             continue
         merged[key] = value  # key-preserving: incoming wins, omitted keys kept
+
+    # A tender in a project is always bookmarked: a removal of one is undone
+    # and a new project's tender is added, stamped like any bookmark change.
+    kept = org_access.with_project_bookmarks(merged)
+    if kept is not merged:
+        before = _coerce_tender_id_set(merged.get("bookmarkTenderIds"))
+        merged["bookmarkTenderIds"] = kept["bookmarkTenderIds"]
+        for item in set(kept["bookmarkTenderIds"]) - before:
+            _stamp_add("bookmarkTenderIds", item)
 
     pruned_v = _prune_version_map(versions, now)
     pruned_del = _prune_version_map(deleted, now)
@@ -948,6 +975,15 @@ def client_push_sync(body: SyncPushRequest, user_id: int = Depends(require_clien
             _check_sync_size(personal)
             org_access.write_org_blob(conn, account["org_id"], merged, now)
             org_access.write_user_blob(conn, user_id, personal, now)
+        # A checklist row this push removed takes its uploaded file with it.
+        before = org_stored if account["org_id"] is not None else stored
+        kept = {str(r.get("id")) for r in (merged.get("checklist") or []) if isinstance(r, dict)}
+        gone = [
+            r.get("id") for r in (before.get("checklist") or [])
+            if isinstance(r, dict) and r.get("server_file") and str(r.get("id")) not in kept
+        ]
+        if gone:
+            project_files.trash_items(conn, project_files.scope_for(account), gone, now)
         conn.commit()
     _apply_bookmark_schedules(merged)
     return {"ok": True, "updated_at": now}
@@ -958,7 +994,11 @@ def _check_sync_size(blob: dict) -> None:
         raise HTTPException(413, "Sync payload is too large.")
 
 
-_ALERTABLE_CHANGED_FIELDS = {"closing_date", "status", "prebid_count", "corrigendum_count"}
+_ALERTABLE_CHANGED_FIELDS = {
+    "closing_date", "status", "prebid_count", "corrigendum_count",
+    # A new corrigendum that replaced the old one in the Latest Corrigendum List.
+    "corrigendum_latest",
+}
 
 
 def _compute_user_changes(
@@ -2132,7 +2172,11 @@ def client_document_download(document_id: int, token: str = Query(..., min_lengt
     kind, reference = _download_reference(data)
     if not security.verify_download_token(token, _document_token_subject(document_id, kind, reference)):
         raise HTTPException(401, "Invalid or expired download token.")
-    file_name = str(data.get("file_name") or f"document-{document_id}")
+    return _stored_file_response(kind, reference, str(data.get("file_name") or f"document-{document_id}"))
+
+
+def _stored_file_response(kind: str, reference: str, file_name: str):
+    """Stream a stored file (Drive or local) as an attachment download."""
     disposition = f"attachment; filename*=UTF-8''{quote(file_name)}"
     if kind == "drive":
         try:
@@ -2593,3 +2637,254 @@ def client_portal_search_status(
         if not raw:
             raise HTTPException(404, "Search not found.")
         return {"search": _public_portal_search(conn, user_id, raw, _public_base_url(request))}
+
+
+# ── project checklist files ────────────────────────────────────────────
+# A file attached to a checklist row is uploaded here and shared with every
+# platform of the account (or member of the org) through the row's
+# server_file field. One file per row: the first upload wins, a later one
+# gets 409 with the kept file. See project_files.py.
+
+_UPLOAD_CHUNK = 1024 * 1024
+PROJECT_FILE_STORE_ATTEMPTS = 3
+PROJECT_FILE_STORE_RETRY_SECONDS = 2
+
+
+class _ProjectFileStoreError(Exception):
+    """Storing an uploaded file failed after every attempt."""
+
+    def __init__(self, cause: BaseException):
+        super().__init__(str(cause))
+        self.cause = cause
+
+
+def _log_project_file_failure(file_id, scope, item_key, folder_path, stored_name, exc) -> None:
+    cause = exc.cause if isinstance(exc, _ProjectFileStoreError) else exc
+    detail = getattr(cause, "detail", None) or f"{type(cause).__name__}: {cause}"
+    message = (
+        f"[client] project file upload failed: file #{file_id} ({scope}, checklist row {item_key}) "
+        f"'{folder_path}/{stored_name}': {detail}"
+    )
+    print(message)
+    try:
+        import api_server  # deferred: api_server imports this module at load time
+
+        api_server._append_live_log(message)
+    except Exception:
+        pass
+
+
+def _project_file_for_user(conn: Any, user_id: int, file_id: int) -> tuple[dict[str, Any], str]:
+    """The active file, if it belongs to this user's (or their org's) projects."""
+    account = org_access.get_account(conn, user_id)
+    scope = project_files.scope_for(account)
+    row = project_files.get_file(conn, file_id)
+    if not row or row["scope"] != scope or row["status"] != "active":
+        raise HTTPException(404, "File not found.")
+    return row, scope
+
+
+def _project_file_subject(file_id: int, kind: str, reference: str) -> str:
+    digest = hashlib.sha256(str(reference).encode("utf-8")).hexdigest()
+    return f"client-project-file:{file_id}:{kind}:{digest}"
+
+
+@router.post("/project-files")
+def client_upload_project_file(
+    checklist_item_id: str = Form(..., min_length=1, max_length=100),
+    project_id: str = Form("", max_length=100),
+    device: str = Form("", max_length=40),
+    file: UploadFile = File(...),
+    user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    """Attach a file to a checklist row. The row must already be on the
+    server (push /client/sync first). 409 {reason: "file_exists", file} when
+    the row already has a file: the first upload wins."""
+    _require_section(user_id, "projects")
+    now = time.time()
+    file_name = project_files.safe_file_name(file.filename)
+    with _get_db() as conn:
+        account = org_access.get_account(conn, user_id)
+        scope = project_files.scope_for(account)
+        blob, _updated_at, _found = org_access.effective_blob(conn, user_id, account)
+        item = project_files.find_checklist_row(blob, checklist_item_id)
+        if item is None:
+            raise HTTPException(404, detail={
+                "reason": "row_not_found",
+                "message": "This checklist row isn't on the server yet. Sync, then try again.",
+            })
+        item_key = str(item.get("id"))
+        project_key = str(item.get("project_id") or project_id or "")
+        # project-files/P - <tender>/<owner>/<project>/ (see project_files.py)
+        folder_path = "/".join((
+            project_files.tender_folder(project_files.find_project(blob, project_key)),
+            project_files.owner_folder(conn, account),
+            project_files.project_folder(project_files.find_project(blob, project_key), project_key),
+        ))
+        # Committed on its own: on Postgres a unique-index clash below rolls the
+        # whole connection back, which would also undo this clean-up and leave
+        # the row stuck on "upload in progress".
+        project_files.drop_stale_reservation(conn, scope, item_key, now)
+        conn.commit()
+        file_id = None
+        for stored_name in project_files.name_candidates(file_name):
+            if project_files.name_taken(conn, scope, project_key, stored_name):
+                continue
+            try:
+                cur = conn.execute(
+                    "INSERT INTO client_project_files (scope, project_id, checklist_item_id, file_name, "
+                    "stored_name, folder_path, mime_type, uploaded_by, uploaded_device, status, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (scope, project_key, item_key, file_name, stored_name, folder_path,
+                     str(file.content_type or ""), user_id, str(device or "").strip()[:40], "uploading", now),
+                )
+                file_id = int(cur.lastrowid)
+                conn.commit()
+                break
+            except core.sqlite3.IntegrityError:
+                existing = project_files.active_file(conn, scope, item_key)
+                if existing and existing["status"] == "active":
+                    raise HTTPException(409, detail={
+                        "reason": "file_exists",
+                        "message": "Another device attached a file to this row first.",
+                        "file": project_files.public_file(existing),
+                    })
+                if existing:
+                    raise HTTPException(409, detail={
+                        "reason": "upload_in_progress",
+                        "message": "A file for this row is being uploaded from another device. Try again shortly.",
+                    })
+                # Another upload took this name a moment ago: try the next one.
+        if file_id is None:
+            raise HTTPException(409, "Too many files with this name in the project. Rename the file.")
+
+    # Store the bytes outside the DB connection (an upload can take a while).
+    max_bytes = core.setting_int("max_file_size_mb", 80, minimum=1, maximum=2048) * 1024 * 1024
+    files_root = os.path.join(core.BASE_DOWNLOAD_DIRECTORY, "project-files")
+    scratch = os.path.join(files_root, ".uploading", str(file_id))
+    local_path = os.path.join(scratch, stored_name)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        os.makedirs(scratch, exist_ok=True)
+        with open(local_path, "wb") as out:
+            while True:
+                chunk = file.file.read(_UPLOAD_CHUNK)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    raise HTTPException(413, f"The file is larger than {max_bytes // (1024 * 1024)} MB.")
+                digest.update(chunk)
+                out.write(chunk)
+        if size == 0:
+            raise HTTPException(400, "The file is empty.")
+        storage = storage_runtime.active_document_storage()
+        if not storage.remote:
+            # Local storage keeps the same layout under the download folder.
+            final_dir = os.path.join(files_root, *folder_path.split("/"))
+            os.makedirs(final_dir, exist_ok=True)
+            final_path = os.path.join(final_dir, stored_name)
+            shutil.move(local_path, final_path)
+            local_path = final_path
+        # Like tender documents (app_core download_file_with_requests), a
+        # passing storage error gets two more tries. The file is labelled with
+        # its "P - <tender>" folder only: the full path is too long for Drive.
+        last_error = None
+        for attempt in range(1, PROJECT_FILE_STORE_ATTEMPTS + 1):
+            try:
+                stored = storage.persist(
+                    local_path, folder_path, "project_file", project_files.FILE_PREFIX,
+                    tag=folder_path.split("/", 1)[0],
+                )
+                last_error = None
+                break
+            except Exception as exc:  # noqa: BLE001 - retried, then reported
+                last_error = exc
+                if attempt < PROJECT_FILE_STORE_ATTEMPTS:
+                    time.sleep(PROJECT_FILE_STORE_RETRY_SECONDS)
+        if last_error is not None:
+            raise _ProjectFileStoreError(last_error)
+        shutil.rmtree(scratch, ignore_errors=True)
+    except BaseException as exc:
+        # Say what failed before the reservation and the partial file go, so
+        # the failure can be traced afterwards.
+        _log_project_file_failure(file_id, scope, item_key, folder_path, stored_name, exc)
+        with _get_db() as conn:
+            conn.execute("DELETE FROM client_project_files WHERE id=?", (file_id,))
+            conn.commit()
+        shutil.rmtree(scratch, ignore_errors=True)
+        if isinstance(exc, _ProjectFileStoreError):
+            raise HTTPException(502, detail={
+                "reason": "storage_failed",
+                "message": "The file couldn't be saved to the server's storage. Try again shortly.",
+            })
+        raise
+
+    done = time.time()
+    with _get_db() as conn:
+        conn.execute(
+            "UPDATE client_project_files SET status='active', storage_ref=?, size_bytes=?, sha256=?, "
+            "uploaded_at=? WHERE id=?",
+            (stored.reference, size, digest.hexdigest(), done, file_id),
+        )
+        row = project_files.get_file(conn, file_id)
+        project_files.set_server_file(conn, scope, item_key, project_files.server_file_entry(row), done)
+        conn.commit()
+    return {"file": project_files.public_file(row)}
+
+
+@router.get("/project-files")
+def client_project_files(
+    project_id: Optional[str] = Query(None, max_length=100), user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    _require_section(user_id, "projects")
+    with _get_db() as conn:
+        scope = project_files.scope_for(org_access.get_account(conn, user_id))
+        return {"items": [project_files.public_file(r) for r in project_files.list_files(conn, scope, project_id)]}
+
+
+@router.post("/project-files/{file_id}/download-request")
+def client_project_file_download_request(
+    file_id: int, request: Request, user_id: int = Depends(require_client_user),
+) -> dict[str, Any]:
+    _require_section(user_id, "projects")
+    with _get_db() as conn:
+        row, _scope = _project_file_for_user(conn, user_id, file_id)
+    kind, reference = _download_reference({"local_path": row["storage_ref"]})
+    ttl_minutes = core.setting_int("signed_url_ttl_min", 15, minimum=1, maximum=60)
+    token, expires = security.create_download_token(
+        _project_file_subject(file_id, kind, reference), ttl_minutes * 60
+    )
+    base_url = str(request.base_url).rstrip("/")
+    return {
+        "file": project_files.public_file(row),
+        "url": f"{base_url}/client/project-files/{file_id}/download?token={quote(token)}",
+        "expires_at": datetime.fromtimestamp(expires, timezone.utc).isoformat(),
+    }
+
+
+@download_router.get("/project-files/{file_id}/download", include_in_schema=False)
+def client_project_file_download(file_id: int, token: str = Query(..., min_length=20)):
+    with _get_db() as conn:
+        org_access.ensure_schema(conn)
+        row = project_files.get_file(conn, file_id)
+    if not row or row["status"] != "active":
+        raise HTTPException(404, "File not found.")
+    kind, reference = _download_reference({"local_path": row["storage_ref"]})
+    if not security.verify_download_token(token, _project_file_subject(file_id, kind, reference)):
+        raise HTTPException(401, "Invalid or expired download token.")
+    return _stored_file_response(kind, reference, row["file_name"])
+
+
+@router.delete("/project-files/{file_id}")
+def client_delete_project_file(file_id: int, user_id: int = Depends(require_client_user)) -> dict[str, Any]:
+    """Remove a row's file (to replace it: delete, then upload the new one)."""
+    _require_section(user_id, "projects")
+    now = time.time()
+    with _get_db() as conn:
+        row, scope = _project_file_for_user(conn, user_id, file_id)
+        project_files.trash_file(conn, row, now)
+        project_files.set_server_file(conn, scope, row["checklist_item_id"], None, now)
+        conn.commit()
+    return {"ok": True}

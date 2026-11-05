@@ -1,0 +1,1 @@
+Files attached to project checklist rows are uploaded to the server and shared with every platform (and org members); if two devices attach different files to the same row, the first one kept by the server wins and is sent to the others.

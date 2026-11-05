@@ -58,7 +58,7 @@ class StoredDocument:
 class LocalDocumentStorage:
     remote = False
 
-    def persist(self, local_path: str, tender_id: str, file_type: str, prefix: str) -> StoredDocument:
+    def persist(self, local_path: str, tender_id: str, file_type: str, prefix: str, tag=None) -> StoredDocument:
         return StoredDocument(reference=str(local_path), remove_local_copy=False)
 
     def exists(self, local_path: str, tender_id: str, file_name: str, prefix: str) -> bool:
@@ -71,12 +71,16 @@ class LocalDocumentStorage:
 class DriveDocumentStorage:
     remote = True
 
-    def persist(self, local_path: str, tender_id: str, file_type: str, prefix: str) -> StoredDocument:
+    def persist(self, local_path: str, tender_id: str, file_type: str, prefix: str, tag=None) -> StoredDocument:
+        # tag: the file's bidmanager_tender_id label when it isn't tender_id
+        # (project files keep a long folder path in tender_id).
+        extra = {"tag": tag} if tag is not None else {}
         reference = drive_storage.upload_file(
             local_path,
             tender_id=tender_id,
             file_type=file_type,
             prefix=prefix,
+            **extra,
         )
         return StoredDocument(reference=reference, remove_local_copy=True)
 

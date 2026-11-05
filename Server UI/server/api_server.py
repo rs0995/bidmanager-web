@@ -3352,7 +3352,7 @@ def _tender_change_push_text(t: dict) -> tuple[str, str]:
         clauses.append(f'status changed to "{status}"' if status else "status changed")
     if "closing_date" in fields:
         clauses.append("has a new closing date")
-    if "prebid_count" in fields or "corrigendum_count" in fields:
+    if fields & {"prebid_count", "corrigendum_count", "corrigendum_latest"}:
         clauses.append("has a new pre-bid or corrigendum")
     if not clauses:
         clauses.append("was updated")
@@ -3584,18 +3584,15 @@ def _bump_badge(token: str) -> int:
     return new_value
 
 
-_NAMED_NEW_TENDERS = 3
+_NAMED_NEW_TENDERS = 1
 
 
 def _org_push_text(org: str, items: list) -> tuple[str, str]:
-    """Bidwise's grouped "new tenders" push: up to 3 tenders by name, otherwise
+    """Bidwise's grouped "new tenders" push: a single tender by name, otherwise
     the count. Matches the app's alert text (Bidwise src/lib/alerts.ts)."""
     if len(items) > _NAMED_NEW_TENDERS:
         return "New tenders", f"{len(items)} new tenders added under {org}."
-    names = [f'"{i["title"]}"' for i in items]
-    if len(names) == 1:
-        return "New tender", f"{names[0]} added under {org}."
-    return "New tenders", f'{", ".join(names[:-1])} and {names[-1]} added under {org}.'
+    return "New tender", f'"{items[0]["title"]}" added under {org}.'
 
 
 def _org_collapse_id(org: str) -> str:

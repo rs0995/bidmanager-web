@@ -6,6 +6,7 @@ import {
   Copy, ExternalLink, Filter, ShieldCheck, Zap, FileText,
   Eye, Bell, SkipForward, Timer, Send, Users, Ban, Archive, Pencil
 } from 'lucide-react';
+import bmServerIcon from './src/assets/bm-server-icon.svg';
 
 /* ────────────────────────────────────────────────────────────────────────────
    BidManager Control — operator console for the Cloud Run backend.
@@ -3706,7 +3707,8 @@ export default function BidManagerControl() {
       {/* Masthead */}
       <header className="sticky top-0 z-20" style={{ background: c.card, borderBottom: `1px solid ${c.rule}` }}>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-2 mx-auto" style={{ maxWidth: 1400 }}>
-          <div className="flex items-baseline gap-2.5">
+          <div className="flex items-center gap-2.5">
+            <img src={bmServerIcon} alt="" width={26} height={26} style={{ borderRadius: 6, display: 'block' }} />
             <span style={{ fontFamily: cond, fontWeight: 700, fontSize: 18, letterSpacing: '-0.01em', color: c.ink }}>BidManager</span>
             <span style={{ fontFamily: mono, fontSize: 10.5, letterSpacing: '0.18em', textTransform: 'uppercase', color: c.indigo }}>Control</span>
           </div>

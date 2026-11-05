@@ -322,7 +322,8 @@ class PushNotificationPassTests(unittest.TestCase):
         first = self._org_pass(ok)
         self.assertEqual(first.call_count, 1)
         kw = first.call_args.kwargs
-        self.assertEqual(kw["body"], '"Tender 70" and "Tender 71" added under Road Authority.')
+        self.assertEqual(kw["title"], "New tenders")
+        self.assertEqual(kw["body"], "2 new tenders added under Road Authority.")
         self.assertEqual(kw["badge"], 1)
         collapse = kw["collapse_id"]
         self.assertTrue(collapse.startswith("org-"))
