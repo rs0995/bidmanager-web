@@ -59,6 +59,15 @@ SCHEMA = [
         updated_at REAL,
         PRIMARY KEY (owner_key, tender_db_id)
     )""",
+    """CREATE TABLE IF NOT EXISTS bid_agent_chats (
+        owner_key TEXT NOT NULL,
+        tender_db_id INTEGER NOT NULL,
+        messages_json TEXT,
+        status TEXT,
+        progress TEXT,
+        updated_at REAL,
+        PRIMARY KEY (owner_key, tender_db_id)
+    )""",
     """CREATE TABLE IF NOT EXISTS bid_company_profiles (
         owner_key TEXT PRIMARY KEY,
         data_json TEXT,
@@ -260,5 +269,29 @@ class Store:
                 "ON CONFLICT (owner_key) DO UPDATE SET data_json=excluded.data_json, updated_by=excluded.updated_by, "
                 "updated_at=excluded.updated_at",
                 (owner_key, json.dumps(data), user_id, time.time()),
+            )
+            c.commit()
+
+    # ---- chat (per owner and tender) -------------------------------------
+    def get_chat(self, owner_key: str, tender_db_id: int) -> dict:
+        with self.conn() as c:
+            r = c.execute("SELECT messages_json, status, progress, updated_at FROM bid_agent_chats "
+                          "WHERE owner_key=? AND tender_db_id=?", (owner_key, int(tender_db_id))).fetchone()
+        if not r:
+            return {"messages": [], "status": "idle", "progress": "", "updated_at": None}
+        return {"messages": _loads(r[0], []), "status": r[1] or "idle", "progress": r[2] or "", "updated_at": r[3]}
+
+    def save_chat(self, owner_key: str, tender_db_id: int, *, messages: list | None = None,
+                  status: str | None = None, progress: str | None = None) -> None:
+        cur = self.get_chat(owner_key, tender_db_id)
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO bid_agent_chats (owner_key, tender_db_id, messages_json, status, progress, updated_at) "
+                "VALUES (?,?,?,?,?,?) ON CONFLICT (owner_key, tender_db_id) DO UPDATE SET "
+                "messages_json=excluded.messages_json, status=excluded.status, progress=excluded.progress, "
+                "updated_at=excluded.updated_at",
+                (owner_key, int(tender_db_id), json.dumps(cur["messages"] if messages is None else messages[-200:]),
+                 cur["status"] if status is None else status, cur["progress"] if progress is None else progress,
+                 time.time()),
             )
             c.commit()

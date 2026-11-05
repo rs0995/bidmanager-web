@@ -18,3 +18,5 @@ Backed up: server/api_server.py, server/requirements.txt, server/API_CHANGES.md
   - server/bid_agent/ (new package: Bid Agent pipeline + /client bid-pack and /admin/bid-agent routes)
   - server/requirements.txt: xlrd>=2.0.1, striprtf>=0.0.26
   - correction: the entry above is an UPDATE of server/bid_agent/, not a new package: tender ZIPs (also ZIPs inside ZIPs) are unpacked with size/depth limits; damaged or password-protected ZIPs, .rar/.7z and unreadable files are listed in the bid pack with the reason; .xls (xlrd) and .rtf (striprtf) are converted, .doc/.odt/.ods via LibreOffice only if it is installed.
+  - server/bid_agent/: chat agent (bid_agent/chat.py, workspace.py): routes /client/tenders/{id}/bid-agent/chat, /files, /prep-files; saves into project-files/P - <tender>/<owner>/<project>/ (Docs for Preparation subfolder) with 'Bid Agent index.json' and table bid_agent_files; adds Ready Docs checklist rows to the sync data and attaches its files.
+  - server/Dockerfile (backed up): LibreOffice headless Writer + Calc and fonts, for old .doc/.odt/.ods and PDF output.

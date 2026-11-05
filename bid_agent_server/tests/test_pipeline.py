@@ -203,5 +203,48 @@ class ZipTests(unittest.TestCase):
             agent.analyze_files(src, self.tender, new_store(self.tmp), None, PROFILE, log=lambda m: None)
 
 
+class ChatLoopTests(unittest.TestCase):
+    """Claude chooses the tools; the loop feeds results back until it answers."""
+
+    def test_tool_loop(self):
+        from types import SimpleNamespace as NS
+
+        from bid_agent import chat
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+                self.beta = NS(messages=NS(create=self.create))
+
+            def create(self, **kw):
+                self.calls.append({**kw, "messages": list(kw["messages"])})
+                if len(self.calls) == 1:
+                    return NS(stop_reason="tool_use", content=[
+                        NS(type="text", text="Let me look."),
+                        NS(type="tool_use", id="t1", name="show_prequalification", input={"include_our_position": True})])
+                return NS(stop_reason="end_turn", content=[NS(type="text", text="Turnover needs INR 100 Cr; you meet it.")])
+
+        fake = FakeClient()
+        llm = LLM(api_key="k")
+        llm._client = fake
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, "docs")
+        build_tender(src)
+        tender = {"id": 7, "tender_id": "T-1", "title": "Works", "org_chain": "ABC Authority"}
+        result = agent.analyze_files(src, tender, new_store(tmp), None, PROFILE, log=lambda m: None)
+        turn = chat.Turn(NS(tender=tender), lambda: result, lambda: PROFILE)
+        history = [{"role": "assistant", "text": "Hi"}, {"role": "user", "text": "earlier"}, {"role": "assistant", "text": "ok"}]
+        reply = chat.run_turn(turn, history, "What is the prequal and do we meet it?", llm)
+        self.assertEqual(reply, "Turnover needs INR 100 Cr; you meet it.")
+        self.assertEqual(turn.cards[0]["title"], "Prequalification criteria")
+        self.assertIn("Ours", turn.cards[0]["columns"])
+        first = fake.calls[0]["messages"]
+        self.assertEqual([m["role"] for m in first], ["user", "assistant", "user"])  # history starts with a user turn
+        second = fake.calls[1]["messages"]
+        self.assertEqual(second[-1]["content"][0]["tool_use_id"], "t1")
+        self.assertIn("3.4", second[-1]["content"][0]["content"])
+        self.assertTrue(all(t.get("strict") for t in fake.calls[0]["tools"]))
+
+
 if __name__ == "__main__":
     unittest.main()

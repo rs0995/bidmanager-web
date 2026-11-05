@@ -23,16 +23,17 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from . import agent, company
+from . import agent, chat, company
 from .docreader import load_document
 from .llm import DEFAULT_MODEL, LLM
 from .roles import ROLES
 from .store import Store
+from .workspace import Workspace
 
 API_KEY_SETTING = "bid_agent_api_key"
 MODEL_SETTING = "bid_agent_model"
@@ -52,6 +53,10 @@ class SegmentIn(BaseModel):
 class DocumentRolesIn(BaseModel):
     file: str
     segments: list[SegmentIn] = Field(min_length=1, max_length=50)
+
+
+class ChatIn(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
 
 
 class ConfigIn(BaseModel):
@@ -135,6 +140,21 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
                 continue
         return n
 
+    def analyse(owner: str, tender: dict, overrides: dict, log: Callable[[str], None]) -> dict:
+        """Reads the tender's documents and stores the result for the owner."""
+        work = tempfile.mkdtemp(prefix="bidpack_")
+        try:
+            log("Collecting the tender’s documents…")
+            n = materialize(tender, work)
+            if not n:
+                raise RuntimeError("No downloaded documents are available for this tender yet. Request the documents first.")
+            profile = store.get_company_profile(owner)
+            result = agent.analyze_files(work, tender, store, make_llm(log), profile, log=log, overrides=overrides)
+            store.save_analysis(owner, tender["id"], status="completed", result=result, error="")
+            return result
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
     def run_analysis(owner: str, tender: dict, user_id: int, overrides: dict) -> None:
         key = (owner, int(tender["id"]))
         logs: list[str] = []
@@ -146,20 +166,13 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
                 last_flush[0] = time.time()
                 store.save_analysis(owner, tender["id"], status="running", logs=logs[-400:])
 
-        work = tempfile.mkdtemp(prefix="bidpack_")
         try:
-            log("Collecting the tender's documents…")
-            n = materialize(tender, work)
-            if not n:
-                raise RuntimeError("No downloaded documents are available for this tender yet. Request the documents first.")
-            profile = store.get_company_profile(owner)
-            result = agent.analyze_files(work, tender, store, make_llm(log), profile, log=log, overrides=overrides)
+            result = analyse(owner, tender, overrides, log)
             store.save_analysis(owner, tender["id"], status="completed", logs=logs[-400:], result=result, error="")
         except Exception as e:
             logs.append(f"Error: {e}")
             store.save_analysis(owner, tender["id"], status="failed", logs=logs[-400:], error=str(e))
         finally:
-            shutil.rmtree(work, ignore_errors=True)
             with _runs_lock:
                 _runs.pop(key, None)
 
@@ -268,6 +281,132 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
                  "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         return FileResponse(path, media_type=media, filename=name,
                             background=BackgroundTask(shutil.rmtree, out, True))
+
+
+    # ------------------------------------------------------------- chat
+    # The Bid Agent works as a chat: each message runs one agent turn in the
+    # background; the apps poll GET .../chat?since=n for new messages.
+    def run_chat(owner: str, tender: dict, user_id: int, text: str) -> None:
+        key = ("chat", owner, int(tender["id"]))
+        tid = int(tender["id"])
+
+        def progress(msg: str) -> None:
+            store.save_chat(owner, tid, progress=str(msg)[:200])
+
+        try:
+            ws = Workspace(connect, user_id, tender)
+
+            def get_result() -> dict:
+                a = store.get_analysis(owner, tid)
+                if a and a.get("status") == "completed" and a.get("result"):
+                    return a["result"]
+                progress("Reading the tender documents (the first time takes a minute)…")
+                overrides = ((a or {}).get("result") or {}).get("overrides") or {}
+                return analyse(owner, tender, overrides, lambda m: progress(m))
+
+            turn = chat.Turn(ws, get_result, lambda: store.get_company_profile(owner), progress)
+            history = store.get_chat(owner, tid)["messages"][:-1]
+            reply = chat.run_turn(turn, history, text, make_llm(lambda m: None))
+            msg = {"role": "assistant", "text": reply, "cards": turn.cards}
+        except Exception as e:
+            msg = {"role": "assistant", "text": f"Sorry, that didn’t work: {e}", "cards": [], "error": True}
+        finally:
+            with _runs_lock:
+                _runs.pop(key, None)
+        cur = store.get_chat(owner, tid)["messages"]
+        msg.update({"id": (cur[-1]["id"] + 1) if cur else 1, "at": time.time()})
+        store.save_chat(owner, tid, messages=cur + [msg], status="idle", progress="")
+
+    def chat_state(owner: str, tid: int, since: int = 0) -> dict:
+        c = store.get_chat(owner, tid)
+        working = c["status"] == "working" and time.time() - float(c.get("updated_at") or 0) < STALE_RUN_SEC
+        msgs = c["messages"]
+        return {
+            "messages": [m for m in msgs if int(m.get("id", 0)) > since],
+            "next": msgs[-1]["id"] if msgs else 0,
+            "status": "working" if working else "idle",
+            "progress": c["progress"] if working else "",
+            "ai_enabled": bool(setting(API_KEY_SETTING) or os.getenv("ANTHROPIC_API_KEY")),
+            "suggestions": chat.suggestions(True),
+        }
+
+    @client.get("/tenders/{tender_db_id}/bid-agent/chat")
+    def client_bid_chat(tender_db_id: int, since: int = 0, user_id: int = Depends(client_api.require_client_user)) -> dict:
+        tender_row(user_id, tender_db_id)
+        return chat_state(owner_of(user_id), tender_db_id, max(0, since))
+
+    @client.post("/tenders/{tender_db_id}/bid-agent/chat")
+    def client_bid_chat_send(tender_db_id: int, body: ChatIn, since: int = 0,
+                             user_id: int = Depends(client_api.require_client_user)) -> dict:
+        tender = tender_row(user_id, tender_db_id)
+        owner = owner_of(user_id)
+        key = ("chat", owner, int(tender_db_id))
+        with _runs_lock:
+            t = _runs.get(key)
+            busy = (t and t.is_alive()) or chat_state(owner, tender_db_id)["status"] == "working"
+            if busy:
+                raise HTTPException(409, detail={"reason": "busy", "message": "The agent is still working on the last request."})
+            cur = store.get_chat(owner, tender_db_id)["messages"]
+            msg = {"id": (cur[-1]["id"] + 1) if cur else 1, "role": "user", "text": body.message.strip(),
+                   "user_id": user_id, "at": time.time()}
+            store.save_chat(owner, tender_db_id, messages=cur + [msg], status="working", progress="Working…")
+            t = threading.Thread(target=run_chat, args=(owner, tender, user_id, msg["text"]), daemon=True)
+            _runs[key] = t
+            t.start()
+        return chat_state(owner, tender_db_id, max(0, since))
+
+    @client.delete("/tenders/{tender_db_id}/bid-agent/chat")
+    def client_bid_chat_clear(tender_db_id: int, user_id: int = Depends(client_api.require_client_user)) -> dict:
+        tender_row(user_id, tender_db_id)
+        owner = owner_of(user_id)
+        if chat_state(owner, tender_db_id)["status"] == "working":
+            raise HTTPException(409, detail={"reason": "busy", "message": "Wait for the agent to finish."})
+        store.save_chat(owner, tender_db_id, messages=[], status="idle", progress="")
+        return chat_state(owner, tender_db_id)
+
+    # Files the agent / team saved for the tender (download through the usual
+    # POST /client/project-files/{file_id}/download-request).
+    @client.get("/tenders/{tender_db_id}/bid-agent/files")
+    def client_bid_files(tender_db_id: int, folder: str = "", user_id: int = Depends(client_api.require_client_user)) -> dict:
+        tender = tender_row(user_id, tender_db_id)
+        ws = Workspace(connect, user_id, tender)
+        return {"items": ws.files(folder if folder in ("prep", "ready") else None)}
+
+    @client.post("/tenders/{tender_db_id}/bid-agent/prep-files")
+    def client_bid_prep_upload(tender_db_id: int, file: UploadFile = File(...),
+                               user_id: int = Depends(client_api.require_client_user)) -> dict:
+        """A user's own Docs for Preparation file, stored on Drive beside the agent's."""
+        tender = tender_row(user_id, tender_db_id)
+        max_bytes = core.setting_int("max_file_size_mb", 80, minimum=1, maximum=2048) * 1024 * 1024
+        tmp = tempfile.mkdtemp(prefix="bidprep_")
+        try:
+            name = os.path.basename(str(file.filename or "file"))
+            path = os.path.join(tmp, name or "file")
+            size = 0
+            with open(path, "wb") as out:
+                while True:
+                    chunk = file.file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise HTTPException(413, f"The file is larger than {max_bytes // (1024 * 1024)} MB.")
+                    out.write(chunk)
+            if not size:
+                raise HTTPException(400, "The file is empty.")
+            ws = Workspace(connect, user_id, tender)
+            saved = ws.save_file(path, name, kind="user", folder="prep", device="app")
+            return saved
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @client.delete("/tenders/{tender_db_id}/bid-agent/prep-files/{file_id}")
+    def client_bid_prep_delete(tender_db_id: int, file_id: int,
+                               user_id: int = Depends(client_api.require_client_user)) -> dict:
+        tender = tender_row(user_id, tender_db_id)
+        if not Workspace(connect, user_id, tender).remove_prep_file(file_id):
+            raise HTTPException(404, "File not found.")
+        return {"ok": True}
 
     @client.get("/company-profile")
     def client_company_profile(user_id: int = Depends(client_api.require_client_user)) -> dict:

@@ -303,3 +303,128 @@ def safe_sheet_title(title: str, wb) -> str:
         name = f"{base[:25]}-{n}"
         n += 1
     return name
+
+
+# ----------------------------------------------------------- prequalification
+def _criteria_rows(criteria: dict) -> list[list[str]]:
+    return [[r.get("ref", ""), r.get("subject", ""), r.get("requirement", ""), r.get("single_entity", ""),
+             r.get("jv_all_parties", ""), r.get("jv_each_member", ""), r.get("jv_one_member", ""),
+             ", ".join(r.get("forms", []))] for r in criteria.get("criteria", [])]
+
+
+CRITERIA_HEAD = ["Ref", "Subject", "Requirement", "Single entity", "JV all parties", "JV each member",
+                 "JV one member", "Forms / evidence"]
+
+
+def write_prequal_docx(path: str, result: dict) -> None:
+    """The qualification criteria as an editable Word document (landscape)."""
+    from docx import Document
+    from docx.enum.section import WD_ORIENT
+    from docx.shared import Cm, Pt
+
+    tender = result.get("tender", {})
+    crit = result.get("criteria", {})
+    d = Document()
+    sec = d.sections[0]
+    sec.orientation = WD_ORIENT.LANDSCAPE
+    sec.page_width, sec.page_height = sec.page_height, sec.page_width
+    for side in ("left_margin", "right_margin", "top_margin", "bottom_margin"):
+        setattr(sec, side, Cm(1.5))
+    d.styles["Normal"].font.name = "Arial"
+    d.styles["Normal"].font.size = Pt(9)
+    d.add_heading("Prequalification / Qualification Criteria", level=1)
+    meta = " | ".join(x for x in (tender.get("reference", ""), tender.get("employer", ""), tender.get("title", "")) if x)
+    if meta:
+        d.add_paragraph(meta).runs[0].italic = True
+
+    def table(head, rows):
+        t = d.add_table(rows=1, cols=len(head))
+        t.style = "Table Grid"
+        for i, h in enumerate(head):
+            t.rows[0].cells[i].text = h
+            for run in t.rows[0].cells[i].paragraphs[0].runs:
+                run.bold = True
+        for r in rows:
+            cells = t.add_row().cells
+            for i, v in enumerate(r[:len(head)]):
+                cells[i].text = str(v or "")
+
+    table(CRITERIA_HEAD, _criteria_rows(crit))
+    if crit.get("similar_work_definition"):
+        d.add_heading("Similar work", level=2)
+        d.add_paragraph(crit["similar_work_definition"])
+    if crit.get("personnel"):
+        d.add_heading("Key personnel", level=2)
+        table(["Position", "Min. no.", "Qualification", "Experience"],
+              [[p.get("position"), p.get("count"), p.get("qualification"), p.get("experience")] for p in crit["personnel"]])
+    if crit.get("equipment"):
+        d.add_heading("Key equipment", level=2)
+        table(["Equipment", "Min. units", "Max age (years)"],
+              [[e.get("type"), e.get("min_units"), e.get("max_age_years")] for e in crit["equipment"]])
+    if result.get("compliance"):
+        d.add_heading("Our position (from the company profile)", level=2)
+        table(["Ref", "Criterion", "Required", "Ours", "Result", "Remarks"],
+              [[c.get("ref"), c.get("subject"), c.get("required"), c.get("actual"), c.get("status"), c.get("remarks")]
+               for c in result["compliance"]])
+    if crit.get("notes"):
+        d.add_heading("Notes", level=2)
+        for n in crit["notes"]:
+            d.add_paragraph(n, style="List Bullet")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    d.save(path)
+
+
+def write_prequal_xlsx(path: str, result: dict) -> None:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    crit = result.get("criteria", {})
+    wb = Workbook()
+    wb.remove(wb.active)
+    head_fill = PatternFill("solid", fgColor=HEADER)
+
+    def sheet(title, head, rows, widths):
+        ws = wb.create_sheet(title)
+        ws.append(head)
+        for i, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+            c = ws.cell(row=1, column=i)
+            c.font, c.fill = Font(bold=True), head_fill
+        for r in rows:
+            ws.append([_num(v) for v in r])
+            for col in range(1, len(head) + 1):
+                ws.cell(row=ws.max_row, column=col).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.freeze_panes = "A2"
+
+    sheet("Criteria", CRITERIA_HEAD, _criteria_rows(crit), [8, 24, 70, 18, 18, 18, 18, 24])
+    if result.get("compliance"):
+        sheet("Our position", ["Ref", "Criterion", "Required", "Ours", "Result", "Remarks"],
+              [[c.get("ref"), c.get("subject"), c.get("required"), c.get("actual"), c.get("status"), c.get("remarks")]
+               for c in result["compliance"]], [8, 30, 20, 20, 14, 50])
+    if crit.get("personnel"):
+        sheet("Key personnel", ["Position", "Min. no.", "Qualification", "Experience"],
+              [[p.get("position"), p.get("count"), p.get("qualification"), p.get("experience")] for p in crit["personnel"]],
+              [28, 8, 36, 44])
+    if crit.get("equipment"):
+        sheet("Key equipment", ["Equipment", "Min. units", "Max age (years)"],
+              [[e.get("type"), e.get("min_units"), e.get("max_age_years")] for e in crit["equipment"]], [44, 18, 14])
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    wb.save(path)
+
+
+def to_pdf(path: str) -> str:
+    """Converts a .docx/.xlsx to PDF with LibreOffice (in the server image)."""
+    import shutil
+    import subprocess
+
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        raise RuntimeError("PDF needs LibreOffice on the server; saved as Word instead.")
+    outdir = os.path.dirname(path) or "."
+    subprocess.run([soffice, "--headless", "--convert-to", "pdf", "--outdir", outdir, path],
+                   check=True, timeout=180, capture_output=True)
+    out = os.path.splitext(path)[0] + ".pdf"
+    if not os.path.isfile(out):
+        raise RuntimeError("PDF conversion failed.")
+    return out

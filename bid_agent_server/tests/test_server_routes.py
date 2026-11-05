@@ -115,6 +115,90 @@ class BidPackRouteTests(unittest.TestCase):
         self.assertTrue(cfg["api_key_set"])
         self.assertNotIn("123456789", cfg["api_key_hint"][:-4])
 
+
+    # ------------------------------------------------------------ chat agent
+    def _say(self, text):
+        r = self.client.post("/client/tenders/1/bid-agent/chat", headers=self.h, json={"message": text})
+        self.assertEqual(r.status_code, 200, r.text)
+        for _ in range(300):
+            st = self.client.get("/client/tenders/1/bid-agent/chat", headers=self.h).json()
+            if st["status"] == "idle":
+                return st["messages"][-1]
+            time.sleep(0.05)
+        self.fail("agent did not answer")
+
+    def test_chat_agent_does_what_is_asked(self):
+        import glob
+        import json
+        import sqlite3
+
+        self.client.put("/client/company-profile", headers=self.h, json={"general": {"name": "Acme Infra"}})
+        st = self.client.get("/client/tenders/1/bid-agent/chat", headers=self.h).json()
+        self.assertEqual((st["messages"], st["status"]), ([], "idle"))
+
+        # show the prequal -> a table, nothing saved
+        m = self._say("Fetch the prequalification")
+        self.assertEqual(m["role"], "assistant")
+        self.assertEqual(m["cards"][0]["title"], "Prequalification criteria")
+        self.assertEqual([r[0] for r in m["cards"][0]["rows"]], ["3.4", "4.2", "5.1"])
+
+        # save it as Excel -> Docs for Preparation on storage + manifest + index
+        m = self._say("Save the prequal as excel")
+        self.assertEqual(m["cards"][0]["type"], "files")
+        prep = self.client.get("/client/tenders/1/bid-agent/files?folder=prep", headers=self.h).json()["items"]
+        self.assertEqual(len(prep), 1)
+        self.assertTrue(prep[0]["name"].endswith(".xlsx"))
+        stored = glob.glob(str(self.root / "project-files" / "P - T-100" / "*" / "*" / "Docs for Preparation" / "*.xlsx"))
+        self.assertEqual(len(stored), 1, list(self.root.rglob("*"))[:20])
+        index = glob.glob(str(self.root / "project-files" / "P - T-100" / "*" / "*" / "Bid Agent index.json"))
+        with open(index[0], encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["files"][0]["folder"], "Docs for Preparation")
+
+        # a specific form
+        m = self._say("Extract form FIN-3.2 in word")
+        self.assertEqual([f["name"] for f in m["cards"][0]["files"]], ["FIN-3.2 - Average Annual Construction Turnover.docx"])
+
+        # checklist -> rows in Ready Docs (shared sync data), forms attached, rest pending
+        m = self._say("Prepare the checklist of documents required")
+        rows = {r["name"]: r for r in m["cards"][0]["rows"]}
+        self.assertIn("FIN-3.2 - Average Annual Construction Turnover", rows)
+        self.assertTrue(rows["FIN-3.2 - Average Annual Construction Turnover"]["file"].endswith(".docx"))
+        self.assertIn("CER-5.1", rows)  # asked for by the criteria, not in the files: pending
+        self.assertEqual(rows["CER-5.1"]["file"], "")
+        sync = self.client.get("/client/sync", headers=self.h).json()["data"]
+        mine = [r for r in sync["checklist"] if r["subfolder"] == "Ready Docs"]
+        self.assertTrue(all(r["status"] == "Pending" for r in mine))
+        fin = next(r for r in mine if r["req_file_name"].startswith("FIN-3.2"))
+        self.assertTrue(fin["server_file"]["name"].endswith(".docx"))
+        self.assertEqual(sync["projects"][0]["source_tender_id"], "T-100")
+        # asking again doesn't duplicate rows
+        m = self._say("prepare the checklist again")
+        self.assertFalse(any(r["added"] for r in m["cards"][0]["rows"]))
+
+        # the conversation is kept, and the attached file downloads through project-files
+        st = self.client.get("/client/tenders/1/bid-agent/chat", headers=self.h).json()
+        self.assertEqual(len(st["messages"]), 10)
+        dl = self.client.post(f"/client/project-files/{fin['server_file']['id']}/download-request", headers=self.h)
+        self.assertEqual(dl.status_code, 200, dl.text)
+
+
+    @unittest.skipUnless(shutil.which("soffice"), "LibreOffice not installed")
+    def test_chat_saves_pdf_with_libreoffice(self):
+        m = self._say("save the prequalification as pdf")
+        self.assertTrue(m["cards"][0]["files"][0]["name"].endswith(".pdf"), m)
+        m = self._say("extract the bidder information form as pdf")
+        self.assertTrue(all(f["name"].endswith(".pdf") for f in m["cards"][0]["files"]) if m["cards"] else True, m)
+
+    def test_prep_files_upload_and_delete(self):
+        r = self.client.post("/client/tenders/1/bid-agent/prep-files", headers=self.h,
+                             files={"file": ("site visit notes.txt", b"notes", "text/plain")})
+        self.assertEqual(r.status_code, 200, r.text)
+        fid = r.json()["file"]["id"]
+        items = self.client.get("/client/tenders/1/bid-agent/files?folder=prep", headers=self.h).json()["items"]
+        self.assertEqual([(i["name"], i["kind"]) for i in items], [("site visit notes.txt", "user")])
+        self.assertEqual(self.client.delete(f"/client/tenders/1/bid-agent/prep-files/{fid}", headers=self.h).status_code, 200)
+        self.assertEqual(self.client.get("/client/tenders/1/bid-agent/files", headers=self.h).json()["items"], [])
+
     def test_auth_and_scope(self):
         self.assertEqual(self.client.get("/client/tenders/1/bid-pack").status_code, 401)
         self.assertEqual(self.client.post("/client/tenders/999/bid-pack", headers=self.h).status_code, 404)

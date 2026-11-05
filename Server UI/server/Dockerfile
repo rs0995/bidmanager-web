@@ -21,6 +21,14 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends firefox-esr chromium chromium-driver ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Bid Agent: LibreOffice (headless Writer + Calc, no desktop) reads old .doc /
+# .odt / .ods tender files and saves bid documents as PDF. Liberation + DejaVu
+# fonts keep Arial / Times layouts in the converted PDFs.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libreoffice-writer-nogui libreoffice-calc-nogui fonts-liberation fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt \
     && python -c "from webdriver_manager.firefox import GeckoDriverManager; GeckoDriverManager(version='v0.37.1').install()"
