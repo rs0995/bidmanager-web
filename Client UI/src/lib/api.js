@@ -1881,6 +1881,40 @@ export const api = {
     requestClient(`/client/tenders/${Number(tenderDbId)}/bid-agent/chat`, { method: 'DELETE' }),
   listBidAgentFiles: (tenderDbId, folder = '') =>
     requestClient(`/client/tenders/${Number(tenderDbId)}/bid-agent/files?folder=${encodeURIComponent(folder)}`),
+  // Bid Agent page: find a tender on the server, recent chats, training.
+  searchServerTenders: (q, limit = 20) =>
+    requestClient(`/client/tenders?q=${encodeURIComponent(String(q || '').trim())}&page=1&page_size=${Number(limit) || 20}`),
+  getBidAgentRecent: () => requestClient('/client/bid-agent/recent'),
+  getBidAgentInstructions: () => requestClient('/client/bid-agent/instructions'),
+  saveBidAgentInstructions: (text) => requestClient('/client/bid-agent/instructions', { method: 'PUT', body: { text } }),
+  getBidAgentLearnings: () => requestClient('/client/bid-agent/learnings'),
+  updateBidAgentLearning: (id, patch) => requestClient(`/client/bid-agent/learnings/${Number(id)}`, { method: 'PATCH', body: patch }),
+  deleteBidAgentLearning: (id) => requestClient(`/client/bid-agent/learnings/${Number(id)}`, { method: 'DELETE' }),
+  getBidAgentReferences: () => requestClient('/client/bid-agent/references'),
+  deleteBidAgentReference: (fileId) => requestClient(`/client/bid-agent/references/${Number(fileId)}`, { method: 'DELETE' }),
+  // Desktop: a path from pickPath. Browser: a File from <input type=file>.
+  uploadBidAgentReference: async ({ filePath, file } = {}, overrides = {}) => {
+    const config = await connection(overrides);
+    if (!config.auth_token) throw new AuthError('Sign in to continue.', 'unauthorized');
+    const bridge = desktop();
+    if (bridge?.uploadFile && filePath) {
+      const result = await bridge.uploadFile({
+        baseUrl: config.server_url, clientKey: config.auth_token, route: '/client/bid-agent/references',
+        filePath: String(filePath), contentType: '', fields: {},
+      });
+      if (!result?.ok) throw new Error(result?.message || 'Could not upload the file.');
+      return result.data;
+    }
+    if (!file) throw new Error('Choose a file.');
+    const form = new FormData();
+    form.append('file', file, file.name);
+    const response = await fetch(`${config.server_url}/client/bid-agent/references`, {
+      method: 'POST', headers: { 'x-client-key': config.auth_token }, body: form,
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) throw new Error((payload?.detail?.message || payload?.detail) || `Upload failed (HTTP ${response.status}).`);
+    return payload;
+  },
   getCompanyProfile: () => requestClient('/client/company-profile'),
   saveCompanyProfile: (profile) => requestClient('/client/company-profile', { method: 'PUT', body: profile }),
   // Saves a file the agent made into a local folder (desktop) or downloads it (browser).

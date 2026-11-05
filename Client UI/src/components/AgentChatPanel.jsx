@@ -20,18 +20,129 @@ const readSaved = () => { try { return new Set(JSON.parse(localStorage.getItem(S
 const writeSaved = (set) => { try { localStorage.setItem(SAVED_KEY, JSON.stringify([...set].slice(-2000))); } catch { /* ignore */ } };
 const changesData = (m) => (m.cards || []).some((c) => c.type === 'files' || c.type === 'checklist');
 
+/* The chat's state for one server tender: messages, polling while the agent
+   works (fast, so the streamed reply shows as it is written), send and clear.
+   ``onAnswers(added)`` runs for new assistant messages after the first load. */
+export function useAgentChat(tenderDbId, onAnswers) {
+  const [messages, setMessages] = useState([]);
+  const [state, setState] = useState({ status: 'idle', progress: '', partial: '', suggestions: [], ai_enabled: true });
+  const [error, setError] = useState('');
+  const [sending, setSending] = useState(false);
+  const lastId = useRef(0);
+  const known = useRef(new Set());
+  const onAnswersRef = useRef(onAnswers);
+  onAnswersRef.current = onAnswers;
+
+  const apply = (r, { initial = false } = {}) => {
+    const added = (r.messages || []).filter((m) => !known.current.has(m.id));
+    if (added.length) {
+      added.forEach((m) => known.current.add(m.id));
+      setMessages((prev) => [...prev, ...added]);
+      lastId.current = Math.max(lastId.current, ...added.map((m) => m.id));
+    }
+    setState({ status: r.status, progress: r.progress, partial: r.partial || '', suggestions: r.suggestions || [], ai_enabled: r.ai_enabled });
+    const answers = added.filter((m) => m.role === 'assistant');
+    if (!initial && answers.length) onAnswersRef.current?.(answers);
+  };
+
+  useEffect(() => {
+    lastId.current = 0; known.current = new Set(); setMessages([]); setError('');
+    if (!tenderDbId) return undefined;
+    let stop = false;
+    api.getBidChat(tenderDbId, 0).then((r) => !stop && apply(r, { initial: true })).catch((e) => !stop && setError(e.message));
+    return () => { stop = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tenderDbId]);
+
+  useEffect(() => {
+    if (!tenderDbId || state.status !== 'working') return undefined;
+    let stop = false;
+    const timer = setInterval(() => {
+      api.getBidChat(tenderDbId, lastId.current).then((r) => !stop && apply(r)).catch(() => {});
+    }, 900);
+    return () => { stop = true; clearInterval(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tenderDbId, state.status]);
+
+  const send = async (msg) => {
+    const body = String(msg || '').trim();
+    if (!body || !tenderDbId || sending || state.status === 'working') return false;
+    setSending(true); setError('');
+    try {
+      apply(await api.sendBidChat(tenderDbId, body, lastId.current));
+      return true;
+    } catch (e) {
+      setError(e?.detail?.message || e?.message || String(e));
+      return false;
+    } finally { setSending(false); }
+  };
+
+  const clear = async () => {
+    if (!tenderDbId) return;
+    try {
+      const r = await api.clearBidChat(tenderDbId);
+      setMessages([]); lastId.current = 0; known.current = new Set();
+      setState((s) => ({ ...s, status: r.status, partial: '' }));
+    } catch (e) { setError(e.message); }
+  };
+
+  const busy = sending || state.status === 'working';
+  return { messages, state, error, busy, send, clear };
+}
+
+/* Messages + composer of a chat (the floating window and the Bid Agent page). */
+export function ChatThread({ chat, onOpenFile }) {
+  const [text, setText] = useState('');
+  const listRef = useRef(null);
+  const { messages, state, busy, error } = chat;
+  useEffect(() => { if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight; }, [messages.length, state.status, state.partial]);
+  const asked = useMemo(() => new Set(messages.filter((m) => m.role === 'user').map((m) => m.text)), [messages]);
+  const chips = (state.suggestions || []).filter((s) => !asked.has(s)).slice(0, 5);
+  const send = async (msg) => { if (await chat.send(msg)) setText(''); };
+  return (
+    <>
+      <div ref={listRef} className="min-h-0 flex-1 cursor-text select-text space-y-2 overflow-auto p-3">
+        {messages.length === 0 && (
+          <p className="py-6 text-center text-xs text-[var(--text-muted)]">
+            Ask in your own words, e.g. “fetch the qualification criteria”, “the criteria are on pages 12–14”, “save the prequal as PDF”, “extract form FIN-3.2”, “prepare the checklist”.
+          </p>
+        )}
+        {messages.map((m) => <Message key={m.id} m={m} onOpenFile={onOpenFile} />)}
+        {busy && state.partial ? (
+          <div className="flex flex-col items-start">
+            <div className="max-w-[85%] select-text whitespace-pre-wrap rounded-xl bg-[var(--surface-2)] px-3 py-1.5 text-[13px] text-[var(--text)]">{state.partial}</div>
+          </div>
+        ) : busy ? (
+          <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)]"><Spinner size={11} />{state.progress || 'Working…'}</div>
+        ) : null}
+      </div>
+      <div className="border-t border-[var(--border)] p-3">
+        {error && <div className="mb-2 text-xs text-rose-400">{error}</div>}
+        {!busy && chips.length > 0 && (
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {chips.map((s) => (
+              <button key={s} onClick={() => send(s)} className="rounded-full border border-[var(--border)] px-2.5 py-1 text-[11px] text-[var(--text-muted)] hover:border-[var(--accent)] hover:text-[var(--text)]">{s}</button>
+            ))}
+          </div>
+        )}
+        <form className="flex items-end gap-2" onSubmit={(e) => { e.preventDefault(); send(text); }}>
+          <textarea value={text} onChange={(e) => setText(e.target.value)} disabled={busy} rows={2}
+            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(text); } }}
+            placeholder="Ask the Bid Agent… (Enter to send, Shift+Enter for a new line)"
+            className="input-field min-h-[38px] flex-1 resize-none py-2 text-sm" />
+          <button type="submit" disabled={busy || !text.trim()} className="btn-primary h-9 w-9 justify-center p-0" title="Send">
+            {busy ? <Spinner size={13} /> : <ArrowUp size={15} />}
+          </button>
+        </form>
+      </div>
+    </>
+  );
+}
+
 export default function AgentChatPanel({ project, resolveProjectFolder, folderFor, onDataChanged, pushToast }) {
   const qc = useQueryClient();
   const tenderId = String(project?.source_tender_id || '').trim();
   const [open, setOpen] = useState(false);
-  const [text, setText] = useState('');
-  const [messages, setMessages] = useState([]);
-  const [state, setState] = useState({ status: 'idle', progress: '', suggestions: [], ai_enabled: true });
-  const [error, setError] = useState('');
-  const [sending, setSending] = useState(false);
-  const listRef = useRef(null);
-  const lastId = useRef(0);
-
 
   const { data: tenderDbId, isLoading: resolving } = useQuery({
     queryKey: ['bid-agent-tender', tenderId],
@@ -61,73 +172,13 @@ export default function AgentChatPanel({ project, resolveProjectFolder, folderFo
     pushToast?.({ type: 'success', message: `Saved to Working Docs: ${todo.map((f) => f.name).join(', ')}` });
   };
 
-  const apply = async (r, { initial = false } = {}) => {
-    const known = new Set(messages.map((m) => m.id));
-    const added = (r.messages || []).filter((m) => !known.has(m.id));
-    if (added.length) {
-      setMessages((prev) => {
-        const ids = new Set(prev.map((m) => m.id));
-        return [...prev, ...added.filter((m) => !ids.has(m.id))];
-      });
-      lastId.current = Math.max(lastId.current, ...added.map((m) => m.id));
-    }
-    setState({ status: r.status, progress: r.progress, suggestions: r.suggestions || [], ai_enabled: r.ai_enabled });
-    if (!initial) {
-      const answers = added.filter((m) => m.role === 'assistant');
-      if (answers.some(changesData)) {
-        await api.pullUserData().catch(() => {});
-        qc.invalidateQueries({ queryKey: ['project-checklist', project.id] });
-        onDataChanged?.();
-        saveToWorkingDocs(answers);
-      }
-    }
-  };
-
-  // Initial load, then poll only while the agent works.
-  useEffect(() => {
-    if (!tenderDbId) return undefined;
-    let stop = false;
-    lastId.current = 0;
-    setMessages([]);
-    api.getBidChat(tenderDbId, 0).then((r) => !stop && apply(r, { initial: true })).catch((e) => !stop && setError(e.message));
-    return () => { stop = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tenderDbId]);
-
-  useEffect(() => {
-    if (!tenderDbId || state.status !== 'working') return undefined;
-    let stop = false;
-    const timer = setInterval(() => {
-      api.getBidChat(tenderDbId, lastId.current).then((r) => !stop && apply(r)).catch(() => {});
-    }, 1500);
-    return () => { stop = true; clearInterval(timer); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tenderDbId, state.status, messages.length]);
-
-  useEffect(() => { if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight; }, [messages.length, state.status, open]);
-
-  const send = async (msg) => {
-    const body = String(msg || '').trim();
-    if (!body || !tenderDbId || sending || state.status === 'working') return;
-    setSending(true); setError('');
-    try {
-      const r = await api.sendBidChat(tenderDbId, body, lastId.current);
-      setText('');
-      await apply(r);
-      setOpen(true);
-    } catch (e) {
-      setError(e?.detail?.message || e?.message || String(e));
-    } finally { setSending(false); }
-  };
-
-  const clear = async () => {
-    if (!tenderDbId) return;
-    try {
-      const r = await api.clearBidChat(tenderDbId);
-      setMessages([]); lastId.current = 0;
-      setState((s) => ({ ...s, status: r.status }));
-    } catch (e) { setError(e.message); }
-  };
+  const chat = useAgentChat(tenderDbId, async (answers) => {
+    if (!answers.some(changesData)) return;
+    await api.pullUserData().catch(() => {});
+    qc.invalidateQueries({ queryKey: ['project-checklist', project.id] });
+    onDataChanged?.();
+    saveToWorkingDocs(answers);
+  });
 
   const openFile = async (f) => {
     try {
@@ -138,10 +189,7 @@ export default function AgentChatPanel({ project, resolveProjectFolder, folderFo
     } catch (e) { pushToast?.({ type: 'error', message: e.message }); }
   };
 
-  const busy = sending || state.status === 'working';
-  const asked = useMemo(() => new Set(messages.filter((m) => m.role === 'user').map((m) => m.text)), [messages]);
-  const chips = (state.suggestions || []).filter((s) => !asked.has(s)).slice(0, 5);
-
+  const { messages, state, busy } = chat;
   if (!tenderId) return null;
   const last = [...messages].reverse().find((m) => m.role === 'assistant');
   return (
@@ -160,42 +208,11 @@ export default function AgentChatPanel({ project, resolveProjectFolder, folderFo
       </div>
       {open && (
         <ChatWindow onClose={() => setOpen(false)} title={project?.title || tenderId} busy={busy} progress={state.progress}
-          aiEnabled={state.ai_enabled} onClear={messages.length && !busy ? clear : null}>
+          aiEnabled={state.ai_enabled} onClear={messages.length && !busy ? chat.clear : null}>
           {resolving ? <div className="p-4"><Spinner size={14} /></div> : !tenderDbId ? (
             <p className="p-4 text-xs text-[var(--text-muted)]">This tender is no longer on the server.</p>
           ) : (
-            <>
-              <div ref={listRef} className="min-h-0 flex-1 cursor-text select-text space-y-2 overflow-auto p-3">
-                {messages.length === 0 && (
-                  <p className="py-6 text-center text-xs text-[var(--text-muted)]">
-                    Ask in your own words, e.g. “fetch the qualification criteria”, “the criteria are on pages 12–14”, “save the prequal as PDF”, “extract form FIN-3.2”, “prepare the checklist”.
-                  </p>
-                )}
-                {messages.map((m) => <Message key={m.id} m={m} onOpenFile={openFile} />)}
-                {busy && (
-                  <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)]"><Spinner size={11} />{state.progress || 'Working…'}</div>
-                )}
-              </div>
-              <div className="border-t border-[var(--border)] p-3">
-                {error && <div className="mb-2 text-xs text-rose-400">{error}</div>}
-                {!busy && chips.length > 0 && (
-                  <div className="mb-2 flex flex-wrap gap-1.5">
-                    {chips.map((s) => (
-                      <button key={s} onClick={() => send(s)} className="rounded-full border border-[var(--border)] px-2.5 py-1 text-[11px] text-[var(--text-muted)] hover:border-[var(--accent)] hover:text-[var(--text)]">{s}</button>
-                    ))}
-                  </div>
-                )}
-                <form className="flex items-end gap-2" onSubmit={(e) => { e.preventDefault(); send(text); }}>
-                  <textarea value={text} onChange={(e) => setText(e.target.value)} disabled={busy} rows={2}
-                    onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(text); } }}
-                    placeholder="Ask the Bid Agent… (Enter to send, Shift+Enter for a new line)"
-                    className="input-field min-h-[38px] flex-1 resize-none py-2 text-sm" />
-                  <button type="submit" disabled={busy || !text.trim()} className="btn-primary h-9 w-9 justify-center p-0" title="Send">
-                    {busy ? <Spinner size={13} /> : <ArrowUp size={15} />}
-                  </button>
-                </form>
-              </div>
-            </>
+            <ChatThread chat={chat} onOpenFile={openFile} />
           )}
         </ChatWindow>
       )}

@@ -12,7 +12,7 @@ import {
   Paperclip, FolderCog, Link2, BookOpen, Pencil,
   Palette, RotateCcw, Home, Download, Upload, Rows3, Type, Info, Filter,
   LogOut, LogIn, UserPlus, KeyRound, ArrowLeft, ShieldQuestion,
-  Users, Shield, UserMinus, Check, Ban, Briefcase,
+  Users, Shield, UserMinus, Check, Ban, Briefcase, Sparkles,
 } from 'lucide-react';
 import { api, canonTenderId, tenderKey, PROJECT_BOOKMARK_LOCKED } from './lib/api';
 import { cn, formatINR, formatCrores, timeRemaining } from './lib/utils';
@@ -22,6 +22,7 @@ import {
 } from './components/ui/shared';
 import AgentChatPanel from './components/AgentChatPanel';
 import CompanyProfilePage from './components/CompanyProfilePage';
+import BidAgentPage from './components/BidAgentPage';
 
 /* ════════════════════════════════════════════════════════════════════════════
    BID MANAGER — CLIENT APP (draft)
@@ -801,7 +802,7 @@ function sidebarKeyGatedOff(key, permissions) {
   // member who'd had only active revoked.
   if (key === 'organizations') return permissions.active === false;
   if (key === 'bookmarks') return permissions.bookmarks === false;
-  if (key === 'projects' || key === 'archived_projects' || key === 'templates' || key === 'company') return permissions.projects === false;
+  if (key === 'projects' || key === 'archived_projects' || key === 'templates' || key === 'company' || key === 'bid_agent') return permissions.projects === false;
   return false;
 }
 
@@ -829,6 +830,7 @@ function Sidebar({ active, onNavigate, collapsed, onToggle, badges = {}, permiss
     { key: 'organizations', label: 'Organizations', icon: Building2 },
     { key: 'bookmarks', label: 'Bookmarks', icon: Star },
     { key: 'projects', label: 'Projects', icon: FolderOpen },
+    { key: 'bid_agent', label: 'Bid Agent', icon: Sparkles },
     { key: 'templates', label: 'Templates', icon: FileText },
     { key: 'company', label: 'Company Profile', icon: Briefcase },
     { key: 'portal_search', label: 'Portal Search', icon: Search },
@@ -6077,7 +6079,7 @@ export default function App() {
     retry: false,
   });
   const [page, setPage] = useState(() => {
-    const allowed = ['dashboard', 'tenders', 'organizations', 'bookmarks', 'projects', 'templates', 'company', 'archived_projects', 'captcha', 'files', 'settings', 'portal_search'];
+    const allowed = ['dashboard', 'tenders', 'organizations', 'bookmarks', 'projects', 'templates', 'company', 'bid_agent', 'archived_projects', 'captcha', 'files', 'settings', 'portal_search'];
     const startupPage = readClientPrefs().startupPage;
     if (startupPage && startupPage !== 'resume' && allowed.includes(startupPage)) return startupPage;
     const saved = localStorage.getItem('bm-client-last-page');
@@ -6308,6 +6310,7 @@ export default function App() {
     captcha: <CaptchaPage />,
     templates: <TemplatesPage />,
     company: <CompanyProfilePage />,
+    bid_agent: <BidAgentPage onNavigate={navigate} />,
     files: <FilesPage />,
     settings: <SettingsPage />,
     portal_search: <PortalSearchPage onOpenTender={openTenderDetails} />,
