@@ -37,7 +37,13 @@ export type OpenResult = 'opened' | 'elsewhere' | 'missing';
 export type ChecklistFolder = { name: string; items: ChecklistItem[] };
 
 /** A file the user added under "Docs for Preparation". */
-export type PrepDoc = { id: string; name: string; meta: string };
+export type PrepDoc = {
+  id: string;
+  name: string;
+  meta: string;
+  /** Live: the copy in the tender's folder on Drive. */
+  serverFileId?: number;
+};
 
 export type ProjectStatus =
   | 'Bid in preparation'

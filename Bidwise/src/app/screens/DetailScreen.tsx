@@ -23,7 +23,6 @@ import {
   FolderCheck,
   Plus,
   RefreshCw,
-  Sparkles,
   Star,
   Trash2,
 } from 'lucide-react-native';
@@ -53,6 +52,8 @@ import {
 import type { Tender } from '../../fixtures/tenders';
 import { useTenderSource } from '../../data/tenderSource';
 import { useDocs } from '../../data/docs';
+import { useBidAgent } from '../../data/bidAgent';
+import { AgentChatCard } from '../../components/project/AgentChat';
 import { Spinning } from '../../components/ui/motion';
 import { browser } from '../../platform/browser';
 import { showActionSheet } from '../../platform/actionSheet';
@@ -218,6 +219,9 @@ export function DetailScreen() {
   const tender =
     fetched.tender ?? (project ? tenderFromProject(project) : undefined);
   const docs = useDocs().useTenderDocs(fetched.tender);
+  const agent = useBidAgent();
+  const agentChat = agent.useChat(fetched.tender?.id ?? '');
+  const agentPrep = agent.usePrep(fetched.tender?.id ?? '');
   const [checking, setChecking] = useState(false);
   const [busyAll, setBusyAll] = useState(false);
 
@@ -498,6 +502,18 @@ export function DetailScreen() {
         </Text>
       </Card>
 
+      {access.projects && fetched.tender ? (
+        <AgentChatCard
+          chat={agentChat}
+          onOpenFile={f =>
+            agentPrep
+              .open(project ? Number(project.id) : null, f)
+              .then(msg => (msg ? toast.show(msg) : undefined))
+              .catch(e => toast.show((e as Error).message))
+          }
+        />
+      ) : null}
+
       {access.projects ? (
         <ReadyChecklist
           rows={rows}
@@ -652,47 +668,55 @@ export function DetailScreen() {
         }
       />
 
-      {access.projects && fetched.tender ? (
-        <View style={styles.bidPack}>
-          <Button
-            label="Bid pack: criteria check and forms"
-            variant="outline"
-            size="sm"
-            block
-            icon={<Sparkles size={15} color={t.colors.accentInk} />}
-            onPress={() =>
-              navigation.navigate('BidPack', {
-                tenderId: fetched.tender!.id,
-                title: tender.title,
-              })
-            }
-          />
-        </View>
-      ) : null}
 
       {access.projects ? (
         <DocGroup
           title="Docs for Preparation"
-          rows={(project?.prepDocs ?? []).map(d => ({
-            key: d.id,
-            name: d.name,
-            meta: d.meta,
-          }))}
+          rows={[
+            ...(project?.prepDocs ?? []).map(d => ({
+              key: d.id,
+              name: d.name,
+              meta: d.meta,
+            })),
+            // On Drive but not on this phone yet (saved by the Bid Agent or a teammate).
+            ...agentPrep.files
+              .filter(f => !(project?.prepDocs ?? []).some(d => d.serverFileId === f.file_id))
+              .map(f => ({
+                key: `drive:${f.file_id}`,
+                name: f.name,
+                meta: f.kind === 'user' ? 'On Drive' : 'Bid Agent · on Drive',
+              })),
+          ]}
           empty="Add your estimates, drafts and working files here."
           onAdd={() => {
             const p = ensureProject();
             if (p) addPrepDoc(p.id);
           }}
-          onRowPress={r =>
-            project &&
-            openPrepDoc(project.id, r.key)
-              .then(showOpen)
-              .catch(e => toast.show((e as Error).message))
-          }
+          onRowPress={r => {
+            const drive = agentPrep.files.find(f => `drive:${f.file_id}` === r.key);
+            if (drive) {
+              agentPrep
+                .open(project ? Number(project.id) : null, drive)
+                .then(msg => (msg ? toast.show(msg) : undefined))
+                .catch(e => toast.show((e as Error).message));
+              return;
+            }
+            if (project)
+              openPrepDoc(project.id, r.key)
+                .then(showOpen)
+                .catch(e => toast.show((e as Error).message));
+          }}
           rowAction={{
             icon: <Trash2 size={17} color={t.colors.muted} />,
             label: r => `Remove ${r.name}`,
-            onPress: r => project && removePrepDoc(project.id, r.key),
+            onPress: r => {
+              const drive = agentPrep.files.find(f => `drive:${f.file_id}` === r.key);
+              if (drive) {
+                agentPrep
+                  .remove(drive)
+                  .catch(e => toast.show((e as Error).message));
+              } else if (project) removePrepDoc(project.id, r.key);
+            },
           }}
         />
       ) : null}
@@ -718,7 +742,6 @@ export function DetailScreen() {
 }
 
 const styles = StyleSheet.create({
-  bidPack: { marginTop: 14 },
   missing: { fontFamily: fonts.regular, fontSize: 14, marginTop: 24 },
   loading: { marginTop: 40 },
   docActions: { gap: 8, marginTop: 6 },

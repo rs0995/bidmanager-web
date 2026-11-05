@@ -10,6 +10,7 @@ import { schedulePush } from './pushQueue';
 import { addAlert } from './alerts';
 import { noteOwnProject } from './projectAlerts';
 import { files } from '../platform/files';
+import { bidAgentApi } from './bidAgent';
 
 // Projects + checklist, local-first, in the EXACT row format the desktop Client UI and
 // BM Pro use: all three apps read and write the same /client/sync projects/checklist.
@@ -22,7 +23,9 @@ import { files } from '../platform/files';
 //                     status: "Pending" | "Completed", attachment }
 //
 // Bidwise-only data ("Docs for Preparation") lives under its own local key and does
-// not sync, so the other apps never see rows they don't understand.
+// not sync, so the other apps never see rows they don't understand. Each prep doc is
+// also uploaded to the tender's folder on Drive (Bid Agent prep-files route), so the
+// team and the Bid Agent's own files sit together; `serverFileId` links the two.
 
 const PROJECTS_KEY = 'bw.projects';
 const CHECKLIST_KEY = 'bw.checklist';
@@ -43,6 +46,8 @@ export type PrepDocRow = {
   size?: number | null;
   /** Path relative to Documents (attachments/prep/<projectId>/<id>/<name>). */
   rel?: string;
+  /** The copy in the tender's folder on Drive (project-files id), once uploaded. */
+  serverFileId?: number;
 };
 
 export type PickedAsset = {
@@ -372,11 +377,57 @@ export async function addPrepDoc(projectId: number, a: PickedAsset) {
   await files.copy(a.uri, files.abs(rel));
   const row: PrepDocRow = { id, name: a.name, size: a.size ?? null, rel };
   commit({ prep: { ...state.prep, [key]: [...(state.prep[key] ?? []), row] } });
+  // Best effort: the local copy is the user's; Drive gets it when reachable.
+  const tender = state.projects.find(p => p.id === projectId)?.source_tender_db_id;
+  if (tender) {
+    bidAgentApi
+      .uploadPrep(String(tender), files.abs(rel), a.name, a.mimeType)
+      .then(fileId => setPrepServerId(projectId, id, fileId))
+      .catch(() => {});
+  }
 }
+
+function setPrepServerId(projectId: number, docId: string, fileId: number) {
+  if (!fileId) return;
+  const key = String(projectId);
+  commit({
+    prep: {
+      ...state.prep,
+      [key]: (state.prep[key] ?? []).map(d => (d.id === docId ? { ...d, serverFileId: fileId } : d)),
+    },
+  });
+}
+
+/** Keeps a Drive-only prep file (e.g. one the Bid Agent saved) on this phone once opened. */
+export function adoptServerPrepDoc(
+  projectId: number,
+  file: { file_id: number; name: string; size?: number | null },
+  rel: string,
+) {
+  const key = String(projectId);
+  if ((state.prep[key] ?? []).some(d => d.serverFileId === file.file_id)) return;
+  const row: PrepDocRow = {
+    id: `srv${file.file_id}`,
+    name: file.name,
+    size: file.size ?? null,
+    rel,
+    serverFileId: file.file_id,
+  };
+  commit({ prep: { ...state.prep, [key]: [...(state.prep[key] ?? []), row] } });
+}
+
+/** Where a Drive prep file is kept on this phone once downloaded. */
+export const serverPrepRel = (projectId: number, fileId: number, name: string) =>
+  `${prepDir(projectId, `srv${fileId}`)}/${safeName(name, 'document')}`;
 
 export function removePrepDoc(projectId: number, docId: string) {
   files.remove(files.abs(prepDir(projectId, docId))).catch(() => {});
   const key = String(projectId);
+  const doc = (state.prep[key] ?? []).find(d => d.id === docId);
+  const tender = state.projects.find(p => p.id === projectId)?.source_tender_db_id;
+  if (doc?.serverFileId && tender) {
+    bidAgentApi.deletePrep(String(tender), doc.serverFileId).catch(() => {});
+  }
   commit({
     prep: {
       ...state.prep,

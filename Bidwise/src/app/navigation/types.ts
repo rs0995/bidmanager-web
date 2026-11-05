@@ -34,8 +34,6 @@ export type RootStackParamList = {
   Export: undefined;
   /** Every tender needing attention (the Dashboard card's "See more"). */
   NeedsAttention: undefined;
-  /** Bid pack for a tender: criteria checks and the bidding forms as Word / Excel. */
-  BidPack: { tenderId: string; title?: string };
   /** Files inside a downloaded ZIP. */
   ZipContents: { docId: string; name: string };
   /** One organisation's tenders (tapping an organisation row, as BM Pro). */

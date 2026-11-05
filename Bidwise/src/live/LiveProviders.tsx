@@ -264,9 +264,10 @@ export function toProject(
     prepDocs: prep.map(d => ({
       id: d.id,
       name: d.name,
+      serverFileId: d.serverFileId,
       meta: `${
         d.size ? `${Math.max(1, Math.round(d.size / 1024))} KB · ` : ''
-      }Added by you`,
+      }${d.id.startsWith('srv') ? 'From Drive' : 'Added by you'}${d.serverFileId && !d.id.startsWith('srv') ? ' · on Drive' : ''}`,
     })),
   };
 }

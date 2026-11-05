@@ -9,7 +9,7 @@ import { QueryClientProvider } from '@tanstack/react-query';
 import { RootNavigator } from './src/app/navigation/RootNavigator';
 import { ToastProvider } from './src/components/ui';
 import { ActionsProvider } from './src/data/actions';
-import { BidPackProvider } from './src/data/bidPack';
+import { BidAgentProvider } from './src/data/bidAgent';
 import { DocsProvider } from './src/data/docs';
 import { TenderSourceProvider } from './src/data/tenderSource';
 import { AlertsProvider } from './src/fixtures/alerts';
@@ -121,7 +121,7 @@ export default function App({
         <ToastProvider>
           <TenderSourceProvider mode={mode}>
             <DocsProvider mode={mode}>
-              <BidPackProvider mode={mode}>
+              <BidAgentProvider mode={mode}>
               {mode === 'live' ? (
                 <LiveData>
                   <ActionsProvider mode="live">
@@ -137,7 +137,7 @@ export default function App({
                   </ActionsProvider>
                 </DemoData>
               )}
-              </BidPackProvider>
+              </BidAgentProvider>
             </DocsProvider>
           </TenderSourceProvider>
         </ToastProvider>
