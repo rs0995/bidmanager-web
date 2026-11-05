@@ -143,7 +143,9 @@ def analyze_files(
     org["org_key"] = org_key
     org["org_name"] = org.get("org_name") or employer
     org["form_codes"] = sorted(set(org.get("form_codes", [])) | {f.get("code", "") for f in forms if f.get("code")})
-    org["tender_count"] = int(org.get("tender_count", 0)) + 1
+    ref = str(tender.get("tender_id") or tender.get("id") or "")
+    if ref and ref not in org.setdefault("tender_ids", []):
+        org["tender_ids"].append(ref)
     for d in documents:
         for s in d.get("segments", []):
             term = (s.get("employer_term") or "").strip()

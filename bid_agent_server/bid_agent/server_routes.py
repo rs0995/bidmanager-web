@@ -310,7 +310,7 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
 
     @admin.get("/employers")
     def admin_bid_employers() -> list:
-        return store.list_orgs()
+        return [{k: v for k, v in o.items() if k != "tender_ids"} for o in store.list_orgs()]
 
     @admin.delete("/employers/{org_key}")
     def admin_bid_employer_forget(org_key: str) -> dict:

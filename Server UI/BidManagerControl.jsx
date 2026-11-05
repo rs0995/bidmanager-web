@@ -4,7 +4,7 @@ import {
   Globe, Key, Search, X, Check, AlertTriangle, RefreshCw, Play, Pause, Trash2,
   Download, Upload, Plus, RotateCcw, Loader2, ChevronRight, ChevronDown, ArrowLeft,
   Copy, ExternalLink, Filter, ShieldCheck, Zap, FileText,
-  Eye, Bell, SkipForward, Timer, Send, Users, Ban, Archive, Pencil
+  Eye, Bell, SkipForward, Timer, Send, Users, Ban, Archive, Pencil, Sparkles
 } from 'lucide-react';
 import bmServerIcon from './src/assets/bm-server-icon.svg';
 
@@ -3564,6 +3564,155 @@ function DbPanel({ toast, env, base, adminKey, dbUrl, localScope }) {
 
 /* ═══════════════════════════ SHELL ══════════════════════════════════════ */
 
+/* ─── Bid Agent ────────────────────────────────────────────────────────────
+   Reads tender documents into bid packs for client apps (Server UI/server/
+   API_CHANGES.md §5). Here: the Claude key / model it uses, the employers it
+   has learned (section names, form codes) and its form-template library.
+   Routes: /admin/bid-agent/*. A 404 means the server doesn't have it yet. */
+function BidAgentPanel({ toast, base, adminKey }) {
+  const [state, setState] = useState({ loading: true, missing: false, error: '', config: null, employers: [], forms: [] });
+  const [keyIn, setKeyIn] = useState('');
+  const [modelIn, setModelIn] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [orgFilter, setOrgFilter] = useState('');
+  const [busyOrg, setBusyOrg] = useState('');
+
+  const load = useCallback(async () => {
+    setState((s) => ({ ...s, loading: true, error: '' }));
+    try {
+      const [config, employers, forms] = await Promise.all([
+        apiFetch(base, '/admin/bid-agent/config', { adminKey }),
+        apiFetch(base, '/admin/bid-agent/employers', { adminKey }),
+        apiFetch(base, '/admin/bid-agent/forms', { adminKey }),
+      ]);
+      setState({ loading: false, missing: false, error: '', config, employers: employers || [], forms: forms || [] });
+      setModelIn(config?.model || '');
+    } catch (e) {
+      const msg = String(e?.message || e);
+      setState((s) => ({ ...s, loading: false, missing: /not found|404/i.test(msg), error: msg }));
+    }
+  }, [base, adminKey]);
+  useEffect(() => { load(); }, [load]);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const body = { model: modelIn.trim() };
+      if (keyIn.trim()) body.api_key = keyIn.trim();
+      const config = await apiFetch(base, '/admin/bid-agent/config', { method: 'PUT', adminKey, body });
+      setState((s) => ({ ...s, config }));
+      setKeyIn('');
+      toast('Bid Agent settings saved');
+    } catch (e) { toast(`Save failed: ${e.message}`); } finally { setSaving(false); }
+  };
+  const clearKey = async () => {
+    setSaving(true);
+    try {
+      const config = await apiFetch(base, '/admin/bid-agent/config', { method: 'PUT', adminKey, body: { api_key: '' } });
+      setState((s) => ({ ...s, config }));
+      toast('API key removed');
+    } catch (e) { toast(`Failed: ${e.message}`); } finally { setSaving(false); }
+  };
+  const forget = async (orgKey) => {
+    if (!window.confirm('Forget this employer? Its learned section names and form templates are deleted; the next tender is read from scratch.')) return;
+    setBusyOrg(orgKey);
+    try {
+      await apiFetch(base, `/admin/bid-agent/employers/${encodeURIComponent(orgKey)}`, { method: 'DELETE', adminKey });
+      toast('Employer forgotten');
+      load();
+    } catch (e) { toast(`Failed: ${e.message}`); } finally { setBusyOrg(''); }
+  };
+
+  if (state.loading && !state.config) return <Panel code="BID" title="Bid Agent"><Card><Empty icon={Loader2} title="Loading…" /></Card></Panel>;
+  if (state.missing) {
+    return (
+      <Panel code="BID" title="Bid Agent" note="Bid packs: criteria checks and bidding forms for client apps">
+        <Card><Empty icon={Sparkles} title="This server doesn't have the Bid Agent yet. Install it with bid_agent_server/install.py and deploy." action={<Btn icon={RefreshCw} onClick={load}>Check again</Btn>} /></Card>
+      </Panel>
+    );
+  }
+  const cfg = state.config || {};
+  const forms = orgFilter ? state.forms.filter((f) => f.org_key === orgFilter) : state.forms;
+  const th = { fontFamily: mono, fontSize: 10.5, letterSpacing: '0.09em', color: c.ink60, textTransform: 'uppercase', textAlign: 'left', padding: '6px 8px', borderBottom: `1px solid ${c.rule}` };
+  const td = { fontSize: 12.5, padding: '6px 8px', borderBottom: `1px solid ${c.ruleSoft}`, verticalAlign: 'top' };
+
+  return (
+    <>
+      <Panel code="BID" title="Bid Agent" note="Bid packs: criteria checks and bidding forms for client apps"
+        right={<Btn icon={RefreshCw} size="sm" onClick={load} busy={state.loading}>Refresh</Btn>}>
+        {state.error && <Card style={{ marginBottom: 12 }}><span style={{ color: c.stamp, fontSize: 12.5 }}>{state.error}</span></Card>}
+        <StatStrip items={[
+          ['AI reading', cfg.api_key_set ? 'On' : 'Off', cfg.api_key_set ? c.seal : c.amber],
+          ['Employers learned', state.employers.length, c.ink],
+          ['Form templates', state.forms.length, c.ink],
+          ['Template reuses', state.forms.reduce((n, f) => n + Math.max(0, (f.use_count || 1) - 1), 0), c.ink],
+        ]} />
+        <Card style={{ marginTop: 12 }}>
+          <SubHead>Claude (Anthropic) access</SubHead>
+          <RegisterRow label="API key" value={cfg.api_key_set ? `${cfg.api_key_hint || 'set'}${cfg.api_key_source === 'env' ? ' (from ANTHROPIC_API_KEY)' : ''}` : 'not set: keyword reading only'} tone={cfg.api_key_set ? c.seal : c.amber} />
+          <RegisterRow label="Model" value={cfg.model || cfg.default_model || '—'} />
+          <div className="mt-3 flex flex-wrap items-end gap-2">
+            <Field label="New API key" stacked><TextIn type="password" value={keyIn} onChange={setKeyIn} placeholder="sk-ant-…" w={280} /></Field>
+            <Field label="Model" stacked><TextIn value={modelIn} onChange={setModelIn} placeholder={cfg.default_model} w={200} /></Field>
+            <Btn variant="primary" icon={Check} onClick={save} busy={saving}>Save</Btn>
+            {cfg.api_key_source === 'settings' && <Btn variant="danger" icon={Trash2} onClick={clearKey} disabled={saving}>Remove key</Btn>}
+          </div>
+          <p className="mt-2" style={{ fontSize: 11.5, color: c.ink60 }}>The key is stored in app settings and never sent back to this console or to client apps.</p>
+        </Card>
+      </Panel>
+
+      <Panel code="EMP" title="Employers learned" note="Section names and form codes remembered per tendering authority">
+        <Card pad={false}>
+          {!state.employers.length ? <Empty icon={Sparkles} title="None yet. Employers appear after their first bid pack." /> : (
+            <table className="w-full" style={{ borderCollapse: 'collapse' }}>
+              <thead><tr><th style={th}>Employer</th><th style={th}>Tenders</th><th style={th}>Section names</th><th style={th}>Forms</th><th style={th} /></tr></thead>
+              <tbody>
+                {state.employers.map((o) => (
+                  <tr key={o.org_key}>
+                    <td style={td}><div style={{ fontWeight: 500 }}>{o.org_name || o.org_key}</div><Mono style={{ fontSize: 10.5, color: c.ink40 }}>{o.org_key}</Mono></td>
+                    <td style={td}><Mono>{o.tender_count}</Mono></td>
+                    <td style={{ ...td, fontSize: 11.5, color: c.ink60 }}>
+                      {Object.entries(o.aliases || {}).filter(([, v]) => v.length).map(([role, v]) => (
+                        <div key={role}><Mono style={{ color: c.indigo }}>{role}</Mono>: {v.join(' · ')}</div>
+                      ))}
+                    </td>
+                    <td style={td}>
+                      <button className="underline" style={{ fontSize: 12, color: c.indigo }} onClick={() => setOrgFilter(o.org_key)}>{(o.form_codes || []).length} forms</button>
+                    </td>
+                    <td style={{ ...td, textAlign: 'right' }}><Btn size="sm" variant="danger" icon={Trash2} busy={busyOrg === o.org_key} onClick={() => forget(o.org_key)}>Forget</Btn></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </Card>
+      </Panel>
+
+      <Panel code="TPL" title="Form templates" note="Bidding forms converted once and reused while the employer's wording doesn't change"
+        right={<Select value={orgFilter} onChange={setOrgFilter} w={240} options={[{ value: '', label: 'All employers' }, ...state.employers.map((o) => ({ value: o.org_key, label: o.org_name || o.org_key }))]} />}>
+        <Card pad={false}>
+          {!forms.length ? <Empty icon={FileText} title="No form templates yet." /> : (
+            <table className="w-full" style={{ borderCollapse: 'collapse' }}>
+              <thead><tr><th style={th}>Form</th><th style={th}>Title</th><th style={th}>Employer</th><th style={th}>Used</th><th style={th}>From file</th></tr></thead>
+              <tbody>
+                {forms.map((f, i) => (
+                  <tr key={`${f.org_key}-${f.form_code}-${i}`}>
+                    <td style={td}><Mono>{f.form_code}</Mono></td>
+                    <td style={td}>{f.title}</td>
+                    <td style={{ ...td, color: c.ink60 }}>{f.org_key}</td>
+                    <td style={td}><Mono>{f.use_count}×</Mono></td>
+                    <td style={{ ...td, fontSize: 11.5, color: c.ink60 }}>{f.source_file}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </Card>
+      </Panel>
+    </>
+  );
+}
+
 const NAV = [
   { code: 'SRV', key: 'server',  label: 'Server',   icon: Server },
   { code: 'CFG', key: 'config',  label: 'Settings', icon: Sliders },
@@ -3572,6 +3721,7 @@ const NAV = [
   { code: 'JOB', key: 'jobs',    label: 'Jobs',     icon: Layers },
   { code: 'CAP', key: 'captcha', label: 'Captchas', icon: Eye, badge: true },
   { code: 'USR', key: 'users',   label: 'Users',    icon: Users },
+  { code: 'BID', key: 'bidagent', label: 'Bid Agent', icon: Sparkles },
   { code: 'FS',  key: 'storage', label: 'Files',    icon: Folder },
   { code: 'LOG', key: 'logs',    label: 'Logs',     icon: Terminal },
   { code: 'DB',  key: 'db',      label: 'Database', icon: Database },
@@ -3680,7 +3830,7 @@ export default function BidManagerControl() {
   }, [bases, env, keyVal]);
   const toast = useCallback((m) => { setToastMsg(m); setTimeout(() => setToastMsg(null), 2600); }, []);
 
-  const Body = { server: ServerPanel, config: ConfigPanel, scraper: ScraperPanel, archive: ArchivePanel, jobs: JobsPanel, captcha: CaptchaPanel, users: UsersPanel, storage: StoragePanel, logs: LogsPanel, db: DbPanel }[tab];
+  const Body = { server: ServerPanel, config: ConfigPanel, scraper: ScraperPanel, archive: ArchivePanel, jobs: JobsPanel, captcha: CaptchaPanel, users: UsersPanel, bidagent: BidAgentPanel, storage: StoragePanel, logs: LogsPanel, db: DbPanel }[tab];
 
   return (
     <div style={{ background: c.paper, minHeight: '100vh', fontFamily: sans, color: c.ink }}>

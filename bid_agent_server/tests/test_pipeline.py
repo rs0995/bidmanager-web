@@ -89,6 +89,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(status["4.2"], "Meets")       # 75 Cr work within 7 years
         self.assertEqual(status["5.1"], "Shortfall")   # no ISO 14001
         self.assertEqual(r["org_key"], "abc-authority")
+        agent.analyze_files(self.src, self.tender, store, None, PROFILE, log=lambda m: None)
+        self.assertEqual(store.get_org("abc-authority")["tender_count"], 1)  # same tender twice
         json.dumps(r)  # result must be JSON-serialisable for the DB
 
     def test_outputs_are_built_on_demand(self):

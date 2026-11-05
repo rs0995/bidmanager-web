@@ -1,0 +1,5 @@
+----
+01:15 2026-11-05 (Bid Agent session) - Request: Bid Agent tab in the console (API key / model, learned employers, form library).
+Backed up: BidManagerControl.jsx
+- BidManagerControl.jsx: new BidAgentPanel + NAV entry 'BID' (calls /admin/bid-agent/*; shows 'not installed' when the server has no Bid Agent yet).
+- Server part is bid_agent_server/ (not applied to server/ by this session).

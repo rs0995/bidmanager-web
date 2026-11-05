@@ -25,6 +25,7 @@ SCHEMA = [
         org_name TEXT,
         aliases_json TEXT,
         form_codes_json TEXT,
+        tender_ids_json TEXT,
         tender_count INTEGER DEFAULT 0,
         updated_at REAL
     )""",
@@ -113,12 +114,14 @@ class Store:
     def get_org(self, org_key: str) -> dict:
         with self.conn() as c:
             r = c.execute(
-                "SELECT org_key, org_name, aliases_json, form_codes_json, tender_count, updated_at "
+                "SELECT org_key, org_name, aliases_json, form_codes_json, tender_ids_json, updated_at "
                 "FROM bid_org_profiles WHERE org_key=?", (org_key,)).fetchone()
         if not r:
-            return {"org_key": org_key, "org_name": "", "aliases": {}, "form_codes": [], "tender_count": 0}
+            return {"org_key": org_key, "org_name": "", "aliases": {}, "form_codes": [], "tender_ids": [],
+                    "tender_count": 0}
+        ids = _loads(r[4], [])
         return {"org_key": r[0], "org_name": r[1] or "", "aliases": _loads(r[2], {}),
-                "form_codes": _loads(r[3], []), "tender_count": int(r[4] or 0), "updated_at": r[5]}
+                "form_codes": _loads(r[3], []), "tender_ids": ids, "tender_count": len(ids), "updated_at": r[5]}
 
     def list_orgs(self) -> list[dict]:
         with self.conn() as c:
@@ -128,12 +131,13 @@ class Store:
     def save_org(self, org: dict) -> None:
         with self.conn() as c:
             c.execute(
-                "INSERT INTO bid_org_profiles (org_key, org_name, aliases_json, form_codes_json, tender_count, updated_at) "
-                "VALUES (?,?,?,?,?,?) ON CONFLICT (org_key) DO UPDATE SET org_name=excluded.org_name, "
-                "aliases_json=excluded.aliases_json, form_codes_json=excluded.form_codes_json, "
-                "tender_count=excluded.tender_count, updated_at=excluded.updated_at",
+                "INSERT INTO bid_org_profiles (org_key, org_name, aliases_json, form_codes_json, tender_ids_json, "
+                "tender_count, updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT (org_key) DO UPDATE SET "
+                "org_name=excluded.org_name, aliases_json=excluded.aliases_json, form_codes_json=excluded.form_codes_json, "
+                "tender_ids_json=excluded.tender_ids_json, tender_count=excluded.tender_count, updated_at=excluded.updated_at",
                 (org["org_key"], org.get("org_name", ""), json.dumps(org.get("aliases", {})),
-                 json.dumps(sorted(set(org.get("form_codes", [])))), int(org.get("tender_count", 0)), time.time()),
+                 json.dumps(sorted(set(org.get("form_codes", [])))), json.dumps(org.get("tender_ids", [])[-500:]),
+                 len(org.get("tender_ids", [])), time.time()),
             )
             c.commit()
 
