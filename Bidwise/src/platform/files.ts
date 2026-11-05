@@ -21,13 +21,21 @@ export const files = {
     if (!(await fs.exists(absDir))) await fs.mkdir(absDir);
   },
 
-  /** Downloads `url` to `absPath`; rejects on a non-2xx answer. Returns the byte size. */
-  async download(url: string, absPath: string): Promise<number> {
+  /**
+   * Downloads `url` to `absPath`; rejects on a non-2xx answer. Returns the byte size.
+   * `headers` is for routes that need the session key (bid-pack files).
+   */
+  async download(
+    url: string,
+    absPath: string,
+    headers?: Record<string, string>,
+  ): Promise<number> {
     const dir = absPath.slice(0, absPath.lastIndexOf('/'));
     await files.ensureDir(dir);
     const res = await ReactNativeBlobUtil.config({ path: absPath }).fetch(
       'GET',
       url,
+      headers,
     );
     const status = res.info().status;
     if (status < 200 || status >= 300) {

@@ -23,6 +23,7 @@ import {
   FolderCheck,
   Plus,
   RefreshCw,
+  Sparkles,
   Star,
   Trash2,
 } from 'lucide-react-native';
@@ -651,6 +652,24 @@ export function DetailScreen() {
         }
       />
 
+      {access.projects && fetched.tender ? (
+        <View style={styles.bidPack}>
+          <Button
+            label="Bid pack: criteria check and forms"
+            variant="outline"
+            size="sm"
+            block
+            icon={<Sparkles size={15} color={t.colors.accentInk} />}
+            onPress={() =>
+              navigation.navigate('BidPack', {
+                tenderId: fetched.tender!.id,
+                title: tender.title,
+              })
+            }
+          />
+        </View>
+      ) : null}
+
       {access.projects ? (
         <DocGroup
           title="Docs for Preparation"
@@ -699,6 +718,7 @@ export function DetailScreen() {
 }
 
 const styles = StyleSheet.create({
+  bidPack: { marginTop: 14 },
   missing: { fontFamily: fonts.regular, fontSize: 14, marginTop: 24 },
   loading: { marginTop: 40 },
   docActions: { gap: 8, marginTop: 6 },
