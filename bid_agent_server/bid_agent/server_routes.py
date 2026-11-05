@@ -116,7 +116,9 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
         for row in rows:
             data = dict(row)
             name = os.path.basename(str(data.get("file_name") or f"document_{data['id']}")) or f"document_{data['id']}"
-            target = os.path.join(dest, f"{data['id']}_{name}")
+            target = os.path.join(dest, name)
+            if os.path.exists(target):  # same name twice: keep both
+                target = os.path.join(dest, f"{data['id']}_{name}")
             try:
                 kind, ref = client_api._download_reference(data)
                 if kind == "local":
@@ -242,7 +244,6 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
             for s in segs:
                 if s["role"] != "other":
                     stem = os.path.splitext(body.file.split("/")[-1])[0]
-                    stem = stem.split("_", 1)[1] if "_" in stem and stem.split("_", 1)[0].isdigit() else stem
                     store.learn_alias(org_key, result.get("org_name", ""), s["role"], stem.replace("_", " "))
         start(owner, tender, user_id, overrides)
         return public(store.get_analysis(owner, tender_db_id))

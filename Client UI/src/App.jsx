@@ -12,7 +12,7 @@ import {
   Paperclip, FolderCog, Link2, BookOpen, Pencil,
   Palette, RotateCcw, Home, Download, Upload, Rows3, Type, Info, Filter,
   LogOut, LogIn, UserPlus, KeyRound, ArrowLeft, ShieldQuestion,
-  Users, Shield, UserMinus, Check, Ban,
+  Users, Shield, UserMinus, Check, Ban, Sparkles, Briefcase,
 } from 'lucide-react';
 import { api, canonTenderId, tenderKey, PROJECT_BOOKMARK_LOCKED } from './lib/api';
 import { cn, formatINR, formatCrores, timeRemaining } from './lib/utils';
@@ -20,6 +20,8 @@ import { useAppStore } from './lib/store';
 import {
   Badge, TimeBadge, StatusBadge, EmptyState, Spinner, NotificationIcon,
 } from './components/ui/shared';
+import BidAgentPanel from './components/BidAgentPanel';
+import CompanyProfilePage from './components/CompanyProfilePage';
 
 /* ════════════════════════════════════════════════════════════════════════════
    BID MANAGER — CLIENT APP (draft)
@@ -799,7 +801,7 @@ function sidebarKeyGatedOff(key, permissions) {
   // member who'd had only active revoked.
   if (key === 'organizations') return permissions.active === false;
   if (key === 'bookmarks') return permissions.bookmarks === false;
-  if (key === 'projects' || key === 'archived_projects' || key === 'templates') return permissions.projects === false;
+  if (key === 'projects' || key === 'archived_projects' || key === 'templates' || key === 'company') return permissions.projects === false;
   return false;
 }
 
@@ -828,6 +830,7 @@ function Sidebar({ active, onNavigate, collapsed, onToggle, badges = {}, permiss
     { key: 'bookmarks', label: 'Bookmarks', icon: Star },
     { key: 'projects', label: 'Projects', icon: FolderOpen },
     { key: 'templates', label: 'Templates', icon: FileText },
+    { key: 'company', label: 'Company Profile', icon: Briefcase },
     { key: 'portal_search', label: 'Portal Search', icon: Search },
   ].filter((item) => !sidebarKeyGatedOff(item.key, permissions));
   const bottomItems = [
@@ -3541,6 +3544,7 @@ function ToolBtn({ icon: Icon, label, onClick, disabled, danger, active, spinnin
 
 function ProjectWorkspacePage({ projectId, embedded = false }) {
   const qc = useQueryClient();
+  const [bidAgentOpen, setBidAgentOpen] = useState(false);
   const [docName, setDocName] = useState('');
   const [desc, setDesc] = useState('');
   const [folder, setFolder] = useState('Ready Docs');
@@ -4538,6 +4542,8 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
           <ToolBtn icon={RefreshCw} label={checklistFetching ? 'Refreshing…' : 'Refresh'} spinning={checklistFetching} disabled={checklistFetching} onClick={() => qc.invalidateQueries({ queryKey: ['project-checklist', projectId] })} />
           <ToolBtn icon={BookOpen} label="Apply Template" onClick={() => { setTemplateSearch(''); setApplyTemplateOpen(true); }} />
           <span className="mx-1 h-4 w-px bg-[var(--border)] shrink-0" />
+          <ToolBtn icon={Sparkles} label="Bid Agent" active={bidAgentOpen} disabled={!project?.source_tender_id} onClick={() => setBidAgentOpen(true)} />
+          <span className="mx-1 h-4 w-px bg-[var(--border)] shrink-0" />
           <ToolBtn icon={Save} label="Save Template" disabled={!(checklist || []).length} onClick={() => { setSaveTemplateForm(f => ({ ...f, template_name: String(project?.title || ''), organization: String(project?.client_name || '') })); setSaveTemplateOpen(true); }} />
         </div>
       </div>
@@ -4797,6 +4803,8 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
           </div>
         </div>
       )}
+
+      {bidAgentOpen && project && <BidAgentPanel project={project} onClose={() => setBidAgentOpen(false)} />}
 
       {/* ── Apply Template Modal ────────────────────────────────────────────── */}
       {applyTemplateOpen && (
@@ -6064,7 +6072,7 @@ export default function App() {
     retry: false,
   });
   const [page, setPage] = useState(() => {
-    const allowed = ['dashboard', 'tenders', 'organizations', 'bookmarks', 'projects', 'templates', 'archived_projects', 'captcha', 'files', 'settings', 'portal_search'];
+    const allowed = ['dashboard', 'tenders', 'organizations', 'bookmarks', 'projects', 'templates', 'company', 'archived_projects', 'captcha', 'files', 'settings', 'portal_search'];
     const startupPage = readClientPrefs().startupPage;
     if (startupPage && startupPage !== 'resume' && allowed.includes(startupPage)) return startupPage;
     const saved = localStorage.getItem('bm-client-last-page');
@@ -6294,6 +6302,7 @@ export default function App() {
     archived_projects: <ProjectsPage key="projects-archived" archived onOpenProjectWorkspace={(projectId) => setWorkspaceProjectId(projectId)} />,
     captcha: <CaptchaPage />,
     templates: <TemplatesPage />,
+    company: <CompanyProfilePage />,
     files: <FilesPage />,
     settings: <SettingsPage />,
     portal_search: <PortalSearchPage onOpenTender={openTenderDetails} />,

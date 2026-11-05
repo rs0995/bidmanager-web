@@ -98,7 +98,7 @@ class BidPackRouteTests(unittest.TestCase):
         self.assertEqual(self.client.get("/client/tenders/1/bid-pack/files/..%2Fx", headers=self.h).status_code, 404)
 
         # correction -> rerun with override, alias learned for the employer
-        vol1 = "10_Volume 1 - ITT.docx"
+        vol1 = "Volume 1 - ITT.docx"
         r = self.client.put("/client/tenders/1/bid-pack/documents", headers=self.h,
                             json={"file": vol1, "segments": [{"role": "nit", "start_page": 1, "end_page": 2}]})
         self.assertEqual(r.status_code, 200, r.text)

@@ -1868,6 +1868,71 @@ export const api = {
     for (const [key, width] of Object.entries(widths)) store.setTenderColumnWidth(key, width);
     return data;
   },
+
+  // ── Bid Agent (server: bid_agent_server/, routes in API_CHANGES §5) ─────
+  // A bid pack is prepared on the server from the tender's downloaded
+  // documents and is shared by everyone in the organisation.
+  getBidAgentStatus: () => requestClient('/client/bid-agent/status'),
+  getBidPack: (tenderDbId, since = 0) =>
+    requestClient(`/client/tenders/${Number(tenderDbId)}/bid-pack?since=${Number(since) || 0}`),
+  startBidPack: (tenderDbId) =>
+    requestClient(`/client/tenders/${Number(tenderDbId)}/bid-pack`, { method: 'POST', body: {} }),
+  correctBidPackSections: (tenderDbId, file, segments) =>
+    requestClient(`/client/tenders/${Number(tenderDbId)}/bid-pack/documents`, { method: 'PUT', body: { file, segments } }),
+  getCompanyProfile: () => requestClient('/client/company-profile'),
+  saveCompanyProfile: (profile) => requestClient('/client/company-profile', { method: 'PUT', body: profile }),
+  // Saves a generated Word/Excel/ZIP file. Desktop: into
+  // <parent>/Bid Packs/<tender>/ and returns the path; browser: a download.
+  downloadBidPackFile: async (tenderDbId, name, tenderId) => {
+    const config = await connection();
+    if (!config.auth_token) throw new AuthError('Sign in to continue.', 'unauthorized');
+    const url = `${config.server_url}/client/tenders/${Number(tenderDbId)}/bid-pack/files/${encodeURIComponent(name)}`;
+    const bridge = desktop();
+    if (bridge?.downloadFile) {
+      const settings = (await getState()).settings;
+      const parentDir = String(settings.parent_dir || '').trim();
+      if (!parentDir) throw new Error('Set a parent folder in Settings before downloading files.');
+      const destinationPath = joinPath(parentDir, 'Bid Packs', leaf(tenderId || String(tenderDbId)), leaf(name));
+      const result = await bridge.downloadFile({ url, destinationPath, headers: { 'x-client-key': config.auth_token } });
+      if (!result?.ok) throw new Error(result?.message || 'Download failed.');
+      return { path: result.path };
+    }
+    const response = await fetch(url, { headers: { 'x-client-key': config.auth_token } });
+    if (response.status === 401) throw new AuthError('Sign in again.');
+    if (!response.ok) throw new Error(`Download failed (HTTP ${response.status}).`);
+    const blobUrl = URL.createObjectURL(await response.blob());
+    const anchor = window.document.createElement('a');
+    anchor.href = blobUrl;
+    anchor.download = name;
+    window.document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
+    return { path: null };
+  },
+  // One checklist row per bid form (and per form the criteria cite but the
+  // tender files lack). Skips rows whose name already exists.
+  addBidFormsToChecklist: async (projectId, result) => {
+    const existing = new Set((await api.listChecklist(projectId)).map((row) => String(row.req_file_name || '').trim().toLowerCase()));
+    let added = 0;
+    const rows = [
+      ...(result?.forms || []).map((f) => ({
+        req_file_name: `${f.code} - ${f.title}`.replace(/^\s*-\s*|\s*-\s*$/g, ''),
+        description: `Bid form (tender p${f.start_page}-${f.end_page})`,
+      })),
+      ...(result?.missing_forms || []).map((code) => ({
+        req_file_name: `${code} (not found in tender files - check)`,
+        description: 'Referenced in qualification criteria',
+      })),
+    ];
+    for (const row of rows) {
+      if (!row.req_file_name || existing.has(row.req_file_name.toLowerCase())) continue;
+      await api.createChecklistItem(projectId, { ...row, subfolder: 'Bid Forms', status: 'Pending' });
+      existing.add(row.req_file_name.toLowerCase());
+      added += 1;
+    }
+    return { added };
+  },
 };
 
 // Column customization lives in the Zustand store (Client UI/src/lib/store.ts),
