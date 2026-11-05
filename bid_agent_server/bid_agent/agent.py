@@ -18,12 +18,15 @@ from typing import Callable
 
 from . import compliance, generate
 from .classify import classify_document
-from .criteria import extract_criteria, referenced_form_codes
+from .criteria import criteria_pages, extract_criteria, page_criteria_score, referenced_form_codes
 from .docreader import Document, display_name, ensure_tables, list_tender_files, load_document
 from .forms import extract_forms, missing_forms
 from .llm import LLM
 from .roles import PRIMARY_ROLES, role_label
 from .store import Store, employer_from_org_chain, org_key_for
+
+# Bump when extraction changes enough that stored results should be redone.
+PIPELINE_VERSION = 2
 
 REF_RE = re.compile(
     r"\b(?:IFB|NIT|ICB|NCB|RFP|Bid|Tender|E-?Tender)\s*(?:No|Number|Ref)\.?\s*[:.\-]?\s*([A-Z0-9][A-Z0-9/\-_.()]{5,60})",
@@ -104,7 +107,10 @@ def analyze_files(
                 for d in documents for s in d.get("segments", []) if s["role"] in roles and d["file"] in docs]
 
     # criteria
-    crit_src = segments_of("qualification_criteria") or segments_of("bds", "nit")
+    # Classified criteria sections + pages anywhere that read like criteria (Indian NITs
+    # often keep them in an "Eligibility Criteria" list inside the NIT).
+    crit_src = criteria_pages(list(docs.values()), segments_of("qualification_criteria")) \
+        or segments_of("bds", "nit")
     for doc, s, e in crit_src:
         ensure_tables(doc, s, e)
     log(f"Reading qualification criteria from {len(crit_src)} section(s)…")
@@ -147,6 +153,8 @@ def analyze_files(
         "overrides": overrides,
         "llm": {"model": llm.model if llm else "", "used": bool(llm and llm.available), "usage": llm.usage if llm else {}},
         "elapsed_sec": round(time.time() - t0, 1),
+        "pipeline_version": PIPELINE_VERSION,
+        "criteria_pages": [{"file": _rel_of(d, documents, docs), "start_page": s, "end_page": e} for d, s, e in crit_src],
     }
 
     # learn employer nomenclature + form codes
@@ -166,6 +174,58 @@ def analyze_files(
     store.save_org(org)
     log(f"Done in {result['elapsed_sec']} s: {len(forms)} form(s), {len(criteria.get('criteria', []))} criteria.")
     return result
+
+
+def _rel_of(doc: Document, documents: list[dict], docs: dict) -> str:
+    for rel, d in docs.items():
+        if d is doc:
+            return rel
+    return doc.name
+
+
+def _pick_doc(src_dir: str, file_hint: str, start: int, end: int) -> tuple[str, Document]:
+    """The tender file a user means: by (part of) its name, else the one whose pages
+    [start, end] read most like criteria."""
+    paths = list_tender_files(src_dir)
+    hint = re.sub(r"[^a-z0-9]+", " ", (file_hint or "").lower()).strip()
+    named = [p for p in paths if hint and hint in re.sub(r"[^a-z0-9]+", " ", display_name(p, src_dir).lower())]
+    best = None
+    for p in named or paths:
+        doc = load_document(p, with_tables=False)
+        if not doc.pages or doc.page_count < start:
+            continue
+        score = sum(page_criteria_score(pg.text) for pg in doc.pages[start - 1:end])
+        if best is None or score > best[0]:
+            best = (score, display_name(p, src_dir), doc)
+    if best is None:
+        raise RuntimeError(f"No tender file has page {start}." if not hint else f"No tender file named like “{file_hint}”.")
+    return best[1], best[2]
+
+
+def criteria_from_pages(src_dir: str, file_hint: str, start: int, end: int, store: Store,
+                        llm: LLM | None, log: Callable[[str], None] = print) -> tuple[str, dict]:
+    """Re-reads the qualification criteria from the pages the user named."""
+    start, end = max(1, int(start)), max(int(start), int(end))
+    name, doc = _pick_doc(src_dir, file_hint, start, end)
+    end = min(end, doc.page_count)
+    ensure_tables(doc, start, end)
+    key = f"crit:{doc.sha1}:{start}-{end}"
+    cached = store.get_doc_cache(key)
+    if cached and cached.get("source") == "ai":
+        return name, cached
+    crit = extract_criteria([(doc, start, end)], llm, log)
+    if crit.get("source") == "ai":
+        store.put_doc_cache(key, "criteria", crit)
+    return name, crit
+
+
+def read_pages(src_dir: str, file_hint: str, start: int, end: int, max_chars: int = 60000) -> tuple[str, str, bool]:
+    """Text of pages [start, end] of a tender file -> (file, text, scanned)."""
+    name, doc = _pick_doc(src_dir, file_hint, start, end)
+    end = min(max(start, end), doc.page_count, start + 29)
+    text = doc.text_range(start, end, max_chars=max_chars)
+    scanned = sum(len(p.text.strip()) for p in doc.pages[start - 1:end]) < 100 * (end - start + 1)
+    return name, text, scanned
 
 
 def refresh_compliance(result: dict, profile: dict) -> dict:

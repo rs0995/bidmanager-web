@@ -246,5 +246,63 @@ class ChatLoopTests(unittest.TestCase):
         self.assertTrue(all(t.get("strict") for t in fake.calls[0]["tools"]))
 
 
+class IndianNitTests(unittest.TestCase):
+    """Criteria as an 'Eligibility Criteria' paragraph list inside one NIT (e.g. MMRDA)."""
+
+    def setUp(self):
+        from fixtures import build_mmrda_style_nit
+
+        self.tmp = tempfile.mkdtemp()
+        self.src = os.path.join(self.tmp, "docs")
+        self.nit = build_mmrda_style_nit(self.src)
+        self.tender = {"id": 11, "tender_id": "2026_MMRDA_1345405_1", "title": "Flyover",
+                       "org_chain": "Mumbai Metropolitan Region Development Authority||Engineering"}
+
+    def test_finds_every_criterion_not_only_jv(self):
+        r = agent.analyze_files(self.src, self.tender, new_store(self.tmp), None, PROFILE, log=lambda m: None)
+        reqs = " | ".join(c["requirement"] for c in r["criteria"]["criteria"])
+        for needle in ("Rs. 45.00 Crore", "Rs. 60.00 Crore", "2AN-B", "net worth", "60% of the qualification"):
+            self.assertIn(needle.lower(), reqs.lower())
+        turnover = next(c for c in r["criteria"]["criteria"] if "turnover" in c["requirement"].lower()
+                        and "45" in c["requirement"])
+        self.assertEqual((turnover["metric"], turnover["threshold_inr_cr"], turnover["period_years"]),
+                         ("avg_annual_turnover", 45.0, 3))
+        self.assertTrue(r["criteria_pages"])
+        self.assertEqual(r["pipeline_version"], agent.PIPELINE_VERSION)
+
+    def test_criteria_from_pages_the_user_names(self):
+        from bid_agent.docreader import load_document
+
+        doc = load_document(self.nit)
+        page = next(p.number for p in doc.pages if "ELIGIBILITY CRITERIA" in p.text)
+        name, crit = agent.criteria_from_pages(self.src, "", page, page, new_store(self.tmp), None, lambda m: None)
+        self.assertTrue(name.startswith("Tender Document MMRDA"))
+        self.assertGreaterEqual(len(crit["criteria"]), 4)
+        _name, text, scanned = agent.read_pages(self.src, "mmrda", page, page)
+        self.assertIn("ELIGIBILITY CRITERIA", text)
+        self.assertFalse(scanned)
+
+    def test_chat_reextracts_from_named_pages_and_keeps_them(self):
+        from types import SimpleNamespace as NS
+
+        from bid_agent import chat
+        from bid_agent.docreader import load_document
+
+        store = new_store(self.tmp)
+        result = agent.analyze_files(self.src, self.tender, store, None, PROFILE, log=lambda m: None)
+        result["criteria"] = {"criteria": [{"ref": "a", "subject": "JV", "requirement": "JV only", "forms": []}]}
+        saved = {}
+        page = next(p.number for p in load_document(self.nit).pages if "ELIGIBILITY CRITERIA" in p.text)
+        pages = NS(read=lambda f, a, b: agent.read_pages(self.src, f, a, b),
+                   criteria=lambda f, a, b: agent.criteria_from_pages(self.src, f, a, b, store, None, lambda m: None))
+        turn = chat.Turn(NS(tender=self.tender), lambda: result, lambda: PROFILE, pages=pages,
+                         save_result=lambda r: saved.update(r))
+        reply = chat.run_turn(turn, [], f"The eligibility criteria are on page {page}", None)
+        self.assertTrue(reply.startswith("Read "), reply)
+        self.assertGreaterEqual(len(saved["criteria"]["criteria"]), 4)
+        self.assertEqual(saved["criteria_pages"][0]["by"], "user")
+        self.assertEqual(turn.cards[0]["title"], "Prequalification criteria")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -35,6 +35,10 @@ How to work:
 - Use tools for every fact about the tender. Never invent criteria, values, form codes or page numbers.
 - "Show/fetch/what is the prequal(ification) / PQ / eligibility / qualification criteria" -> \
 show_prequalification. Then answer briefly; the table is already shown to the user.
+- If the user says the criteria are on particular pages (or the table you showed is incomplete / only has \
+JV rules), call extract_criteria_from_pages with those pages (and the file if they name it; call \
+list_tender_documents first if unsure which file). That replaces the stored criteria, so later saves use it.
+- To answer a question about specific pages, read them with read_tender_pages.
 - "Save/download/export the prequal" -> save_prequalification in the format asked (Excel by default; \
 Word or PDF if asked). It goes to Docs for Preparation.
 - "Extract/save the tender forms" or a specific form ("Form FIN-3.2", "letter of bid", "bidder information \
@@ -88,6 +92,19 @@ TOOLS = [
              "name": {"type": "string"}, "description": {"type": "string"}},
              "required": ["name", "description"], "additionalProperties": False}}},
          "required": ["items"], "additionalProperties": False}},
+    {"name": "list_tender_documents", "description": "The tender's files with page counts and the sections "
+     "found in each, and the pages the criteria were read from.",
+     "input_schema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "read_tender_pages", "description": "Returns the text of pages of a tender file (max 30 pages). "
+     "file = part of the file name, or '' to pick the file whose pages look most like criteria.",
+     "input_schema": {"type": "object", "properties": {
+         "file": {"type": "string"}, "start_page": {"type": "integer"}, "end_page": {"type": "integer"}},
+         "required": ["file", "start_page", "end_page"], "additionalProperties": False}},
+    {"name": "extract_criteria_from_pages", "description": "Re-reads the qualification criteria from the given "
+     "pages (as the user points them out), replaces the stored criteria and shows the table.",
+     "input_schema": {"type": "object", "properties": {
+         "file": {"type": "string"}, "start_page": {"type": "integer"}, "end_page": {"type": "integer"}},
+         "required": ["file", "start_page", "end_page"], "additionalProperties": False}},
     {"name": "list_saved_files", "description": "Lists files the agent and the team saved for this tender "
      "(Docs for Preparation and Ready Docs attachments).",
      "input_schema": {"type": "object", "properties": {}, "additionalProperties": False}},
@@ -104,11 +121,16 @@ class Turn:
     """Runs one user request. ``get_result`` returns the tender analysis (running it if needed)."""
 
     def __init__(self, workspace: Workspace, get_result: Callable[[], dict], get_profile: Callable[[], dict],
-                 progress: Callable[[str], None] = lambda _m: None):
+                 progress: Callable[[str], None] = lambda _m: None, pages=None,
+                 save_result: Callable[[dict], None] = lambda _r: None):
+        """``pages`` gives access to the tender files: .read(file, start, end) -> (name, text, scanned)
+        and .criteria(file, start, end) -> (name, criteria)."""
         self.ws = workspace
         self._get_result = get_result
         self.get_profile = get_profile
         self.progress = progress
+        self.pages = pages
+        self.save_result = save_result
         self.cards: list[dict] = []
         self._result: dict | None = None
 
@@ -322,6 +344,43 @@ class Turn:
         return (f"Ready Docs: {added} row(s) added ({len(rows) - added} already there), {len(attached)} form(s) "
                 f"attached; the rest are Pending for files to be attached.")
 
+    def tool_list_tender_documents(self) -> str:
+        docs = self.result.get("documents", [])
+        self.cards.append({"type": "table", "title": "Tender files", "columns": ["File", "Pages", "Sections"],
+                           "rows": [[d["file"], d.get("pages", 0), d.get("error") or "; ".join(
+                               f"{s['label']} p{s['start_page']}-{s['end_page']}" for s in d.get("segments", []))]
+                                    for d in docs]})
+        used = "; ".join(f"{c['file']} p{c['start_page']}-{c['end_page']}" for c in self.result.get("criteria_pages", []))
+        return "\n".join(f"{d['file']} ({d.get('pages', 0)} pages): " + (d.get("error") or ", ".join(
+            f"{s['label']} p{s['start_page']}-{s['end_page']}" for s in d.get("segments", []))) for d in docs) + \
+            (f"\nCriteria were read from: {used}" if used else "")
+
+    def tool_read_tender_pages(self, file: str = "", start_page: int = 1, end_page: int = 1) -> str:
+        if not self.pages:
+            return "Page reading isn't available."
+        name, text, scanned = self.pages.read(file, int(start_page), int(end_page))
+        if scanned:
+            return (f"{name} pages {start_page}-{end_page} are scanned images with little text. Use "
+                    "extract_criteria_from_pages to read them with the page images.\n" + text)
+        return f"{name} pages {start_page}-{end_page}:\n{text}"
+
+    def tool_extract_criteria_from_pages(self, file: str = "", start_page: int = 1, end_page: int = 1) -> str:
+        if not self.pages:
+            return "Page reading isn't available."
+        self.progress(f"Reading the criteria on pages {start_page}-{end_page}…")
+        name, crit = self.pages.criteria(file, int(start_page), int(end_page))
+        if not crit.get("criteria"):
+            return (f"No qualification criteria could be read on {name} pages {start_page}-{end_page}. "
+                    "Ask the user to check the page numbers (they may be printed page numbers, not PDF pages).")
+        result = dict(self.result)
+        result["criteria"] = crit
+        result["criteria_pages"] = [{"file": name, "start_page": int(start_page), "end_page": int(end_page), "by": "user"}]
+        result["compliance"] = compliance.check(crit, self.get_profile())
+        self._result = result
+        self.save_result(result)
+        out = self.tool_show_prequalification(False)
+        return f"Read {len(crit['criteria'])} criteria from {name} pages {start_page}-{end_page} and saved them. " + out
+
     def tool_list_saved_files(self) -> str:
         files = self.ws.files()
         self.cards.append({"type": "files", "title": "Saved for this tender", "folder": "",
@@ -372,12 +431,24 @@ INTENTS = [
     ("check_eligibility", r"(\bqualify\b|\beligible\b|complian\w*|can we bid|do we meet)"),
     ("show_prequalification", _PQ),
     ("show_tender_sections", r"(\bsections?\b|\bvolumes?\b|where is|which file)"),
+    ("list_tender_documents", r"(which files|tender files|documents? (in|of) the tender|list (the )?documents)"),
     ("list_saved_files", r"(\bsaved\b|\bfiles\b|what have you)"),
 ]
 
 
+PAGES_RE = re.compile(r"\b(?:pages?|pgs?|p)\.?\s*(?:no\.?\s*)?(\d{1,4})(?:\s*(?:-|–|to|till|until|and)\s*(\d{1,4}))?", re.I)
+FILE_RE = re.compile(r"\b(?:in|of|from)\s+(?:the\s+)?(?:file|document|doc|volume|vol\.?)\s+[\"“']?([^\"”',.]+)", re.I)
+
+
 def route_without_ai(text: str) -> tuple[str, dict] | None:
     t = (text or "").lower()
+    pages = PAGES_RE.search(text or "")
+    if pages and re.search(_PQ + r"|requirement|turnover|experience", t):
+        a = int(pages.group(1))
+        b = int(pages.group(2) or a)
+        f = FILE_RE.search(text or "")
+        return "extract_criteria_from_pages", {"file": f.group(1).strip() if f else "", "start_page": min(a, b),
+                                               "end_page": max(a, b)}
     fmt = "pdf" if "pdf" in t else "xlsx" if re.search(r"excel|xlsx|sheet", t) else "docx" if re.search(r"word|docx|doc\b", t) else ""
     for name, pattern in INTENTS:
         if re.search(pattern, t):
@@ -408,7 +479,9 @@ def run_turn(turn: Turn, history: list[dict], message: str, llm) -> str:
             return HELP
         name, args = routed
         out = turn.call(name, args)
-        if name.startswith("show_") or name in ("list_tender_forms", "check_eligibility"):
+        if name == "extract_criteria_from_pages":
+            return out.split(" Shown to the user.")[0]
+        if name.startswith("show_") or name in ("list_tender_forms", "check_eligibility", "list_tender_documents"):
             return "Here it is." if not out.startswith("Error") else out
         return out
 
@@ -454,6 +527,9 @@ TOOL_PROGRESS = {
     "check_eligibility": "Checking against your company profile…",
     "prepare_checklist": "Preparing the checklist…",
     "list_saved_files": "Listing saved files…",
+    "list_tender_documents": "Listing the tender files…",
+    "read_tender_pages": "Reading those pages…",
+    "extract_criteria_from_pages": "Reading the criteria on those pages…",
 }
 
 

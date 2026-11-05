@@ -91,7 +91,11 @@ CRITERIA_SYSTEM = (
     "of Z) emit one row per alternative with the same ref suffixed (a), (b), (c). Also list key personnel "
     "and key equipment requirements, the definition of 'similar work', the financial-year cut-off date, "
     "and important notes (JV share rules, certificate requirements, escalation factors for updating "
-    "past values)."
+    "past values). Criteria may be a table or numbered paragraphs (Indian NITs often use an 'Eligibility "
+    "Criteria' / 'Qualifying requirements' list): capture EVERY criterion - financial (turnover, net worth, "
+    "solvency, bid capacity), technical / similar-work experience, registration / licences, personnel, "
+    "equipment - not only the JV conditions. JV conditions are separate rows. Pages that are scanned images "
+    "are attached as PDF pages; read them too. If the given pages hold no criteria, return an empty list."
 )
 
 
@@ -134,13 +138,128 @@ def form_codes_in(text: str) -> list[str]:
     return out
 
 
+# Words that mark qualification criteria in any tender style (tables or paragraphs).
+CRITERIA_TERMS = [
+    (re.compile(r"(average\s+)?annual\s+(financial\s+)?turnover|\bturnover\b", re.I), 3),
+    (re.compile(r"similar\s+(nature\s+of\s+)?works?", re.I), 3),
+    (re.compile(r"bid(ding)?\s+capacity|\b2\s*A\s*N\s*-\s*B\b", re.I), 3),
+    (re.compile(r"net\s*worth|solvency|liquid\s+assets|working\s+capital|credit\s+facilit", re.I), 2),
+    (re.compile(r"eligibility\s+criteria|qualif(ying|ication)\s+(criteria|requirements?)|minimum\s+eligibility", re.I), 4),
+    (re.compile(r"(completed|executed)\s+.{0,40}(works?|contracts?)", re.I), 1),
+    (re.compile(r"(last|preceding)\s+(\d+|three|five|seven)\s*(financial\s+)?years", re.I), 1),
+    (re.compile(r"(rs\.?|inr|₹)\s*\d[\d,.]*\s*(crores?|cr\b|lakhs?|lacs?)", re.I), 1),
+    (re.compile(r"work\s+done\s+certificate|completion\s+certificate|audited\s+(balance|financial)", re.I), 1),
+]
+
+
+def page_criteria_score(text: str) -> int:
+    return sum(min(3, len(rx.findall(text or ""))) * w for rx, w in CRITERIA_TERMS)
+
+
+def criteria_pages(docs, classified: list[tuple], max_pages: int = 40) -> list[tuple]:
+    """Pages that hold the qualification criteria: the sections classified as such,
+    plus any page (in any file) dense with criteria language, with a page of context.
+    Returns (doc, start, end) ranges."""
+    picked: dict[str, set[int]] = {}
+    by_name = {d.name: d for d in docs}
+    for doc, s, e in classified:
+        if e - s + 1 <= max_pages:
+            picked.setdefault(doc.name, set()).update(range(s, e + 1))
+    # Pages outside the classified sections count only if they read at least as much
+    # like criteria as the best classified page (a wrongly classified section, e.g.
+    # just the JV clause, is then overruled by the real criteria list).
+    best_in = 0
+    for doc in docs:
+        for n in picked.get(doc.name, ()):
+            best_in = max(best_in, page_criteria_score(doc.pages[n - 1].text))
+    threshold = max(9, 0.8 * best_in)
+    scored = []
+    for doc in docs:
+        inside = picked.get(doc.name, set())
+        for p in doc.pages:
+            if p.number in inside:
+                continue
+            sc = page_criteria_score(p.text)
+            if sc >= threshold:
+                scored.append((sc, doc.name, p.number))
+    scored.sort(reverse=True)
+    for sc, name, num in scored[:max_pages]:
+        doc = by_name[name]
+        pages = picked.setdefault(name, set())
+        for n in (num - 1, num, num + 1):
+            if 1 <= n <= doc.page_count:
+                pages.add(n)
+    out: list[tuple] = []
+    budget = max_pages * 2
+    for name, pages in picked.items():
+        doc = by_name[name]
+        for a, b in _ranges(sorted(pages)):
+            if budget <= 0:
+                break
+            b = min(b, a + budget - 1)
+            out.append((doc, a, b))
+            budget -= b - a + 1
+    return out
+
+
+def _ranges(nums: list[int]):
+    if not nums:
+        return
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        yield start, prev
+        start = prev = n
+    yield start, prev
+
+
+CLAUSE_RE = re.compile(r"^\s*((\d{1,2}(\.\d{1,2}){0,2})[.)]?|\(?[a-z]\)|\(?[ivx]{1,4}\)|[a-z]\.)\s+(?=\S)", re.I)
+
+
+def paragraph_criteria(doc: Document, start: int, end: int) -> list[dict]:
+    """Numbered paragraphs that state criteria ("1. Average annual turnover ... Rs 45 Cr")."""
+    lines: list[tuple[int, str]] = []
+    for page in doc.pages[start - 1:end]:
+        for ln in page.text.splitlines():
+            if ln.strip():
+                lines.append((page.number, ln.strip()))
+    clauses: list[tuple[str, int, list[str]]] = []
+    for num, ln in lines:
+        if ln.count(" | ") >= 2:  # a table row as DOCX text: read from the table instead
+            continue
+        m = CLAUSE_RE.match(ln)
+        if m and len(ln) > 12:
+            clauses.append((m.group(1).strip("()."), num, [ln[m.end():]]))
+        elif clauses:
+            clauses[-1][2].append(ln)
+    rows = []
+    for ref, page_no, body in clauses:
+        text = " ".join(body)
+        text = re.sub(r"\s+", " ", text).strip()
+        if page_criteria_score(text) < 3 or len(text) < 30:
+            continue
+        subject = re.split(r"[:–—-]\s|\.\s", text, maxsplit=1)[0][:80] if len(text) > 80 else ""
+        m = INR_RE.search(text)
+        rows.append({
+            "ref": ref, "category": "", "subject": subject, "requirement": text[:1500],
+            "single_entity": "", "jv_all_parties": "", "jv_each_member": "", "jv_one_member": "",
+            "forms": form_codes_in(text), "metric": _guess_metric(text),
+            "threshold_inr_cr": _to_crore(m.group(1), m.group(2)) if m else 0.0,
+            "threshold_count": 0, "period_years": _period_years(text), "page": page_no,
+        })
+    return rows
+
+
 def _table_kind(table: list[list[str]]) -> str:
     head = " ".join(" ".join(r) for r in table[:3]).lower()
     if ("designation" in head or "position" in head) and "qualification" in head:
         return "personnel"
     if "equipment" in head and ("no. of units" in head or "minimum" in head or "type" in head):
         return "equipment"
-    if "requirement" in head and ("form" in head or "documentation" in head or "single entity" in head):
+    if re.search(r"requirement|criteri|qualif|eligib|particulars", head) and re.search(
+            r"form|document|single entity|joint venture|\bjv\b|evidence|submit|complian|remarks|annex", head):
         return "criteria"
     return ""
 
@@ -188,6 +307,25 @@ def heuristic_criteria(doc: Document, start: int, end: int) -> dict:
                             "page": page.number,
                         }
                     )
+    # Criteria written as numbered paragraphs (common in Indian NITs) - only where the
+    # tables didn't already give the criteria.
+    if len(rows_out) >= 3:
+        return {
+            "criteria": rows_out,
+            "personnel": personnel,
+            "equipment": equipment,
+            "similar_work_definition": "",
+            "financial_year_cutoff": "",
+            "notes": ["Extracted without AI (no Claude API key configured): verify against the document."],
+        }
+    norm = lambda x: re.sub(r"\W+", "", (x or "").lower())  # noqa: E731
+    known = [norm(r["requirement"])[:60] for r in rows_out if norm(r["requirement"])]
+    for row in paragraph_criteria(doc, start, end):
+        text = norm(row["requirement"])
+        if any(k and (k[:40] in text or text[:40] in k) for k in known):
+            continue  # already read from a table
+        known.append(text[:60])
+        rows_out.append(row)
     return {
         "criteria": rows_out,
         "personnel": personnel,
@@ -229,14 +367,28 @@ def extract_criteria(
                 "financial_year_cutoff": "", "notes": []}
     if llm is not None and llm.available:
         parts = []
+        blocks: list[dict] = []
         for doc, s, e in sources:
-            parts.append(f"===== FILE: {doc.name} (pages {s}-{e}) =====\n" + doc.text_range(s, e))
+            body = doc.text_range(s, e)
+            chars = sum(len(p.text.strip()) for p in doc.pages[s - 1:e])
+            if doc.ext == ".pdf" and chars < 300 * (e - s + 1):
+                # Scanned (or nearly empty) pages: let Claude read the page images.
+                from .llm import pdf_pages_block
+
+                try:
+                    blocks.append(pdf_pages_block(doc.path, s, min(e, s + 39)))
+                    parts.append(f"===== FILE: {doc.name} (pages {s}-{e}) is attached as PDF pages (scanned) =====")
+                    continue
+                except Exception as ex:
+                    log(f"Couldn't attach scanned pages of {doc.name}: {ex}")
+            parts.append(f"===== FILE: {doc.name} (pages {s}-{e}) =====\n" + body)
         text = "\n\n".join(parts)
         if len(text) > 600_000:
             log("Criteria section is very large; sending first 600k characters.")
             text = text[:600_000]
+        content = blocks + [{"type": "text", "text": text}] if blocks else text
         try:
-            data = llm.json_call(CRITERIA_SYSTEM, text, CRITERIA_SCHEMA, effort="medium", max_tokens=64000)
+            data = llm.json_call(CRITERIA_SYSTEM, content, CRITERIA_SCHEMA, effort="medium", max_tokens=64000)
             data["source"] = "ai"
             return data
         except Exception as e:

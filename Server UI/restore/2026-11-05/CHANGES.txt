@@ -22,3 +22,6 @@ Backed up: server/api_server.py, server/requirements.txt, server/API_CHANGES.md
   - server/Dockerfile (backed up): LibreOffice headless Writer + Calc and fonts, for old .doc/.odt/.ods and PDF output.
 ----
 03:03 2026-11-05 (Bid Agent session) - API_CHANGES.md section 5 rewritten for the chat agent (chat / files / prep-files routes, Drive layout, index file); section 4 to-do lines updated.
+----
+04:31 2026-11-05 (Bid Agent session) - Request: agent missed the qualification criteria of 2026_MMRDA_1345405_1 (only JV rules), even with pages given.
+- server/bid_agent/: 'Eligibility Criteria' (Indian NIT heading) now counts as qualification criteria; criteria pages are also found by content (turnover / similar work / bid capacity / crore amounts) when they beat the classified section; numbered-paragraph criteria are read; scanned pages are sent to Claude as page images; chat tools list_tender_documents / read_tender_pages / extract_criteria_from_pages use the pages the user names and keep the result; analyses from the old pipeline are redone (pipeline_version 2).

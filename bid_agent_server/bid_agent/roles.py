@@ -30,10 +30,13 @@ ROLES: dict[str, dict] = {
     },
     "qualification_criteria": {
         "label": "Qualification & Evaluation Criteria",
+        # Indian NITs (MMRDA, PWD, CPWD ...) put these under "Eligibility Criteria".
         "aliases": [r"qualification\s+and\s+evaluation\s+criteria", r"evaluation\s+and\s+qualification\s+criteria",
                     r"qualification\s+criteria", r"eligibility\s+and\s+qualification", r"minimum\s+eligibility",
                     r"pre-?qualification\s+(criteria|requirements?)", r"\bPQ\s+criteria", r"\bIFCQR\b",
-                    r"evaluation\s+criteria"],
+                    r"evaluation\s+criteria", r"eligibility\s+criteria", r"eligibility\s+conditions?",
+                    r"qualif(ying|ication)\s+requirements?", r"minimum\s+qualif\w*", r"criteria\s+for\s+eligibility",
+                    r"conditions?\s+of\s+eligibility", r"technical\s+eligibility", r"financial\s+eligibility"],
     },
     "bidding_forms": {
         "label": "Bidding Forms / Formats",
@@ -43,8 +46,8 @@ ROLES: dict[str, dict] = {
                     r"proforma"],
     },
     "eligibility": {
-        "label": "Eligible Countries / Eligibility",
-        "aliases": [r"eligibility\s+criteria", r"eligible\s+countries", r"source\s+countries"],
+        "label": "Eligible Countries (funding agency)",
+        "aliases": [r"eligible\s+countries", r"source\s+countries", r"eligible\s+goods"],
     },
     "fraud_policy": {
         "label": "Fraud & Corruption / Funding Agency Policy",

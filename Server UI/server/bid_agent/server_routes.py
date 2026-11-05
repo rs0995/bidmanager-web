@@ -298,15 +298,48 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
 
             def get_result() -> dict:
                 a = store.get_analysis(owner, tid)
-                if a and a.get("status") == "completed" and a.get("result"):
-                    return a["result"]
+                res = (a or {}).get("result") or {}
+                if a and a.get("status") == "completed" and res and \
+                        res.get("pipeline_version", 1) >= agent.PIPELINE_VERSION:
+                    return res
                 progress("Reading the tender documents (the first time takes a minute)…")
-                overrides = ((a or {}).get("result") or {}).get("overrides") or {}
-                return analyse(owner, tender, overrides, lambda m: progress(m))
+                return analyse(owner, tender, res.get("overrides") or {}, lambda m: progress(m))
 
-            turn = chat.Turn(ws, get_result, lambda: store.get_company_profile(owner), progress)
+            class Pages:
+                """The tender's files, copied once per turn for page-level requests."""
+
+                def __init__(self):
+                    self.dir = None
+
+                def _src(self) -> str:
+                    if self.dir is None:
+                        self.dir = tempfile.mkdtemp(prefix="bidpages_")
+                        if not materialize(tender, self.dir):
+                            raise RuntimeError("No downloaded documents are available for this tender yet.")
+                    return self.dir
+
+                def read(self, file: str, start: int, end: int):
+                    return agent.read_pages(self._src(), file, start, end)
+
+                def criteria(self, file: str, start: int, end: int):
+                    return agent.criteria_from_pages(self._src(), file, start, end, store, make_llm(progress), progress)
+
+                def cleanup(self):
+                    if self.dir:
+                        shutil.rmtree(self.dir, ignore_errors=True)
+
+            pages = Pages()
+
+            def save_result(res: dict) -> None:
+                store.save_analysis(owner, tid, status="completed", result=res, error="")
+
+            turn = chat.Turn(ws, get_result, lambda: store.get_company_profile(owner), progress,
+                             pages=pages, save_result=save_result)
             history = store.get_chat(owner, tid)["messages"][:-1]
-            reply = chat.run_turn(turn, history, text, make_llm(lambda m: None))
+            try:
+                reply = chat.run_turn(turn, history, text, make_llm(lambda m: None))
+            finally:
+                pages.cleanup()
             msg = {"role": "assistant", "text": reply, "cards": turn.cards}
         except Exception as e:
             msg = {"role": "assistant", "text": f"Sorry, that didn’t work: {e}", "cards": [], "error": True}
