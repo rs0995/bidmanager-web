@@ -3,3 +3,13 @@
 Backed up: BidManagerControl.jsx
 - BidManagerControl.jsx: new BidAgentPanel + NAV entry 'BID' (calls /admin/bid-agent/*; shows 'not installed' when the server has no Bid Agent yet).
 - Server part is bid_agent_server/ (not applied to server/ by this session).
+----
+01:47 Bid Agent installed (bid_agent_server/install.py)
+  - server/bid_agent/ (new package: Bid Agent pipeline + /client bid-pack and /admin/bid-agent routes)
+  - server/api_server.py: mount bid_agent routers before the SPA catch-all
+  - server/requirements.txt: anthropic>=2.5.0, pdfplumber>=0.11.0, pypdf>=5.0.0, python-docx>=1.1.0, openpyxl>=3.1.0
+----
+01:48 2026-11-05 (Bid Agent session) - Request: apply the Bid Agent to the server.
+Backed up: server/api_server.py, server/requirements.txt, server/API_CHANGES.md
+- server/API_CHANGES.md: new section 5 (bid packs, READY) + to-do items per app in section 4.
+- bid_agent_server/install.py now keeps api_server.py's UTF-8 byte-order mark.

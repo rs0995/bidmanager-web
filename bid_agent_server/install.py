@@ -87,8 +87,10 @@ def main() -> int:
     changes.append("server/bid_agent/ (new package: Bid Agent pipeline + /client bid-pack and /admin/bid-agent routes)")
 
     # 2. api_server.py
-    with open(api, encoding="utf-8-sig") as f:
-        src = f.read()
+    with open(api, "rb") as f:
+        raw = f.read()
+    bom = raw.startswith(b"\xef\xbb\xbf")  # keep the file's byte-order mark as it was
+    src = raw.decode("utf-8-sig")
     if MARKER in src:
         print("skip    api_server.py already mounts the Bid Agent")
     else:
@@ -100,7 +102,7 @@ def main() -> int:
         backup(api, day_dir, dry)
         new = src[: idx + 1] + SNIPPET + src[idx + 1:]
         if not dry:
-            with open(api, "w", encoding="utf-8", newline="") as f:
+            with open(api, "w", encoding="utf-8-sig" if bom else "utf-8", newline="") as f:
                 f.write(new)
         changes.append("server/api_server.py: mount bid_agent routers before the SPA catch-all")
 

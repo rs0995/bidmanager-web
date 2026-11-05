@@ -7303,6 +7303,16 @@ if _job_execution_enabled():
     _start_scheduler()
 else:
     _load_and_recover_jobs(recover_running=False, submit_queued=False)
+# -- Bid Agent (bid packs: section map, qualification criteria, bid forms) --
+try:
+    import bid_agent.server_routes as _bid_agent_routes
+
+    _bid_client_router, _bid_admin_router = _bid_agent_routes.create_routers(require_admin_key)
+    app.include_router(_bid_client_router)
+    app.include_router(_bid_admin_router)
+except Exception as _bid_agent_error:  # the rest of the API must keep working
+    print(f"[bid-agent] disabled: {_bid_agent_error}")
+
 _mount_frontend_if_available()
 
 if __name__ == "__main__":
