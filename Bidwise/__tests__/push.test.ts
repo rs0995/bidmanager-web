@@ -101,20 +101,14 @@ describe('where a tapped notification goes', () => {
       name: 'NewTenders',
       params: { org: 'PWD' },
     });
-    expect(routeForPush({ thread: 'org' })).toEqual({
-      name: 'Tabs',
-      params: { screen: 'Alerts' },
-    });
+    expect(routeForPush({ thread: 'org' })).toEqual({ name: 'Alerts' });
   });
 
   it('opens the CAPTCHA screen, and Alerts for anything else', () => {
     expect(routeForPush({ thread: 'captcha', captchaId: 'c1' })).toEqual({
       name: 'Captcha',
     });
-    expect(routeForPush({ thread: 'other' })).toEqual({
-      name: 'Tabs',
-      params: { screen: 'Alerts' },
-    });
+    expect(routeForPush({ thread: 'other' })).toEqual({ name: 'Alerts' });
     expect(routeForPush(null)).toBeNull();
   });
 });

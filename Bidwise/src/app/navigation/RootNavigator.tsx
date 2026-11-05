@@ -3,7 +3,10 @@ import { DefaultTheme, NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { useSession } from '../../fixtures/session';
 import { useTheme } from '../../theme';
+import { AlertsScreen } from '../screens/AlertsScreen';
 import { ArchiveScreen } from '../screens/ArchiveScreen';
+import { BidAgentHubScreen } from '../screens/BidAgentHubScreen';
+import { BidAgentSettingsScreen } from '../screens/BidAgentSettingsScreen';
 import { BidAgentChatScreen } from '../screens/BidAgentChatScreen';
 import { CaptchaScreen } from '../screens/CaptchaScreen';
 import { DetailScreen } from '../screens/DetailScreen';
@@ -33,6 +36,8 @@ const Bookmarks = gated('bookmarks', BookmarksScreen);
 const ClosingThisWeek = gated('bookmarks', ClosingThisWeekScreen);
 const ArchivedProjects = gated('projects', ArchivedProjectsScreen);
 const PortalSearch = gated('portal_search', PortalSearchScreen);
+const BidAgentHub = gated('projects', BidAgentHubScreen);
+const BidAgentSettings = gated('projects', BidAgentSettingsScreen);
 
 export function RootNavigator() {
   const t = useTheme();
@@ -63,6 +68,13 @@ export function RootNavigator() {
             <Stack.Screen name="Archive" component={Archive} />
             <Stack.Screen name="Captcha" component={CaptchaScreen} />
             <Stack.Screen name="ZipContents" component={ZipContentsScreen} />
+            <Stack.Screen name="Alerts" component={AlertsScreen} />
+            <Stack.Screen
+              name="BidAgentHub"
+              component={BidAgentHub}
+              options={{ presentation: 'modal' }}
+            />
+            <Stack.Screen name="BidAgentSettings" component={BidAgentSettings} />
             <Stack.Screen
               name="BidAgentChat"
               component={BidAgentChatScreen}

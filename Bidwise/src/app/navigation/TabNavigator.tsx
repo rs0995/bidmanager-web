@@ -3,7 +3,6 @@ import {
   BottomTabBarProps,
   createBottomTabNavigator,
 } from '@react-navigation/bottom-tabs';
-import { AlertsScreen } from '../screens/AlertsScreen';
 import { DashboardScreen } from '../screens/DashboardScreen';
 import { MoreScreen } from '../screens/MoreScreen';
 import { ProjectsScreen } from '../screens/ProjectsScreen';
@@ -39,7 +38,6 @@ export function TabNavigator() {
       {access.projects ? (
         <Tab.Screen name="Projects" component={ProjectsScreen} />
       ) : null}
-      <Tab.Screen name="Alerts" component={AlertsScreen} />
       <Tab.Screen name="More" component={MoreScreen} />
     </Tab.Navigator>
   );

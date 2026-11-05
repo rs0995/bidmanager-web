@@ -4,23 +4,22 @@ import {
   LayoutChangeEvent,
   Pressable,
   StyleSheet,
-  Text,
   View,
 } from 'react-native';
 import { BlurView } from '@react-native-community/blur';
 import { BottomTabBarProps } from '@react-navigation/bottom-tabs';
-import { Bell, Files, Folder, LayoutGrid, Menu } from 'lucide-react-native';
+import { Files, Folder, LayoutGrid, Menu, Sparkles } from 'lucide-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { TAB_BAR_HEIGHT } from '../../components/ui/Screen';
 import { useReducedMotion } from '../../components/ui/motion';
-import { useAlerts } from '../../fixtures/alerts';
-import { fonts, useTheme } from '../../theme';
+import { useBidAgent } from '../../data/bidAgent';
+import { useAccess } from '../../lib/account';
+import { useTheme } from '../../theme';
 
 const ICONS = {
   Dashboard: LayoutGrid,
   Tenders: Files,
   Projects: Folder,
-  Alerts: Bell,
   More: Menu,
 } as const;
 
@@ -28,20 +27,26 @@ const LABELS = {
   Dashboard: 'Overview',
   Tenders: 'Tenders',
   Projects: 'Projects',
-  Alerts: 'Alerts',
   More: 'More',
 } as const;
 
 const PAD = 7;
 const GAP = 3;
+/** The centre Bid Agent button: its slot in the bar and the raised circle. */
+const CENTER_W = 64;
+const CENTER_SIZE = 56;
+const RING = 4;
 
 /**
  * Icon-only floating island spanning the full width, with a slim side margin. The
- * highlight behind the current tab slides to the tab you pick.
+ * highlight behind the current tab slides to the tab you pick. In the middle sits a
+ * raised round Bid Agent button (not a tab): it opens the Bid Agent hub. Alerts are
+ * reached from the dashboard bell.
  */
 export function TabBar({ state, navigation }: BottomTabBarProps) {
   const t = useTheme();
-  const { unread } = useAlerts();
+  const access = useAccess();
+  const agentBusy = useBidAgent().useBusy();
   const insets = useSafeAreaInsets();
   const glass = t.isGlass;
   const reduced = useReducedMotion();
@@ -60,9 +65,19 @@ export function TabBar({ state, navigation }: BottomTabBarProps) {
     }).start();
   }, [state.index, pos, reduced]);
   const count = state.routes.length;
+  const center = access.projects; // the agent works on tenders in Projects' section
+  const mid = Math.floor(count / 2);
+  const centerSpace = center ? CENTER_W + GAP : 0;
   // The island has a 1pt border: the tabs share the width inside it.
   const tabW =
-    width > 0 ? (width - 2 - PAD * 2 - GAP * (count - 1)) / count : 0;
+    width > 0
+      ? (width - 2 - PAD * 2 - GAP * (count - 1) - centerSpace) / count
+      : 0;
+  const xs = state.routes.map(
+    (_r, i) => i * (tabW + GAP) + (center && i >= mid ? centerSpace : 0),
+  );
+  const inputRange = count > 1 ? xs.map((_x, i) => i) : [0, 1];
+  const outputRange = count > 1 ? xs : [0, 0];
   const onLayout = (e: LayoutChangeEvent) =>
     setWidth(e.nativeEvent.layout.width);
   const surface = {
@@ -106,10 +121,7 @@ export function TabBar({ state, navigation }: BottomTabBarProps) {
                     : t.colors.accentWash,
                   transform: [
                     {
-                      translateX: pos.interpolate({
-                        inputRange: [0, Math.max(1, count - 1)],
-                        outputRange: [0, (tabW + GAP) * Math.max(1, count - 1)],
-                      }),
+                      translateX: pos.interpolate({ inputRange, outputRange }),
                     },
                   ],
                 },
@@ -117,7 +129,7 @@ export function TabBar({ state, navigation }: BottomTabBarProps) {
             />
           </View>
         ) : null}
-        {state.routes.map((route, index) => {
+        {state.routes.flatMap((route, index) => {
           const focused = state.index === index;
           const name = route.name as keyof typeof ICONS;
           const Icon = ICONS[name];
@@ -130,7 +142,7 @@ export function TabBar({ state, navigation }: BottomTabBarProps) {
             if (!focused && !event.defaultPrevented)
               navigation.navigate(route.name);
           };
-          return (
+          const tab = (
             <Pressable
               key={route.key}
               accessibilityRole="tab"
@@ -144,33 +156,95 @@ export function TabBar({ state, navigation }: BottomTabBarProps) {
                 color={focused ? t.colors.accent : t.colors.muted}
                 strokeWidth={1.8}
               />
-              {name === 'Alerts' && unread > 0 ? (
-                <View
-                  accessibilityLabel={`${unread} unread alerts`}
-                  style={[
-                    styles.badge,
-                    {
-                      backgroundColor: t.colors.crit,
-                      borderColor: glass
-                        ? t.glass.fillStrong
-                        : t.colors.surface,
-                    },
-                  ]}
-                >
-                  <Text style={styles.badgeText}>
-                    {unread > 9 ? '9+' : unread}
-                  </Text>
-                </View>
-              ) : null}
             </Pressable>
           );
+          return center && index === mid
+            ? [
+                <CenterButton
+                  key="bid-agent"
+                  busy={agentBusy}
+                  onPress={() =>
+                    (navigation.navigate as (name: string) => void)(
+                      'BidAgentHub',
+                    )
+                  }
+                />,
+                tab,
+              ]
+            : [tab];
         })}
       </View>
     </View>
   );
 }
 
+function CenterButton({
+  onPress,
+  busy,
+}: {
+  onPress: () => void;
+  busy: boolean;
+}) {
+  const t = useTheme();
+  // The ring takes the page colour so the circle sits in a notch of the island.
+  return (
+    <View style={styles.centerSlot}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="Bid Agent"
+        accessibilityHint="Ask the Bid Agent about any tender"
+        onPress={onPress}
+        style={({ pressed }) => [
+          styles.center,
+          {
+            backgroundColor: t.colors.accent,
+            borderColor: t.colors.bg,
+            transform: [{ scale: pressed ? 0.94 : 1 }],
+          },
+          t.shadow.md,
+        ]}
+      >
+        <Sparkles size={23} color={t.colors.onAccent} strokeWidth={2} />
+        {busy ? (
+          <View
+            accessibilityLabel="The Bid Agent is working"
+            style={[
+              styles.busyDot,
+              { backgroundColor: t.colors.good, borderColor: t.colors.accent },
+            ]}
+          />
+        ) : null}
+      </Pressable>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
+  centerSlot: {
+    width: CENTER_W,
+    height: 46,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  center: {
+    position: 'absolute',
+    top: (46 - CENTER_SIZE) / 2 - 16,
+    width: CENTER_SIZE,
+    height: CENTER_SIZE,
+    borderRadius: CENTER_SIZE / 2,
+    borderWidth: RING,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  busyDot: {
+    position: 'absolute',
+    top: 7,
+    right: 7,
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    borderWidth: 2,
+  },
   wrap: { position: 'absolute', left: 10, right: 10 },
   island: {
     flexDirection: 'row',
@@ -206,17 +280,4 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  badge: {
-    position: 'absolute',
-    top: 6,
-    left: '54%',
-    minWidth: 16,
-    height: 16,
-    paddingHorizontal: 3,
-    borderRadius: 8,
-    borderWidth: 2,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  badgeText: { color: '#ffffff', fontFamily: fonts.bold, fontSize: 8.5 },
 });

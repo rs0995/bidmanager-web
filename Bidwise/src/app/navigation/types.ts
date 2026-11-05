@@ -1,3 +1,5 @@
+import type { NavigatorScreenParams } from '@react-navigation/native';
+
 export type TabParamList = {
   Dashboard: undefined;
   /** Optional preset, used by the Dashboard tiles. */
@@ -8,7 +10,6 @@ export type TabParamList = {
       }
     | undefined;
   Projects: undefined;
-  Alerts: undefined;
   More: undefined;
 };
 
@@ -20,7 +21,13 @@ export type RootStackParamList = {
   Organisation: undefined;
   /** Search a tender ID on a NIC portal (the portal_search section). */
   PortalSearch: undefined;
-  Tabs: undefined;
+  Tabs: NavigatorScreenParams<TabParamList> | undefined;
+  /** Alerts (the dashboard bell, notification taps). */
+  Alerts: undefined;
+  /** The Bid Agent hub (the tab bar's centre button): find a tender, recent chats. */
+  BidAgentHub: undefined;
+  /** The agent's instructions, learned notes, reference documents and templates. */
+  BidAgentSettings: undefined;
   TenderDetail: { id: string };
   /** The same detail screen, opened from Projects. */
   ProjectDetail: { id: string };

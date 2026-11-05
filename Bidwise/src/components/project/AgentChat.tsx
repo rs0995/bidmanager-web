@@ -85,7 +85,15 @@ export function ChatMessages({ chat, onOpenFile }: { chat: AgentChat; onOpenFile
       {chat.messages.map(m => (
         <Message key={m.id} m={m} onOpenFile={onOpenFile} />
       ))}
-      {chat.working ? (
+      {chat.working && chat.partial ? (
+        <View style={[styles.msg, styles.theirs]}>
+          <View style={[styles.bubble, { backgroundColor: t.colors.surfaceSunk }]}>
+            <Text selectable style={[styles.bubbleText, { color: t.colors.ink }]}>
+              {chat.partial}
+            </Text>
+          </View>
+        </View>
+      ) : chat.working ? (
         <View style={styles.progress}>
           <ActivityIndicator size="small" color={t.colors.accent} />
           <Text style={[styles.progressText, { color: t.colors.muted }]}>{chat.progress || 'Working…'}</Text>

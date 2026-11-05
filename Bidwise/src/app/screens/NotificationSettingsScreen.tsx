@@ -230,7 +230,7 @@ export function NotificationSettingsScreen() {
         <SettingsRow
           icon={icon(FolderPlus)}
           title="New projects"
-          sub="Show an alert in the Alerts tab when someone else adds a project (another device or a member of your organisation). Not sent as a notification."
+          sub="Show an alert in Alerts when someone else adds a project (another device or a member of your organisation). Not sent as a notification."
           right={toggle(
             settings.projectAlerts,
             v => set({ projectAlerts: v }),
@@ -296,7 +296,7 @@ export function NotificationSettingsScreen() {
         The server sends these as they happen, even when the app is closed;
         closing reminders go out once a day between 10:00 and 21:00. They follow
         your account, so the same choices apply in BM Pro. New projects only
-        appears in the Alerts tab. All options above can be on together.
+        appears in Alerts. All options above can be on together.
       </Text>
     </Screen>
   );

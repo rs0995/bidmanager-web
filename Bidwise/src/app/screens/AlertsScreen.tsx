@@ -2,11 +2,10 @@ import React, { useMemo, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { useAccess } from '../../lib/account';
-import type { CompositeNavigationProp } from '@react-navigation/native';
-import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import {
   CheckCheck,
+  ChevronLeft,
   DownloadCloud,
   ChevronRight,
   CircleCheck,
@@ -16,17 +15,21 @@ import {
   FolderPlus,
   Paperclip,
 } from 'lucide-react-native';
-import { Card, PageTitle, Screen, Segmented } from '../../components/ui';
+import {
+  Card,
+  IconButton,
+  PageTitle,
+  Screen,
+  Segmented,
+} from '../../components/ui';
 import { FadeSwitch } from '../../components/ui/motion';
 import { AlertItem, AlertKind, useAlerts } from '../../fixtures/alerts';
 import { ALERT_TITLES, groupAlerts } from '../../lib/alertGroups';
 import { fonts, useTheme } from '../../theme';
-import type { RootStackParamList, TabParamList } from '../navigation/types';
+import type { RootStackParamList } from '../navigation/types';
 
-type Nav = CompositeNavigationProp<
-  BottomTabNavigationProp<TabParamList, 'Alerts'>,
-  NativeStackNavigationProp<RootStackParamList>
->;
+// Opened from the dashboard bell (and notification taps); not a tab.
+type Nav = NativeStackNavigationProp<RootStackParamList, 'Alerts'>;
 
 const ICONS: Record<AlertKind, typeof Clock3> = {
   deadline: Clock3,
@@ -126,11 +129,20 @@ export function AlertsScreen() {
     // Several new tenders under one organisation: a page of just those tenders.
     else if (a.kind === 'new' && a.newTenderIds?.length)
       navigation.navigate('NewTenders', { alertId: a.id });
-    else if (access.active) navigation.navigate('Tenders', { view: 'tenders' });
+    else if (access.active)
+      navigation.navigate('Tabs', {
+        screen: 'Tenders',
+        params: { view: 'tenders' },
+      });
   };
 
   return (
-    <Screen tabBar>
+    <Screen>
+      <View style={styles.head}>
+        <IconButton label="Back" onPress={() => navigation.goBack()}>
+          <ChevronLeft size={22} color={t.colors.ink} />
+        </IconButton>
+      </View>
       <PageTitle
         sub="Deadlines, updates and bid preparation."
         right={
@@ -199,6 +211,7 @@ export function AlertsScreen() {
 }
 
 const styles = StyleSheet.create({
+  head: { marginTop: 4, marginBottom: 14, flexDirection: 'row' },
   markAll: { fontFamily: fonts.semibold, fontSize: 12, marginBottom: 4 },
   group: {
     fontFamily: fonts.semibold,

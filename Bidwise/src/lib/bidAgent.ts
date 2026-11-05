@@ -39,6 +39,8 @@ export type ChatState = {
   next: number;
   status: 'idle' | 'working';
   progress: string;
+  /** The reply as it is being written (while working). */
+  partial?: string;
   ai_enabled: boolean;
   suggestions: string[];
 };
@@ -51,6 +53,39 @@ export type AgentFile = {
   checklist_item_id: string | null;
   size: number;
   created_at: number;
+};
+
+/** A tender the account chatted with the agent about (GET /client/bid-agent/recent). */
+export type RecentChat = {
+  id: number;
+  tender_id: string;
+  title: string;
+  organisation: string;
+  closing_date: string;
+  last: string;
+  count: number;
+  updated_at: number;
+};
+
+/** Something the agent learned from a correction ("remember …"). */
+export type Learning = {
+  id: number;
+  employer_key: string;
+  text: string;
+  source: string;
+  tender_id: number | null;
+  created_at: number;
+  active: number;
+};
+
+/** A reference document (certificate, standard format) the agent can attach. */
+export type ReferenceDoc = {
+  file_id: number;
+  name: string;
+  label: string;
+  created_at: number;
+  size: number;
+  type: string;
 };
 
 const base = (tenderId: string) => `/client/tenders/${encodeURIComponent(tenderId)}/bid-agent`;
@@ -77,6 +112,30 @@ export const bidAgentApi = {
   },
   deletePrep: (tenderId: string, fileId: number) =>
     request(`${base(tenderId)}/prep-files/${Number(fileId)}`, { method: 'DELETE' }),
+  recent: () => request<{ items: RecentChat[] }>('/client/bid-agent/recent'),
+  instructions: () => request<{ text: string; can_edit: boolean }>('/client/bid-agent/instructions'),
+  saveInstructions: (text: string) =>
+    request<{ text: string; can_edit: boolean }>('/client/bid-agent/instructions', { method: 'PUT', body: { text } }),
+  learnings: () => request<{ items: Learning[]; can_edit: boolean }>('/client/bid-agent/learnings'),
+  setLearning: (id: number, patch: { active?: boolean; text?: string }) =>
+    request<{ items: Learning[] }>(`/client/bid-agent/learnings/${Number(id)}`, { method: 'PATCH', body: patch }),
+  deleteLearning: (id: number) =>
+    request<{ items: Learning[] }>(`/client/bid-agent/learnings/${Number(id)}`, { method: 'DELETE' }),
+  references: () => request<{ items: ReferenceDoc[] }>('/client/bid-agent/references'),
+  async uploadReference(abs: string, name: string, type?: string | null): Promise<ReferenceDoc[]> {
+    const token = getToken();
+    if (!token) throw new AuthError('Sign in to continue.');
+    const { status, json } = await files.upload(
+      `${BACKEND_URL}/client/bid-agent/references`,
+      { 'x-client-key': token },
+      {},
+      { abs, name, type },
+    );
+    if (status < 200 || status >= 300) throw new Error(`Upload failed (HTTP ${status}).`);
+    return ((json as { items?: ReferenceDoc[] })?.items ?? []) as ReferenceDoc[];
+  },
+  deleteReference: (fileId: number) =>
+    request<{ items: ReferenceDoc[] }>(`/client/bid-agent/references/${Number(fileId)}`, { method: 'DELETE' }),
   /** Downloads a server file (project-files) to `rel` under Documents; returns the path. */
   async download(fileId: number, rel: string): Promise<string> {
     const { url } = await api.projectFileDownload(fileId);

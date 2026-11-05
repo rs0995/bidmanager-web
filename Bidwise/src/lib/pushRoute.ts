@@ -9,7 +9,7 @@ export type PushRoute =
   | { name: 'TenderDetail'; params: { id: string } }
   | { name: 'NewTenders'; params: { org: string } }
   | { name: 'OrgTenders'; params: { org: string } }
-  | { name: 'Tabs'; params: { screen: 'Alerts' } }
+  | { name: 'Alerts' }
   | { name: 'Captcha' };
 
 export function routeForPush(
@@ -30,14 +30,14 @@ export function routeForPush(
     case 'org': {
       return p.orgName
         ? { name: 'NewTenders', params: { org: p.orgName } }
-        : { name: 'Tabs', params: { screen: 'Alerts' } };
+        : { name: 'Alerts' };
     }
     case 'captcha':
       return { name: 'Captcha' };
     default:
-      // Anything else that names a tender opens it; otherwise the Alerts tab.
+      // Anything else that names a tender opens it; otherwise Alerts.
       return tenderId
         ? { name: 'TenderDetail', params: { id: tenderId } }
-        : { name: 'Tabs', params: { screen: 'Alerts' } };
+        : { name: 'Alerts' };
   }
 }

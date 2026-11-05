@@ -94,6 +94,59 @@ const tab = (r: Renderer, label: string) =>
       n.props.accessibilityLabel === label,
   )[0];
 
+describe('bid agent from the tab bar', () => {
+  it('opens the hub from the centre button, finds a tender and chats about it', async () => {
+    const r = await mount();
+    const tabs = r.root
+      .findAll(n => isPressable(n) && n.props.accessibilityRole === 'tab')
+      .map(n => n.props.accessibilityLabel);
+    expect(tabs).toEqual(['Overview', 'Tenders', 'Projects', 'More']);
+    await press(pressable(r, 'Bid Agent'));
+    expect(screenText(r)).toContain('Pick a tender to ask about it.');
+    expect(screenText(r)).toContain('No chats yet.');
+    const input = r.root.findAll(
+      n =>
+        n.props.accessibilityLabel === 'Tender ID or title' &&
+        n.props.onChangeText,
+    )[0];
+    await ReactTestRenderer.act(async () => {
+      input.props.onChangeText('road');
+    });
+    await ReactTestRenderer.act(async () => {
+      await new Promise(res => setTimeout(res, 450));
+    });
+    const hit = r.root.findAll(
+      n =>
+        isPressable(n) &&
+        String(n.props.accessibilityLabel ?? '').startsWith('Chat about'),
+    )[0];
+    expect(hit).toBeDefined();
+    await press(hit);
+    await press(byText(r, 'Show the prequalification'));
+    await ReactTestRenderer.act(async () => {
+      await new Promise(res => setTimeout(res, 700));
+    });
+    expect(screenText(r)).toContain('Prequalification criteria');
+    await press(last(r, 'Close the chat'));
+    expect(screenText(r)).not.toContain('No chats yet.');
+  });
+
+  it('shows the training screen: rules, learned notes and reference documents', async () => {
+    const r = await mount();
+    await press(pressable(r, 'Bid Agent'));
+    await press(last(r, 'Bid Agent settings and training'));
+    expect(screenText(r)).toContain('Standing instructions');
+    await press(byText(r, 'Learned'));
+    expect(screenText(r)).toContain('GMRC tenders: the qualification criteria are in Section III.');
+    await press(pressable(r, 'Forget'));
+    expect(screenText(r)).not.toContain('GMRC tenders: the qualification');
+    await press(byText(r, 'Docs'));
+    expect(screenText(r)).toContain('GST registration certificate.pdf');
+    await press(byText(r, 'Add a document'));
+    expect(screenText(r)).toContain('Bank solvency certificate.pdf');
+  });
+});
+
 describe('bidwise flows', () => {
   it('signs in and lands on the Mobile App EH dashboard', async () => {
     const r = await mount(false);
@@ -108,7 +161,7 @@ describe('bidwise flows', () => {
     ].forEach(s => expect(out).toContain(s));
   });
 
-  it('has an icon-only island with five tabs', async () => {
+  it('has an icon-only island with four tabs (Alerts is behind the bell)', async () => {
     const r = await mount();
     const tabs = r.root.findAll(
       n => typeof n.type === 'string' && n.props.accessibilityRole === 'tab',
@@ -117,7 +170,6 @@ describe('bidwise flows', () => {
       'Overview',
       'Tenders',
       'Projects',
-      'Alerts',
       'More',
     ]);
   });
@@ -272,7 +324,9 @@ describe('bidwise flows', () => {
 
   it('filters alerts and marks all read', async () => {
     const r = await mount();
-    await press(tab(r, 'Alerts'));
+    // No Alerts tab: the dashboard bell opens Alerts.
+    expect(tab(r, 'Alerts')).toBeUndefined();
+    await press(pressable(r, 'Alerts'));
     const unreadRows = () =>
       r.root.findAll(
         n =>
@@ -322,7 +376,7 @@ describe('bidwise flows', () => {
 
   it('opens a new-tenders alert as a page of just those tenders, with search and sort', async () => {
     const r = await mount();
-    await press(tab(r, 'Alerts'));
+    await press(pressable(r, 'Alerts'));
     await press(byText(r, '2 new tenders were added under'));
     let out = screenText(r);
     expect(out).toContain('Municipal Corp. of Greater Mumbai');
@@ -510,7 +564,7 @@ describe('bidwise flows', () => {
     expect(screenText(r)).toContain('Tender details');
     await press(last(r, 'Back'));
     // Another tab and back: the tile is on today again and the sheet is gone.
-    await press(tab(r, 'Alerts'));
+    await press(tab(r, 'Tenders'));
     await press(tab(r, 'Overview'));
     expect(day('Tu 27, 0 closing').props.accessibilityState).toEqual({
       selected: true,

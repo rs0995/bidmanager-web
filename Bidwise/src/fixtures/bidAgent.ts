@@ -1,4 +1,4 @@
-import type { AgentFile, ChatMessage } from '../lib/bidAgent';
+import type { AgentFile, ChatMessage, Learning, ReferenceDoc } from '../lib/bidAgent';
 
 // Sample Bid Agent conversation material for the browser preview and tests
 // (a metro-station works tender).
@@ -104,3 +104,16 @@ export function demoReply(text: string): Omit<ChatMessage, 'id' | 'at'> {
 }
 
 export const demoPrepFiles: AgentFile[] = [];
+
+/** Sample training for the preview: instructions, two learned notes, two reference documents. */
+export const demoTraining: { instructions: string; learnings: Learning[]; references: ReferenceDoc[] } = {
+  instructions: 'Save the prequalification as Excel.\nKeep answers short.',
+  learnings: [
+    { id: 2, employer_key: 'GMRC', text: 'GMRC tenders: the qualification criteria are in Section III.', source: 'chat', tender_id: null, created_at: 1793800000, active: 1 },
+    { id: 1, employer_key: '', text: "Name the EMD row 'EMD - Bank Guarantee'.", source: 'chat', tender_id: null, created_at: 1793700000, active: 1 },
+  ],
+  references: [
+    { file_id: 901, name: 'GST registration certificate.pdf', label: '', created_at: 1793700000, size: 240000, type: 'application/pdf' },
+    { file_id: 902, name: 'PAN card.pdf', label: '', created_at: 1793700000, size: 96000, type: 'application/pdf' },
+  ],
+};

@@ -12,7 +12,7 @@ export class AuthError extends Error {
 }
 
 type Options = {
-  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
   /** false for sign-in / register, which run before there is a token. */
   auth?: boolean;
