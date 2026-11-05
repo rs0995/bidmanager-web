@@ -32,11 +32,13 @@ from . import agent, chat, company
 from .docreader import load_document
 from .llm import DEFAULT_MODEL, LLM
 from .roles import ROLES
-from .store import Store
+from .store import Store, org_key_for
 from .workspace import Workspace
 
 API_KEY_SETTING = "bid_agent_api_key"
-MODEL_SETTING = "bid_agent_model"
+MODEL_SETTING = "bid_agent_model"            # reads documents (criteria, forms, scanned pages)
+CHAT_MODEL_SETTING = "bid_agent_chat_model"  # answers in the chat
+DEFAULT_CHAT_MODEL = "claude-sonnet-5-5"
 STALE_RUN_SEC = 45 * 60
 
 _runs: dict[tuple[str, int], threading.Thread] = {}
@@ -59,9 +61,19 @@ class ChatIn(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
 
 
+class InstructionsIn(BaseModel):
+    text: str = Field(default="", max_length=8000)
+
+
+class LearningIn(BaseModel):
+    text: Optional[str] = Field(default=None, max_length=600)
+    active: Optional[bool] = None
+
+
 class ConfigIn(BaseModel):
     api_key: Optional[str] = None
     model: Optional[str] = None
+    chat_model: Optional[str] = None
 
 
 def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRouter]:
@@ -285,16 +297,69 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
 
     # ------------------------------------------------------------- chat
     # The Bid Agent works as a chat: each message runs one agent turn in the
-    # background; the apps poll GET .../chat?since=n for new messages.
-    def run_chat(owner: str, tender: dict, user_id: int, text: str) -> None:
+    # background; the apps poll GET .../chat?since=n for new messages and, while
+    # it works, for ``partial`` (the reply as it is being written).
+    def chat_model() -> str:
+        return setting(CHAT_MODEL_SETTING) or os.getenv("BID_AGENT_CHAT_MODEL", "") or DEFAULT_CHAT_MODEL
+
+    def training_text(owner: str, employer: str) -> str:
+        """Standing instructions (global, then the owner's) and learned notes, for the prompt."""
+        parts = []
+        g = store.get_instructions("global").strip()
+        if g:
+            parts.append("Standing instructions from the operator:\n" + g)
+        if owner != "admin":
+            o = store.get_instructions(owner).strip()
+            if o:
+                parts.append("Standing instructions from the user's organisation (follow these):\n" + o)
+            notes = store.list_learnings(owner, org_key_for(employer) if employer else "")
+            if notes:
+                parts.append("Things the user taught you earlier (apply them):\n" +
+                             "\n".join(f"- {n['text']}" for n in notes[:40]))
+        return "\n\n".join(parts)
+
+    class _AdminWorkspace:
+        """Console chats: read and answer only; saving belongs to the apps."""
+
+        def __init__(self, tender):
+            self.tender = tender
+
+        def _no(self, *a, **k):
+            raise RuntimeError("Saving files or checklist rows is done from the apps (Bidwise or the desktop app).")
+
+        save_file = add_checklist_rows = _no
+
+        def references(self):
+            return []
+
+        def template_rows(self, employer):
+            return "", []
+
+        def files(self, folder=None):
+            return []
+
+        def checklist(self):
+            return []
+
+        def attach_matching(self, saved):
+            return []
+
+    def run_chat(owner: str, tender: dict, user_id: int, text: str, admin: bool = False) -> None:
         key = ("chat", owner, int(tender["id"]))
         tid = int(tender["id"])
+        last_partial = [0.0]
 
         def progress(msg: str) -> None:
             store.save_chat(owner, tid, progress=str(msg)[:200])
 
+        def partial(txt: str) -> None:
+            if time.time() - last_partial[0] > 0.35:
+                last_partial[0] = time.time()
+                store.set_chat_partial(owner, tid, txt)
+
+        pages = None
         try:
-            ws = Workspace(connect, user_id, tender)
+            ws = _AdminWorkspace(tender) if admin else Workspace(connect, user_id, tender)
 
             def get_result() -> dict:
                 a = store.get_analysis(owner, tid)
@@ -333,22 +398,62 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
             def save_result(res: dict) -> None:
                 store.save_analysis(owner, tid, status="completed", result=res, error="")
 
+            def remember(note: str, applies_to: str) -> None:
+                if admin:
+                    store.set_instructions("global", (store.get_instructions("global") + "\n- " + note).strip())
+                    return
+                emp = ((get_result().get("tender") or {}).get("employer") or "") if applies_to == "employer" else ""
+                store.add_learning(owner, note, employer_key=org_key_for(emp) if emp else "", source="chat",
+                                   tender_db_id=tid, user_id=user_id)
+
             turn = chat.Turn(ws, get_result, lambda: store.get_company_profile(owner), progress,
-                             pages=pages, save_result=save_result)
+                             pages=pages, save_result=save_result, remember=remember)
             history = store.get_chat(owner, tid)["messages"][:-1]
+            llm = make_llm(lambda m: None)
+            extra, grounding = "", None
+            if llm.available:
+                result = get_result()
+                extra = training_text(owner, (result.get("tender") or {}).get("employer") or "")
+                grounding = grounding_for(tender, result, pages, llm, progress)
             try:
-                reply = chat.run_turn(turn, history, text, make_llm(lambda m: None))
-            finally:
-                pages.cleanup()
+                reply = chat.run_turn(turn, history, text, llm, model=chat_model(), effort="low",
+                                      system_extra=extra, grounding=grounding, on_partial=partial)
+            except Exception as e:
+                if grounding and "file" in str(e).lower():
+                    store.put_doc_cache(agent.grounding_key(tid, turn.result), "grounding", None)
+                    reply = chat.run_turn(turn, history, text, llm, model=chat_model(), effort="low",
+                                          system_extra=extra, grounding=None, on_partial=partial)
+                else:
+                    raise
             msg = {"role": "assistant", "text": reply, "cards": turn.cards}
         except Exception as e:
             msg = {"role": "assistant", "text": f"Sorry, that didn’t work: {e}", "cards": [], "error": True}
         finally:
+            if pages:
+                pages.cleanup()
             with _runs_lock:
                 _runs.pop(key, None)
         cur = store.get_chat(owner, tid)["messages"]
         msg.update({"id": (cur[-1]["id"] + 1) if cur else 1, "at": time.time()})
         store.save_chat(owner, tid, messages=cur + [msg], status="idle", progress="")
+        store.set_chat_partial(owner, tid, "")
+
+    def grounding_for(tender: dict, result: dict, pages, llm, progress) -> list | None:
+        """The tender's key pages for the chat model, uploaded once (Files API) and reused."""
+        if not result.get("criteria_pages"):
+            return None
+        key = agent.grounding_key(int(tender["id"]), result)
+        cached = store.get_doc_cache(key)
+        if cached:
+            return cached
+        try:
+            progress("Opening the tender pages…")
+            blocks = agent.grounding_blocks(pages._src(), result, llm._get_client())
+        except Exception:
+            return None
+        if blocks and all(b["source"]["type"] in ("file", "text") for b in blocks):
+            store.put_doc_cache(key, "grounding", blocks)
+        return blocks or None
 
     def chat_state(owner: str, tid: int, since: int = 0) -> dict:
         c = store.get_chat(owner, tid)
@@ -359,9 +464,28 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
             "next": msgs[-1]["id"] if msgs else 0,
             "status": "working" if working else "idle",
             "progress": c["progress"] if working else "",
+            "partial": store.get_chat_partial(owner, tid) if working else "",
             "ai_enabled": bool(setting(API_KEY_SETTING) or os.getenv("ANTHROPIC_API_KEY")),
             "suggestions": chat.suggestions(True),
         }
+
+    def start_chat(owner: str, tender: dict, user_id: int, text: str, since: int, admin: bool = False) -> dict:
+        tid = int(tender["id"])
+        key = ("chat", owner, tid)
+        with _runs_lock:
+            t = _runs.get(key)
+            busy = (t and t.is_alive()) or chat_state(owner, tid)["status"] == "working"
+            if busy:
+                raise HTTPException(409, detail={"reason": "busy", "message": "The agent is still working on the last request."})
+            cur = store.get_chat(owner, tid)["messages"]
+            msg = {"id": (cur[-1]["id"] + 1) if cur else 1, "role": "user", "text": text.strip(),
+                   "user_id": user_id, "at": time.time()}
+            store.save_chat(owner, tid, messages=cur + [msg], status="working", progress="Thinking…")
+            store.set_chat_partial(owner, tid, "")
+            t = threading.Thread(target=run_chat, args=(owner, tender, user_id, msg["text"], admin), daemon=True)
+            _runs[key] = t
+            t.start()
+        return chat_state(owner, tid, max(0, since))
 
     @client.get("/tenders/{tender_db_id}/bid-agent/chat")
     def client_bid_chat(tender_db_id: int, since: int = 0, user_id: int = Depends(client_api.require_client_user)) -> dict:
@@ -372,21 +496,7 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
     def client_bid_chat_send(tender_db_id: int, body: ChatIn, since: int = 0,
                              user_id: int = Depends(client_api.require_client_user)) -> dict:
         tender = tender_row(user_id, tender_db_id)
-        owner = owner_of(user_id)
-        key = ("chat", owner, int(tender_db_id))
-        with _runs_lock:
-            t = _runs.get(key)
-            busy = (t and t.is_alive()) or chat_state(owner, tender_db_id)["status"] == "working"
-            if busy:
-                raise HTTPException(409, detail={"reason": "busy", "message": "The agent is still working on the last request."})
-            cur = store.get_chat(owner, tender_db_id)["messages"]
-            msg = {"id": (cur[-1]["id"] + 1) if cur else 1, "role": "user", "text": body.message.strip(),
-                   "user_id": user_id, "at": time.time()}
-            store.save_chat(owner, tender_db_id, messages=cur + [msg], status="working", progress="Working…")
-            t = threading.Thread(target=run_chat, args=(owner, tender, user_id, msg["text"]), daemon=True)
-            _runs[key] = t
-            t.start()
-        return chat_state(owner, tender_db_id, max(0, since))
+        return start_chat(owner_of(user_id), tender, user_id, body.message, since)
 
     @client.delete("/tenders/{tender_db_id}/bid-agent/chat")
     def client_bid_chat_clear(tender_db_id: int, user_id: int = Depends(client_api.require_client_user)) -> dict:
@@ -405,16 +515,12 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
         ws = Workspace(connect, user_id, tender)
         return {"items": ws.files(folder if folder in ("prep", "ready") else None)}
 
-    @client.post("/tenders/{tender_db_id}/bid-agent/prep-files")
-    def client_bid_prep_upload(tender_db_id: int, file: UploadFile = File(...),
-                               user_id: int = Depends(client_api.require_client_user)) -> dict:
-        """A user's own Docs for Preparation file, stored on Drive beside the agent's."""
-        tender = tender_row(user_id, tender_db_id)
+    def receive_upload(file: UploadFile, save: Callable[[str, str], dict]) -> dict:
         max_bytes = core.setting_int("max_file_size_mb", 80, minimum=1, maximum=2048) * 1024 * 1024
-        tmp = tempfile.mkdtemp(prefix="bidprep_")
+        tmp = tempfile.mkdtemp(prefix="bidupload_")
         try:
-            name = os.path.basename(str(file.filename or "file"))
-            path = os.path.join(tmp, name or "file")
+            name = os.path.basename(str(file.filename or "file")) or "file"
+            path = os.path.join(tmp, name)
             size = 0
             with open(path, "wb") as out:
                 while True:
@@ -427,11 +533,17 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
                     out.write(chunk)
             if not size:
                 raise HTTPException(400, "The file is empty.")
-            ws = Workspace(connect, user_id, tender)
-            saved = ws.save_file(path, name, kind="user", folder="prep", device="app")
-            return saved
+            return save(path, name)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    @client.post("/tenders/{tender_db_id}/bid-agent/prep-files")
+    def client_bid_prep_upload(tender_db_id: int, file: UploadFile = File(...),
+                               user_id: int = Depends(client_api.require_client_user)) -> dict:
+        """A user's own Docs for Preparation file, stored on Drive beside the agent's."""
+        tender = tender_row(user_id, tender_db_id)
+        return receive_upload(file, lambda path, name: Workspace(connect, user_id, tender).save_file(
+            path, name, kind="user", folder="prep", device="app"))
 
     @client.delete("/tenders/{tender_db_id}/bid-agent/prep-files/{file_id}")
     def client_bid_prep_delete(tender_db_id: int, file_id: int,
@@ -440,6 +552,93 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
         if not Workspace(connect, user_id, tender).remove_prep_file(file_id):
             raise HTTPException(404, "File not found.")
         return {"ok": True}
+
+    # --------------------------------------------- open anywhere / training
+    def can_edit_training(user_id: int) -> bool:
+        acc = account(user_id)
+        return acc.get("org_id") is None or acc.get("role") == "admin"
+
+    def tender_brief(conn, tid: int) -> dict:
+        t = dict(client_api._find_tender(conn, tid))
+        return {"id": tid, "tender_id": t.get("tender_id") or "", "title": t.get("title") or "",
+                "organisation": (t.get("org_chain") or "").split("||")[0].strip(),
+                "closing_date": t.get("closing_date") or ""}
+
+    @client.get("/bid-agent/recent")
+    def client_bid_recent(limit: int = 20, user_id: int = Depends(client_api.require_client_user)) -> dict:
+        """Tenders the owner chatted with the agent about, newest first."""
+        client_api._require_section(user_id, "projects")
+        items = []
+        with client_api._get_db() as conn:
+            for c in store.recent_chats(owner_of(user_id), max(1, min(int(limit), 50))):
+                try:
+                    client_api._require_tender_access(conn, user_id, c["tender_id"])
+                    info = tender_brief(conn, c["tender_id"])
+                except Exception:
+                    continue
+                info.update({"last": c["last"], "count": c["count"], "updated_at": c["updated_at"]})
+                items.append(info)
+        return {"items": items}
+
+    @client.get("/bid-agent/instructions")
+    def client_bid_instructions(user_id: int = Depends(client_api.require_client_user)) -> dict:
+        return {"text": store.get_instructions(owner_of(user_id)), "can_edit": can_edit_training(user_id)}
+
+    @client.put("/bid-agent/instructions")
+    def client_bid_instructions_save(body: InstructionsIn, user_id: int = Depends(client_api.require_client_user)) -> dict:
+        if not can_edit_training(user_id):
+            raise HTTPException(403, detail={"reason": "org_admin_only",
+                                             "message": "Only your organisation's admins can change the agent's instructions."})
+        store.set_instructions(owner_of(user_id), body.text.strip(), user_id)
+        return client_bid_instructions(user_id)
+
+    @client.get("/bid-agent/learnings")
+    def client_bid_learnings(user_id: int = Depends(client_api.require_client_user)) -> dict:
+        return {"items": store.list_learnings(owner_of(user_id), include_inactive=True),
+                "can_edit": can_edit_training(user_id)}
+
+    @client.patch("/bid-agent/learnings/{learning_id}")
+    def client_bid_learning_update(learning_id: int, body: LearningIn,
+                                   user_id: int = Depends(client_api.require_client_user)) -> dict:
+        if not can_edit_training(user_id):
+            raise HTTPException(403, detail={"reason": "org_admin_only", "message": "Only your organisation's admins can change this."})
+        if not store.update_learning(owner_of(user_id), learning_id, text=body.text, active=body.active):
+            raise HTTPException(404, "Not found.")
+        return client_bid_learnings(user_id)
+
+    @client.delete("/bid-agent/learnings/{learning_id}")
+    def client_bid_learning_delete(learning_id: int, user_id: int = Depends(client_api.require_client_user)) -> dict:
+        if not can_edit_training(user_id):
+            raise HTTPException(403, detail={"reason": "org_admin_only", "message": "Only your organisation's admins can change this."})
+        if not store.delete_learning(owner_of(user_id), learning_id):
+            raise HTTPException(404, "Not found.")
+        return client_bid_learnings(user_id)
+
+    def library(user_id: int) -> Workspace:
+        client_api._require_section(user_id, "projects")
+        return Workspace(connect, user_id, {"id": 0, "tender_id": "", "title": ""})
+
+    def public_refs(ws: Workspace) -> list:
+        return [{k: v for k, v in r.items() if k != "storage_ref"} for r in ws.references()]
+
+    @client.get("/bid-agent/references")
+    def client_bid_references(user_id: int = Depends(client_api.require_client_user)) -> dict:
+        return {"items": public_refs(library(user_id))}
+
+    @client.post("/bid-agent/references")
+    def client_bid_reference_upload(file: UploadFile = File(...), label: str = "",
+                                    user_id: int = Depends(client_api.require_client_user)) -> dict:
+        ws = library(user_id)
+        receive_upload(file, lambda path, name: ws.save_file(path, name, kind="reference", folder="library",
+                                                             label=label[:200], device="app"))
+        return {"items": public_refs(ws)}
+
+    @client.delete("/bid-agent/references/{file_id}")
+    def client_bid_reference_delete(file_id: int, user_id: int = Depends(client_api.require_client_user)) -> dict:
+        ws = library(user_id)
+        if not ws.remove_reference(file_id):
+            raise HTTPException(404, "File not found.")
+        return {"items": public_refs(ws)}
 
     @client.get("/company-profile")
     def client_company_profile(user_id: int = Depends(client_api.require_client_user)) -> dict:
@@ -470,7 +669,8 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
         key = setting(API_KEY_SETTING) or os.getenv("ANTHROPIC_API_KEY", "")
         return {"api_key_set": bool(key), "api_key_hint": (key[:7] + "…" + key[-4:]) if len(key) > 12 else "",
                 "api_key_source": "settings" if setting(API_KEY_SETTING) else ("env" if key else ""),
-                "model": setting(MODEL_SETTING) or DEFAULT_MODEL, "default_model": DEFAULT_MODEL}
+                "model": setting(MODEL_SETTING) or DEFAULT_MODEL, "default_model": DEFAULT_MODEL,
+                "chat_model": chat_model(), "default_chat_model": DEFAULT_CHAT_MODEL}
 
     @admin.put("/config")
     def admin_bid_config_save(body: ConfigIn) -> dict:
@@ -478,6 +678,8 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
             core.ScraperBackend.set_setting(API_KEY_SETTING, body.api_key.strip())
         if body.model is not None:
             core.ScraperBackend.set_setting(MODEL_SETTING, body.model.strip())
+        if body.chat_model is not None:
+            core.ScraperBackend.set_setting(CHAT_MODEL_SETTING, body.chat_model.strip())
         return admin_bid_config()
 
     @admin.get("/employers")
@@ -492,5 +694,41 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
     @admin.get("/forms")
     def admin_bid_forms(org_key: str = "") -> list:
         return store.list_forms(org_key)
+
+    @admin.get("/instructions")
+    def admin_bid_instructions() -> dict:
+        return {"text": store.get_instructions("global")}
+
+    @admin.put("/instructions")
+    def admin_bid_instructions_save(body: InstructionsIn) -> dict:
+        store.set_instructions("global", body.text.strip(), None)
+        return admin_bid_instructions()
+
+    @admin.get("/learnings")
+    def admin_bid_learnings(owner: str = "") -> dict:
+        """Learned notes of one owner (``org:N`` / ``user:N``), or of everyone."""
+        if owner:
+            return {"items": [dict(r, owner=owner) for r in store.list_learnings(owner, include_inactive=True)]}
+        return {"items": store.all_learnings()}
+
+    def admin_tender(tid: int) -> dict:
+        with client_api._get_db() as conn:
+            return dict(client_api._find_tender(conn, tid))
+
+    @admin.get("/tenders/{tender_db_id}/chat")
+    def admin_bid_chat(tender_db_id: int, since: int = 0) -> dict:
+        admin_tender(tender_db_id)
+        return chat_state("admin", tender_db_id, max(0, since))
+
+    @admin.post("/tenders/{tender_db_id}/chat")
+    def admin_bid_chat_send(tender_db_id: int, body: ChatIn, since: int = 0) -> dict:
+        return start_chat("admin", admin_tender(tender_db_id), 0, body.message, since, admin=True)
+
+    @admin.delete("/tenders/{tender_db_id}/chat")
+    def admin_bid_chat_clear(tender_db_id: int) -> dict:
+        if chat_state("admin", tender_db_id)["status"] == "working":
+            raise HTTPException(409, detail={"reason": "busy", "message": "Wait for the agent to finish."})
+        store.save_chat("admin", tender_db_id, messages=[], status="idle", progress="")
+        return chat_state("admin", tender_db_id)
 
     return client, admin

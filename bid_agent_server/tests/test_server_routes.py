@@ -114,6 +114,8 @@ class BidPackRouteTests(unittest.TestCase):
         cfg = self.client.put("/admin/bid-agent/config", headers=ah, json={"api_key": "sk-ant-test-123456789"}).json()
         self.assertTrue(cfg["api_key_set"])
         self.assertNotIn("123456789", cfg["api_key_hint"][:-4])
+        cfg = self.client.put("/admin/bid-agent/config", headers=ah, json={"api_key": ""}).json()
+        self.assertFalse(cfg["api_key_set"])
 
 
     # ------------------------------------------------------------ chat agent
@@ -198,6 +200,63 @@ class BidPackRouteTests(unittest.TestCase):
         self.assertEqual([(i["name"], i["kind"]) for i in items], [("site visit notes.txt", "user")])
         self.assertEqual(self.client.delete(f"/client/tenders/1/bid-agent/prep-files/{fid}", headers=self.h).status_code, 200)
         self.assertEqual(self.client.get("/client/tenders/1/bid-agent/files", headers=self.h).json()["items"], [])
+
+    def test_training_and_open_anywhere(self):
+        # remember from a chat correction -> learned notes, editable
+        m = self._say("remember: always name the EMD row 'EMD - Bank Guarantee'")
+        self.assertFalse(m.get("error"), m)
+        items = self.client.get("/client/bid-agent/learnings", headers=self.h).json()["items"]
+        self.assertEqual(len(items), 1, items)
+        self.assertIn("EMD - Bank Guarantee", items[0]["text"])
+        lid = items[0]["id"]
+        r = self.client.patch(f"/client/bid-agent/learnings/{lid}", headers=self.h, json={"active": False}).json()
+        self.assertEqual(r["items"][0]["active"], 0)
+        self.assertEqual(self.client.delete(f"/client/bid-agent/learnings/{lid}", headers=self.h).json()["items"], [])
+
+        # standing instructions
+        r = self.client.put("/client/bid-agent/instructions", headers=self.h, json={"text": "Answer in one line."}).json()
+        self.assertEqual(r["text"], "Answer in one line.")
+        self.assertTrue(r["can_edit"])
+
+        # recent chats list the tender with its title
+        recent = self.client.get("/client/bid-agent/recent", headers=self.h).json()["items"]
+        self.assertEqual([x["id"] for x in recent], [1])
+        self.assertEqual(recent[0]["tender_id"], "T-100")
+
+        # reference documents
+        r = self.client.post("/client/bid-agent/references", headers=self.h,
+                             files={"file": ("GST certificate.pdf", b"%PDF-1.4 gst", "application/pdf")})
+        self.assertEqual(r.status_code, 200, r.text)
+        refs = r.json()["items"]
+        self.assertEqual([x["name"] for x in refs], ["GST certificate.pdf"])
+        self.assertNotIn("storage_ref", refs[0])
+        r = self.client.delete(f"/client/bid-agent/references/{refs[0]['file_id']}", headers=self.h)
+        self.assertEqual(r.json()["items"], [])
+
+    def test_admin_chat_and_instructions(self):
+        a = {"x-admin-key": "admin-secret"}
+        self.assertEqual(self.client.get("/admin/bid-agent/instructions").status_code, 401)
+        self.assertEqual(self.client.put("/admin/bid-agent/instructions", headers=a,
+                                         json={"text": "Be brief."}).json()["text"], "Be brief.")
+        r = self.client.post("/admin/bid-agent/tenders/1/chat", headers=a, json={"message": "show the prequalification"})
+        self.assertEqual(r.status_code, 200, r.text)
+        for _ in range(200):
+            st = self.client.get("/admin/bid-agent/tenders/1/chat", headers=a).json()
+            if st["status"] == "idle" and len(st["messages"]) >= 2:
+                break
+            time.sleep(0.05)
+        reply = st["messages"][-1]
+        self.assertEqual(reply["cards"][0]["title"], "Prequalification criteria", reply)
+        # saving from the console is refused politely
+        r = self.client.post("/admin/bid-agent/tenders/1/chat", headers=a, json={"message": "save the prequalification"})
+        for _ in range(200):
+            st = self.client.get("/admin/bid-agent/tenders/1/chat", headers=a).json()
+            if st["status"] == "idle" and len(st["messages"]) >= 4:
+                break
+            time.sleep(0.05)
+        self.assertIn("apps", st["messages"][-1]["text"])
+        self.assertEqual(self.client.get("/admin/bid-agent/tenders/999/chat", headers=a).status_code, 404)
+        self.assertEqual(self.client.get("/admin/bid-agent/learnings", headers=a).json()["items"], [])
 
     def test_auth_and_scope(self):
         self.assertEqual(self.client.get("/client/tenders/1/bid-pack").status_code, 401)

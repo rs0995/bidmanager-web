@@ -25,3 +25,7 @@ Backed up: server/api_server.py, server/requirements.txt, server/API_CHANGES.md
 ----
 04:31 2026-11-05 (Bid Agent session) - Request: agent missed the qualification criteria of 2026_MMRDA_1345405_1 (only JV rules), even with pages given.
 - server/bid_agent/: 'Eligibility Criteria' (Indian NIT heading) now counts as qualification criteria; criteria pages are also found by content (turnover / similar work / bid capacity / crore amounts) when they beat the classified section; numbered-paragraph criteria are read; scanned pages are sent to Claude as page images; chat tools list_tender_documents / read_tender_pages / extract_criteria_from_pages use the pages the user names and keep the result; analyses from the old pipeline are redone (pipeline_version 2).
+----
+09:48 2026-11-05 (Bid Agent session) - Request: agent slow and long-winded; open and train it outside projects.
+- server/bid_agent/: chat runs on a fast chat model (setting bid_agent_chat_model, default claude-sonnet-5-5, effort low), streams the reply (GET chat 'partial'), answers from the tender's key pages (Files API, cached), short replies by default. Training: tables bid_agent_instructions / bid_agent_learnings, chat tool 'remember', reference documents (project-files/Bid Agent Library/<owner>/), checklist starts from the owner's matching template.
+- New routes: /client/bid-agent/recent, /instructions, /learnings[/id], /references[/id]; /admin/bid-agent/instructions, /learnings, /tenders/{id}/chat; /admin/bid-agent/config gains chat_model.

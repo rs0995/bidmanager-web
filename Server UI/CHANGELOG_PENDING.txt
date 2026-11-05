@@ -9,3 +9,5 @@ Fixed project file uploads failing with "HTTP 500" (file label too long for Goog
   (correction: the line above repeats the first Bid Agent note. This update: the Bid Agent reads tender ZIPs from Drive, including ZIPs inside ZIPs, converts old .xls/.rtf files, and lists any file it can't read with the reason.)
 ----
 03:03 Bid Agent is now a chat on each tender/project (Bidwise above Ready for Bid, Client UI above the Ready Docs checklist): show/save the prequal (Excel/Word/PDF), extract all or specific tender forms, prepare the Ready Docs checklist with the forms attached. Files are saved to the tender folder on Drive (Docs for Preparation) with a 'Bid Agent index.json' key; phone prep docs are uploaded there too. Server image adds LibreOffice.
+----
+09:48 Bid Agent replies faster and shorter (streamed, fast chat model, grounded on the tender pages). It can be taught: standing instructions, 'remember …' corrections, reference documents, checklist templates; console can chat with any tender.

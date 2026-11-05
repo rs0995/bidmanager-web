@@ -27,34 +27,29 @@ from .workspace import PREP_FOLDER, READY_SUBFOLDER, Workspace, norm_name
 
 FORMATS_DOC = ("docx", "pdf", "xlsx")
 
-SYSTEM = """You are the Bid Agent inside BidManager, working for a contractor preparing a bid for one \
-public tender (Indian government / PSU / metro rail / multilateral-funded works). You act on the user's \
-instructions using your tools; you don't just describe what could be done.
+SYSTEM = """You are the Bid Agent in BidManager. You help a contractor prepare a bid for ONE public tender \
+(Indian government / PSU / metro rail / multilateral-funded works). Work like a sharp assistant on claude.ai: \
+read the tender pages you are given and answer directly.
 
-How to work:
-- Use tools for every fact about the tender. Never invent criteria, values, form codes or page numbers.
-- "Show/fetch/what is the prequal(ification) / PQ / eligibility / qualification criteria" -> \
-show_prequalification. Then answer briefly; the table is already shown to the user.
-- If the user says the criteria are on particular pages (or the table you showed is incomplete / only has \
-JV rules), call extract_criteria_from_pages with those pages (and the file if they name it; call \
-list_tender_documents first if unsure which file). That replaces the stored criteria, so later saves use it.
-- To answer a question about specific pages, read them with read_tender_pages.
-- "Save/download/export the prequal" -> save_prequalification in the format asked (Excel by default; \
-Word or PDF if asked). It goes to Docs for Preparation.
-- "Extract/save the tender forms" or a specific form ("Form FIN-3.2", "letter of bid", "bidder information \
-form") -> extract_tender_forms with the matching codes (call list_tender_forms first if unsure of codes), \
-in the format asked (Word by default).
-- "Prepare/make the checklist (of documents required)" -> prepare_checklist with every document the bid \
-must contain according to THIS tender: each bidding form, each document the criteria ask as evidence (audited \
-balance sheets, CA certificates, completion certificates, ISO certificates, ...), and the usual submission \
-items the tender mentions (bid security / EMD, tender fee, power of attorney, JV agreement if JV is allowed, \
-undertakings, affidavits). Name rows as the tender names them and put the form code first when there is one \
-(e.g. "FIN-3.2 (a) - Average Annual Construction Turnover"). Rows start Pending; the agent attaches the \
-forms it prepares to their rows automatically.
-- "Can we qualify / are we eligible" -> check_eligibility.
-- Keep answers short (1-4 sentences), say what you did and where it was saved. Don't repeat table contents \
-the user can already see. Write amounts like "INR 190 Cr".
-- If the tender's documents haven't been downloaded, say so and stop.
+Answer style (always, unless the user's standing instructions say otherwise):
+- Lead with the answer. At most 4 short lines, or one compact table. No preamble, no "Sure", no summary of \
+what you are about to do, no repeating what a card already shows. Amounts like "INR 190 Cr".
+- Quote the tender's own numbers and clause refs; never invent criteria, values, form codes or pages. If the \
+pages you have don't say, say so in one line and offer to read more pages.
+- End with at most one short next step when useful (e.g. "Save it as Excel?").
+
+Use tools only for actions or for pages you don't have:
+- show_prequalification shows the full criteria table to the user (use it when they ask to see/fetch the \
+prequal or criteria; then reply in one line).
+- save_prequalification (Excel default; Word / PDF if asked) and extract_tender_forms save files to Docs for \
+Preparation; prepare_checklist fills the Ready Docs checklist (start from the user's checklist template rows \
+when given, add every form and evidence document THIS tender asks for, form code first, e.g. "FIN-3.2 (a) - \
+Average Annual Construction Turnover"); check_eligibility compares with the company profile.
+- If the user says the criteria are on particular pages, or your criteria look incomplete (e.g. only JV \
+rules), call extract_criteria_from_pages. read_tender_pages for any other pages.
+- When the user corrects you or states a preference that should apply next time, call remember (once).
+- Saving creates the tender's project if there isn't one yet; mention that briefly.
+- If no tender documents are downloaded, say so and stop.
 """
 
 TOOLS = [
@@ -105,6 +100,20 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "file": {"type": "string"}, "start_page": {"type": "integer"}, "end_page": {"type": "integer"}},
          "required": ["file", "start_page", "end_page"], "additionalProperties": False}},
+    {"name": "remember", "description": "Saves a correction or preference so the agent follows it next time "
+     "(e.g. 'MMRDA puts eligibility criteria in the NIT, pages 12-14', 'always add GST certificate to the "
+     "checklist'). applies_to: 'employer' = this tender's employer only, 'all' = every tender.",
+     "input_schema": {"type": "object", "properties": {
+         "text": {"type": "string"}, "applies_to": {"type": "string", "enum": ["employer", "all"]}},
+         "required": ["text", "applies_to"], "additionalProperties": False}},
+    {"name": "list_reference_documents", "description": "The organisation's reference documents (certificates, "
+     "registrations, standard formats, previous bids) that can be attached to checklist rows.",
+     "input_schema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "attach_reference_document", "description": "Attaches a reference document to a Ready Docs "
+     "checklist row (adds the row if missing). document = its name (or part); row = the checklist row name.",
+     "input_schema": {"type": "object", "properties": {
+         "document": {"type": "string"}, "row": {"type": "string"}},
+         "required": ["document", "row"], "additionalProperties": False}},
     {"name": "list_saved_files", "description": "Lists files the agent and the team saved for this tender "
      "(Docs for Preparation and Ready Docs attachments).",
      "input_schema": {"type": "object", "properties": {}, "additionalProperties": False}},
@@ -122,7 +131,8 @@ class Turn:
 
     def __init__(self, workspace: Workspace, get_result: Callable[[], dict], get_profile: Callable[[], dict],
                  progress: Callable[[str], None] = lambda _m: None, pages=None,
-                 save_result: Callable[[dict], None] = lambda _r: None):
+                 save_result: Callable[[dict], None] = lambda _r: None,
+                 remember: Callable[[str, str], None] | None = None):
         """``pages`` gives access to the tender files: .read(file, start, end) -> (name, text, scanned)
         and .criteria(file, start, end) -> (name, criteria)."""
         self.ws = workspace
@@ -131,6 +141,7 @@ class Turn:
         self.progress = progress
         self.pages = pages
         self.save_result = save_result
+        self._remember = remember
         self.cards: list[dict] = []
         self._result: dict | None = None
 
@@ -190,11 +201,12 @@ class Turn:
         if crit.get("equipment"):
             self.cards.append({"type": "table", "title": "Key equipment", "columns": ["Equipment", "Min. units", "Max age"],
                                "rows": [[e.get("type"), e.get("min_units"), e.get("max_age_years")] for e in crit["equipment"]]})
-        brief = [f"{r.get('ref')} {r.get('subject')}: {r.get('requirement', '')[:300]} | forms {', '.join(r.get('forms', []))}"
-                 for r in rows]
+        brief = [f"{r.get('ref')} {r.get('subject')}: {r.get('requirement', '')[:180]}"
+                 + (f" [{r.get('threshold_inr_cr')} Cr]" if r.get("threshold_inr_cr") else "") for r in rows]
         if crit.get("similar_work_definition"):
             brief.append("Similar work: " + crit["similar_work_definition"])
-        return "Shown to the user. Criteria:\n" + "\n".join(brief)
+        return (f"Shown to the user as a table ({len(rows)} criteria). Reply in one line; don't repeat them.\n"
+                + "\n".join(brief))
 
     def _save(self, path: str, name: str, kind: str, label: str, folder: str = "prep", match: str = "") -> dict:
         saved = self.ws.save_file(path, name, kind=kind, folder=folder, label=label)
@@ -312,7 +324,13 @@ class Turn:
                          for c in checks)
 
     def tool_prepare_checklist(self, items: list[dict]) -> str:
-        items = [i for i in (items or []) if str(i.get("name") or "").strip()] or default_checklist(self.result)
+        employer = (self.result.get("tender") or {}).get("employer") or ""
+        tname, trows = ("", [])
+        try:
+            tname, trows = self.ws.template_rows(employer)
+        except Exception:
+            pass
+        items = trows + ([i for i in (items or []) if str(i.get("name") or "").strip()] or default_checklist(self.result))
         self.progress("Adding rows to Ready Docs…")
         rows = self.ws.add_checklist_rows(items)
         # Attach the forms the agent prepares: every row that names a tender form gets that form.
@@ -342,7 +360,8 @@ class Turn:
                                     for r in rows]})
         added = sum(1 for r in rows if r.get("added"))
         return (f"Ready Docs: {added} row(s) added ({len(rows) - added} already there), {len(attached)} form(s) "
-                f"attached; the rest are Pending for files to be attached.")
+                f"attached; the rest are Pending for files to be attached."
+                + (f" Started from your template '{tname}'." if tname else ""))
 
     def tool_list_tender_documents(self) -> str:
         docs = self.result.get("documents", [])
@@ -380,6 +399,45 @@ class Turn:
         self.save_result(result)
         out = self.tool_show_prequalification(False)
         return f"Read {len(crit['criteria'])} criteria from {name} pages {start_page}-{end_page} and saved them. " + out
+
+    def tool_remember(self, text: str = "", applies_to: str = "employer") -> str:
+        if not self._remember:
+            return "Can't save that here."
+        self._remember(text, applies_to)
+        return "Saved; I'll follow it next time."
+
+    def tool_list_reference_documents(self) -> str:
+        refs = self.ws.references()
+        if not refs:
+            return "No reference documents yet. They can be added in Bid Agent settings."
+        self.cards.append({"type": "table", "title": "Reference documents", "columns": ["Document", "Note"],
+                           "rows": [[r["name"], r.get("label") or ""] for r in refs]})
+        return "\n".join(r["name"] for r in refs)
+
+    def tool_attach_reference_document(self, document: str = "", row: str = "") -> str:
+        refs = self.ws.references()
+        want = norm_name(document)
+        hit = next((r for r in refs if norm_name(r["name"]) == want), None) or \
+            next((r for r in refs if want and want in norm_name(r["name"])), None)
+        if not hit:
+            return f"No reference document named like '{document}'."
+        rows = self.ws.add_checklist_rows([{"name": row or os.path.splitext(hit["name"])[0],
+                                            "description": "Reference document"}])
+        target = rows[0]
+        if target.get("server_file"):
+            return f"'{target['req_file_name']}' already has a file."
+        tmp = tempfile.mkdtemp(prefix="bidref_")
+        try:
+            path = self.ws.fetch_to(hit["storage_ref"], os.path.join(tmp, hit["name"]))
+            r = self.ws.save_file(path, hit["name"], kind="reference", folder="ready",
+                                  checklist_item_id=target["id"], label=hit.get("label") or "")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.cards.append({"type": "checklist", "title": "Ready Docs checklist", "folder": READY_SUBFOLDER,
+                           "rows": [{"id": target["id"], "name": target["req_file_name"], "added": target.get("added", False),
+                                     "file": r["file"]["name"] if r.get("attached") else ""}]})
+        return f"Attached {hit['name']} to '{target['req_file_name']}'." if r.get("attached") else \
+            f"'{target['req_file_name']}' already has a file."
 
     def tool_list_saved_files(self) -> str:
         files = self.ws.files()
@@ -442,6 +500,9 @@ FILE_RE = re.compile(r"\b(?:in|of|from)\s+(?:the\s+)?(?:file|document|doc|volume
 
 def route_without_ai(text: str) -> tuple[str, dict] | None:
     t = (text or "").lower()
+    if re.match(r"^\s*(remember|note that|always|from now on|next time)\b", t):
+        body = re.sub(r"^\s*(remember( that)?|note that)\s*[:,-]?\s*", "", text or "", flags=re.I).strip()
+        return "remember", {"text": body or text, "applies_to": "all" if re.search(r"\b(all|every|always)\b", t) else "employer"}
     pages = PAGES_RE.search(text or "")
     if pages and re.search(_PQ + r"|requirement|turnover|experience", t):
         a = int(pages.group(1))
@@ -471,8 +532,15 @@ def route_without_ai(text: str) -> tuple[str, dict] | None:
     return None
 
 
-def run_turn(turn: Turn, history: list[dict], message: str, llm) -> str:
-    """Runs one request; returns the assistant's reply text (cards are on ``turn.cards``)."""
+def run_turn(turn: Turn, history: list[dict], message: str, llm, *, model: str = "", effort: str = "low",
+             system_extra: str = "", grounding: list[dict] | None = None,
+             on_partial: Callable[[str], None] | None = None, max_steps: int = 5) -> str:
+    """Runs one request; returns the assistant's reply text (cards are on ``turn.cards``).
+
+    ``model``/``effort``: the chat model (fast; documents are read by the document model).
+    ``system_extra``: standing instructions and learned notes. ``grounding``: content blocks with the
+    tender's key pages, sent as a fixed first turn so follow-ups are answered from them (prompt-cached).
+    ``on_partial``: receives the reply text as it streams."""
     if llm is None or not llm.available:
         routed = route_without_ai(message)
         if not routed:
@@ -486,36 +554,55 @@ def run_turn(turn: Turn, history: list[dict], message: str, llm) -> str:
         return out
 
     client = llm._get_client()
+    tender = turn.ws.tender
     msgs: list[Any] = []
+    if grounding:
+        blocks = [dict(b) for b in grounding]
+        blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
+        msgs.append({"role": "user", "content": blocks + [{"type": "text", "text":
+                     "These are the tender's key pages. Answer from them."}]})
+        msgs.append({"role": "assistant", "content": "Understood."})
+    convo: list[dict] = []
     for h in history[-12:]:
         if h.get("role") in ("user", "assistant") and h.get("text"):
-            msgs.append({"role": h["role"], "content": h["text"]})
-    while msgs and msgs[0]["role"] != "user":
-        msgs.pop(0)
+            convo.append({"role": h["role"], "content": h["text"]})
+    while convo and convo[0]["role"] != "user":
+        convo.pop(0)
+    msgs += convo
     msgs.append({"role": "user", "content": message})
-    tender = turn.ws.tender
-    system = SYSTEM + f"\nTender: {tender.get('tender_id')} - {tender.get('title')} ({tender.get('org_chain', '').split('||')[0]})."
-    for _step in range(8):
-        resp = client.beta.messages.create(
-            model=llm.model, max_tokens=8000, betas=["server-side-fallback-2026-07-01"], fallbacks="default",
+    system = SYSTEM + (f"\n{system_extra.strip()}\n" if system_extra.strip() else "") + \
+        f"\nTender: {tender.get('tender_id')} - {tender.get('title')} ({str(tender.get('org_chain', '')).split('||')[0]})."
+    text_so_far = ""
+    for _step in range(max_steps):
+        with client.beta.messages.stream(
+            model=model or llm.model, max_tokens=4000, betas=["server-side-fallback-2026-07-01"], fallbacks="default",
             system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-            tools=TOOLS, messages=msgs, output_config={"effort": "medium"},
-        )
+            tools=TOOLS, messages=msgs, output_config={"effort": effort},
+        ) as stream:
+            step_text = ""
+            for chunk in stream.text_stream:
+                step_text += chunk
+                if on_partial and step_text.strip():
+                    on_partial(step_text.strip())  # the bubble shows the step being written
+            resp = stream.get_final_message()
         llm.usage["calls"] += 1
         if resp.stop_reason == "refusal":
             return "I can't help with that request."
         msgs.append({"role": "assistant", "content": resp.content})
-        uses = [b for b in resp.content if getattr(b, "type", "") == "tool_use"]
         if resp.stop_reason == "pause_turn":
             continue
+        uses = [b for b in resp.content if getattr(b, "type", "") == "tool_use"]
+        text = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", "") == "text").strip()
         if not uses:
-            return "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", "") == "text").strip() or "Done."
+            return text or text_so_far.strip() or "Done."
+        if text:
+            text_so_far += text + "\n\n"
         results = []
         for u in uses:
             turn.progress(TOOL_PROGRESS.get(u.name, "Working…"))
             results.append({"type": "tool_result", "tool_use_id": u.id, "content": turn.call(u.name, dict(u.input))})
         msgs.append({"role": "user", "content": results})
-    return "Done."
+    return text_so_far.strip() or "Done."
 
 
 TOOL_PROGRESS = {
@@ -527,6 +614,9 @@ TOOL_PROGRESS = {
     "check_eligibility": "Checking against your company profile…",
     "prepare_checklist": "Preparing the checklist…",
     "list_saved_files": "Listing saved files…",
+    "remember": "Noting that…",
+    "list_reference_documents": "Looking at your reference documents…",
+    "attach_reference_document": "Attaching the document…",
     "list_tender_documents": "Listing the tender files…",
     "read_tender_pages": "Reading those pages…",
     "extract_criteria_from_pages": "Reading the criteria on those pages…",

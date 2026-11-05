@@ -37,6 +37,8 @@ from typing import Any, Optional
 READY_SUBFOLDER = "Ready Docs"
 PREP_FOLDER = "Docs for Preparation"
 INDEX_NAME = "Bid Agent index.json"
+LIBRARY_FOLDER = "Reference documents"
+LIBRARY_ROOT = "Bid Agent Library"
 SERVER_ID_FLOOR = 9_000_000
 
 MANIFEST_SCHEMA = [
@@ -215,17 +217,21 @@ class Workspace:
     def save_file(self, local_path: str, name: str, *, kind: str, folder: str,
                   checklist_item_id: Any = None, label: str = "", device: str = "bid-agent") -> dict:
         """Stores a file in the tender's project folder and records it in the manifest.
-        ``folder`` is "prep" (Docs for Preparation) or "ready" (attached to a checklist row)."""
+        ``folder`` is "prep" (Docs for Preparation), "ready" (attached to a checklist row) or
+        "library" (the owner's reference documents, not tied to a tender)."""
         import app_core as core
         import storage_runtime
 
-        project = self.project()
+        library = folder == "library"
+        project = {"id": "library", "title": LIBRARY_FOLDER} if library else self.project()
         name = self.pf.safe_file_name(name)
-        slot = str(checklist_item_id) if checklist_item_id is not None else f"bidagent-prep:{uuid.uuid4().hex[:12]}"
+        prefix = "bidagent-ref" if library else "bidagent-prep"
+        slot = str(checklist_item_id) if checklist_item_id is not None else f"{prefix}:{uuid.uuid4().hex[:12]}"
         now = time.time()
         with self._db() as conn:
             blob = self._blob(conn)
-            folder_path = self._folder_path(conn, blob, project, folder)
+            folder_path = (f"{LIBRARY_ROOT}/{self.pf.owner_folder(conn, self.account)}" if library
+                           else self._folder_path(conn, blob, project, folder))
             if checklist_item_id is not None:
                 if self.pf.find_checklist_row(self.oa.effective_blob(conn, self.user_id, self.account)[0],
                                               checklist_item_id) is None:
@@ -296,12 +302,14 @@ class Workspace:
             conn.execute(
                 "INSERT INTO bid_agent_files (owner_key, tender_db_id, tender_ref, project_id, file_id, name, kind, "
                 "folder, checklist_item_id, label, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (self.scope, int(self.tender["id"]), str(self.tender.get("tender_id") or ""), str(project["id"]),
-                 file_id, name, kind, PREP_FOLDER if folder == "prep" else READY_SUBFOLDER,
+                (self.scope, 0 if library else int(self.tender["id"]),
+                 "" if library else str(self.tender.get("tender_id") or ""), str(project["id"]),
+                 file_id, name, kind, LIBRARY_FOLDER if library else PREP_FOLDER if folder == "prep" else READY_SUBFOLDER,
                  str(checklist_item_id) if checklist_item_id is not None else None, label, self.user_id, done),
             )
             conn.commit()
-        self.write_index()
+        if not library:
+            self.write_index()
         return {"file": self.pf.public_file(row), "attached": checklist_item_id is not None}
 
     def files(self, folder: Optional[str] = None) -> list[dict]:
@@ -319,6 +327,69 @@ class Workspace:
             want = PREP_FOLDER if folder == "prep" else READY_SUBFOLDER
             out = [r for r in out if r["folder"] == want]
         return out
+
+    def template_rows(self, employer: str) -> tuple[str, list[dict]]:
+        """Rows of the owner's checklist template for this employer (the apps' Templates page,
+        matched by organisation), else a template named "Bid Agent default". -> (name, rows)."""
+        with self._db() as conn:
+            blob = self.oa.effective_blob(conn, self.user_id, self.account)[0]
+        templates = [t for t in (blob.get("templates") or []) if isinstance(t, dict)]
+        items = [i for i in (blob.get("templateItems") or []) if isinstance(i, dict)]
+        emp = norm_name(employer)
+
+        def match(t):
+            org = norm_name(t.get("organization") or "")
+            return bool(org) and bool(emp) and (org in emp or emp in org)
+
+        pick = next((t for t in templates if match(t)), None) or \
+            next((t for t in templates if norm_name(t.get("template_name") or "") == "bid agent default"), None)
+        if not pick:
+            return "", []
+        rows = sorted((i for i in items if str(i.get("template_id")) == str(pick.get("id"))),
+                      key=lambda i: int(i.get("sr_no") or 0))
+        return str(pick.get("template_name") or "Template"), [
+            {"name": i.get("req_file_name") or "", "description": i.get("description") or ""} for i in rows
+            if i.get("req_file_name")]
+
+    # ------------------------------------------------- reference documents
+    def references(self) -> list[dict]:
+        """The owner's reference documents (certificates, standard formats, previous bids)."""
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT m.file_id, m.name, m.label, m.created_at, f.size_bytes, f.mime_type, f.storage_ref "
+                "FROM bid_agent_files m JOIN client_project_files f ON f.id=m.file_id "
+                "WHERE m.owner_key=? AND m.folder=? AND m.removed_at IS NULL AND f.trashed_at IS NULL "
+                "ORDER BY m.name", (self.scope, LIBRARY_FOLDER)).fetchall()
+        cols = ["file_id", "name", "label", "created_at", "size", "type", "storage_ref"]
+        return [dict(zip(cols, tuple(r))) for r in rows]
+
+    def remove_reference(self, file_id: int) -> bool:
+        with self._db() as conn:
+            hit = conn.execute("SELECT id FROM bid_agent_files WHERE owner_key=? AND file_id=? AND folder=? "
+                               "AND removed_at IS NULL", (self.scope, int(file_id), LIBRARY_FOLDER)).fetchone()
+            if not hit:
+                return False
+            row = self.pf.get_file(conn, int(file_id))
+            now = time.time()
+            if row:
+                self.pf.trash_file(conn, row, now)
+            conn.execute("UPDATE bid_agent_files SET removed_at=? WHERE id=?", (now, hit[0]))
+            conn.commit()
+        return True
+
+    def fetch_to(self, storage_ref: str, dest: str) -> str:
+        """Copies a stored file (local or Drive) to ``dest``."""
+        ref = str(storage_ref or "")
+        if ref.startswith("gdrive://"):
+            import drive_storage
+
+            _meta, response = drive_storage.open_download(ref[len("gdrive://"):].split("/", 1)[0])
+            with open(dest, "wb") as f:
+                for chunk in drive_storage.iter_download_response(response):
+                    f.write(chunk)
+        else:
+            shutil.copyfile(ref, dest)
+        return dest
 
     def remove_prep_file(self, file_id: int) -> bool:
         with self._db() as conn:

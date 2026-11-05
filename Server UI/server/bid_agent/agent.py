@@ -288,3 +288,65 @@ def build_output(result: dict, profile: dict, name: str, out_dir: str) -> str:
                 p = build_output(result, profile, other["name"], out_dir)
                 z.write(p, other["name"])
     return path
+
+
+# ---------------------------------------------------------------- chat grounding
+MAX_GROUNDING_PAGES = 30
+
+
+def grounding_key(tender_id, result: dict) -> str:
+    pages = [(c.get("file"), c.get("start_page"), c.get("end_page")) for c in result.get("criteria_pages", [])]
+    return f"ground:{tender_id}:{pages}"
+
+
+def grounding_blocks(src_dir: str, result: dict, client=None) -> list[dict]:
+    """Content blocks with the tender's key pages (the criteria pages) for the chat model.
+
+    PDF ranges are uploaded once to the Files API when ``client`` is given (blocks then
+    reference the file id, so later turns don't resend the pages); otherwise they're sent
+    inline. DOCX/XLSX ranges go as text. Returns [] when nothing fits."""
+    import io
+
+    blocks: list[dict] = []
+    used = 0
+    paths = {display_name(p, src_dir): p for p in list_tender_files(src_dir)}
+    for c in result.get("criteria_pages", []):
+        path = paths.get(c.get("file"))
+        if not path:
+            continue
+        s, e = int(c["start_page"]), int(c["end_page"])
+        e = min(e, s + (MAX_GROUNDING_PAGES - used) - 1)
+        if e < s:
+            break
+        used += e - s + 1
+        title = f"{c.get('file')} (pages {s}-{e})"
+        if path.lower().endswith(".pdf"):
+            from pypdf import PdfReader, PdfWriter
+
+            reader = PdfReader(path)
+            writer = PdfWriter()
+            for i in range(s - 1, min(e, len(reader.pages))):
+                writer.add_page(reader.pages[i])
+            buf = io.BytesIO()
+            writer.write(buf)
+            data = buf.getvalue()
+            source = None
+            if client is not None:
+                try:
+                    meta = client.files.upload(file=(f"tender-pages-{s}-{e}.pdf", data, "application/pdf"))
+                    source = {"type": "file", "file_id": meta.id}
+                except Exception:
+                    source = None
+            if source is None:
+                import base64
+
+                source = {"type": "base64", "media_type": "application/pdf", "data": base64.b64encode(data).decode()}
+            blocks.append({"type": "document", "source": source, "title": title})
+        else:
+            doc = load_document(path, with_tables=False)
+            blocks.append({"type": "document", "title": title,
+                           "source": {"type": "text", "media_type": "text/plain",
+                                      "data": doc.text_range(s, min(e, doc.page_count), max_chars=150000) or "(empty)"}})
+        if used >= MAX_GROUNDING_PAGES:
+            break
+    return blocks

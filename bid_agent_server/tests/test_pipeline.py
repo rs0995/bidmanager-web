@@ -216,6 +216,39 @@ class ZipTests(unittest.TestCase):
             agent.analyze_files(src, self.tender, new_store(self.tmp), None, PROFILE, log=lambda m: None)
 
 
+class FakeStreamClient:
+    """Stands in for anthropic.Anthropic: beta.messages.stream returns the scripted responses in turn."""
+
+    def __init__(self, responses):
+        from types import SimpleNamespace as NS
+
+        self.responses = list(responses)
+        self.calls = []
+        self.beta = NS(messages=NS(stream=self.stream))
+
+    def stream(self, **kw):
+        self.calls.append({**kw, "messages": list(kw["messages"])})
+        resp = self.responses.pop(0)
+        text = "".join(getattr(b, "text", "") for b in resp.content if b.type == "text")
+
+        class _S:
+            def __enter__(s):
+                return s
+
+            def __exit__(s, *a):
+                return False
+
+            @property
+            def text_stream(s):
+                for i in range(0, len(text), 5):
+                    yield text[i:i + 5]
+
+            def get_final_message(s):
+                return resp
+
+        return _S()
+
+
 class ChatLoopTests(unittest.TestCase):
     """Claude chooses the tools; the loop feeds results back until it answers."""
 
@@ -224,20 +257,12 @@ class ChatLoopTests(unittest.TestCase):
 
         from bid_agent import chat
 
-        class FakeClient:
-            def __init__(self):
-                self.calls = []
-                self.beta = NS(messages=NS(create=self.create))
-
-            def create(self, **kw):
-                self.calls.append({**kw, "messages": list(kw["messages"])})
-                if len(self.calls) == 1:
-                    return NS(stop_reason="tool_use", content=[
-                        NS(type="text", text="Let me look."),
-                        NS(type="tool_use", id="t1", name="show_prequalification", input={"include_our_position": True})])
-                return NS(stop_reason="end_turn", content=[NS(type="text", text="Turnover needs INR 100 Cr; you meet it.")])
-
-        fake = FakeClient()
+        fake = FakeStreamClient([
+            NS(stop_reason="tool_use", content=[
+                NS(type="text", text="Let me look."),
+                NS(type="tool_use", id="t1", name="show_prequalification", input={"include_our_position": True})]),
+            NS(stop_reason="end_turn", content=[NS(type="text", text="Turnover needs INR 100 Cr; you meet it.")]),
+        ])
         llm = LLM(api_key="k")
         llm._client = fake
         tmp = tempfile.mkdtemp()
@@ -247,11 +272,22 @@ class ChatLoopTests(unittest.TestCase):
         result = agent.analyze_files(src, tender, new_store(tmp), None, PROFILE, log=lambda m: None)
         turn = chat.Turn(NS(tender=tender), lambda: result, lambda: PROFILE)
         history = [{"role": "assistant", "text": "Hi"}, {"role": "user", "text": "earlier"}, {"role": "assistant", "text": "ok"}]
-        reply = chat.run_turn(turn, history, "What is the prequal and do we meet it?", llm)
+        partials = []
+        grounding = [{"type": "document", "source": {"type": "file", "file_id": "f1"}, "title": "NIT p1-3"}]
+        reply = chat.run_turn(turn, history, "What is the prequal and do we meet it?", llm, model="claude-sonnet-5-5",
+                              system_extra="Standing instructions: answer in Hindi.", grounding=grounding,
+                              on_partial=partials.append)
         self.assertEqual(reply, "Turnover needs INR 100 Cr; you meet it.")
+        self.assertEqual(fake.calls[0]["model"], "claude-sonnet-5-5")
+        self.assertEqual(fake.calls[0]["output_config"]["effort"], "low")
+        self.assertIn("answer in Hindi", fake.calls[0]["system"][0]["text"])
+        self.assertTrue(partials and partials[-1].startswith("Turnover"))
+        grounded = fake.calls[0]["messages"][0]["content"]
+        self.assertEqual(grounded[0]["source"]["file_id"], "f1")
+        self.assertIn("cache_control", grounded[0])
         self.assertEqual(turn.cards[0]["title"], "Prequalification criteria")
         self.assertIn("Ours", turn.cards[0]["columns"])
-        first = fake.calls[0]["messages"]
+        first = fake.calls[0]["messages"][2:]  # after the grounding pages
         self.assertEqual([m["role"] for m in first], ["user", "assistant", "user"])  # history starts with a user turn
         second = fake.calls[1]["messages"]
         self.assertEqual(second[-1]["content"][0]["tool_use_id"], "t1")

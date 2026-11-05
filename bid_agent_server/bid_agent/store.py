@@ -68,6 +68,24 @@ SCHEMA = [
         updated_at REAL,
         PRIMARY KEY (owner_key, tender_db_id)
     )""",
+    """CREATE TABLE IF NOT EXISTS bid_agent_instructions (
+        scope TEXT PRIMARY KEY,
+        text TEXT,
+        updated_by INTEGER,
+        updated_at REAL
+    )""",
+    """CREATE TABLE IF NOT EXISTS bid_agent_learnings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_key TEXT NOT NULL,
+        employer_key TEXT,
+        text TEXT NOT NULL,
+        source TEXT,
+        tender_db_id INTEGER,
+        created_by INTEGER,
+        created_at REAL,
+        active INTEGER DEFAULT 1
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_bid_agent_learnings_owner ON bid_agent_learnings(owner_key)",
     """CREATE TABLE IF NOT EXISTS bid_company_profiles (
         owner_key TEXT PRIMARY KEY,
         data_json TEXT,
@@ -79,6 +97,7 @@ SCHEMA = [
 
 MIGRATIONS = [
     ("bid_org_profiles", "tender_ids_json", "TEXT"),
+    ("bid_agent_chats", "partial", "TEXT"),
 ]
 
 
@@ -309,3 +328,102 @@ class Store:
                  time.time()),
             )
             c.commit()
+
+    def set_chat_partial(self, owner_key: str, tender_db_id: int, text: str) -> None:
+        with self.conn() as c:
+            c.execute("UPDATE bid_agent_chats SET partial=?, updated_at=? WHERE owner_key=? AND tender_db_id=?",
+                      (text[-8000:], time.time(), owner_key, int(tender_db_id)))
+            c.commit()
+
+    def get_chat_partial(self, owner_key: str, tender_db_id: int) -> str:
+        with self.conn() as c:
+            r = c.execute("SELECT partial FROM bid_agent_chats WHERE owner_key=? AND tender_db_id=?",
+                          (owner_key, int(tender_db_id))).fetchone()
+        return (r[0] or "") if r else ""
+
+    def recent_chats(self, owner_key: str, limit: int = 20) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute("SELECT tender_db_id, messages_json, updated_at FROM bid_agent_chats WHERE owner_key=? "
+                             "ORDER BY updated_at DESC LIMIT ?", (owner_key, int(limit))).fetchall()
+        out = []
+        for r in rows:
+            msgs = _loads(r[1], [])
+            if not msgs:
+                continue
+            last = msgs[-1]
+            out.append({"tender_id": int(r[0]), "updated_at": r[2], "last": str(last.get("text") or "")[:200],
+                        "count": len(msgs)})
+        return out
+
+    # ---- training: standing instructions and learned notes ----------------
+    def get_instructions(self, scope: str) -> str:
+        with self.conn() as c:
+            r = c.execute("SELECT text FROM bid_agent_instructions WHERE scope=?", (scope,)).fetchone()
+        return (r[0] or "") if r else ""
+
+    def set_instructions(self, scope: str, text: str, user_id: int | None = None) -> None:
+        with self.conn() as c:
+            c.execute("INSERT INTO bid_agent_instructions (scope, text, updated_by, updated_at) VALUES (?,?,?,?) "
+                      "ON CONFLICT (scope) DO UPDATE SET text=excluded.text, updated_by=excluded.updated_by, "
+                      "updated_at=excluded.updated_at", (scope, (text or "")[:8000], user_id, time.time()))
+            c.commit()
+
+    def add_learning(self, owner_key: str, text: str, *, employer_key: str = "", source: str = "chat",
+                     tender_db_id: int | None = None, user_id: int | None = None) -> int:
+        text = " ".join(str(text or "").split())[:600]
+        if not text:
+            return 0
+        with self.conn() as c:
+            dup = c.execute("SELECT id FROM bid_agent_learnings WHERE owner_key=? AND COALESCE(employer_key,'')=? "
+                            "AND LOWER(text)=LOWER(?) AND active=1", (owner_key, employer_key or "", text)).fetchone()
+            if dup:
+                return int(dup[0])
+            cur = c.execute("INSERT INTO bid_agent_learnings (owner_key, employer_key, text, source, tender_db_id, "
+                            "created_by, created_at, active) VALUES (?,?,?,?,?,?,?,1)",
+                            (owner_key, employer_key or "", text, source, tender_db_id, user_id, time.time()))
+            c.commit()
+            return int(cur.lastrowid or 0)
+
+    def list_learnings(self, owner_key: str, employer_key: str | None = None, include_inactive: bool = False) -> list[dict]:
+        q = ("SELECT id, employer_key, text, source, tender_db_id, created_at, active FROM bid_agent_learnings "
+             "WHERE owner_key=?")
+        args: list = [owner_key]
+        if employer_key is not None:
+            q += " AND (COALESCE(employer_key,'')='' OR employer_key=?)"
+            args.append(employer_key)
+        if not include_inactive:
+            q += " AND active=1"
+        with self.conn() as c:
+            rows = c.execute(q + " ORDER BY id DESC", args).fetchall()
+        cols = ["id", "employer_key", "text", "source", "tender_id", "created_at", "active"]
+        return [dict(zip(cols, tuple(r))) for r in rows]
+
+    def all_learnings(self, limit: int = 500) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute("SELECT id, owner_key, employer_key, text, source, tender_db_id, created_at, active "
+                             "FROM bid_agent_learnings ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+        cols = ["id", "owner", "employer_key", "text", "source", "tender_id", "created_at", "active"]
+        return [dict(zip(cols, tuple(r))) for r in rows]
+
+    def update_learning(self, owner_key: str, learning_id: int, *, text: str | None = None,
+                        active: bool | None = None) -> bool:
+        sets, args = [], []
+        if text is not None:
+            sets.append("text=?")
+            args.append(" ".join(text.split())[:600])
+        if active is not None:
+            sets.append("active=?")
+            args.append(1 if active else 0)
+        if not sets:
+            return False
+        with self.conn() as c:
+            cur = c.execute(f"UPDATE bid_agent_learnings SET {', '.join(sets)} WHERE id=? AND owner_key=?",
+                            (*args, int(learning_id), owner_key))
+            c.commit()
+            return bool(getattr(cur, "rowcount", 0))
+
+    def delete_learning(self, owner_key: str, learning_id: int) -> bool:
+        with self.conn() as c:
+            cur = c.execute("DELETE FROM bid_agent_learnings WHERE id=? AND owner_key=?", (int(learning_id), owner_key))
+            c.commit()
+            return bool(getattr(cur, "rowcount", 0))
