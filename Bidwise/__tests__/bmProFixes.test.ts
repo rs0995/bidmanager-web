@@ -12,6 +12,7 @@ import {
   attachToItem,
   attachmentPath,
   createProjectFromTender,
+  deleteChecklistItem,
   deleteProject,
   getProjectsState,
   mergeFromServer,
@@ -245,6 +246,21 @@ describe('deleting an archived project', () => {
     const { removed } = buildPushBody();
     expect(removed.projects).toEqual([gone.id]);
     expect(removed.checklist).toEqual([item.id]);
+  });
+});
+
+describe('deleting a checklist item', () => {
+  it('removes the row and sends it as removed, so the server drops its file too', () => {
+    const p = createProjectFromTender(tender);
+    const keep = addChecklistItem(p.id, 'EMD');
+    const gone = addChecklistItem(p.id, 'PoA');
+    writeJSON('bw.syncBlob', {
+      projects: getProjectsState().projects,
+      checklist: getProjectsState().checklist,
+    });
+    deleteChecklistItem(gone.id);
+    expect(getProjectsState().checklist.map(r => r.id)).toEqual([keep.id]);
+    expect(buildPushBody().removed.checklist).toEqual([gone.id]);
   });
 });
 

@@ -15,6 +15,8 @@ export type AlertKind =
   | 'new'
   | 'success'
   | 'prep'
+  /** A project someone else added (another device or organisation member). */
+  | 'project'
   | 'download';
 
 export type AlertItem = {
@@ -63,8 +65,7 @@ const seed: AlertItem[] = [
   {
     id: 'a3',
     kind: 'new',
-    message:
-      '“P-North road resurfacing” and “K-West storm-water drains” were added under Municipal Corp. of Greater Mumbai.',
+    message: '2 new tenders were added under Municipal Corp. of Greater Mumbai.',
     time: 'Updated 4 min ago',
     unread: true,
     orgName: 'Municipal Corp. of Greater Mumbai',

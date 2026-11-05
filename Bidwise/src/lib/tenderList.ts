@@ -1,5 +1,6 @@
 import type { Tender } from '../fixtures/tenders';
 import { hoursUntilClose } from './deadlines';
+import { parseCrores } from './format';
 import {
   closesWithinDays,
   passesSheetFilters,
@@ -16,7 +17,7 @@ export type TenderListQuery = {
   search: string;
   savedOnly: boolean;
   closingSoon: boolean;
-  sort: 'closing' | 'value';
+  sort: 'closing' | 'value' | 'emd';
   /** The Filter sheet's choices. */
   filters?: SheetFilters;
   isSaved: (id: string) => boolean;
@@ -40,6 +41,8 @@ export function listTenders(all: Tender[], q: TenderListQuery): Tender[] {
     .sort((a, b) =>
       q.sort === 'value'
         ? crores(b) - crores(a)
+        : q.sort === 'emd'
+        ? parseCrores(b.emd) - parseCrores(a.emd)
         : hoursUntilClose(a.closeIn) - hoursUntilClose(b.closeIn),
     );
 }

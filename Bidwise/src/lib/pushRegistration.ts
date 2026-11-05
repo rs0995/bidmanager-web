@@ -1,3 +1,4 @@
+import { AppState } from 'react-native';
 import { push, type PushPermission } from '../platform/push';
 import { api } from './api';
 import { isSignedIn } from './auth';
@@ -95,10 +96,22 @@ function syncBadge() {
     const count = unreadCount();
     const orgs = unreadOrgs();
     const key = `${count}|${orgs.join('')}`;
-    if (key === lastBadge || !isSignedIn() || !getRaw(TOKEN_KEY)) return;
+    // Per user, not per phone: the server sets this count on all the user's devices,
+    // so it doesn't need this phone's push token.
+    if (key === lastBadge || !isSignedIn()) return;
     lastBadge = key;
     api.badge(count, orgs).catch(() => {});
   }, BADGE_EVERY_MS);
+}
+
+/**
+ * Sets the icon to the real unread count and tells the server even if the count hasn't
+ * changed: the server's counter climbs with every push it sends, so it must be put
+ * back each time the app is back in front or a push came in.
+ */
+export function forceBadgeSync() {
+  lastBadge = '';
+  syncBadge();
 }
 
 let started = false;
@@ -113,8 +126,15 @@ export function initPush(onForegroundPush?: () => void) {
   push.onToken(token => {
     sendToken(token).catch(() => {});
   });
-  if (onForegroundPush) push.onReceived(() => onForegroundPush());
+  push.onReceived(() => {
+    onForegroundPush?.();
+    forceBadgeSync();
+  });
   onAlertsChange(syncBadge);
+  // Back in front: the pushes received meanwhile set the server's number; reset it.
+  AppState.addEventListener('change', st => {
+    if (st === 'active') forceBadgeSync();
+  });
   syncBadge();
   syncPushToken().catch(() => {});
 }

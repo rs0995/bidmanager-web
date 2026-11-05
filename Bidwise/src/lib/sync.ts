@@ -11,6 +11,7 @@ import {
 import { forSync, mergeFromServer } from './sharedProjects';
 import { checkForAlerts } from './alertChecks';
 import { refreshAccount } from './account';
+import { checkNewProjects } from './projectAlerts';
 import {
   getBookmarkedOrgs,
   getBookmarks,
@@ -145,6 +146,8 @@ export async function pull(): Promise<boolean> {
   setBookmarks((blob.bookmarks ?? []).map(Number));
   setBookmarkedOrgs(blob.bookmarkedOrgs ?? []);
   mergeFromServer(blob.projects ?? [], blob.checklist ?? []);
+  // Projects someone else added: an alert in the Alerts tab (if that's on).
+  if (Array.isArray(blob.projects)) checkNewProjects(blob.projects);
   applyServerNotificationPrefs(blob.notificationPrefs);
   writeJSON(BLOB_KEY, blob);
   setBase(res.updated_at);
@@ -161,10 +164,20 @@ export async function syncUserData(): Promise<void> {
     if (isDirty() && !(await pushNow())) return;
     await pull();
     if (isDirty()) await pushNow();
+    afterSync.forEach(fn => fn());
   })().finally(() => {
     syncInFlight = null;
   });
   return syncInFlight;
+}
+
+const afterSync = new Set<() => void>();
+/** Runs `fn` after every completed sync (lib/projectFiles.ts uploads waiting files). */
+export function onSynced(fn: () => void) {
+  afterSync.add(fn);
+  return () => {
+    afterSync.delete(fn);
+  };
 }
 
 registerSyncRunner(syncUserData);

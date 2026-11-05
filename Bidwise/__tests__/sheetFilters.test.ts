@@ -1,4 +1,7 @@
+import { locationOptions } from '../src/data/tenderSource';
 import { tenders } from '../src/fixtures/tenders';
+import { parseCrores } from '../src/lib/format';
+import { listTenders } from '../src/lib/tenderList';
 import {
   closingThisWeek,
   NO_SHEET_FILTERS,
@@ -16,59 +19,77 @@ const t = {
   closeIn: '2d 4h',
 };
 
-it('counts the filters that are set', () => {
+it('counts the filters that are set; a value range counts once', () => {
   expect(sheetFilterCount(NO_SHEET_FILTERS)).toBe(0);
   expect(
     sheetFilterCount({
-      ...NO_SHEET_FILTERS,
-      category: 'works',
-      value: 'gt25',
-      closingSoon: true,
+      category: 'Works',
+      location: 'Pune',
+      minCr: '5',
+      maxCr: '20',
     }),
   ).toBe(3);
+  expect(sheetFilterCount({ ...NO_SHEET_FILTERS, maxCr: 'abc' })).toBe(0);
 });
 
-it('matches category and location as text, and documents', () => {
+it('matches category and location as text', () => {
   expect(
-    passesSheetFilters(t, { ...NO_SHEET_FILTERS, category: 'works' }),
+    passesSheetFilters(t, { ...NO_SHEET_FILTERS, category: 'Works' }),
   ).toBe(true);
   expect(
-    passesSheetFilters(t, { ...NO_SHEET_FILTERS, location: 'nagpur' }),
+    passesSheetFilters(t, { ...NO_SHEET_FILTERS, category: 'Goods' }),
   ).toBe(false);
-  expect(passesSheetFilters(t, { ...NO_SHEET_FILTERS, docs: 'with' })).toBe(
-    false,
-  );
-  expect(passesSheetFilters(t, { ...NO_SHEET_FILTERS, docs: 'without' })).toBe(
-    true,
-  );
+  expect(
+    passesSheetFilters(t, { ...NO_SHEET_FILTERS, location: 'Nagpur' }),
+  ).toBe(false);
   // Live pages are already filtered by the server on these.
   expect(
-    passesSheetFilters(t, { ...NO_SHEET_FILTERS, location: 'nagpur' }, true),
+    passesSheetFilters(t, { ...NO_SHEET_FILTERS, location: 'Nagpur' }, true),
   ).toBe(true);
 });
 
-it('filters by value and closing within 5 days', () => {
-  expect(passesSheetFilters(t, { ...NO_SHEET_FILTERS, value: 'gt25' })).toBe(
-    true,
-  );
-  expect(passesSheetFilters(t, { ...NO_SHEET_FILTERS, value: 'lt10' })).toBe(
-    false,
-  );
+it('filters by a typed value range in crores', () => {
+  // The tender is worth ₹30 Cr.
+  const range = (minCr: string, maxCr: string) =>
+    passesSheetFilters(t, { ...NO_SHEET_FILTERS, minCr, maxCr });
+  expect(range('25', '')).toBe(true);
+  expect(range('', '10')).toBe(false);
+  expect(range('10', '40')).toBe(true);
+  expect(range('31', '')).toBe(false);
+  expect(range('', '')).toBe(true);
+});
+
+it('lists only the locations in the data, most tenders first', () => {
+  const at = (location: string) => ({ ...t, location });
   expect(
-    passesSheetFilters(t, { ...NO_SHEET_FILTERS, closingSoon: true }),
-  ).toBe(true);
-  expect(
-    passesSheetFilters(
-      { ...t, closeIn: '12d' },
-      { ...NO_SHEET_FILTERS, closingSoon: true },
-    ),
-  ).toBe(false);
-  expect(
-    passesSheetFilters(
-      { ...t, closeIn: 'Closed' },
-      { ...NO_SHEET_FILTERS, closingSoon: true },
-    ),
-  ).toBe(false);
+    locationOptions([
+      at('Pune'),
+      at('Nagpur'),
+      at('Pune'),
+      at(' '),
+      at('—'),
+      at('Mumbai'),
+    ]),
+  ).toEqual([
+    { value: 'Pune', count: 2 },
+    { value: 'Mumbai', count: 1 },
+    { value: 'Nagpur', count: 1 },
+  ]);
+});
+
+it('sorts the demo list by EMD, highest first', () => {
+  const rows = listTenders(tenders, {
+    portal: null,
+    org: null,
+    search: '',
+    savedOnly: false,
+    closingSoon: false,
+    sort: 'emd',
+    isSaved: () => false,
+  });
+  const emd = rows.map(r => parseCrores(r.emd));
+  expect(emd).toEqual([...emd].sort((x, y) => y - x));
+  expect(emd[0]).toBeGreaterThan(emd[emd.length - 1]);
 });
 
 it('closing this week: bookmarked, still open, within 7 days, soonest first (as BM Pro)', () => {

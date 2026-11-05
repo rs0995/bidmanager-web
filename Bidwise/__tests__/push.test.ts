@@ -186,4 +186,36 @@ describe('badge', () => {
     expect(badges).toHaveLength(1);
     expect(badges[0].body).toEqual({ count: 2, unread_orgs: [] });
   });
+
+  it('resets the badge (and the server’s count) on coming back and on a push, token or not', () => {
+    const { AppState } = require('react-native');
+    let onChange: (s: string) => void = () => {};
+    const spy = jest
+      .spyOn(AppState, 'addEventListener')
+      .mockImplementation((...args: unknown[]) => {
+        onChange = args[1] as (s: string) => void;
+        return { remove: () => {} };
+      });
+    markAllRead();
+    initPush(); // no push token on this phone
+    jest.advanceTimersByTime(5_100);
+    const sent = () => mockCalls.filter(c => c.route === '/client/badge');
+    // Per user: sent without this phone's token.
+    expect(sent()).toHaveLength(1);
+    expect(sent()[0].body).toEqual({ count: 0, unread_orgs: [] });
+
+    // Pushes meanwhile raised the server's number: coming back puts it right.
+    mockNative.badges.length = 0;
+    onChange('active');
+    expect(mockNative.badges.at(-1)).toBe(0);
+    jest.advanceTimersByTime(5_100);
+    expect(sent()).toHaveLength(2);
+    expect(sent()[1].body).toEqual({ count: 0, unread_orgs: [] });
+
+    // A push while open does the same.
+    mockNative.listeners.get('received')!({ thread: 'tender', tenderId: 1 });
+    jest.advanceTimersByTime(5_100);
+    expect(sent()).toHaveLength(3);
+    spy.mockRestore();
+  });
 });

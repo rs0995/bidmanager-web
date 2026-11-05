@@ -13,6 +13,7 @@ import {
   Clock3,
   FileDiff,
   Files,
+  FolderPlus,
   Paperclip,
 } from 'lucide-react-native';
 import { Card, PageTitle, Screen, Segmented } from '../../components/ui';
@@ -34,6 +35,7 @@ const ICONS: Record<AlertKind, typeof Clock3> = {
   success: CircleCheck,
   prep: Paperclip,
   download: DownloadCloud,
+  project: FolderPlus,
 };
 
 function AlertRow({

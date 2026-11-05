@@ -110,14 +110,15 @@ static NSDictionary *PayloadOf(UNNotification *notification)
   [self emit:kEventError body:@{@"message" : error.localizedDescription ?: @"Registration failed"}];
 }
 
-// A notification arrives while the app is open: show it anyway, and tell JS.
+// A notification arrives while the app is open: show it anyway, and tell JS. Not its
+// badge: the server's number would overwrite the app's own unread count, which JS sets.
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
        willPresentNotification:(UNNotification *)notification
          withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler
 {
   [self emit:kEventReceived body:PayloadOf(notification)];
   completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionList |
-                    UNNotificationPresentationOptionSound | UNNotificationPresentationOptionBadge);
+                    UNNotificationPresentationOptionSound);
 }
 
 // The user tapped a notification. Before JS is listening (the tap launched the app),

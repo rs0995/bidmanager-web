@@ -1,8 +1,14 @@
 import { useSyncExternalStore } from 'react';
-import type { SharedChecklistItem, SharedProject, ServerTender } from './api';
+import type {
+  ServerFile,
+  SharedChecklistItem,
+  SharedProject,
+  ServerTender,
+} from './api';
 import { readJSON, writeJSON } from './kv';
 import { schedulePush } from './pushQueue';
 import { addAlert } from './alerts';
+import { noteOwnProject } from './projectAlerts';
 import { files } from '../platform/files';
 
 // Projects + checklist, local-first, in the EXACT row format the desktop Client UI and
@@ -129,6 +135,8 @@ export function createProjectFromTender(t: ServerTender): SharedProject {
     description: t.work_description || '',
   };
   commit({ projects: [...state.projects, project] });
+  // Made here: no "new project" alert for it after the next pull.
+  noteOwnProject(project.id);
   return project;
 }
 
@@ -215,13 +223,76 @@ export function setChecklistStatus(
 // apps (and other phones) the stored uri only means something on this phone.
 
 export const ATTACHMENTS_DIR = 'attachments';
+
+// The server keeps each row's file too (lib/projectFiles.ts uploads, downloads and
+// deletes it). Set there, so this module doesn't import the sync layer.
+type FileHooks = {
+  /** Upload the row's new local file; resolves a note to show, if any. */
+  upload?: (itemId: number) => Promise<string | undefined>;
+  /** Delete the row's file on the server. */
+  remove?: (row: SharedChecklistItem) => Promise<void>;
+  /** This phone's downloaded copy of the row's server file, if it has one. */
+  localCopy?: (row: SharedChecklistItem) => Promise<string | null>;
+  /** Forget this phone's downloaded copy (row deleted or file removed). */
+  forget?: (itemId: number) => void;
+};
+let hooks: FileHooks = {};
+export function setFileHooks(h: FileHooks) {
+  hooks = { ...hooks, ...h };
+}
+
+/** Records the server's file on a row here only (the server owns it; never pushed). */
+export function setItemServerFile(itemId: number, file: ServerFile | null) {
+  commit(
+    { checklist: mapItem(itemId, r => ({ ...r, server_file: file })) },
+    false,
+  );
+}
+
+/** The row now uses a file downloaded from the server (another device's won). */
+export function adoptServerCopy(itemId: number, file: ServerFile, abs: string) {
+  commit({
+    checklist: mapItem(itemId, r => ({
+      ...r,
+      status: 'Completed',
+      server_file: file,
+      attachment: {
+        name: file.name,
+        size: file.size ?? null,
+        type: file.type ?? null,
+        uri: abs,
+        device: 'phone',
+      },
+    })),
+  });
+}
+
+/**
+ * Deletes a checklist item: the row, its file on this phone, and (through the sync's
+ * `removed` delta) its file on the server.
+ */
+export function deleteChecklistItem(itemId: number) {
+  files.remove(files.abs(itemDir(itemId))).catch(() => {});
+  hooks.forget?.(itemId);
+  commit({ checklist: state.checklist.filter(r => r.id !== itemId) });
+}
 const itemDir = (itemId: number) => `${ATTACHMENTS_DIR}/${itemId}`;
 const prepDir = (projectId: number, docId: string) =>
   `${ATTACHMENTS_DIR}/prep/${projectId}/${docId}`;
 const safeName = (name: string, fallback: string) =>
   (name || fallback).replace(/[/\\]/g, '-');
 
-export async function attachToItem(itemId: number, a: PickedAsset) {
+export async function attachToItem(
+  itemId: number,
+  a: PickedAsset,
+): Promise<string | undefined> {
+  // Replacing a file: the server's copy has to go first (one file per row).
+  const existing = state.checklist.find(r => r.id === itemId);
+  if (existing?.server_file) {
+    await hooks.remove?.(existing).catch(() => {});
+    hooks.forget?.(itemId);
+    setItemServerFile(itemId, null);
+  }
   const name = safeName(a.name, `attachment-${itemId}`);
   const dest = files.abs(`${itemDir(itemId)}/${name}`);
   await files.remove(files.abs(itemDir(itemId))).catch(() => {});
@@ -246,15 +317,21 @@ export async function attachToItem(itemId: number, a: PickedAsset) {
     })),
   });
   maybeComplete(itemId, before);
+  // Then to the server, so every device can open it (retried by the backfill).
+  return hooks.upload?.(itemId).catch(() => undefined);
 }
 
 export function removeAttachment(itemId: number) {
   files.remove(files.abs(itemDir(itemId))).catch(() => {});
+  const row = state.checklist.find(r => r.id === itemId);
+  if (row?.server_file) hooks.remove?.(row).catch(() => {});
+  hooks.forget?.(itemId);
   commit({
     checklist: mapItem(itemId, r => ({
       ...r,
       status: 'Pending',
       attachment: null,
+      server_file: null,
     })),
   });
 }
@@ -268,15 +345,23 @@ export async function attachmentPath(
   row: SharedChecklistItem,
 ): Promise<{ path: string } | { reason: 'elsewhere' | 'missing' }> {
   const a = row.attachment;
-  if (!a) return { reason: 'missing' };
-  if (a.device !== 'phone') return { reason: 'elsewhere' };
-  const candidates = [
-    a.uri ? decodeURI(a.uri.replace(/^file:\/\//, '')) : '',
-    files.abs(`${itemDir(row.id)}/${safeName(a.name, `attachment-${row.id}`)}`),
-  ].filter(Boolean);
-  for (const path of candidates) {
-    if (await files.exists(path).catch(() => false)) return { path };
+  if (a && a.device === 'phone') {
+    const candidates = [
+      a.uri ? decodeURI(a.uri.replace(/^file:\/\//, '')) : '',
+      files.abs(
+        `${itemDir(row.id)}/${safeName(a.name, `attachment-${row.id}`)}`,
+      ),
+    ].filter(Boolean);
+    for (const path of candidates) {
+      if (await files.exists(path).catch(() => false)) return { path };
+    }
   }
+  // A copy of the server's file this phone downloaded earlier.
+  const copy = row.server_file
+    ? await hooks.localCopy?.(row).catch(() => null)
+    : null;
+  if (copy) return { path: copy };
+  if (a && a.device !== 'phone') return { reason: 'elsewhere' };
   return { reason: 'missing' };
 }
 

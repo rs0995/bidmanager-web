@@ -9,6 +9,7 @@ export const ALERT_TITLES: Record<AlertKind, string> = {
   success: 'Checklist complete',
   prep: 'Documents pending',
   download: 'Download finished',
+  project: 'New project',
 };
 
 /** "22 min ago", "Updated 4 min ago", "2 hours ago" are today; anything else is earlier. */

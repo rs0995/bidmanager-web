@@ -1,5 +1,7 @@
 import React from 'react';
-import ReactTestRenderer, { ReactTestRenderer as Renderer } from 'react-test-renderer';
+import ReactTestRenderer, {
+  ReactTestRenderer as Renderer,
+} from 'react-test-renderer';
 import { NextDeadlineCard } from '../src/components/dashboard/NextDeadlineCard';
 import { ThemeProvider } from '../src/theme';
 import { tenders } from '../src/fixtures/tenders';
@@ -28,6 +30,12 @@ async function render(items: AttentionItem[], next = tenders[0]) {
       </ThemeProvider>,
     );
   });
+  // The pager draws every slide once it knows its width (as after a real layout).
+  const pager = r.root.findAll(n => typeof n.props.onLayout === 'function')[0];
+  if (pager)
+    await ReactTestRenderer.act(async () => {
+      pager.props.onLayout({ nativeEvent: { layout: { width: 350 } } });
+    });
   return { r, onSeeMore, onOpenItem };
 }
 
@@ -37,7 +45,12 @@ const item = (i: number, level: 'crit' | 'soon' = 'crit'): AttentionItem => ({
 });
 
 it('slides through the 3 most urgent and offers See more for the rest', async () => {
-  const { r, onSeeMore } = await render([item(0), item(1), item(2, 'soon'), item(3, 'soon')]);
+  const { r, onSeeMore } = await render([
+    item(0),
+    item(1),
+    item(2, 'soon'),
+    item(3, 'soon'),
+  ]);
   const out = text(r);
   expect(out).toContain('NEEDS ATTENTION · 1 OF 4');
   expect(out).toContain('NEEDS ATTENTION · 3 OF 4');
@@ -48,7 +61,9 @@ it('slides through the 3 most urgent and offers See more for the rest', async ()
   // The Closing soon bar is gone.
   expect(out).not.toContain('Closing soon');
   const more = r.root.findAll(
-    n => n.props.accessibilityLabel === 'See all 4 tenders needing attention' && n.props.onPress,
+    n =>
+      n.props.accessibilityLabel === 'See all 4 tenders needing attention' &&
+      n.props.onPress,
   )[0];
   await ReactTestRenderer.act(async () => more.props.onPress());
   expect(onSeeMore).toHaveBeenCalled();
@@ -56,7 +71,11 @@ it('slides through the 3 most urgent and offers See more for the rest', async ()
 
 it('has no See more with 3 or fewer', async () => {
   const { r } = await render([item(0), item(1)]);
-  expect(r.root.findAll(n => String(n.props.accessibilityLabel ?? '').startsWith('See all')).length).toBe(0);
+  expect(
+    r.root.findAll(n =>
+      String(n.props.accessibilityLabel ?? '').startsWith('See all'),
+    ).length,
+  ).toBe(0);
 });
 
 it('shows the single next deadline when nothing needs attention', async () => {
@@ -71,4 +90,30 @@ it('fills the card: organisation and closing date under the title', async () => 
   const out = text(r);
   expect(out).toContain(tenders[0].org);
   expect(out).toContain(`Closes ${tenders[0].closing}`);
+});
+
+it('shows only the first slide, full width, until the pager is measured', async () => {
+  let r!: Renderer;
+  await ReactTestRenderer.act(async () => {
+    r = ReactTestRenderer.create(
+      <ThemeProvider>
+        <NextDeadlineCard
+          items={[item(0), item(1)]}
+          onOpenItem={jest.fn()}
+          onOpenTender={jest.fn()}
+          onSeeMore={jest.fn()}
+        />
+      </ThemeProvider>,
+    );
+  });
+  const slides = r.root.findAll(
+    n =>
+      typeof n.props.onPress === 'function' &&
+      String(n.props.accessibilityLabel ?? '').startsWith('Open '),
+  );
+  expect(new Set(slides.map(n => n.props.accessibilityLabel)).size).toBe(1);
+  // Each slide clips to its page, so a long title can't spill over the next one.
+  expect(JSON.stringify(slides[0].props.style)).toContain(
+    '"overflow":"hidden"',
+  );
 });

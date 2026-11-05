@@ -175,33 +175,40 @@ export function groupByOrg(
     );
 }
 
-/** The Tenders tab's Filter sheet: BM Pro's filter sheet plus its value and closing presets. */
+/** The portals' only tender categories. */
+export const CATEGORIES = ['Works', 'Services', 'Goods'] as const;
+export type Category = (typeof CATEGORIES)[number];
+
+/** The Tenders tab's Filter sheet: category and location pick-lists, tender value range. */
 export type SheetFilters = {
-  /** Text match, as the server's `category` / `location` filters. */
-  category: string;
+  /** '' = any. Text match, as the server's `category` / `location` filters. */
+  category: '' | Category;
+  /** '' = any; one of the locations in the data. */
   location: string;
-  docs: 'any' | 'with' | 'without';
-  value: 'any' | 'gt25' | 'lt10';
-  /** Closing within 5 days (was the "Closing < 5 days" chip). */
-  closingSoon: boolean;
+  /** Tender value range in crores, typed by hand; '' = no limit. */
+  minCr: string;
+  maxCr: string;
 };
 
 export const NO_SHEET_FILTERS: SheetFilters = {
   category: '',
   location: '',
-  docs: 'any',
-  value: 'any',
-  closingSoon: false,
+  minCr: '',
+  maxCr: '',
 };
 
-/** How many filters are set, for the Filter button's badge. */
+/** A typed amount: digits and one dot; anything else (or nothing) is no limit. */
+export function parseLimit(text: string): number | null {
+  const n = parseFloat(text.replace(/[^0-9.]/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+/** How many filters are set, for the Filter button's badge (the value range counts once). */
 export function sheetFilterCount(f: SheetFilters): number {
   return [
-    f.category.trim(),
+    f.category,
     f.location.trim(),
-    f.docs !== 'any',
-    f.value !== 'any',
-    f.closingSoon,
+    parseLimit(f.minCr) !== null || parseLimit(f.maxCr) !== null,
   ].filter(Boolean).length;
 }
 
@@ -210,7 +217,7 @@ const matches = (field: string, needle: string) =>
 
 /**
  * Whether a tender passes the sheet's filters. `serverSide` skips the ones the server
- * already applied (category, location, documents) to a live page of results.
+ * already applied (category, location) to a live page of results.
  */
 export function passesSheetFilters(
   t: Tender,
@@ -220,14 +227,13 @@ export function passesSheetFilters(
   if (!serverSide) {
     if (!matches(t.category, f.category) || !matches(t.location, f.location))
       return false;
-    const docs = t.docCount ?? t.docs.length;
-    if (f.docs === 'with' && docs === 0) return false;
-    if (f.docs === 'without' && docs > 0) return false;
   }
-  const cr = parseCrores(t.value);
-  if (f.value === 'gt25' && !(cr > 25)) return false;
-  if (f.value === 'lt10' && !(cr < 10)) return false;
-  if (f.closingSoon && (t.closeIn === 'Closed' || !closesWithinDays(t, 5)))
-    return false;
+  const min = parseLimit(f.minCr);
+  const max = parseLimit(f.maxCr);
+  if (min !== null || max !== null) {
+    const cr = parseCrores(t.value);
+    if (min !== null && cr < min) return false;
+    if (max !== null && cr > max) return false;
+  }
   return true;
 }

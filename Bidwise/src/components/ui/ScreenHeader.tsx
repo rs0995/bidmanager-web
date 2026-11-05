@@ -146,7 +146,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  initials: { fontFamily: fonts.extrabold, fontSize: 14, letterSpacing: -0.3 },
+  initials: { fontFamily: fonts.extrabold, fontSize: 15, letterSpacing: -0.3 },
   glassBorder: { borderWidth: 1 },
   blurClip: {
     ...StyleSheet.absoluteFill,

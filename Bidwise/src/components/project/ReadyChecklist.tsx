@@ -11,8 +11,10 @@ export type ReadyRow = {
   name: string;
   file?: string;
   done: boolean;
-  /** Attached on another device: listed, but not on this phone. */
+  /** Attached on another device and not on the server: listed, but can't open here. */
   elsewhere?: boolean;
+  /** On the server, not on this phone yet: opening downloads it. */
+  remote?: boolean;
 };
 
 /** "1 of 3 ready". */
@@ -31,6 +33,7 @@ export function ReadyChecklist({
   onAttach,
   onOpen,
   onRemove,
+  onDelete,
   onAdd,
 }: {
   rows: ReadyRow[];
@@ -39,12 +42,19 @@ export function ReadyChecklist({
   onAttach: (key: string) => void;
   onOpen: (key: string) => void;
   onRemove: (key: string) => void;
+  /** Deletes the item itself (and its file). */
+  onDelete: (key: string) => void;
   onAdd: (name: string) => void;
 }) {
   const t = useTheme();
   const surface = useSurface();
   const [draft, setDraft] = useState('');
-  // An attached item: open it, swap the file, or take it off (iOS action sheet).
+  const deleteItem = (r: ReadyRow) => ({
+    label: 'Delete item',
+    destructive: true,
+    onPress: () => onDelete(r.key),
+  });
+  // An attached item: open it, swap the file, take it off, or delete the item.
   const manage = (r: ReadyRow) =>
     showActionSheet(r.file ?? r.name, [
       { label: 'Open', onPress: () => onOpen(r.key) },
@@ -54,7 +64,11 @@ export function ReadyChecklist({
         destructive: true,
         onPress: () => onRemove(r.key),
       },
+      deleteItem(r),
     ]);
+  // Tap and hold an item: the same menu, or just Delete item when nothing is attached.
+  const hold = (r: ReadyRow) =>
+    r.file ? manage(r) : showActionSheet(r.name, [deleteItem(r)]);
 
   const add = () => {
     const name = draft.trim();
@@ -92,10 +106,11 @@ export function ReadyChecklist({
             />
             <Pressable
               style={styles.copy}
-              disabled={!r.file}
-              accessibilityRole={r.file ? 'button' : undefined}
-              accessibilityLabel={r.file ? `Open ${r.file}` : undefined}
-              onPress={() => onOpen(r.key)}
+              accessibilityRole="button"
+              accessibilityLabel={r.file ? `Open ${r.file}` : r.name}
+              accessibilityHint="Touch and hold for more options"
+              onPress={() => (r.file ? onOpen(r.key) : undefined)}
+              onLongPress={() => hold(r)}
             >
               <Text
                 numberOfLines={1}
@@ -117,6 +132,8 @@ export function ReadyChecklist({
                 {r.file
                   ? r.elsewhere
                     ? `${r.file} · on another device`
+                    : r.remote
+                    ? `${r.file} · tap to download`
                     : r.file
                   : 'Awaiting attachment'}
               </Text>

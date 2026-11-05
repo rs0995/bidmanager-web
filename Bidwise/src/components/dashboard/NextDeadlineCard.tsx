@@ -122,8 +122,12 @@ export function NextDeadlineCard({
               showsHorizontalScrollIndicator={false}
               onScroll={onScroll}
               scrollEventThrottle={32}
+              // Before it's measured: one page as wide as the pager itself.
+              contentContainerStyle={width ? undefined : styles.full}
             >
-              {slides.map((it, i) => (
+              {/* Until the pager is measured, only the first slide (so nothing from
+                  the next one can show beside it); each slide clips to its page. */}
+              {(width ? slides : slides.slice(0, 1)).map((it, i) => (
                 <Pressable
                   key={it.tender.id}
                   accessibilityRole="button"
@@ -131,7 +135,7 @@ export function NextDeadlineCard({
                     it.tender.short
                   }, ${attentionReason(it)}`}
                   onPress={() => onOpenItem(it)}
-                  style={{ width: width || undefined }}
+                  style={[styles.slide, width ? { width } : styles.full]}
                 >
                   <Slide
                     tender={it.tender}
@@ -198,7 +202,10 @@ export function NextDeadlineCard({
 const styles = StyleSheet.create({
   card: { gap: 14, marginBottom: 14 },
   // Ring at the left, text filling the rest of the card.
+  slide: { overflow: 'hidden' },
+  full: { width: '100%' },
   row: {
+    width: '100%',
     flexDirection: 'row',
     alignItems: 'center',
     gap: 16,

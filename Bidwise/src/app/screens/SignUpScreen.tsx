@@ -135,7 +135,9 @@ export function SignUpScreen() {
         placeholder="At least 8 characters"
         secureTextEntry
         textContentType="newPassword"
-        onSubmitEditing={submit}
+        // Return only closes the keyboard: the button creates the account.
+        returnKeyType="done"
+        submitBehavior="blurAndSubmit"
       />
 
       {error ? (
@@ -147,12 +149,14 @@ export function SignUpScreen() {
         </Text>
       ) : null}
 
-      <Button
-        label={busy ? 'Creating account…' : 'Create account'}
-        block
-        loading={busy}
-        onPress={submit}
-      />
+      <View style={styles.submit}>
+        <Button
+          label={busy ? 'Creating account…' : 'Create account'}
+          block
+          loading={busy}
+          onPress={submit}
+        />
+      </View>
     </Screen>
   );
 }
@@ -172,5 +176,7 @@ const styles = StyleSheet.create({
     marginTop: 6,
   },
   seg: { marginTop: 16, marginBottom: 14 },
-  error: { fontFamily: fonts.medium, fontSize: 13, marginBottom: 12 },
+  error: { fontFamily: fonts.medium, fontSize: 13, marginTop: 14 },
+  // Clear of the last field, as on the sign-in screen.
+  submit: { marginTop: 18 },
 });

@@ -23,6 +23,9 @@ import {
 } from './orgRequests';
 import { websitesQuery } from '../data/tenderSource';
 import { ACCOUNT_KEYS, refreshAccount, rehydrateAccount } from './account';
+// Checklist files on the server: registers its upload hooks and post-sync backfill.
+import { PROJECT_FILE_KEYS } from './projectFiles';
+import { PROJECT_ALERT_KEYS } from './projectAlerts';
 
 /** Every AsyncStorage key the live stores read; cleared by Clear local cache. */
 export const ALL_KEYS = [
@@ -36,6 +39,8 @@ export const ALL_KEYS = [
   ...PUSH_KEYS,
   ...ORG_REQUEST_KEYS,
   ...ACCOUNT_KEYS,
+  ...PROJECT_FILE_KEYS,
+  ...PROJECT_ALERT_KEYS,
   // Last portal chosen on Tenders / Archive (components/tender/PortalPicker.tsx).
   'bw.tendersLastPortal',
   // Last synced portals, organisations and tender pages (lib/queryPersist.ts).

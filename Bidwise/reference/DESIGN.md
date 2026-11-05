@@ -68,4 +68,4 @@ The source is `bidwise-preview.html`: the final phone preview from the ChatGPT d
   | Comfortable | #4b7f55 | #8bceaa |
 
 - **Type:** Inter for text, Space Grotesk for headings and figures, IBM Plex Mono for IDs.
-- **Logo:** a near-black (#0b0c10) tile with a warm orange glow rising from the bottom (#ffa05a / #ff7a1a / #c2410c), holding two slanted slabs filled white (#ffffff) to ice blue (#bfe3ff): a long bar on top and a stepped bar below that kicks up to the right. It is followed by the word "bidwise". This replaced the original "b." letter mark (2026-10-19).
+- **Logo:** the desktop app's icon (`Client UI/assets/icon.svg`): a navy gradient tile (#273352 to #0f1422) with three rising rounded bars (#5f719a, #8ca7d8, #3b6ce7 to #8db0ff) under a green (#10b981) tick badge. It is followed by the word "bidwise" in semibold. Matched to the desktop icon 2026-11-03; it replaced the slanted-slabs-on-black mark (2026-10-19), which had replaced the original "b." letter mark.

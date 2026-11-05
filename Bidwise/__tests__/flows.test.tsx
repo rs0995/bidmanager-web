@@ -156,7 +156,7 @@ describe('bidwise flows', () => {
     expect(r.root.findAll(isPressable).indexOf(segs[0])).toBeGreaterThan(
       order.indexOf('Portal: MahaTenders'),
     );
-    // No chips: the bookmarked filter is the star square, closing-soon is in Filter.
+    // No chips: the bookmarked filter is the star square, the rest are in Filter.
     let out = screenText(r);
     expect(out).not.toContain('Closing \u2264 5d');
 
@@ -174,8 +174,15 @@ describe('bidwise flows', () => {
     await press(pressable(r, 'Bookmarked tenders only'));
 
     await press(pressable(r, 'Filters'));
-    expect(screenText(r)).toContain('Has documents');
-    await press(pressable(r, 'Closing within 5 days'));
+    // Category and location are pick-lists; documents and closing-soon are gone.
+    out = screenText(r);
+    expect(out).not.toContain('Has documents');
+    expect(out).not.toContain('Closing within 5 days');
+    await press(pressable(r, 'Category: Any'));
+    out = screenText(r);
+    ['Works', 'Services', 'Goods'].forEach(c => expect(out).toContain(c));
+    await press(byText(r, 'Services', 'menuitem'));
+    expect(pressable(r, 'Category: Services')).toBeTruthy();
     await press(byText(r, 'Apply', 'button'));
     expect(pressable(r, 'Filters, 1 on')).toBeTruthy();
     expect(screenText(r)).toContain('Filter \u00b7 1');
@@ -230,6 +237,14 @@ describe('bidwise flows', () => {
     // BM Pro layout: once it's a project the middle button opens it.
     expect(out).toContain('View project');
     expect(out).toContain('0 of 1 ready');
+    // A project's tender is bookmarked, and can't be un-bookmarked while it's a project.
+    expect(out).toContain('Bookmarked');
+    await press(last(r, 'Unsave tender'));
+    out = screenText(r);
+    expect(out).toContain('Bookmarked');
+    expect(out).toContain(
+      "Tenders in projects can't be removed from bookmarks. Remove the project first.",
+    );
 
     // R3: tapping the checkbox marks it done, and again undoes it.
     await press(pressable(r, 'Site visit certificate ready'));
@@ -308,12 +323,29 @@ describe('bidwise flows', () => {
   it('opens a new-tenders alert as a page of just those tenders, with search and sort', async () => {
     const r = await mount();
     await press(tab(r, 'Alerts'));
-    await press(byText(r, 'K-West storm-water drains'));
+    await press(byText(r, '2 new tenders were added under'));
     let out = screenText(r);
     expect(out).toContain('Municipal Corp. of Greater Mumbai');
-    expect(out).toContain('2 new tenders');
-    expect(out).toContain('P-North road resurfacing');
+    expect(out).toContain('MCGM/RD/2024/1601');
     expect(out).toContain('Newest first');
+    // EMD is one of the sorts, highest first.
+    const page = r.root.findAll(n => Array.isArray(n.props.sorts));
+    const keys = (page[page.length - 1].props.sorts as { key: string }[]).map(
+      s => s.key,
+    );
+    expect(keys).toContain('emd');
+    await ReactTestRenderer.act(async () => {
+      page[page.length - 1].props.onSort('emd');
+    });
+    const byEmd = r.root.findAll(
+      n =>
+        Array.isArray(n.props.data) &&
+        n.props.ListHeaderComponent !== undefined,
+    );
+    const order = (
+      byEmd[byEmd.length - 1].props.data as { emd: string }[]
+    ).map(x => x.emd);
+    expect(order).toEqual(['₹16,20,000', '₹9,35,000']);
     // Search narrows the list.
     const search = r.root.findAll(
       n =>
@@ -440,6 +472,142 @@ describe('bidwise flows', () => {
     expect(page.every(x => initialBookmarks.includes(x.id))).toBe(true);
     // Its own page: search and sort, not the Tenders tab's portal and filters.
     expect(last(r, 'Sort: Closing soonest')).toBeTruthy();
+  });
+
+  it('opens a tapped calendar day in a sheet, and resets to today on leaving the tab', async () => {
+    const r = await mount();
+    const day = (label: string) =>
+      r.root.findAll(
+        n => isPressable(n) && n.props.accessibilityLabel === label,
+      )[0];
+    expect(day('Tu 27, 0 closing').props.accessibilityState).toEqual({
+      selected: true,
+    });
+    // An empty day only moves the tile: no sheet.
+    const empty = r.root.findAll(
+      n =>
+        isPressable(n) &&
+        / 0 closing$/.test(String(n.props.accessibilityLabel ?? '')) &&
+        n.props.accessibilityLabel !== 'Tu 27, 0 closing',
+    )[0];
+    await press(empty);
+    expect(empty.props.accessibilityState).toEqual({ selected: true });
+    expect(screenText(r)).not.toContain('due');
+    await press(day('Mo 26, 1 closing'));
+    expect(day('Mo 26, 1 closing').props.accessibilityState).toEqual({
+      selected: true,
+    });
+    let out = screenText(r);
+    expect(out).toContain('Mon, 26 Aug');
+    expect(out).toContain('1 tender due');
+    // The day's tender opens from the sheet.
+    await press(
+      last(
+        r,
+        'Panvel–Uran road widening, Public Works Department, Konkan Region',
+      ),
+    );
+    expect(screenText(r)).toContain('Tender details');
+    await press(last(r, 'Back'));
+    // Another tab and back: the tile is on today again and the sheet is gone.
+    await press(tab(r, 'Alerts'));
+    await press(tab(r, 'Overview'));
+    expect(day('Tu 27, 0 closing').props.accessibilityState).toEqual({
+      selected: true,
+    });
+    out = screenText(r);
+    expect(out).not.toContain('1 tender due');
+  });
+
+  it('signs in from the button only, not from Return in the password field', async () => {
+    const r = await mount(false);
+    const password = r.root.findAll(
+      n => n.props.label === 'Password' && n.props.onChangeText,
+    )[0];
+    expect(password.props.onSubmitEditing).toBeUndefined();
+    expect(password.props.returnKeyType).toBe('done');
+    await press(byText(r, 'Create an account'));
+    const newPassword = r.root
+      .findAll(n => n.props.label === 'Password' && n.props.onChangeText)
+      .slice(-1)[0];
+    expect(newPassword.props.onSubmitEditing).toBeUndefined();
+  });
+
+  it('tap and hold a checklist item: Delete item alone, or with the attachment options', async () => {
+    const sheet = require('../src/platform/actionSheet');
+    let offered: string[] = [];
+    let pick = '';
+    const spy = jest
+      .spyOn(sheet, 'showActionSheet')
+      .mockImplementation((...args: unknown[]) => {
+        const opts = args[1] as { label: string; onPress: () => void }[];
+        offered = opts.map(o => o.label);
+        opts.find(o => o.label === pick)?.onPress();
+      });
+    const r = await mount();
+    await press(tab(r, 'Projects'));
+    await press(
+      r.root.findAll(
+        n =>
+          isPressable(n) &&
+          String(n.props.accessibilityLabel ?? '').startsWith(
+            'Panvel–Uran road widening',
+          ),
+      )[0],
+    );
+    const items = () =>
+      r.root.findAll(n => typeof n.props.onLongPress === 'function');
+    const withFile = items().find(n =>
+      String(n.props.accessibilityLabel).startsWith('Open '),
+    )!;
+    await ReactTestRenderer.act(async () => withFile.props.onLongPress());
+    expect(offered).toEqual([
+      'Open',
+      'Replace file',
+      'Remove attachment',
+      'Delete item',
+    ]);
+    const before = items().length;
+    const bare = items().find(
+      n => !String(n.props.accessibilityLabel).startsWith('Open '),
+    )!;
+    const name = String(bare.props.accessibilityLabel);
+    pick = 'Delete item';
+    await ReactTestRenderer.act(async () => bare.props.onLongPress());
+    expect(offered).toEqual(['Delete item']);
+    expect(items().length).toBe(before - 1);
+    expect(items().some(n => n.props.accessibilityLabel === name)).toBe(false);
+    spy.mockRestore();
+  });
+
+  it('puts the archive button on the Projects title line, orders cards by closing, and shows the company letter', async () => {
+    const r = await mount();
+    // The Dashboard tile: the company's initial (Rakshit Infra).
+    expect(
+      r.root.findAll(
+        n => (n.type as unknown) === 'Text' && n.props.children === 'R',
+      ).length,
+    ).toBeGreaterThan(0);
+    await press(tab(r, 'Projects'));
+    const archive = last(r, 'Archived projects');
+    // Same row as the title.
+    let row = archive.parent;
+    while (row && !textIn(row).includes('Projects')) row = row.parent;
+    expect(row && textIn(row)).toContain('Your bids, moving forward.');
+    // Cards in closing order: their time-left pills run from soonest.
+    const pills = r.root
+      .findAll(
+        n =>
+          isPressable(n) &&
+          / (\d+[dh]) left$/.test(String(n.props.accessibilityLabel ?? '')),
+      )
+      .map(n => String(n.props.accessibilityLabel).match(/(\d+)([dh]) left$/)!)
+      .map(m => Number(m[1]) * (m[2] === 'd' ? 24 : 1));
+    const unique = pills.filter(
+      (_, i) => i % 2 === 0 || pills[i] !== pills[i - 1],
+    );
+    expect(unique.length).toBeGreaterThan(1);
+    expect([...unique].sort((a, b) => a - b)).toEqual(unique);
   });
 
   it("switches accent and display in More's Theme row", async () => {
@@ -585,17 +753,25 @@ describe('bidwise flows', () => {
     const r = await mount();
     await press(tab(r, 'More'));
     await press(pressable(r, 'Push notifications'));
-    const out = screenText(r);
+    let out = screenText(r);
     [
       'Notifications: Not set up',
       'Allow notifications',
       'Bookmarked organisations',
       'Bookmarked tenders',
-      '1 day before',
-      '2 days before',
-      '3 days before',
-      '5 days before',
+      'New projects',
+      'Closing reminders',
+      '1 and 3 days before',
     ].forEach(x => expect(out).toContain(x));
+    // One row, not a switch per day: the days are in its dropdown.
+    expect(out).not.toContain('2 days before');
+    await press(byText(r, 'Closing reminders'));
+    out = screenText(r);
+    ['1 day before', '2 days before', '3 days before', '5 days before'].forEach(
+      x => expect(out).toContain(x),
+    );
+    await press(last(r, 'Remind 2 days before'));
+    expect(screenText(r)).toContain('1, 2 and 3 days before');
   });
 
   it('shows the profile card first on More', async () => {

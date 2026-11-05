@@ -219,6 +219,22 @@ export type SharedChecklistItem = {
     /** "phone": the uri is a file on the phone that attached it (BM Pro / Bidwise). */
     device?: string;
   } | null;
+  /** The row's file on the server, readable by every device (server-owned; sync can't set it). */
+  server_file?: ServerFile | null;
+};
+
+/** A checklist row's file stored on the server (API_CHANGES.md §3). */
+export type ServerFile = {
+  id: number;
+  name: string;
+  size?: number | null;
+  type?: string | null;
+  sha256?: string | null;
+  uploaded_at?: number | null;
+  uploaded_by?: number | null;
+  device?: string | null;
+  project_id?: number | null;
+  checklist_item_id?: number | null;
 };
 
 export type ChangesResponse = {
@@ -305,6 +321,11 @@ export const api = {
 
   tenders: (params: Params) =>
     request<Page<ServerTender>>(`/client/tenders?${qs(params)}`),
+  /** The values the Filter sheet offers, from the data (404 on a server without it). */
+  tenderFilters: (params: Params) =>
+    request<{ locations?: { value: string; count: number }[] }>(
+      `/client/tender-filters?${qs(params)}`,
+    ),
   tender: (id: number | string) =>
     request<ServerTender>(`/client/tenders/${Number(id)}`),
   tenderDocuments: (id: number | string, params: Params = {}) =>
@@ -392,6 +413,20 @@ export const api = {
       method: 'PUT',
       body: { role },
     }),
+  // Project checklist files on the server (the projects section). Uploads go through
+  // lib/projectFiles.ts (multipart).
+  projectFiles: (projectId: number) =>
+    request<{ items: ServerFile[] }>(
+      `/client/project-files?project_id=${Number(projectId)}`,
+    ),
+  projectFileDownload: (fileId: number) =>
+    request<{ file: ServerFile; url: string; expires_at?: number }>(
+      `/client/project-files/${Number(fileId)}/download-request`,
+      { method: 'POST' },
+    ),
+  deleteProjectFile: (fileId: number) =>
+    request(`/client/project-files/${Number(fileId)}`, { method: 'DELETE' }),
+
   // NIC portal tender search (the portal_search section; 403 without it).
   portalSearchPortals: () =>
     request<{ allowed: boolean; items: SearchPortal[] }>(

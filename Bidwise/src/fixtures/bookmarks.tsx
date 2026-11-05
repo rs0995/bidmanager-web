@@ -7,6 +7,18 @@ import React, {
   useState,
 } from 'react';
 import { initialBookmarks } from './tenders';
+import { useToast } from '../components/feedback/Toast';
+
+/** The server's wording (API_CHANGES.md §1): a project's tender stays bookmarked. */
+export const PROJECT_BOOKMARK_MESSAGE =
+  "Tenders in projects can't be removed from bookmarks. Remove the project first.";
+
+// Sample data: the demo projects' tenders, published by the demo ProjectsProvider
+// (which sits inside this provider, so it can't be read from here directly).
+let projectTenders = new Set<string>();
+export function setProjectTenderIds(ids: string[]) {
+  projectTenders = new Set(ids);
+}
 
 // Phase 1 only: in-memory bookmarks shared by Tenders, org and detail screens.
 // Replaced by lib/store.ts (persisted, synced) in Phase 2D.
@@ -53,19 +65,27 @@ function useToggleSet(initial: string[]) {
 }
 
 export function BookmarksProvider({ children }: { children: React.ReactNode }) {
-  const tenders = useToggleSet(initialBookmarks);
+  const { set: tenderSet, toggle: toggleTender } =
+    useToggleSet(initialBookmarks);
   const orgs = useToggleSet(initialOrgBookmarks);
+  const toast = useToast();
 
   const value = useMemo<BookmarksCtx>(
     () => ({
-      isBookmarked: id => tenders.set.has(id),
-      toggle: tenders.toggle,
-      count: tenders.set.size,
+      isBookmarked: id => tenderSet.has(id),
+      toggle: id => {
+        if (tenderSet.has(id) && projectTenders.has(id)) {
+          toast.show(PROJECT_BOOKMARK_MESSAGE);
+          return true;
+        }
+        return toggleTender(id);
+      },
+      count: tenderSet.size,
       isOrgBookmarked: name => orgs.set.has(name),
       toggleOrg: orgs.toggle,
       orgCount: orgs.set.size,
     }),
-    [tenders.set, tenders.toggle, orgs.set, orgs.toggle],
+    [tenderSet, toggleTender, orgs.set, orgs.toggle, toast],
   );
 
   return (

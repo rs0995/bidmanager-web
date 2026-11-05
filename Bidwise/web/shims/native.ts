@@ -5,7 +5,9 @@ const unavailable = () =>
   Promise.reject(new Error('Not available in the browser preview.'));
 
 // react-native-keychain
-export const ACCESSIBLE = { AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY: 'AfterFirstUnlock' };
+export const ACCESSIBLE = {
+  AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY: 'AfterFirstUnlock',
+};
 export const getGenericPassword = async () => false;
 export const setGenericPassword = async () => true;
 export const resetGenericPassword = async () => true;
@@ -32,6 +34,8 @@ const blobUtil = {
     writeFile: unavailable,
   },
   config: () => ({ fetch: unavailable }),
+  fetch: unavailable,
+  wrap: (path: string) => path,
   ios: { openDocument: unavailable, presentOptionsMenu: () => {} },
   android: { actionViewIntent: unavailable },
 };

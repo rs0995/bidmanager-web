@@ -1,21 +1,19 @@
 import React, { useId } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import Svg, {
+  Circle,
   Defs,
   LinearGradient,
-  Polygon,
-  RadialGradient,
+  Path,
   Rect,
   Stop,
 } from 'react-native-svg';
 import { BRAND, fonts, useTheme } from '../../theme';
 
-// The mark, in a 100×100 tile: two slanted slabs (white to ice blue) on a near-black
-// tile with a warm glow rising from the bottom. Same geometry as the app icon
-// (ios/Bidwise/Images.xcassets/AppIcon.appiconset).
-const TOP_SLAB = '37.25,21.3 73.95,21.3 73.95,36.4 26.05,36.4';
-const LOW_SLAB =
-  '45.35,46.7 65,46.7 65,57.3 40,77.3 26.05,77.3 26.05,62.2 34.25,62.2';
+// The mark, in a 1024×1024 design space: the desktop app's icon (Client UI/assets/icon.svg)
+// on a full-bleed navy tile. Three rising bars under a green tick badge. Same geometry as
+// the app icon (assets/brand/bidwise-icon.svg, ios/Bidwise/Images.xcassets/AppIcon.appiconset).
+const TICK = 'M644 294 L697 348 L792 240';
 
 /** The square brand mark on its own (sign-in, lock screen). */
 export function BrandMark({ size = 38 }: { size?: number }) {
@@ -37,48 +35,81 @@ export function BrandMark({ size = 38 }: { size?: number }) {
         },
       ]}
     >
-      <Svg width="100%" height="100%" viewBox="0 0 100 100">
+      <Svg width="100%" height="100%" viewBox="0 0 1024 1024">
         <Defs>
-          <RadialGradient
-            id={id('glow')}
-            cx="50"
-            cy="108"
-            rx="95"
-            ry="72"
-            fx="50"
-            fy="108"
-            gradientUnits="userSpaceOnUse"
-          >
-            <Stop offset="0" stopColor={BRAND.glowRim} stopOpacity={1} />
-            <Stop offset="0.3" stopColor={BRAND.glow} stopOpacity={0.95} />
-            <Stop offset="0.65" stopColor={BRAND.glowDeep} stopOpacity={0.45} />
-            <Stop offset="1" stopColor={BRAND.glowDeep} stopOpacity={0} />
-          </RadialGradient>
           <LinearGradient
-            id={id('slab')}
+            id={id('tile')}
             x1="0"
-            y1="21.3"
-            x2="0"
-            y2="77.3"
+            y1="0"
+            x2="1024"
+            y2="1024"
             gradientUnits="userSpaceOnUse"
           >
-            <Stop offset="0" stopColor={BRAND.slabTop} />
-            <Stop offset="1" stopColor={BRAND.slabBottom} />
+            <Stop offset="0" stopColor={BRAND.tileTop} />
+            <Stop offset="1" stopColor={BRAND.tileBottom} />
+          </LinearGradient>
+          <LinearGradient
+            id={id('bar')}
+            x1="0"
+            y1="812"
+            x2="0"
+            y2="304"
+            gradientUnits="userSpaceOnUse"
+          >
+            <Stop offset="0" stopColor={BRAND.barFrom} />
+            <Stop offset="1" stopColor={BRAND.barTo} />
           </LinearGradient>
         </Defs>
-        <Rect width="100" height="100" fill={BRAND.tile} />
-        <Rect width="100" height="100" fill={`url(#${id('glow')})`} />
-        <Polygon points={TOP_SLAB} fill={`url(#${id('slab')})`} />
-        <Polygon points={LOW_SLAB} fill={`url(#${id('slab')})`} />
+        <Rect width="1024" height="1024" fill={`url(#${id('tile')})`} />
+        <Rect
+          x="196"
+          y="576"
+          width="156"
+          height="236"
+          rx="42"
+          fill={BRAND.barLow}
+        />
+        <Rect
+          x="382"
+          y="452"
+          width="156"
+          height="360"
+          rx="42"
+          fill={BRAND.barMid}
+        />
+        <Rect
+          x="568"
+          y="304"
+          width="156"
+          height="508"
+          rx="42"
+          fill={`url(#${id('bar')})`}
+        />
+        <Circle cx="716" cy="292" r="168" fill={BRAND.badgeRing} />
+        <Circle cx="716" cy="292" r="146" fill={BRAND.badge} />
+        <Path
+          d={TICK}
+          fill="none"
+          stroke="#ffffff"
+          strokeWidth={66}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
       </Svg>
     </View>
   );
 }
 
 /** The mark followed by the word "bidwise". */
-export function Wordmark({ size = 'md' }: { size?: 'sm' | 'md' | 'lg' }) {
+export function Wordmark({
+  size = 'md',
+}: {
+  /** `xl`: the sign-in screen's large logo. */
+  size?: 'sm' | 'md' | 'lg' | 'xl';
+}) {
   const t = useTheme();
-  const k = size === 'lg' ? 1.25 : size === 'sm' ? 0.8 : 1;
+  const k =
+    size === 'xl' ? 1.6 : size === 'lg' ? 1.25 : size === 'sm' ? 0.8 : 1;
   const dark = t.scheme === 'dark';
   return (
     <View
@@ -106,5 +137,5 @@ export function Wordmark({ size = 'md' }: { size?: 'sm' | 'md' | 'lg' }) {
 const styles = StyleSheet.create({
   row: { flexDirection: 'row', alignItems: 'center', gap: 9 },
   mark: { overflow: 'hidden' },
-  word: { fontFamily: fonts.bold, letterSpacing: -1 },
+  word: { fontFamily: fonts.semibold, letterSpacing: -0.5 },
 });

@@ -8,6 +8,7 @@ import { listTenders } from '../lib/tenderList';
 import {
   groupByOrg,
   closesWithinDays,
+  parseLimit,
   passesSheetFilters,
   type SheetFilters,
 } from '../lib/tenderFilters';
@@ -32,13 +33,16 @@ export type ListQuery = {
   search: string;
   savedOnly: boolean;
   closingSoon: boolean;
-  sort: 'closing' | 'value';
+  sort: 'closing' | 'value' | 'emd';
   /** The Filter sheet's choices (Tenders tab). */
   filters?: SheetFilters;
   archived?: boolean;
   /** Nothing is loaded while true (no portal chosen yet). */
   paused?: boolean;
 };
+
+/** A location in the data, with how many tenders are there. */
+export type LocationOption = { value: string; count: number };
 
 export type ListResult = {
   items: Tender[];
@@ -81,6 +85,8 @@ export type TenderSource = {
   mode: 'demo' | 'live';
   usePortals: () => string[];
   useTenderList: (q: ListQuery) => ListResult;
+  /** The locations that exist in a portal's tenders, most tenders first (Filter sheet). */
+  useLocationOptions: (portal: string | null) => LocationOption[];
   useOrgList: (q: OrgQuery) => {
     items: OrgItem[];
     loading: boolean;
@@ -111,6 +117,20 @@ export type TenderSource = {
     portal: string | null,
   ) => { id: number; lastScrapedAt: number } | undefined;
 };
+
+const NO_LOCATIONS: LocationOption[] = [];
+
+/** The distinct locations of these tenders, most tenders first, then A to Z. */
+export function locationOptions(rows: Tender[]): LocationOption[] {
+  const counts = new Map<string, number>();
+  rows.forEach(t => {
+    const v = t.location.trim();
+    if (v && v !== '—') counts.set(v, (counts.get(v) ?? 0) + 1);
+  });
+  return [...counts]
+    .map(([value, count]) => ({ value, count }))
+    .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value));
+}
 
 const message = (e: unknown) =>
   e ? (e as Error).message || 'Something went wrong.' : null;
@@ -163,6 +183,15 @@ const demoSource: TenderSource = {
       hasMore: false,
       loadMore: () => {},
     };
+  },
+  useLocationOptions: portal => {
+    return useMemo(
+      () =>
+        locationOptions(
+          sampleTenders.filter(t => portal === null || t.portal === portal),
+        ),
+      [portal],
+    );
   },
   useOrgList: q => {
     const pool = q.archived ? archivedTenders : sampleTenders;
@@ -320,7 +349,6 @@ const liveSource: TenderSource = {
         q.archived,
         q.filters?.category.trim() ?? '',
         q.filters?.location.trim() ?? '',
-        q.filters?.docs ?? 'any',
       ],
       enabled:
         !q.paused && !q.savedOnly && (!q.portal || websiteId !== undefined),
@@ -334,14 +362,13 @@ const liveSource: TenderSource = {
           archived: q.archived ? 'true' : 'false',
           category: q.filters?.category.trim(),
           location: q.filters?.location.trim(),
-          has_documents:
-            q.filters?.docs === 'with'
-              ? 'true'
-              : q.filters?.docs === 'without'
-              ? 'false'
-              : undefined,
-          sort_by: q.sort === 'value' ? 'tender_value' : 'closing_date',
-          sort_order: q.sort === 'value' || q.archived ? 'desc' : 'asc',
+          sort_by:
+            q.sort === 'value'
+              ? 'tender_value'
+              : q.sort === 'emd'
+              ? 'emd'
+              : 'closing_date',
+          sort_order: q.sort !== 'closing' || q.archived ? 'desc' : 'asc',
           page: pageParam,
           page_size: PAGE_SIZE,
         });
@@ -392,11 +419,14 @@ const liveSource: TenderSource = {
     }
     if (q.closingSoon)
       rows = rows.filter(t => t.closeIn !== 'Closed' && closesWithinDays(t, 5));
-    // The server applies category, location and documents to a page; value and
-    // closing-soon (and every filter on the saved list) are applied here.
+    // The server applies category and location to a page; the value range (and every
+    // filter on the saved list) is applied here.
     const f = q.filters;
     const clientFiltered =
-      f && (q.savedOnly || f.value !== 'any' || f.closingSoon);
+      f &&
+      (q.savedOnly ||
+        parseLimit(f.minCr) !== null ||
+        parseLimit(f.maxCr) !== null);
     if (f) rows = rows.filter(t => passesSheetFilters(t, f, !q.savedOnly));
     if (!q.archived && q.sort === 'closing') rows = [...rows].sort(openFirst);
 
@@ -415,6 +445,20 @@ const liveSource: TenderSource = {
           paged.fetchNextPage();
       },
     };
+  },
+
+  useLocationOptions: portal => {
+    const websiteId = useWebsiteId(portal);
+    const res = useQuery({
+      queryKey: ['tenderLocations', websiteId ?? null],
+      enabled: !portal || websiteId !== undefined,
+      staleTime: STALE.tenderList,
+      // A server without the list yet (404) just leaves the sheet on its fallback.
+      retry: false,
+      queryFn: async () =>
+        (await api.tenderFilters({ website_id: websiteId })).locations ?? [],
+    });
+    return res.data ?? NO_LOCATIONS;
   },
 
   useOrgMeta: (org, portal) => {

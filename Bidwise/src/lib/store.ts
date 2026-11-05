@@ -24,6 +24,8 @@ export type Settings = {
   notifyOrgAlertsOn: boolean;
   notifyTenderAlertsOn: boolean;
   reminderDays: number[];
+  /** In-app alert when someone else adds a project (this phone only; never pushed). */
+  notifyProjectAlertsOn: boolean;
   /** When the user last changed a notification toggle (ms); 0 = never on this install. */
   notificationPrefsUpdatedAt: number;
 };
@@ -34,6 +36,7 @@ const SETTINGS_DEFAULTS: Settings = {
   notifyOrgAlertsOn: false,
   notifyTenderAlertsOn: false,
   reminderDays: [],
+  notifyProjectAlertsOn: true,
   notificationPrefsUpdatedAt: 0,
 };
 

@@ -1,4 +1,11 @@
-import React, { memo, useCallback, useEffect, useRef, useState } from 'react';
+import React, {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import type {
@@ -38,7 +45,11 @@ import {
   PortalPicker,
   usePortalScope,
 } from '../../components/tender/PortalPicker';
-import { useTenderSource, type OrgItem } from '../../data/tenderSource';
+import {
+  locationOptions,
+  useTenderSource,
+  type OrgItem,
+} from '../../data/tenderSource';
 import {
   ListStatus,
   LoadMore,
@@ -55,7 +66,12 @@ type Nav = CompositeNavigationProp<
 
 type View_ = 'orgs' | 'tenders';
 
-const SORT_LABEL = { closing: 'Closing soonest', value: 'Highest value' };
+type Sort = 'closing' | 'value' | 'emd';
+const SORT_LABEL: Record<Sort, string> = {
+  closing: 'Closing soonest',
+  value: 'Highest value',
+  emd: 'Highest EMD',
+};
 
 /** Rows a list draws up front; the rest are drawn as you scroll. */
 const FIRST_ROWS = 12;
@@ -127,7 +143,7 @@ export function TendersScreen() {
   const [savedOnly, setSavedOnly] = useState(false);
   const [filters, setFilters] = useState<SheetFilters>(NO_SHEET_FILTERS);
   const [filterOpen, setFilterOpen] = useState(false);
-  const [sort, setSort] = useState<'closing' | 'value'>('closing');
+  const [sort, setSort] = useState<Sort>('closing');
   const filterCount = sheetFilterCount(filters);
   const toolInk = filterCount ? t.colors.accentInk : t.colors.inkSoft;
 
@@ -136,11 +152,7 @@ export function TendersScreen() {
     if (!route.params) return;
     if (preset.view) setView(preset.view);
     if (preset.bookmarked !== undefined) setSavedOnly(preset.bookmarked);
-    if (preset.closing !== undefined) {
-      const closingSoon = preset.closing;
-      setFilters(f => ({ ...f, closingSoon }));
-    }
-  }, [route.params, preset.view, preset.bookmarked, preset.closing]);
+  }, [route.params, preset.view, preset.bookmarked]);
 
   const source = useTenderSource();
   const portals = source.usePortals();
@@ -157,6 +169,13 @@ export function TendersScreen() {
     sort,
     paused: !ready,
   });
+  // The locations in the data; until the server lists them, those of the tenders loaded.
+  const serverLocations = source.useLocationOptions(portal);
+  const locations = useMemo(
+    () =>
+      serverLocations.length ? serverLocations : locationOptions(list.items),
+    [serverLocations, list.items],
+  );
   const orgs = source.useOrgList({
     portal,
     search: query,
@@ -277,6 +296,10 @@ export function TendersScreen() {
                   label: SORT_LABEL.value,
                   onPress: () => setSort('value'),
                 },
+                {
+                  label: SORT_LABEL.emd,
+                  onPress: () => setSort('emd'),
+                },
               ])
             }
             style={[styles.tool, surface]}
@@ -384,6 +407,7 @@ export function TendersScreen() {
 
       <TenderFilterSheet
         visible={filterOpen}
+        locations={locations}
         value={filters}
         onApply={setFilters}
         onClose={() => setFilterOpen(false)}

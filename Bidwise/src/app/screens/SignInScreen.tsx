@@ -66,8 +66,9 @@ export function SignInScreen() {
 
   return (
     <Screen>
+      {/* A large logo, centred in the space above the intro. */}
       <View style={styles.top}>
-        <Wordmark />
+        <Wordmark size="xl" />
       </View>
 
       <View style={styles.intro}>
@@ -101,7 +102,9 @@ export function SignInScreen() {
         secureTextEntry={!show}
         autoComplete="password"
         textContentType="password"
-        onSubmitEditing={submit}
+        // Return only closes the keyboard: signing in is the button's job.
+        returnKeyType="done"
+        submitBehavior="blurAndSubmit"
         right={
           <Pressable
             accessibilityRole="button"
@@ -206,8 +209,8 @@ export function SignInScreen() {
 }
 
 const styles = StyleSheet.create({
-  top: { marginTop: 8 },
-  intro: { marginTop: 48, marginBottom: 14 },
+  top: { marginTop: 28, marginBottom: 8, alignItems: 'center' },
+  intro: { marginTop: 36, marginBottom: 14 },
   h1: {
     fontFamily: fonts.display,
     fontSize: 39,

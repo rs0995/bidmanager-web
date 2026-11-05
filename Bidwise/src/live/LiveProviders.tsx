@@ -14,6 +14,8 @@ import {
   SharedProject,
 } from '../lib/api';
 import { refreshAccount, setAccount, useAccount } from '../lib/account';
+import { ensureItemFile } from '../lib/projectFiles';
+import { useToast } from '../components/ui';
 import {
   clearSession,
   getToken,
@@ -33,6 +35,7 @@ import {
   attachmentPath,
   checklistFor,
   createProjectFromTender,
+  deleteChecklistItem,
   deleteProject,
   getProjectsState,
   PrepDocRow,
@@ -68,7 +71,11 @@ import {
   markRead,
   useStoredAlerts,
 } from '../lib/alerts';
-import { BookmarksContext, BookmarksCtx } from '../fixtures/bookmarks';
+import {
+  BookmarksContext,
+  BookmarksCtx,
+  PROJECT_BOOKMARK_MESSAGE,
+} from '../fixtures/bookmarks';
 import { CaptchaContext, CaptchaCtx } from '../fixtures/captcha';
 import { NotifyContext, NotifyCtx } from '../fixtures/notifySettings';
 import {
@@ -172,10 +179,21 @@ const pushSoon = () => {
 function LiveBookmarksProvider({ children }: { children: React.ReactNode }) {
   const ids = useBookmarkIds();
   const orgs = useBookmarkedOrgNames();
+  const toast = useToast();
+  const source = useTenderSource();
   const value = useMemo<BookmarksCtx>(
     () => ({
       isBookmarked: id => ids.has(Number(id)),
       toggle: id => {
+        // A project's tender stays bookmarked while the project exists (the server
+        // keeps it too); archived projects count.
+        if (
+          ids.has(Number(id)) &&
+          findProjectForTender(id, source.peekServerTender(id)?.tender_id)
+        ) {
+          toast.show(PROJECT_BOOKMARK_MESSAGE);
+          return true;
+        }
         const on = toggleBookmark(id);
         pushSoon();
         return on;
@@ -189,7 +207,7 @@ function LiveBookmarksProvider({ children }: { children: React.ReactNode }) {
       },
       orgCount: orgs.size,
     }),
-    [ids, orgs],
+    [ids, orgs, toast, source],
   );
   return (
     <BookmarksContext.Provider value={value}>
@@ -233,8 +251,13 @@ export function toProject(
           name: r.req_file_name,
           note: r.description,
           done: r.status === 'Completed',
-          file: r.attachment?.name,
-          elsewhere: Boolean(r.attachment) && r.attachment?.device !== 'phone',
+          // Shown from this phone's attachment, else the server's file.
+          file: r.attachment?.name ?? r.server_file?.name,
+          elsewhere:
+            Boolean(r.attachment) &&
+            r.attachment?.device !== 'phone' &&
+            !r.server_file,
+          remote: Boolean(r.server_file) && r.attachment?.device !== 'phone',
         })),
       },
     ],
@@ -272,10 +295,17 @@ function LiveProjectsProvider({ children }: { children: React.ReactNode }) {
     ];
   }, [projects, checklist, prep]);
 
-  const attachPicked = useCallback(async (itemId: string) => {
-    const file = await picker.pickDocument();
-    if (file) await attachToItem(Number(itemId), file);
-  }, []);
+  const toast = useToast();
+  const attachPicked = useCallback(
+    async (itemId: string) => {
+      const file = await picker.pickDocument();
+      if (!file) return;
+      // Another device's file may win on the server; say so when it does.
+      const note = await attachToItem(Number(itemId), file);
+      if (note) toast.show(note);
+    },
+    [toast],
+  );
 
   const value = useMemo<ProjectsCtx>(
     () => ({
@@ -291,6 +321,7 @@ function LiveProjectsProvider({ children }: { children: React.ReactNode }) {
         attachPicked(itemId).catch(() => {});
       },
       removeFile: (_projectId, itemId) => removeAttachment(Number(itemId)),
+      removeItem: (_projectId, itemId) => deleteChecklistItem(Number(itemId)),
       toggleDone: (_projectId, itemId) => {
         const row = getProjectsState().checklist.find(
           r => r.id === Number(itemId),
@@ -315,9 +346,20 @@ function LiveProjectsProvider({ children }: { children: React.ReactNode }) {
         );
         if (!row) return 'missing';
         const where = await attachmentPath(row);
-        if ('reason' in where) return where.reason;
-        await files.open(where.path);
-        return 'opened';
+        if ('path' in where) {
+          await files.open(where.path);
+          return 'opened';
+        }
+        // On the server only (or another device's copy): fetch it, then open.
+        if (row.server_file) {
+          toast.show(`Downloading ${row.server_file.name}…`);
+          const path = await ensureItemFile(row);
+          if (path) {
+            await files.open(path);
+            return 'opened';
+          }
+        }
+        return where.reason;
       },
       openPrepDoc: async (projectId, docId) => {
         const path = await prepDocPath(Number(projectId), docId);
@@ -384,7 +426,7 @@ function LiveProjectsProvider({ children }: { children: React.ReactNode }) {
         );
       },
     }),
-    [list, archivedList, attachPicked, source],
+    [list, archivedList, attachPicked, source, toast],
   );
   return (
     <ProjectsContext.Provider value={value}>
@@ -443,8 +485,18 @@ function LiveNotifyProvider({ children }: { children: React.ReactNode }) {
         orgAlerts: s.notifyOrgAlertsOn,
         tenderAlerts: s.notifyTenderAlertsOn,
         reminderDays: s.reminderDays,
+        projectAlerts: s.notifyProjectAlertsOn,
       },
       set: patch => {
+        // New projects is an in-app alert on this phone only: nothing to send.
+        if (patch.projectAlerts !== undefined)
+          setSettings({ notifyProjectAlertsOn: patch.projectAlerts });
+        // The rest go to the server's push pass.
+        const pushed =
+          patch.orgAlerts !== undefined ||
+          patch.tenderAlerts !== undefined ||
+          patch.reminderDays !== undefined;
+        if (!pushed) return;
         setSettings({
           ...(patch.orgAlerts !== undefined && {
             notifyOrgAlertsOn: patch.orgAlerts,

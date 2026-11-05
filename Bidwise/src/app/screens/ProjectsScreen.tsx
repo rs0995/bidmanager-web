@@ -28,6 +28,9 @@ import { useTenderSource } from '../../data/tenderSource';
 import { hoursUntilClose, leftLabel } from '../../lib/deadlines';
 import { splitValue } from '../../lib/format';
 import { projectProgress } from '../../lib/projectProgress';
+import { sortProjectsByClosing } from '../../lib/projectOrder';
+import { parseFlexibleDate } from '../../lib/serverTender';
+import { today } from '../../fixtures/dashboard';
 import { fonts, useTheme } from '../../theme';
 import type { RootStackParamList, TabParamList } from '../navigation/types';
 
@@ -169,20 +172,43 @@ export function ProjectsScreen() {
   const t = useTheme();
   const navigation = useNavigation<Nav>();
   const { projects } = useProjects();
+  const source = useTenderSource();
+  // The pipeline includes every project's tender: its closing date is the current one
+  // (a corrigendum may have moved it); the project's own deadline is the fallback.
+  const { tenders } = source.usePipeline();
   const [section, setSection] = useState<Section>('Active');
   const [search, setSearch] = useState('');
 
   const visible = useMemo(() => {
     const needle = search.trim().toLowerCase();
-    return projects.filter(
-      p =>
-        projectSection(p) === section &&
-        (!needle ||
-          `${p.title} ${p.client} ${p.sourceTenderId}`
-            .toLowerCase()
-            .includes(needle)),
+    // Sample data is pinned to its own "today"; live mode uses the real time.
+    const now = source.mode === 'demo' ? today.getTime() : Date.now();
+    const byId = new Map(tenders.map(x => [x.id, x]));
+    // The same countdown the card's pill shows (the tender's current one, else the
+    // project's); a closed one goes by its closing date to tell recent from old.
+    const closesAt = (p: Project): number | null => {
+      const x = byId.get(p.sourceTenderId);
+      const left = x && x.closeIn && x.closeIn !== '—' ? x.closeIn : p.dueIn;
+      if (left && left !== 'Closed' && left !== '—')
+        return now + hoursUntilClose(left) * 3_600_000;
+      if (left !== 'Closed') return null;
+      const date =
+        parseFlexibleDate(x?.closing ?? '') ?? parseFlexibleDate(p.deadline);
+      return date ? Math.min(date.getTime(), now) : 0;
+    };
+    return sortProjectsByClosing(
+      projects.filter(
+        p =>
+          projectSection(p) === section &&
+          (!needle ||
+            `${p.title} ${p.client} ${p.sourceTenderId}`
+              .toLowerCase()
+              .includes(needle)),
+      ),
+      closesAt,
+      now,
     );
-  }, [projects, section, search]);
+  }, [projects, section, search, tenders, source.mode]);
   const counts = useMemo(
     () => ({
       Active: projects.filter(p => projectSection(p) === 'Active').length,
@@ -193,16 +219,20 @@ export function ProjectsScreen() {
 
   return (
     <Screen tabBar>
-      {/* As BM Pro: archived projects, which can be restored, open from here. */}
-      <View style={styles.head}>
-        <IconButton
-          label="Archived projects"
-          onPress={() => navigation.navigate('ArchivedProjects')}
-        >
-          <Archive size={18} color={t.colors.inkSoft} />
-        </IconButton>
-      </View>
-      <PageTitle sub="Your bids, moving forward.">Projects</PageTitle>
+      {/* As BM Pro: archived projects (which can be restored) open from the title row. */}
+      <PageTitle
+        sub="Your bids, moving forward."
+        right={
+          <IconButton
+            label="Archived projects"
+            onPress={() => navigation.navigate('ArchivedProjects')}
+          >
+            <Archive size={18} color={t.colors.inkSoft} />
+          </IconButton>
+        }
+      >
+        Projects
+      </PageTitle>
       <SearchField
         value={search}
         onChangeText={setSearch}
@@ -236,7 +266,6 @@ export function ProjectsScreen() {
 }
 
 const styles = StyleSheet.create({
-  head: { marginTop: 4, marginBottom: 14, flexDirection: 'row' },
   sections: { marginTop: 12, marginBottom: 16 },
   card: { marginBottom: 12 },
   top: {

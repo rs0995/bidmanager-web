@@ -15,11 +15,12 @@ import { parseFlexibleDate } from '../../lib/serverTender';
 import { fonts, useTheme } from '../../theme';
 import type { RootStackParamList } from '../navigation/types';
 
-type Sort = 'newest' | 'closing' | 'value';
+type Sort = 'newest' | 'closing' | 'value' | 'emd';
 const SORTS: { key: Sort; label: string }[] = [
   { key: 'newest', label: 'Newest first' },
   { key: 'closing', label: 'Closing soonest' },
   { key: 'value', label: 'Highest value' },
+  { key: 'emd', label: 'Highest EMD' },
 ];
 
 const published = (t: Tender) => parseFlexibleDate(t.published)?.getTime() ?? 0;
@@ -92,6 +93,8 @@ export function NewTendersScreen() {
         ? published(b) - published(a)
         : sort === 'value'
         ? parseCrores(b.value) - parseCrores(a.value)
+        : sort === 'emd'
+        ? parseCrores(b.emd) - parseCrores(a.emd)
         : hoursUntilClose(a.closeIn) - hoursUntilClose(b.closeIn),
     );
   }, [tenders, search, sort]);

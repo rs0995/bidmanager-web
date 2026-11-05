@@ -299,6 +299,25 @@ test('signs in against the server and works on live data', async () => {
   const last = puts[puts.length - 1].body as { data: { bookmarks: number[] } };
   expect(last.data.bookmarks.sort()).toEqual([42, 43]);
 
+  // Khed is a project's tender (an archived project still counts): it stays bookmarked.
+  const khed = r.root.findAll(
+    n =>
+      isPressable(n) &&
+      String(n.props.accessibilityLabel ?? '').startsWith(
+        'Khed water supply network',
+      ),
+  )[0];
+  const star = () =>
+    khed.findAll(
+      n => isPressable(n) && n.props.accessibilityLabel === 'Unsave tender',
+    )[0];
+  await press(star());
+  await settle(4);
+  expect(textIn(r.root)).toContain(
+    "Tenders in projects can't be removed from bookmarks. Remove the project first.",
+  );
+  expect(star()).toBeTruthy();
+
   // Tender details list the server's documents; downloading one saves it here.
   await press(byLabel(r, 'Panvel–Uran road widening, PWD Konkan'));
   await settle(10);

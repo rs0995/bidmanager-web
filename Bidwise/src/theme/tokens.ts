@@ -196,16 +196,18 @@ const PAPER_ACCENT2: Record<Scheme, string> = {
 };
 
 /**
- * bidwise brand mark: two slanted slabs (white to ice blue) on a near-black tile with a
- * warm orange glow from below, then the word. Matches the app icon.
+ * bidwise brand mark: the desktop app's icon (Client UI/assets/icon.svg), three rising bars
+ * under a green tick badge on a navy gradient tile, then the word. Matches the app icon.
  */
 export const BRAND = {
-  tile: '#0b0c10',
-  glow: '#ff7a1a',
-  glowDeep: '#c2410c',
-  glowRim: '#ffa05a',
-  slabTop: '#ffffff',
-  slabBottom: '#bfe3ff',
+  tileTop: '#273352',
+  tileBottom: '#0f1422',
+  barLow: '#5f719a',
+  barMid: '#8ca7d8',
+  barFrom: '#3b6ce7',
+  barTo: '#8db0ff',
+  badgeRing: '#131a2b',
+  badge: '#10b981',
   wordLight: '#192f43',
   wordDark: '#f1f4f7',
 };

@@ -13,14 +13,18 @@ import {
   Bell,
   BellOff,
   Building2,
+  ChevronDown,
   ChevronLeft,
+  ChevronUp,
   CircleCheck,
   Clock,
   FileText,
+  FolderPlus,
   RefreshCw,
 } from 'lucide-react-native';
 import {
   Card,
+  Checkbox,
   IconButton,
   PageTitle,
   Screen,
@@ -50,6 +54,15 @@ const DAY_LABEL: Record<number, string> = {
   5: '5 days before',
 };
 
+/** The reminder row's text: "Off", "1 day before", "1 and 3 days before", ... */
+export function reminderSummary(days: number[]) {
+  const d = [...days].sort((a, b) => a - b);
+  if (!d.length) return 'Off';
+  if (d.length === 1) return DAY_LABEL[d[0]] ?? `${d[0]} days before`;
+  const list = `${d.slice(0, -1).join(', ')} and ${d[d.length - 1]}`;
+  return `${list} days before`;
+}
+
 export function NotificationSettingsScreen() {
   const t = useTheme();
   const toast = useToast();
@@ -57,6 +70,7 @@ export function NotificationSettingsScreen() {
   const { settings, set, toggleDay } = useNotifySettings();
   const { sync, syncing, lastSyncAt } = useActions();
   const [permission, setPermission] = useState<PushPermission>('undetermined');
+  const [daysOpen, setDaysOpen] = useState(false);
 
   const refresh = useCallback(() => {
     getPushPermission()
@@ -212,37 +226,77 @@ export function NotificationSettingsScreen() {
             },
             'Bookmarked tenders',
           )}
+        />
+        <SettingsRow
+          icon={icon(FolderPlus)}
+          title="New projects"
+          sub="Show an alert in the Alerts tab when someone else adds a project (another device or a member of your organisation). Not sent as a notification."
+          right={toggle(
+            settings.projectAlerts,
+            v => set({ projectAlerts: v }),
+            'New projects',
+          )}
           last
         />
       </SettingsSection>
 
       <SettingsSection title="Closing reminders">
-        {DAY_THRESHOLDS.map((day, i) => (
-          <SettingsRow
-            key={day}
-            icon={icon(Clock)}
-            title={DAY_LABEL[day]}
-            sub={`Remind me when a bookmarked tender is closing ${day} day${
-              day === 1 ? '' : 's'
-            } from now.`}
-            right={toggle(
-              settings.reminderDays.includes(day),
-              v => {
-                toggleDay(day, v);
-                askIfNeeded(v);
-              },
-              DAY_LABEL[day],
-            )}
-            last={i === DAY_THRESHOLDS.length - 1}
-          />
-        ))}
+        {/* One row; its dropdown ticks any of the days the server sends reminders for. */}
+        <SettingsRow
+          icon={icon(Clock)}
+          title="Closing reminders"
+          sub="Remind me before a bookmarked tender closes."
+          value={reminderSummary(settings.reminderDays)}
+          right={
+            daysOpen ? (
+              <ChevronUp size={16} color={t.colors.muted} />
+            ) : (
+              <ChevronDown size={16} color={t.colors.muted} />
+            )
+          }
+          onPress={() => setDaysOpen(o => !o)}
+          last={!daysOpen}
+        />
+        {daysOpen ? (
+          <View
+            accessibilityLabel="Reminder days"
+            style={[styles.days, { borderTopColor: t.colors.hair }]}
+          >
+            {DAY_THRESHOLDS.map(day => {
+              const on = settings.reminderDays.includes(day);
+              const change = () => {
+                toggleDay(day, !on);
+                askIfNeeded(!on);
+              };
+              return (
+                <Pressable
+                  key={day}
+                  accessibilityRole="checkbox"
+                  accessibilityState={{ checked: on }}
+                  accessibilityLabel={`Remind ${DAY_LABEL[day]}`}
+                  onPress={change}
+                  style={styles.dayRow}
+                >
+                  <Checkbox
+                    checked={on}
+                    label={`Remind ${DAY_LABEL[day]}`}
+                    onPress={change}
+                  />
+                  <Text style={[styles.dayText, { color: t.colors.ink }]}>
+                    {DAY_LABEL[day]}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        ) : null}
       </SettingsSection>
 
       <Text style={[styles.footnote, { color: t.colors.muted }]}>
         The server sends these as they happen, even when the app is closed;
         closing reminders go out once a day between 10:00 and 21:00. They follow
-        your account, so the same choices apply in BM Pro. All options above can
-        be on together.
+        your account, so the same choices apply in BM Pro. New projects only
+        appears in the Alerts tab. All options above can be on together.
       </Text>
     </Screen>
   );
@@ -269,6 +323,14 @@ const styles = StyleSheet.create({
     borderRadius: 10,
   },
   checkText: { fontFamily: fonts.semibold, fontSize: 12.5 },
+  days: { borderTopWidth: 1, paddingVertical: 4, paddingHorizontal: 14 },
+  dayRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 9,
+  },
+  dayText: { fontFamily: fonts.medium, fontSize: 14 },
   footnote: {
     fontFamily: fonts.regular,
     fontSize: 11.5,

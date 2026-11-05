@@ -29,22 +29,14 @@ export type StoredAlert = {
 
 export type NewTender = { id: string; title: string };
 
-/** Up to this many new tenders are named in the alert; above it, just the count. */
-export const NAMED_NEW_TENDERS = 3;
-
 /**
- * "“A” was added under X." / "“A”, “B” and “C” were added under X." /
- * "12 new tenders were added under X."
+ * "“A” was added under X." for one tender; from two up, just the count:
+ * "2 new tenders were added under X."
  */
 export function newTendersMessage(org: string, items: NewTender[]): string {
-  if (items.length > NAMED_NEW_TENDERS)
-    return `${items.length} new tenders were added under ${org}.`;
-  const names = items.map(t => `“${t.title}”`);
-  if (names.length === 1) return `${names[0]} was added under ${org}.`;
-  const list = `${names.slice(0, -1).join(', ')} and ${
-    names[names.length - 1]
-  }`;
-  return `${list} were added under ${org}.`;
+  if (items.length === 1)
+    return `“${items[0].title}” was added under ${org}.`;
+  return `${items.length} new tenders were added under ${org}.`;
 }
 
 let alerts: StoredAlert[] = [];

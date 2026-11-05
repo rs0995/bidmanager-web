@@ -96,6 +96,41 @@ export const files = {
     else await ReactNativeBlobUtil.android.actionViewIntent(absPath, '*/*');
   },
 
+  /**
+   * Multipart POST of a file on this device with some text fields (project checklist
+   * files). Returns the status and parsed JSON body whatever the status, so the caller
+   * can act on 404 / 409.
+   */
+  async upload(
+    url: string,
+    headers: Record<string, string>,
+    fields: Record<string, string>,
+    file: { abs: string; name: string; type?: string | null },
+  ): Promise<{ status: number; json: unknown }> {
+    const parts = [
+      ...Object.entries(fields).map(([name, data]) => ({ name, data })),
+      {
+        name: 'file',
+        filename: file.name,
+        type: file.type || 'application/octet-stream',
+        data: ReactNativeBlobUtil.wrap(file.abs),
+      },
+    ];
+    const res = await ReactNativeBlobUtil.fetch(
+      'POST',
+      url,
+      { ...headers, 'Content-Type': 'multipart/form-data' },
+      parts,
+    );
+    let json: unknown = null;
+    try {
+      json = res.json();
+    } catch {
+      json = null;
+    }
+    return { status: res.info().status, json };
+  },
+
   /** The iOS "share / open in" sheet for a file (CSV export). */
   share(absPath: string) {
     if (Platform.OS === 'ios')

@@ -5,7 +5,6 @@ export type TabParamList = {
     | {
         view?: 'orgs' | 'tenders';
         bookmarked?: boolean;
-        closing?: boolean;
       }
     | undefined;
   Projects: undefined;

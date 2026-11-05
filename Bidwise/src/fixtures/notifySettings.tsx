@@ -10,6 +10,8 @@ export type NotifySettings = {
   orgAlerts: boolean;
   tenderAlerts: boolean;
   reminderDays: number[];
+  /** In-app alert when someone else adds a project (this phone only). */
+  projectAlerts: boolean;
 };
 
 export type NotifyCtx = {
@@ -19,7 +21,12 @@ export type NotifyCtx = {
 };
 
 export const NotifyContext = createContext<NotifyCtx>({
-  settings: { orgAlerts: true, tenderAlerts: true, reminderDays: [1, 3] },
+  settings: {
+    orgAlerts: true,
+    tenderAlerts: true,
+    reminderDays: [1, 3],
+    projectAlerts: true,
+  },
   set: () => {},
   toggleDay: () => {},
 });
@@ -33,6 +40,7 @@ export function NotifySettingsProvider({
     orgAlerts: true,
     tenderAlerts: true,
     reminderDays: [1, 3],
+    projectAlerts: true,
   });
   const value = useMemo<NotifyCtx>(
     () => ({

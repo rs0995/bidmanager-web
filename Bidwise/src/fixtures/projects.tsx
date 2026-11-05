@@ -2,11 +2,13 @@ import React, {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   useState,
 } from 'react';
 import { getTender } from './tenders';
+import { setProjectTenderIds } from './bookmarks';
 import type { Urgency } from './tenders';
 
 // Phase 1 fixture data and in-memory state. Replaced by lib/projects.ts (persisted,
@@ -23,8 +25,10 @@ export type ChecklistItem = {
   done: boolean;
   /** Attached file name. */
   file?: string;
-  /** Attached on another device: the file isn't on this phone. */
+  /** Attached on another device and not on the server: can't be opened here. */
   elsewhere?: boolean;
+  /** On the server but not saved on this phone yet: opening downloads it. */
+  remote?: boolean;
 };
 
 /** Result of opening an attached file. */
@@ -384,6 +388,8 @@ export type ProjectsCtx = {
   ) => void;
   attachFile: (projectId: string, itemId: string, fileName?: string) => void;
   removeFile: (projectId: string, itemId: string) => void;
+  /** Deletes a Ready for Bid item (and its file, everywhere). */
+  removeItem: (projectId: string, itemId: string) => void;
   /** Ticks or unticks a Ready for Bid item by hand. */
   toggleDone: (projectId: string, itemId: string) => void;
   addPrepDoc: (projectId: string, name?: string) => void;
@@ -423,6 +429,7 @@ export const ProjectsContext = createContext<ProjectsCtx>({
   addItem: () => {},
   attachFile: () => {},
   removeFile: () => {},
+  removeItem: () => {},
   toggleDone: () => {},
   addPrepDoc: () => {},
   removePrepDoc: () => {},
@@ -570,6 +577,14 @@ export function ProjectsProvider({ children }: { children: React.ReactNode }) {
     setProjects(prev => prev.filter(x => x.id !== projectId));
     setArchived(prev => [...prev, { ...p, archived: true }]);
   }, []);
+  // Their tenders stay bookmarked (the bookmarks provider checks this list).
+  useEffect(() => {
+    setProjectTenderIds(
+      [...projects, ...archived].flatMap(p =>
+        [p.sourceTenderId, p.tenderRef].filter((x): x is string => !!x),
+      ),
+    );
+  }, [projects, archived]);
   const archivedRef = useRef(archived);
   archivedRef.current = archived;
   const restoreProject = useCallback((projectId: string) => {
@@ -619,6 +634,22 @@ export function ProjectsProvider({ children }: { children: React.ReactNode }) {
     return project;
   }, []);
 
+  const removeItem = useCallback((projectId: string, itemId: string) => {
+    setProjects(prev =>
+      prev.map(p =>
+        p.id !== projectId
+          ? p
+          : {
+              ...p,
+              checklist: p.checklist.map(f => ({
+                ...f,
+                items: f.items.filter(it => it.id !== itemId),
+              })),
+            },
+      ),
+    );
+  }, []);
+
   const removeFile = useCallback((projectId: string, itemId: string) => {
     setProjects(prev =>
       mapItem(prev, projectId, itemId, it => ({
@@ -638,6 +669,7 @@ export function ProjectsProvider({ children }: { children: React.ReactNode }) {
       addItem,
       attachFile,
       removeFile,
+      removeItem,
       toggleDone,
       addPrepDoc,
       removePrepDoc,
@@ -661,6 +693,7 @@ export function ProjectsProvider({ children }: { children: React.ReactNode }) {
       addItem,
       attachFile,
       removeFile,
+      removeItem,
       toggleDone,
       addPrepDoc,
       removePrepDoc,

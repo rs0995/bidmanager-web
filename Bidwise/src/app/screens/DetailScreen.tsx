@@ -194,6 +194,7 @@ export function DetailScreen() {
     addPrepDoc,
     removePrepDoc,
     removeFile,
+    removeItem,
     openAttachment,
     openPrepDoc,
     setStatus,
@@ -270,6 +271,8 @@ export function DetailScreen() {
       return existing.archived ? null : existing.project ?? null;
     }
     const created = startProject(tender.id, tender.refId);
+    // A project's tender is always bookmarked (the server does the same).
+    if (!isBookmarked(tender.id)) toggle(tender.id);
     toast.show(`“${tender.short}” added to Projects.`);
     return created;
   };
@@ -506,6 +509,7 @@ export function DetailScreen() {
               .catch(e => toast.show((e as Error).message))
           }
           onRemove={key => project && removeFile(project.id, key)}
+          onDelete={key => project && removeItem(project.id, key)}
           onAdd={name => {
             const p = ensureProject();
             if (p) addItem(p.id, READY_FOLDER, name, '');

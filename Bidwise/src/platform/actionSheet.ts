@@ -15,19 +15,29 @@ export function showActionSheet(title: string, options: SheetOption[]) {
       {
         title,
         options: labels,
+        // The Cancel action is what lets a tap outside the sheet close it.
         cancelButtonIndex: labels.length - 1,
-        destructiveButtonIndex: options.findIndex(o => o.destructive),
+        // Every destructive choice in red ("Remove attachment", "Delete item").
+        destructiveButtonIndex: options
+          .map((o, i) => (o.destructive ? i : -1))
+          .filter(i => i >= 0),
       },
       i => options[i]?.onPress(),
     );
     return;
   }
-  Alert.alert(title, undefined, [
-    ...options.map(o => ({
-      text: o.label,
-      style: o.destructive ? ('destructive' as const) : ('default' as const),
-      onPress: o.onPress,
-    })),
-    { text: 'Cancel', style: 'cancel' as const },
-  ]);
+  Alert.alert(
+    title,
+    undefined,
+    [
+      ...options.map(o => ({
+        text: o.label,
+        style: o.destructive ? ('destructive' as const) : ('default' as const),
+        onPress: o.onPress,
+      })),
+      { text: 'Cancel', style: 'cancel' as const },
+    ],
+    // A tap outside closes it, as on iOS.
+    { cancelable: true },
+  );
 }

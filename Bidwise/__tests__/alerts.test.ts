@@ -253,12 +253,15 @@ describe('new tenders under an organisation', () => {
       title: `Job ${from + i}`,
     }));
 
-  it('names up to 3 tenders, and counts above that', () => {
+  it('names a single tender, and counts from two up', () => {
     expect(newTendersMessage('PWD', items(1))).toBe(
       '“Job 1” was added under PWD.',
     );
+    expect(newTendersMessage('PWD', items(2))).toBe(
+      '2 new tenders were added under PWD.',
+    );
     expect(newTendersMessage('PWD', items(3))).toBe(
-      '“Job 1”, “Job 2” and “Job 3” were added under PWD.',
+      '3 new tenders were added under PWD.',
     );
     expect(newTendersMessage('PWD', items(4))).toBe(
       '4 new tenders were added under PWD.',
