@@ -4,6 +4,7 @@ import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { useSession } from '../../fixtures/session';
 import { useTheme } from '../../theme';
 import { ArchiveScreen } from '../screens/ArchiveScreen';
+import { BidAgentChatScreen } from '../screens/BidAgentChatScreen';
 import { CaptchaScreen } from '../screens/CaptchaScreen';
 import { DetailScreen } from '../screens/DetailScreen';
 import { DownloadsScreen } from '../screens/DownloadsScreen';
@@ -62,6 +63,11 @@ export function RootNavigator() {
             <Stack.Screen name="Archive" component={Archive} />
             <Stack.Screen name="Captcha" component={CaptchaScreen} />
             <Stack.Screen name="ZipContents" component={ZipContentsScreen} />
+            <Stack.Screen
+              name="BidAgentChat"
+              component={BidAgentChatScreen}
+              options={{ presentation: 'modal' }}
+            />
             <Stack.Screen name="OrgTenders" component={OrgTendersScreen} />
             <Stack.Screen name="Bookmarks" component={Bookmarks} />
             <Stack.Screen

@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useMemo, useRef, useState } from 'react';
+import React, { createContext, useContext, useMemo, useSyncExternalStore } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { files } from '../platform';
 import { bidAgentApi, changesData } from '../lib/bidAgent';
@@ -39,33 +39,48 @@ type Source = {
 
 const wait = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
-function useDemoChat(): AgentChat {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [working, setWorking] = useState(false);
-  const next = useRef(1);
+type DemoThread = { messages: ChatMessage[]; working: boolean };
+const demoThreads = new Map<string, DemoThread>();
+const demoListeners = new Set<() => void>();
+// One shared empty thread: useSyncExternalStore needs the same object back each time.
+const EMPTY_THREAD: DemoThread = { messages: [], working: false };
+const demoGet = (id: string) => demoThreads.get(id) ?? EMPTY_THREAD;
+const demoSet = (id: string, t: DemoThread) => {
+  demoThreads.set(id, t);
+  demoListeners.forEach(fn => fn());
+};
+
+function useDemoChat(tenderId: string): AgentChat {
+  const thread = useSyncExternalStore(
+    fn => {
+      demoListeners.add(fn);
+      return () => demoListeners.delete(fn);
+    },
+    () => demoGet(tenderId),
+  );
   return {
-    messages,
-    working,
-    progress: working ? 'Working…' : '',
+    messages: thread.messages,
+    working: thread.working,
+    progress: thread.working ? 'Working…' : '',
     suggestions: demoSuggestions,
     aiEnabled: true,
     loading: false,
     error: null,
     send: async text => {
-      const user: ChatMessage = { id: next.current++, role: 'user', text, at: Date.now() / 1000 };
-      setMessages(m => [...m, user]);
-      setWorking(true);
+      const cur = demoGet(tenderId);
+      const id = (cur.messages[cur.messages.length - 1]?.id ?? 0) + 1;
+      const user: ChatMessage = { id, role: 'user', text, at: Date.now() / 1000 };
+      demoSet(tenderId, { messages: [...cur.messages, user], working: true });
       await wait(600);
-      const reply: ChatMessage = { ...demoReply(text), id: next.current++, at: Date.now() / 1000 };
-      setMessages(m => [...m, reply]);
-      setWorking(false);
+      const reply: ChatMessage = { ...demoReply(text), id: id + 1, at: Date.now() / 1000 };
+      demoSet(tenderId, { messages: [...demoGet(tenderId).messages, reply], working: false });
     },
-    clear: async () => setMessages([]),
+    clear: async () => demoSet(tenderId, { messages: [], working: false }),
   };
 }
 
 const demoSource: Source = {
-  useChat: () => useDemoChat(),
+  useChat: useDemoChat,
   usePrep: () => ({ files: [], open: async (_projectId, f) => `“${f.name}” opens on the phone.`, remove: async () => {} }),
 };
 

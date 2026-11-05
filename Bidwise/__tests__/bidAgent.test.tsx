@@ -1,7 +1,7 @@
 import React from 'react';
 import ReactTestRenderer, { ReactTestInstance, ReactTestRenderer as Renderer } from 'react-test-renderer';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import { AgentChatCard } from '../src/components/project/AgentChat';
+import { AgentChatPreview, ChatComposer, ChatMessages } from '../src/components/project/AgentChat';
 import { BidAgentProvider, useBidAgent } from '../src/data/bidAgent';
 import { ThemeProvider } from '../src/theme';
 
@@ -16,9 +16,17 @@ const textIn = (n: ReactTestInstance) =>
     .map(c => [c.props.children].flat().join(''))
     .join(' ');
 
+jest.mock('../src/platform/share', () => ({ share: { shareText: jest.fn(() => Promise.resolve()) } }));
+
 function Harness({ onOpen }: { onOpen: (f: { file_id: number; name: string }) => void }) {
   const chat = useBidAgent().useChat('GMRC/MMI-2');
-  return <AgentChatCard chat={chat} onOpenFile={onOpen} />;
+  return (
+    <>
+      <AgentChatPreview chat={chat} onOpen={() => {}} />
+      <ChatMessages chat={chat} onOpenFile={onOpen} />
+      <ChatComposer chat={chat} />
+    </>
+  );
 }
 
 async function mount(onOpen = jest.fn()) {
@@ -74,5 +82,14 @@ describe('bid agent chat', () => {
     expect(out).toContain('Added to Ready for Bid');
     expect(out).toContain('Attached: ELI-1.1 - Bidder Information Form.docx');
     expect(out).toContain('Pending: file to be attached');
+
+    // copy: answers and tables open the share sheet (Copy), text is selectable
+    const { share } = require('../src/platform/share');
+    await press(r, 'Copy table');
+    expect(share.shareText).toHaveBeenCalledWith(expect.stringContaining('Ref\tCriterion\tRequirement'));
+    const selectable = r.root.findAll(n => (n.type as unknown) === 'Text' && n.props.selectable === true);
+    expect(selectable.length).toBeGreaterThan(5);
+    // the preview card shows the last answer, not the whole chat
+    expect(out).toContain('7 rows added');
   });
 });

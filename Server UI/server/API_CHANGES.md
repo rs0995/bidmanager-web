@@ -245,6 +245,7 @@ There are no operator search routes: searches come from users. The operator only
   - "extract the tender forms" or a specific form ("FIN-3.2", "letter of bid") → editable files pre-filled from the company profile, saved to **Docs for Preparation** and attached to the matching Ready Docs row if there is one;
   - "prepare the checklist (of documents required)" → **Ready Docs** rows for every form and evidence document the tender asks for (Pending), with the forms the agent prepares **attached automatically**;
   - "can we qualify?" → criteria checked against the company profile.
+  - "the criteria are on pages 12–14 (of <file>)" → re-reads the criteria from those pages and keeps them for later saves; "which files are in the tender" lists files, pages and sections. Criteria are found under any heading ("Eligibility Criteria", "Qualifying requirements", tables or numbered paragraphs; scanned pages are read as images when AI is on).
 - With an Anthropic key (console → Bid Agent tab) Claude reads the documents and chooses the tools; without one a keyword router handles the same requests (basic mode; `ai_enabled: false`).
 - The tender's documents are read from `downloaded_files` (local or Drive). **ZIPs are unpacked** (also ZIPs inside ZIPs); old `.xls` / `.rtf` and, with LibreOffice in the image, `.doc` / `.odt` / `.ods` are converted; unreadable files are listed with the reason.
 - **Where files go** (Drive, same storage as checklist files §3):

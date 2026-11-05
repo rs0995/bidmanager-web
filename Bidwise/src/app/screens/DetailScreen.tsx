@@ -53,7 +53,7 @@ import type { Tender } from '../../fixtures/tenders';
 import { useTenderSource } from '../../data/tenderSource';
 import { useDocs } from '../../data/docs';
 import { useBidAgent } from '../../data/bidAgent';
-import { AgentChatCard } from '../../components/project/AgentChat';
+import { AgentChatPreview } from '../../components/project/AgentChat';
 import { Spinning } from '../../components/ui/motion';
 import { browser } from '../../platform/browser';
 import { showActionSheet } from '../../platform/actionSheet';
@@ -503,13 +503,14 @@ export function DetailScreen() {
       </Card>
 
       {access.projects && fetched.tender ? (
-        <AgentChatCard
+        <AgentChatPreview
           chat={agentChat}
-          onOpenFile={f =>
-            agentPrep
-              .open(project ? Number(project.id) : null, f)
-              .then(msg => (msg ? toast.show(msg) : undefined))
-              .catch(e => toast.show((e as Error).message))
+          onOpen={() =>
+            navigation.navigate('BidAgentChat', {
+              tenderId: fetched.tender!.id,
+              projectId: project ? Number(project.id) : null,
+              title: tender.title,
+            })
           }
         />
       ) : null}
