@@ -39,7 +39,8 @@ except Exception as _bid_agent_error:  # the rest of the API must keep working
     print(f"[bid-agent] disabled: {{_bid_agent_error}}")
 
 '''
-REQUIREMENTS = ["anthropic>=2.5.0", "pdfplumber>=0.11.0", "pypdf>=5.0.0", "python-docx>=1.1.0", "openpyxl>=3.1.0"]
+REQUIREMENTS = ["anthropic>=2.5.0", "pdfplumber>=0.11.0", "pypdf>=5.0.0", "python-docx>=1.1.0", "openpyxl>=3.1.0",
+                "xlrd>=2.0.1", "striprtf>=0.0.26"]
 
 
 def backup(path: str, day_dir: str, dry: bool) -> None:
@@ -81,10 +82,12 @@ def main() -> int:
     # 1. package
     src_pkg = os.path.join(HERE, "bid_agent")
     dst_pkg = os.path.join(server, "bid_agent")
+    updating = os.path.isdir(dst_pkg)
     print(f"copy    bid_agent/ -> {os.path.relpath(dst_pkg, REPO) if not testing else dst_pkg}")
     if not dry:
         shutil.copytree(src_pkg, dst_pkg, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__", "tests"))
-    changes.append("server/bid_agent/ (new package: Bid Agent pipeline + /client bid-pack and /admin/bid-agent routes)")
+    changes.append("server/bid_agent/ updated from bid_agent_server/" if updating else
+                   "server/bid_agent/ (new package: Bid Agent pipeline + /client bid-pack and /admin/bid-agent routes)")
 
     # 2. api_server.py
     with open(api, "rb") as f:
@@ -119,9 +122,10 @@ def main() -> int:
 
     if len(changes) > 1 or (changes and not os.path.isdir(dst_pkg)):
         stamp = datetime.now().strftime("%H:%M")
-        entry = f"----\n{stamp} Bid Agent installed (bid_agent_server/install.py)\n" + "".join(f"  - {c}\n" for c in changes)
+        what = "updated" if updating else "installed"
+        entry = f"----\n{stamp} Bid Agent {what} (bid_agent_server/install.py)\n" + "".join(f"  - {c}\n" for c in changes)
         append(os.path.join(day_dir, "CHANGES.txt"), entry, dry)
-        if not testing:
+        if not testing and not updating:
             append(os.path.join(SERVER_UI, "CHANGELOG_PENDING.txt"),
                    f"----\n{stamp} Bid Agent: bid packs per tender (section map, qualification criteria vs company "
                    f"profile, Word/Excel bid forms). Routes /client/tenders/{{id}}/bid-pack*, /client/company-profile, "

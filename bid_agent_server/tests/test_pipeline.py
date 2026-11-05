@@ -136,5 +136,72 @@ class PipelineTests(unittest.TestCase):
         self.assertIsNone(store.get_analysis("org:2", 5))
 
 
+class ZipTests(unittest.TestCase):
+    """Portals deliver tender documents as ZIPs (often a ZIP inside a ZIP)."""
+
+    def setUp(self):
+        import zipfile
+
+        self.tmp = tempfile.mkdtemp()
+        loose = os.path.join(self.tmp, "loose")
+        build_tender(loose)
+        self.src = os.path.join(self.tmp, "docs")
+        os.makedirs(self.src)
+        # inner ZIP with the forms volume, outer ZIP with the rest + inner ZIP + Mac junk
+        inner = os.path.join(self.tmp, "forms.zip")
+        with zipfile.ZipFile(inner, "w") as z:
+            z.write(os.path.join(loose, "Volume 3 - Bidding Forms.docx"), "Volume 3 - Bidding Forms.docx")
+        with zipfile.ZipFile(os.path.join(self.src, "2026_ABC_1.zip"), "w") as z:
+            z.write(os.path.join(loose, "Volume 1 - ITT.docx"), "Tender/Volume 1 - ITT.docx")
+            z.write(os.path.join(loose, "Volume 2 - PQ Criteria.docx"), "Tender/Volume 2 - PQ Criteria.docx")
+            z.write(inner, "Tender/forms.zip")
+            z.writestr("__MACOSX/Tender/._Volume 1 - ITT.docx", b"junk")
+            z.writestr("Tender/notes.rtf", r"{\rtf1\ansi Pre-bid meeting on 26 May 2026.}")
+            z.writestr("../../evil.txt", b"zip slip")
+        with open(os.path.join(self.src, "broken.zip"), "wb") as f:
+            f.write(b"PK\x03\x04 not really a zip")
+        with open(os.path.join(self.src, "BOQ.rar"), "wb") as f:
+            f.write(b"Rar!")
+        self.tender = {"id": 9, "tender_id": "2026_ABC_1", "title": "Works", "org_chain": "ABC Authority"}
+
+    def test_reads_documents_inside_nested_zips(self):
+        from bid_agent.docreader import list_tender_files
+
+        report = []
+        files = [os.path.relpath(p, self.src) for p in list_tender_files(self.src, report)]
+        self.assertIn(os.path.join("2026_ABC_1_unzipped", "Tender", "Volume 1 - ITT.docx"), files)
+        self.assertIn(os.path.join("2026_ABC_1_unzipped", "Tender", "forms_unzipped", "Volume 3 - Bidding Forms.docx"), files)
+        self.assertFalse(any("__MACOSX" in f or "evil" in f for f in files))
+        rtf = [p for p in files if p.endswith("notes.rtf.converted.txt")]
+        self.assertEqual(len(rtf), 1)  # old formats are converted where possible
+        with open(os.path.join(self.src, rtf[0]), encoding="utf-8") as f:
+            self.assertIn("Pre-bid meeting on 26 May 2026", f.read())
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "evil.txt")))
+        issues = {r["file"]: r["issue"] for r in report}
+        self.assertIn("damaged", issues["broken.zip"])
+        self.assertIn(".rar", issues["BOQ.rar"])
+
+    def test_pipeline_on_zipped_tender(self):
+        store = new_store(self.tmp)
+        r = agent.analyze_files(self.src, self.tender, store, None, PROFILE, log=lambda m: None)
+        roles = {d["file"].split("/")[-1].split(" › ")[-1]: (d["segments"][0]["role"] if d["segments"] else d["error"])
+                 for d in r["documents"]}
+        self.assertEqual(roles["Volume 2 - PQ Criteria.docx"], "qualification_criteria")
+        self.assertEqual(roles["Volume 3 - Bidding Forms.docx"], "bidding_forms")
+        self.assertEqual([f["code"] for f in r["forms"]], ["FIN-3.2", "EXP-4.2"])
+        self.assertIn("damaged", roles["broken.zip"])  # skipped files are listed with the reason
+        files = [d["file"] for d in r["documents"]]
+        self.assertIn("2026_ABC_1.zip › Tender/forms.zip › Volume 3 - Bidding Forms.docx", files)
+        self.assertIn("2026_ABC_1.zip › Tender/notes.rtf", files)
+
+    def test_only_unreadable_files_gives_a_clear_error(self):
+        src = os.path.join(self.tmp, "bad")
+        os.makedirs(src)
+        with open(os.path.join(src, "tender.zip"), "wb") as f:
+            f.write(b"nope")
+        with self.assertRaisesRegex(RuntimeError, "damaged"):
+            agent.analyze_files(src, self.tender, new_store(self.tmp), None, PROFILE, log=lambda m: None)
+
+
 if __name__ == "__main__":
     unittest.main()

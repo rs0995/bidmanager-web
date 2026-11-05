@@ -19,7 +19,7 @@ from typing import Callable
 from . import compliance, generate
 from .classify import classify_document
 from .criteria import extract_criteria, referenced_form_codes
-from .docreader import Document, ensure_tables, list_tender_files, load_document
+from .docreader import Document, display_name, ensure_tables, list_tender_files, load_document
 from .forms import extract_forms, missing_forms
 from .llm import LLM
 from .roles import PRIMARY_ROLES, role_label
@@ -43,8 +43,14 @@ def analyze_files(
     """``tender`` = server tender row (id, tender_id, title, org_chain ...)."""
     t0 = time.time()
     overrides = overrides or {}
-    files = list_tender_files(src_dir)
+    skipped: list[dict] = []
+    files = list_tender_files(src_dir, skipped)
+    for item in skipped:
+        log(f"  ! {item['file']}: {item['issue']}")
     if not files:
+        if skipped:
+            raise RuntimeError("None of this tender's files could be read: " + "; ".join(
+                f"{i['file']}: {i['issue']}" for i in skipped[:3]))
         raise RuntimeError("This tender has no downloaded documents yet. Download the documents first.")
     log(f"Reading {len(files)} file(s)…")
 
@@ -57,7 +63,7 @@ def analyze_files(
     meta = {"employer": employer, "reference": str(tender.get("tender_id") or ""), "title": str(tender.get("title") or "")}
     for path in files:
         doc = load_document(path, with_tables=False)
-        rel = os.path.relpath(path, src_dir).replace(os.sep, "/")
+        rel = display_name(path, src_dir)
         entry = {"file": rel, "pages": doc.page_count, "error": doc.error, "needs_ocr": doc.needs_ocr, "segments": []}
         if doc.error or not doc.pages:
             documents.append(entry)
@@ -81,6 +87,10 @@ def analyze_files(
                     meta[k_dst] = info[k_src]
         documents.append(entry)
         log(f"  {rel}: " + ", ".join(f"{role_label(s['role'])} p{s['start_page']}-{s['end_page']}" for s in entry["segments"]))
+
+    for item in skipped:  # shown in the document list with the reason
+        documents.append({"file": item["file"], "pages": 0, "error": item["issue"], "needs_ocr": False,
+                          "segments": [], "segments_source": "skipped"})
 
     if not meta.get("reference"):
         meta["reference"] = _find_reference(list(docs.values()))

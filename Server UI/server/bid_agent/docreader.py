@@ -235,36 +235,163 @@ def ensure_tables(doc: Document, start: int, end: int) -> None:
             p._tables_done = True  # type: ignore[attr-defined]
 
 
-def list_tender_files(folder: str) -> list[str]:
-    """All supported files under ``folder`` (recursively), ZIPs extracted."""
+# Limits for archives from portals: generous for real tenders, but a broken or
+# hostile ZIP can't fill the server's disk or loop forever.
+MAX_ARCHIVE_DEPTH = 3
+MAX_EXTRACT_BYTES = 1_500_000_000      # per tender, all archives together
+MAX_ARCHIVE_MEMBERS = 3000
+CONVERTIBLE_EXTS = {".doc", ".rtf", ".xls", ".odt", ".ods"}
+ARCHIVE_EXTS = {".zip"}
+UNSUPPORTED_ARCHIVES = {".rar", ".7z", ".tar", ".gz", ".tgz"}
+SKIP_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".dwg", ".dxf", ".exe", ".db", ".ini", ".lnk"}
+
+
+def _junk(name: str) -> bool:
+    base = os.path.basename(name)
+    return (
+        base.startswith(("~$", "._", ".")) or base in ("Thumbs.db", "desktop.ini")
+        or "__MACOSX" in name.replace("\\", "/").split("/")
+    )
+
+
+def _extract_zip(path: str, dest: str, budget: list[int], report: list[dict], rel: str) -> bool:
+    """Extract a ZIP safely into ``dest``. ``budget`` holds the bytes still allowed."""
     import zipfile
 
+    try:
+        with zipfile.ZipFile(path) as z:
+            infos = [i for i in z.infolist() if not i.is_dir() and not _junk(i.filename)]
+            if len(infos) > MAX_ARCHIVE_MEMBERS:
+                report.append({"file": rel, "issue": f"ZIP has {len(infos)} files; only the first {MAX_ARCHIVE_MEMBERS} were read."})
+                infos = infos[:MAX_ARCHIVE_MEMBERS]
+            root = os.path.realpath(dest)
+            for info in infos:
+                if info.flag_bits & 0x1:
+                    report.append({"file": rel, "issue": "ZIP is password-protected; open it on the portal and upload the files."})
+                    return False
+                target = os.path.realpath(os.path.join(dest, info.filename))
+                if not target.startswith(root + os.sep):
+                    continue  # zip-slip guard
+                if info.file_size > budget[0]:
+                    report.append({"file": rel, "issue": "ZIP is too large to unpack on the server; some files were skipped."})
+                    return True
+                budget[0] -= info.file_size
+                z.extract(info, dest)
+        return True
+    except zipfile.BadZipFile:
+        report.append({"file": rel, "issue": "ZIP file is damaged or incomplete; download it again."})
+    except NotImplementedError:
+        report.append({"file": rel, "issue": "ZIP uses a compression method that can't be read; unpack it on a PC and upload the files."})
+    except Exception as e:  # disk full, odd names ...
+        report.append({"file": rel, "issue": f"Couldn't unpack ZIP: {e}"})
+    return False
+
+
+def convert_legacy(path: str) -> str | None:
+    """Turn .doc/.xls/.rtf/.odt/.ods into something readable. Returns the new path or None."""
+    ext = os.path.splitext(path)[1].lower()
+    base = os.path.splitext(path)[0]
+    try:
+        if ext == ".xls":
+            import xlrd  # pure Python, reads the old Excel format
+            import openpyxl
+
+            book = xlrd.open_workbook(path)
+            wb = openpyxl.Workbook()
+            wb.remove(wb.active)
+            for sh in book.sheets():
+                ws = wb.create_sheet((sh.name or "Sheet")[:31])
+                for r in range(min(sh.nrows, 5000)):
+                    ws.append([sh.cell_value(r, c) for c in range(min(sh.ncols, 200))])
+            out = path + ".converted.xlsx"
+            wb.save(out)
+            return out
+        if ext == ".rtf":
+            from striprtf.striprtf import rtf_to_text
+
+            with open(path, encoding="latin-1", errors="ignore") as f:
+                text = rtf_to_text(f.read())
+            out = path + ".converted.txt"
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(text)
+            return out
+    except ImportError:
+        pass
+    except Exception:
+        return None
+    # .doc / .odt / .ods (and the above without their libraries): LibreOffice if present.
+    import shutil
+    import subprocess
+
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        return None
+    target = "xlsx" if ext in (".xls", ".ods") else "docx"
+    outdir = os.path.dirname(path)
+    try:
+        subprocess.run([soffice, "--headless", "--convert-to", target, "--outdir", outdir, path],
+                       check=True, timeout=120, capture_output=True)
+    except Exception:
+        return None
+    produced = base + "." + target
+    if not os.path.isfile(produced):
+        return None
+    out = path + ".converted." + target
+    os.replace(produced, out)
+    return out
+
+
+def display_name(path: str, top: str) -> str:
+    """'2026_X_unzipped/Vol 1.pdf' -> '2026_X.zip › Vol 1.pdf'; 'BOQ.xls.converted.xlsx' -> 'BOQ.xls'."""
+    rel = os.path.relpath(path, top).replace(os.sep, "/")
+    rel = re.sub(r"\.converted\.\w+$", "", rel)
+    return re.sub(r"_unzipped/", ".zip › ", rel)
+
+
+def list_tender_files(folder: str, report: list[dict] | None = None) -> list[str]:
+    """All readable files under ``folder``. ZIPs (also ZIPs inside ZIPs) are unpacked
+    next to themselves into ``<name>_unzipped/``; old Office formats are converted
+    where possible. Anything skipped is added to ``report`` as {file, issue}."""
+    report = report if report is not None else []
+    budget = [MAX_EXTRACT_BYTES]
     out: list[str] = []
-    if not folder or not os.path.isdir(folder):
-        return out
-    for root, _dirs, files in os.walk(folder):
-        for fn in sorted(files):
-            p = os.path.join(root, fn)
-            ext = os.path.splitext(fn)[1].lower()
-            if ext == ".zip":
-                dest = os.path.splitext(p)[0] + "_unzipped"
-                if not os.path.isdir(dest):
-                    try:
-                        with zipfile.ZipFile(p) as z:
-                            for member in z.namelist():
-                                target = os.path.realpath(os.path.join(dest, member))
-                                if not target.startswith(os.path.realpath(dest) + os.sep):
-                                    continue  # zip-slip guard
-                                z.extract(member, dest)
-                    except Exception:
-                        continue
-                    out.extend(list_tender_files(dest))
-            elif ext in SUPPORTED_EXTS and not fn.startswith("~$"):
-                out.append(p)
-    # de-dupe while keeping order
+    _walk(folder, folder, out, report, budget, depth=0)
     seen, uniq = set(), []
     for p in out:
         if p not in seen:
             seen.add(p)
             uniq.append(p)
     return uniq
+
+
+def _walk(folder: str, top: str, out: list[str], report: list[dict], budget: list[int], depth: int) -> None:
+    if not folder or not os.path.isdir(folder):
+        return
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = sorted(d for d in dirs if not _junk(d) and not d.endswith("_unzipped"))
+        for fn in sorted(files):
+            p = os.path.join(root, fn)
+            rel = os.path.relpath(p, top).replace(os.sep, "/")
+            ext = os.path.splitext(fn)[1].lower()
+            if _junk(rel) or ".converted." in fn:
+                continue
+            if ext in ARCHIVE_EXTS:
+                if depth >= MAX_ARCHIVE_DEPTH:
+                    report.append({"file": rel, "issue": "ZIP nested too deeply; skipped."})
+                    continue
+                dest = os.path.splitext(p)[0] + "_unzipped"
+                if os.path.isdir(dest) or _extract_zip(p, dest, budget, report, rel):
+                    _walk(dest, top, out, report, budget, depth + 1)
+            elif ext in SUPPORTED_EXTS:
+                out.append(p)
+            elif ext in CONVERTIBLE_EXTS:
+                conv = convert_legacy(p)
+                if conv:
+                    out.append(conv)
+                else:
+                    report.append({"file": rel, "issue": f"Old {ext} format can't be read on the server; save it as "
+                                                         f"{'.xlsx' if ext in ('.xls', '.ods') else '.docx or .pdf'} and upload it."})
+            elif ext in UNSUPPORTED_ARCHIVES:
+                report.append({"file": rel, "issue": f"{ext} archives can't be unpacked on the server; unpack it and upload the files."})
+            elif ext not in SKIP_EXTS:
+                report.append({"file": rel, "issue": f"{ext or 'This'} file type isn't read."})

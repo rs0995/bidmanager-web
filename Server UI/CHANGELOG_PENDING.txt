@@ -4,3 +4,6 @@ Fixed project file uploads failing with "HTTP 500" (file label too long for Goog
 2026-11-03: New-tender org push now shows "N new tenders added under ORG" as soon as more than 1 tender is grouped (was more than 3); a single tender is still named.
 ----
 01:47 Bid Agent: bid packs per tender (section map, qualification criteria vs company profile, Word/Excel bid forms). Routes /client/tenders/{id}/bid-pack*, /client/company-profile, /admin/bid-agent/*. Needs an Anthropic API key in the console.
+----
+02:36 Bid Agent: bid packs per tender (section map, qualification criteria vs company profile, Word/Excel bid forms). Routes /client/tenders/{id}/bid-pack*, /client/company-profile, /admin/bid-agent/*. Needs an Anthropic API key in the console.
+  (correction: the line above repeats the first Bid Agent note. This update: the Bid Agent reads tender ZIPs from Drive, including ZIPs inside ZIPs, converts old .xls/.rtf files, and lists any file it can't read with the reason.)
