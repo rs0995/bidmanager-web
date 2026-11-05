@@ -48,13 +48,13 @@ paint(hexc('#8ca7d8'), mask_of(lambda d: rrect(d, 382, 452, 156, 360, 42)))
 # Tallest bar: gradient #3b6ce7 (bottom, y 812) to #8db0ff (top, y 304).
 g = np.clip((812 - ys / SS) / 508.0, 0, 1)[..., None]
 paint(hexc('#3b6ce7') * (1 - g) + hexc('#8db0ff') * g, mask_of(lambda d: rrect(d, 568, 304, 156, 508, 42)))
-paint(hexc('#131a2b'), mask_of(lambda d: circ(d, 716, 292, 168)))
-paint(hexc('#10b981'), mask_of(lambda d: circ(d, 716, 292, 146)))
+paint(hexc('#131a2b'), mask_of(lambda d: circ(d, 716, 292, 151)))
+paint(hexc('#10b981'), mask_of(lambda d: circ(d, 716, 292, 131)))
 
 
 def tick(d):
-    pts = [(644, 294), (697, 348), (792, 240)]
-    w = 66
+    pts = [(651, 294), (699, 342), (784, 245)]
+    w = 59
     d.line([(x * SS, y * SS) for x, y in pts], fill=255, width=w * SS, joint='curve')
     for x, y in (pts[0], pts[-1]):
         circ(d, x, y, w / 2)

@@ -42,7 +42,7 @@ export type RootStackParamList = {
   /** Every tender needing attention (the Dashboard card's "See more"). */
   NeedsAttention: undefined;
   /** The Bid Agent chat for a tender (opened from the card above Ready for Bid). */
-  BidAgentChat: { tenderId: string; projectId?: number | null; title?: string };
+  BidAgentChat: { tenderId: string; projectId?: number | null; title?: string; prefill?: string };
   /** Files inside a downloaded ZIP. */
   ZipContents: { docId: string; name: string };
   /** One organisation's tenders (tapping an organisation row, as BM Pro). */

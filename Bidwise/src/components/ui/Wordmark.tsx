@@ -13,7 +13,7 @@ import { BRAND, fonts, useTheme } from '../../theme';
 // The mark, in a 1024×1024 design space: the desktop app's icon (Client UI/assets/icon.svg)
 // on a full-bleed navy tile. Three rising bars under a green tick badge. Same geometry as
 // the app icon (assets/brand/bidwise-icon.svg, ios/Bidwise/Images.xcassets/AppIcon.appiconset).
-const TICK = 'M644 294 L697 348 L792 240';
+const TICK = 'M651 294 L699 342 L784 245';
 
 /** The square brand mark on its own (sign-in, lock screen). */
 export function BrandMark({ size = 38 }: { size?: number }) {
@@ -85,13 +85,13 @@ export function BrandMark({ size = 38 }: { size?: number }) {
           rx="42"
           fill={`url(#${id('bar')})`}
         />
-        <Circle cx="716" cy="292" r="168" fill={BRAND.badgeRing} />
-        <Circle cx="716" cy="292" r="146" fill={BRAND.badge} />
+        <Circle cx="716" cy="292" r="151" fill={BRAND.badgeRing} />
+        <Circle cx="716" cy="292" r="131" fill={BRAND.badge} />
         <Path
           d={TICK}
           fill="none"
           stroke="#ffffff"
-          strokeWidth={66}
+          strokeWidth={59}
           strokeLinecap="round"
           strokeLinejoin="round"
         />

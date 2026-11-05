@@ -1,6 +1,8 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Animated,
+  PanResponder,
   Pressable,
   StyleSheet,
   Text,
@@ -17,7 +19,9 @@ import {
   MessageSquare,
   Sparkles,
 } from 'lucide-react-native';
-import { Card, Chip, useSurface } from '../ui';
+import { Chip, useSurface } from '../ui';
+import { GlassBlur } from '../ui/GlassBlur';
+import { useReducedMotion } from '../ui/motion';
 import type { AgentChat } from '../../data/bidAgent';
 import type { ChatCard, ChatMessage } from '../../lib/bidAgent';
 import { share } from '../../platform/share';
@@ -27,60 +31,154 @@ type OpenFile = (file: { file_id: number; name: string }) => void;
 
 const ROWS_SHOWN = 4;
 
+const CYCLE_MS = 3200;
+const SWIPE_OPEN = 48;
+
 /**
- * The Bid Agent on the tender / project page, above Ready for Bid: one compact card
- * (last answer or progress) that opens the chat in its own screen, so the page
- * doesn't grow with the conversation.
+ * Cycles through the suggested requests every few seconds (with a quick fade, none with
+ * Reduce Motion) while not `paused`. Used by the one-line box and the chat's message box.
  */
-export function AgentChatPreview({ chat, onOpen }: { chat: AgentChat; onOpen: () => void }) {
+export function useCycledHint(suggestions: string[], paused: boolean) {
+  const reduced = useReducedMotion();
+  const [i, setI] = useState(0);
+  const fade = useRef(new Animated.Value(1)).current;
+  const count = suggestions.length;
+  useEffect(() => {
+    if (paused || count < 2) return;
+    const id = setInterval(() => {
+      if (reduced) {
+        setI(n => n + 1);
+        return;
+      }
+      Animated.timing(fade, { toValue: 0, duration: 160, useNativeDriver: true }).start(() => {
+        setI(n => n + 1);
+        Animated.timing(fade, { toValue: 1, duration: 220, useNativeDriver: true }).start();
+      });
+    }, CYCLE_MS);
+    return () => clearInterval(id);
+  }, [paused, count, reduced, fade]);
+  return { hint: count ? suggestions[i % count] : '', fade };
+}
+
+/** The message being typed and sending it; shared by the message box and the suggestions. */
+export function useChatSend(chat: AgentChat, initialText?: string) {
+  const [text, setText] = useState(initialText ?? '');
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState('');
+  const busy = chat.working || sending;
+  const send = (msg: string) => {
+    const body = msg.trim();
+    if (!body || busy) return;
+    setSending(true);
+    setError('');
+    chat
+      .send(body)
+      .then(() => setText(''))
+      .catch(e => setError((e as Error).message))
+      .finally(() => setSending(false));
+  };
+  return { text, setText, sending, error, busy, send };
+}
+
+export type ChatSend = ReturnType<typeof useChatSend>;
+
+/**
+ * The Bid Agent on the tender / project page, above Ready for Bid: a one-line box whose
+ * placeholder cycles through the suggested requests. Tapping it opens the chat (with the
+ * suggestions); swiping it sideways opens the chat with the request on show typed in.
+ */
+export function AgentChatPreview({
+  chat,
+  onOpen,
+}: {
+  chat: AgentChat;
+  /** Opens the chat; `prefill` is typed into its message box. */
+  onOpen: (prefill?: string) => void;
+}) {
   const t = useTheme();
-  const last = [...chat.messages].reverse().find(m => m.role === 'assistant');
+  const surface = useSurface();
   const busy = chat.working;
+  const { hint, fade } = useCycledHint(chat.suggestions, busy);
+  const drag = useRef(new Animated.Value(0)).current;
+
+  // The pan handlers are made once; they read the latest values from here.
+  const latest = useRef({ hint, onOpen });
+  latest.current = { hint, onOpen };
+  const pan = useMemo(
+    () =>
+      PanResponder.create({
+        onMoveShouldSetPanResponder: (_, g) => Math.abs(g.dx) > 12 && Math.abs(g.dx) > Math.abs(g.dy) * 1.5,
+        onPanResponderTerminationRequest: () => false,
+        onPanResponderMove: (_, g) => drag.setValue(Math.max(-60, Math.min(60, g.dx))),
+        onPanResponderRelease: (_, g) => {
+          Animated.timing(drag, { toValue: 0, duration: 160, useNativeDriver: true }).start();
+          if (Math.abs(g.dx) >= SWIPE_OPEN) latest.current.onOpen(latest.current.hint || undefined);
+        },
+        onPanResponderTerminate: () => drag.setValue(0),
+      }),
+    [drag],
+  );
+
+  const text = busy ? chat.progress || 'Working…' : hint || 'Ask the Bid Agent…';
   return (
-    <Pressable accessibilityRole="button" accessibilityLabel="Open the Bid Agent chat" onPress={onOpen}>
-      <Card padding={14} radius="lg" elevation="sm" style={styles.card}>
-        <View style={styles.head}>
-          <View style={[styles.tile, { backgroundColor: t.colors.accentWash }]}>
-            <Sparkles size={17} color={t.colors.accent} />
-          </View>
-          <View style={styles.headCopy}>
-            <Text style={[styles.h3, { color: t.colors.ink }]}>Bid Agent</Text>
-            <Text numberOfLines={2} style={[styles.sub, { color: t.colors.muted }]}>
-              {busy
-                ? chat.progress || 'Working…'
-                : last
-                ? last.text
-                : chat.aiEnabled
-                ? 'Ask for the prequal, tender forms or the documents checklist'
-                : 'Basic mode: AI reading is off on the server'}
-            </Text>
-          </View>
-          {busy ? (
-            <ActivityIndicator size="small" color={t.colors.accent} />
-          ) : (
-            <View style={[styles.openBtn, { backgroundColor: t.colors.accentWash }]}>
-              <MessageSquare size={14} color={t.colors.accentInk} />
-              <Text style={[styles.openText, { color: t.colors.accentInk }]}>
-                {chat.messages.length ? 'Open' : 'Ask'}
-              </Text>
-            </View>
-          )}
+    <View style={styles.card} {...pan.panHandlers}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={busy ? `Bid Agent: ${text}` : 'Ask the Bid Agent'}
+        accessibilityHint={hint ? `Suggestion: ${hint}` : undefined}
+        accessibilityActions={hint ? [{ name: 'ask', label: `Ask: ${hint}` }] : undefined}
+        onAccessibilityAction={e => e.nativeEvent.actionName === 'ask' && onOpen(hint)}
+        onPress={() => onOpen()}
+        style={[styles.box, surface]}
+      >
+        <GlassBlur amount={14} />
+        <View style={[styles.tile, { backgroundColor: t.colors.accentWash }]}>
+          <Sparkles size={16} color={t.colors.accent} />
         </View>
-      </Card>
-    </Pressable>
+        <Animated.Text
+          numberOfLines={1}
+          style={[
+            styles.hint,
+            { color: busy ? t.colors.inkSoft : t.colors.muted },
+            !busy && { opacity: fade, transform: [{ translateX: drag }] },
+          ]}
+        >
+          {text}
+        </Animated.Text>
+        {busy ? (
+          <ActivityIndicator size="small" color={t.colors.accent} />
+        ) : chat.messages.length ? (
+          <MessageSquare size={16} color={t.colors.accentInk} />
+        ) : null}
+      </Pressable>
+    </View>
   );
 }
 
-/** The conversation (used by the Bid Agent screen). Text is selectable. */
-export function ChatMessages({ chat, onOpenFile }: { chat: AgentChat; onOpenFile: OpenFile }) {
+/**
+ * The conversation (used by the Bid Agent screen). Text is selectable. An empty chat
+ * shows the suggested requests, centred; tapping one sends it (`onPick`).
+ */
+export function ChatMessages({
+  chat,
+  onOpenFile,
+  onPick,
+}: {
+  chat: AgentChat;
+  onOpenFile: OpenFile;
+  onPick?: (request: string) => void;
+}) {
   const t = useTheme();
+  const empty = chat.messages.length === 0 && !chat.working;
+  const pick = onPick ?? ((s: string) => chat.send(s).catch(() => {}));
   return (
-    <View>
-      {chat.messages.length === 0 ? (
-        <Text style={[styles.empty, { color: t.colors.muted }]}>
-          Ask in your own words, e.g. “fetch the qualification criteria”, “the criteria are on pages 12–14”,
-          “save the prequal as PDF”, “extract form FIN-3.2”, “prepare the checklist”.
-        </Text>
+    <View style={empty ? styles.emptyWrap : undefined}>
+      {empty && chat.suggestions.length ? (
+        <View style={styles.cloud}>
+          {chat.suggestions.map(s => (
+            <Chip key={s} label={s} onPress={() => pick(s)} />
+          ))}
+        </View>
       ) : null}
       {chat.messages.map(m => (
         <Message key={m.id} m={m} onOpenFile={onOpenFile} />
@@ -104,58 +202,44 @@ export function ChatMessages({ chat, onOpenFile }: { chat: AgentChat; onOpenFile
   );
 }
 
-/** Suggestions + the message box, pinned at the bottom of the Bid Agent screen. */
-export function ChatComposer({ chat }: { chat: AgentChat }) {
+/**
+ * The message box, pinned at the bottom of the Bid Agent screen. While empty, its
+ * placeholder cycles through the suggested requests.
+ */
+export function ChatComposer({ chat, sender }: { chat: AgentChat; sender: ChatSend }) {
   const t = useTheme();
   const surface = useSurface();
-  const [text, setText] = useState('');
-  const [sending, setSending] = useState(false);
-  const [error, setError] = useState('');
-  const busy = chat.working || sending;
-  const send = (msg: string) => {
-    const body = msg.trim();
-    if (!body || busy) return;
-    setSending(true);
-    setError('');
-    chat
-      .send(body)
-      .then(() => setText(''))
-      .catch(e => setError((e as Error).message))
-      .finally(() => setSending(false));
-  };
-  const chips = chat.suggestions.filter(s => !chat.messages.some(m => m.role === 'user' && m.text === s)).slice(0, 4);
+  const { text, setText, sending, error, busy, send } = sender;
+  const { hint } = useCycledHint(chat.suggestions, busy || Boolean(text));
+  // Focus on open only when a request was swiped in from the tender page.
+  const [focusOnOpen] = useState(Boolean(text));
+  const ready = Boolean(text.trim()) && !busy;
   return (
     <View>
       {error ? <Text style={[styles.error, { color: t.colors.crit }]}>{error}</Text> : null}
-      {!busy && chips.length ? (
-        <View style={styles.chips}>
-          {chips.map(s => (
-            <Chip key={s} label={s} onPress={() => send(s)} />
-          ))}
-        </View>
-      ) : null}
       <View style={[styles.inputRow, surface]}>
         <TextInput
           value={text}
           onChangeText={setText}
-          placeholder="Ask the Bid Agent…"
+          placeholder={hint || 'Ask the Bid Agent…'}
           placeholderTextColor={t.colors.muted}
           accessibilityLabel="Message the Bid Agent"
           style={[styles.input, { color: t.colors.ink }]}
           multiline
+          autoFocus={focusOnOpen}
           editable={!busy}
         />
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Send"
-          disabled={!text.trim() || busy}
+          disabled={!ready}
           onPress={() => send(text)}
-          style={[styles.send, { backgroundColor: text.trim() && !busy ? t.colors.accent : t.colors.surfaceSunk }]}
+          style={[styles.send, { backgroundColor: ready ? t.colors.accent : t.colors.surfaceSunk }]}
         >
           {sending ? (
             <ActivityIndicator size="small" color={t.colors.onAccent} />
           ) : (
-            <ArrowUp size={17} color={text.trim() && !busy ? t.colors.onAccent : t.colors.muted} />
+            <ArrowUp size={17} color={ready ? t.colors.onAccent : t.colors.muted} />
           )}
         </Pressable>
       </View>
@@ -313,15 +397,23 @@ function CardView({ card, onOpenFile }: { card: ChatCard; onOpenFile: OpenFile }
 }
 
 const styles = StyleSheet.create({
-  card: { marginTop: 14 },
-  head: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  tile: { width: 34, height: 34, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
+  card: { marginBottom: 12 },
+  box: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    height: 52,
+    paddingLeft: 8,
+    paddingRight: 16,
+    borderRadius: 26,
+    borderWidth: 1,
+    overflow: 'hidden',
+  },
+  tile: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center' },
+  hint: { flex: 1, fontFamily: fonts.regular, fontSize: 14.5 },
   headCopy: { flex: 1 },
-  h3: { fontFamily: fonts.semibold, fontSize: 15 },
-  sub: { fontFamily: fonts.regular, fontSize: 12, marginTop: 2, lineHeight: 16 },
-  openBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 6 },
-  openText: { fontFamily: fonts.semibold, fontSize: 12 },
-  empty: { fontFamily: fonts.regular, fontSize: 13, lineHeight: 19, textAlign: 'center', marginTop: 20, paddingHorizontal: 12 },
+  emptyWrap: { flex: 1, justifyContent: 'center' },
+  cloud: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 8, paddingHorizontal: 8 },
   msg: { marginTop: 10, maxWidth: '100%' },
   mine: { alignItems: 'flex-end' },
   theirs: { alignItems: 'flex-start' },
@@ -342,7 +434,6 @@ const styles = StyleSheet.create({
   progress: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 12 },
   progressText: { fontFamily: fonts.regular, fontSize: 12 },
   error: { fontFamily: fonts.medium, fontSize: 12, marginTop: 8, marginBottom: 4 },
-  chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 8 },
   inputRow: { flexDirection: 'row', alignItems: 'flex-end', gap: 8, borderRadius: 16, padding: 6 },
   input: { flex: 1, fontFamily: fonts.regular, fontSize: 15, minHeight: 36, maxHeight: 120, paddingHorizontal: 8, paddingVertical: 8 },
   send: { width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center' },

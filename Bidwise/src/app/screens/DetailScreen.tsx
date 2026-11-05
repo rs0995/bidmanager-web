@@ -505,11 +505,12 @@ export function DetailScreen() {
       {access.projects && fetched.tender ? (
         <AgentChatPreview
           chat={agentChat}
-          onOpen={() =>
+          onOpen={prefill =>
             navigation.navigate('BidAgentChat', {
               tenderId: fetched.tender!.id,
               projectId: project ? Number(project.id) : null,
               title: tender.title,
+              prefill,
             })
           }
         />
