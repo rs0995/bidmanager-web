@@ -77,6 +77,11 @@ SCHEMA = [
 ]
 
 
+MIGRATIONS = [
+    ("bid_org_profiles", "tender_ids_json", "TEXT"),
+]
+
+
 def org_key_for(name: str) -> str:
     s = (name or "").lower()
     s = re.sub(r"\b(limited|ltd|pvt|private|corporation|corp|the|of|and)\b", " ", s)
@@ -118,6 +123,15 @@ class Store:
             for stmt in SCHEMA:
                 c.execute(stmt)
             c.commit()
+        # Columns added after a table was first created (CREATE TABLE IF NOT EXISTS
+        # never adds them). Each ALTER is tried on its own; "already exists" is fine.
+        for table, column, decl in MIGRATIONS:
+            with self.conn() as c:
+                try:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+                    c.commit()
+                except Exception:
+                    pass
 
     # ---- employer profiles (shared) -------------------------------------
     def get_org(self, org_key: str) -> dict:

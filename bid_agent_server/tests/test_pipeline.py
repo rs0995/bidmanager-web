@@ -124,6 +124,19 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(llm2.calls, [])  # section maps, criteria and forms all reused
         self.assertTrue(all(f["source"] == "library" for f in r2["forms"]))
 
+    def test_schema_upgrade_adds_new_columns(self):
+        db = os.path.join(self.tmp, "old.db")
+        c = sqlite3.connect(db)
+        c.execute("CREATE TABLE bid_org_profiles (org_key TEXT PRIMARY KEY, org_name TEXT, aliases_json TEXT, "
+                  "form_codes_json TEXT, tender_count INTEGER DEFAULT 0, updated_at REAL)")
+        c.commit()
+        c.close()
+        store = Store(lambda: sqlite3.connect(db))
+        store.init_schema()
+        store.init_schema()  # twice is fine
+        store.save_org({"org_key": "x", "org_name": "X", "tender_ids": ["T1"]})
+        self.assertEqual(store.get_org("x")["tender_count"], 1)
+
     def test_owner_scoped_storage(self):
         store = new_store(self.tmp)
         store.save_company_profile("org:1", {"general": {"name": "A"}})

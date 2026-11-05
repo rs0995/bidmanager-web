@@ -1,8 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
-  ArrowUp, CheckCircle2, ChevronDown, ChevronRight, Clock, FileSpreadsheet, FileText,
-  RotateCcw, Sparkles,
+  ArrowUp, Check, CheckCircle2, Clock, Copy, FileSpreadsheet, FileText, MessageSquare,
+  RotateCcw, Sparkles, X,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import { cn } from '../lib/utils';
@@ -23,7 +23,7 @@ const changesData = (m) => (m.cards || []).some((c) => c.type === 'files' || c.t
 export default function AgentChatPanel({ project, resolveProjectFolder, folderFor, onDataChanged, pushToast }) {
   const qc = useQueryClient();
   const tenderId = String(project?.source_tender_id || '').trim();
-  const [open, setOpen] = useState(() => { try { return localStorage.getItem('bm.bidAgent.open') !== '0'; } catch { return true; } });
+  const [open, setOpen] = useState(false);
   const [text, setText] = useState('');
   const [messages, setMessages] = useState([]);
   const [state, setState] = useState({ status: 'idle', progress: '', suggestions: [], ai_enabled: true });
@@ -32,7 +32,6 @@ export default function AgentChatPanel({ project, resolveProjectFolder, folderFo
   const listRef = useRef(null);
   const lastId = useRef(0);
 
-  useEffect(() => { try { localStorage.setItem('bm.bidAgent.open', open ? '1' : '0'); } catch { /* ignore */ } }, [open]);
 
   const { data: tenderDbId, isLoading: resolving } = useQuery({
     queryKey: ['bid-agent-tender', tenderId],
@@ -105,7 +104,7 @@ export default function AgentChatPanel({ project, resolveProjectFolder, folderFo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenderDbId, state.status, messages.length]);
 
-  useEffect(() => { if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight; }, [messages.length, state.status]);
+  useEffect(() => { if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight; }, [messages.length, state.status, open]);
 
   const send = async (msg) => {
     const body = String(msg || '').trim();
@@ -144,69 +143,165 @@ export default function AgentChatPanel({ project, resolveProjectFolder, folderFo
   const chips = (state.suggestions || []).filter((s) => !asked.has(s)).slice(0, 5);
 
   if (!tenderId) return null;
+  const last = [...messages].reverse().find((m) => m.role === 'assistant');
   return (
-    <div className="border-b border-[var(--border)] bg-[var(--surface-0)]">
-      <button className="flex w-full items-center gap-2 px-5 py-2 text-left" onClick={() => setOpen((v) => !v)}>
-        {open ? <ChevronDown size={14} className="text-[var(--text-muted)]" /> : <ChevronRight size={14} className="text-[var(--text-muted)]" />}
-        <Sparkles size={14} className="text-[var(--accent)]" />
-        <span className="text-sm font-semibold">Bid Agent</span>
-        <span className="truncate text-[11px] text-[var(--text-muted)]">
-          {busy ? (state.progress || 'Working…') : state.ai_enabled ? 'Ask for the prequal, tender forms or the documents checklist' : 'Basic mode: AI reading is off on the server'}
+    <>
+      {/* One line above the checklist; the chat itself opens in a window. */}
+      <div className="flex items-center gap-2 border-b border-[var(--border)] bg-[var(--surface-0)] px-5 py-2">
+        <Sparkles size={14} className="shrink-0 text-[var(--accent)]" />
+        <span className="shrink-0 text-sm font-semibold">Bid Agent</span>
+        <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--text-muted)]">
+          {busy ? (state.progress || 'Working…') : last ? last.text : state.ai_enabled ? 'Ask for the prequal, tender forms or the documents checklist' : 'Basic mode: AI reading is off on the server'}
         </span>
-        {busy && <Spinner size={12} className="ml-1 text-[var(--accent)]" />}
-        {open && messages.length > 0 && !busy && (
-          <span role="button" tabIndex={0} title="Clear the conversation" onClick={(e) => { e.stopPropagation(); clear(); }}
-            className="ml-auto text-[var(--text-muted)] hover:text-[var(--text)]"><RotateCcw size={13} /></span>
-        )}
-      </button>
+        {busy && <Spinner size={12} className="text-[var(--accent)]" />}
+        <button className="btn-primary h-7 gap-1 px-3 text-xs" onClick={() => setOpen(true)}>
+          <MessageSquare size={12} />{messages.length ? 'Open chat' : 'Ask the agent'}
+        </button>
+      </div>
       {open && (
-        <div className="px-5 pb-3">
-          {resolving ? <div className="py-3"><Spinner size={14} /></div> : !tenderDbId ? (
-            <p className="py-2 text-xs text-[var(--text-muted)]">This tender is no longer on the server.</p>
+        <ChatWindow onClose={() => setOpen(false)} title={project?.title || tenderId} busy={busy} progress={state.progress}
+          aiEnabled={state.ai_enabled} onClear={messages.length && !busy ? clear : null}>
+          {resolving ? <div className="p-4"><Spinner size={14} /></div> : !tenderDbId ? (
+            <p className="p-4 text-xs text-[var(--text-muted)]">This tender is no longer on the server.</p>
           ) : (
             <>
-              {messages.length > 0 && (
-                <div ref={listRef} className="mb-2 max-h-[340px] space-y-2 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3">
-                  {messages.map((m) => <Message key={m.id} m={m} onOpenFile={openFile} />)}
-                  {busy && (
-                    <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)]"><Spinner size={11} />{state.progress || 'Working…'}</div>
-                  )}
-                </div>
-              )}
-              {error && <div className="mb-2 text-xs text-rose-400">{error}</div>}
-              {!busy && chips.length > 0 && (
-                <div className="mb-2 flex flex-wrap gap-1.5">
-                  {chips.map((s) => (
-                    <button key={s} onClick={() => send(s)} className="rounded-full border border-[var(--border)] px-2.5 py-1 text-[11px] text-[var(--text-muted)] hover:border-[var(--accent)] hover:text-[var(--text)]">{s}</button>
-                  ))}
-                </div>
-              )}
-              <form className="flex items-center gap-2" onSubmit={(e) => { e.preventDefault(); send(text); }}>
-                <input value={text} onChange={(e) => setText(e.target.value)} disabled={busy}
-                  placeholder="Ask the Bid Agent… e.g. “save the prequal as PDF”, “extract form FIN-3.2”, “prepare the checklist”"
-                  className="input-field h-9 flex-1 text-sm" />
-                <button type="submit" disabled={busy || !text.trim()} className="btn-primary h-9 w-9 justify-center p-0" title="Send">
-                  {busy ? <Spinner size={13} /> : <ArrowUp size={15} />}
-                </button>
-              </form>
+              <div ref={listRef} className="min-h-0 flex-1 cursor-text select-text space-y-2 overflow-auto p-3">
+                {messages.length === 0 && (
+                  <p className="py-6 text-center text-xs text-[var(--text-muted)]">
+                    Ask in your own words, e.g. “fetch the qualification criteria”, “the criteria are on pages 12–14”, “save the prequal as PDF”, “extract form FIN-3.2”, “prepare the checklist”.
+                  </p>
+                )}
+                {messages.map((m) => <Message key={m.id} m={m} onOpenFile={openFile} />)}
+                {busy && (
+                  <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)]"><Spinner size={11} />{state.progress || 'Working…'}</div>
+                )}
+              </div>
+              <div className="border-t border-[var(--border)] p-3">
+                {error && <div className="mb-2 text-xs text-rose-400">{error}</div>}
+                {!busy && chips.length > 0 && (
+                  <div className="mb-2 flex flex-wrap gap-1.5">
+                    {chips.map((s) => (
+                      <button key={s} onClick={() => send(s)} className="rounded-full border border-[var(--border)] px-2.5 py-1 text-[11px] text-[var(--text-muted)] hover:border-[var(--accent)] hover:text-[var(--text)]">{s}</button>
+                    ))}
+                  </div>
+                )}
+                <form className="flex items-end gap-2" onSubmit={(e) => { e.preventDefault(); send(text); }}>
+                  <textarea value={text} onChange={(e) => setText(e.target.value)} disabled={busy} rows={2}
+                    onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(text); } }}
+                    placeholder="Ask the Bid Agent… (Enter to send, Shift+Enter for a new line)"
+                    className="input-field min-h-[38px] flex-1 resize-none py-2 text-sm" />
+                  <button type="submit" disabled={busy || !text.trim()} className="btn-primary h-9 w-9 justify-center p-0" title="Send">
+                    {busy ? <Spinner size={13} /> : <ArrowUp size={15} />}
+                  </button>
+                </form>
+              </div>
             </>
           )}
-        </div>
+        </ChatWindow>
       )}
+    </>
+  );
+}
+
+const WINDOW_KEY = 'bm.bidAgent.window';
+
+/* A floating window inside the tab: drag it by its title bar, resize it from
+   the corner. Its size and position are remembered. */
+function ChatWindow({ title, busy, progress, aiEnabled, onClose, onClear, children }) {
+  const [box, setBox] = useState(() => {
+    const w = Math.min(720, window.innerWidth - 40);
+    const h = Math.min(Math.round(window.innerHeight * 0.75), window.innerHeight - 40);
+    const fallback = { x: window.innerWidth - w - 24, y: 64, w, h };
+    try {
+      const saved = JSON.parse(localStorage.getItem(WINDOW_KEY) || 'null');
+      if (saved && saved.w > 300 && saved.h > 240) {
+        return {
+          w: Math.min(saved.w, window.innerWidth - 20), h: Math.min(saved.h, window.innerHeight - 20),
+          x: Math.max(0, Math.min(saved.x, window.innerWidth - 200)), y: Math.max(0, Math.min(saved.y, window.innerHeight - 80)),
+        };
+      }
+    } catch { /* ignore */ }
+    return fallback;
+  });
+  const ref = useRef(null);
+  useEffect(() => { try { localStorage.setItem(WINDOW_KEY, JSON.stringify(box)); } catch { /* ignore */ } }, [box]);
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  // CSS resize handle -> remember the new size.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(() => {
+      const r = el.getBoundingClientRect();
+      setBox((b) => (Math.abs(b.w - r.width) > 2 || Math.abs(b.h - r.height) > 2 ? { ...b, w: Math.round(r.width), h: Math.round(r.height) } : b));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  const startDrag = (e) => {
+    if (e.button !== 0 || e.target.closest('button')) return;
+    const sx = e.clientX; const sy = e.clientY; const { x, y } = box;
+    const move = (ev) => setBox((b) => ({
+      ...b,
+      x: Math.max(0, Math.min(window.innerWidth - 120, x + ev.clientX - sx)),
+      y: Math.max(0, Math.min(window.innerHeight - 40, y + ev.clientY - sy)),
+    }));
+    const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+  };
+  return (
+    <div ref={ref} role="dialog" aria-label="Bid Agent chat"
+      className="fixed z-[75] flex flex-col overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface-0)] shadow-2xl"
+      style={{ left: box.x, top: box.y, width: box.w, height: box.h, resize: 'both', minWidth: 360, minHeight: 280, maxWidth: '100vw', maxHeight: '100vh' }}>
+      <div onMouseDown={startDrag} className="flex cursor-move select-none items-center gap-2 border-b border-[var(--border)] px-3 py-2">
+        <Sparkles size={14} className="text-[var(--accent)]" />
+        <span className="text-sm font-semibold">Bid Agent</span>
+        <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--text-muted)]">
+          {busy ? (progress || 'Working…') : aiEnabled ? title : 'Basic mode: AI reading is off on the server'}
+        </span>
+        {onClear && <button title="Clear the conversation" onClick={onClear} className="text-[var(--text-muted)] hover:text-[var(--text)]"><RotateCcw size={13} /></button>}
+        <button title="Close (Esc)" onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text)]"><X size={15} /></button>
+      </div>
+      {children}
     </div>
   );
 }
+
+function CopyButton({ text, label = 'Copy' }) {
+  const [done, setDone] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
+    }
+    setDone(true); setTimeout(() => setDone(false), 1500);
+  };
+  return (
+    <button onClick={copy} title={label} className="inline-flex items-center gap-1 text-[10px] text-[var(--text-muted)] hover:text-[var(--text)]">
+      {done ? <Check size={11} /> : <Copy size={11} />}{done ? 'Copied' : label}
+    </button>
+  );
+}
+
+const tableText = (card) => [card.columns, ...card.rows].map((r) => r.map((v) => String(v ?? '').replace(/\s+/g, ' ')).join('\t')).join('\n');
 
 function Message({ m, onOpenFile }) {
   const mine = m.role === 'user';
   return (
     <div className={cn('flex flex-col', mine ? 'items-end' : 'items-start')}>
       {m.text && (
-        <div className={cn('max-w-[85%] whitespace-pre-wrap rounded-xl px-3 py-1.5 text-[13px]',
+        <div className={cn('max-w-[85%] select-text whitespace-pre-wrap rounded-xl px-3 py-1.5 text-[13px]',
           mine ? 'bg-[var(--accent)] text-white' : m.error ? 'bg-rose-500/10 text-rose-400' : 'bg-[var(--surface-2)] text-[var(--text)]')}>
           {m.text}
         </div>
       )}
+      {!mine && m.text && <div className="mt-0.5 px-1"><CopyButton text={m.text} /></div>}
       {(m.cards || []).map((c, i) => <CardView key={i} card={c} onOpenFile={onOpenFile} />)}
     </div>
   );
@@ -218,8 +313,11 @@ function CardView({ card, onOpenFile }) {
     const rows = all ? card.rows : card.rows.slice(0, 8);
     return (
       <div className="mt-1 w-full overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface-0)]">
-        <div className="px-2.5 pt-2 text-[11px] font-semibold text-[var(--text-muted)]">{card.title}</div>
-        <table className="data-table text-[11px]">
+        <div className="flex items-center gap-2 px-2.5 pt-2 text-[11px] font-semibold text-[var(--text-muted)]">
+          <span className="flex-1">{card.title}</span>
+          <CopyButton text={tableText(card)} label="Copy table" />
+        </div>
+        <table className="data-table select-text text-[11px]">
           <thead><tr>{card.columns.map((c) => <th key={c}>{c}</th>)}</tr></thead>
           <tbody>
             {rows.map((r, i) => (
