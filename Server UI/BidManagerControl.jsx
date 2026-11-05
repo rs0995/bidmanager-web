@@ -4,7 +4,7 @@ import {
   Globe, Key, Search, X, Check, AlertTriangle, RefreshCw, Play, Pause, Trash2,
   Download, Upload, Plus, RotateCcw, Loader2, ChevronRight, ChevronDown, ArrowLeft,
   Copy, ExternalLink, Filter, ShieldCheck, Zap, FileText,
-  Eye, Bell, SkipForward, Timer, Send, Users, Ban, Archive, Pencil, Sparkles
+  Eye, Bell, SkipForward, Timer, Send, Users, Ban, Archive, Pencil, Sparkles, MessageSquare
 } from 'lucide-react';
 import bmServerIcon from './src/assets/bm-server-icon.svg';
 
@@ -3569,10 +3569,80 @@ function DbPanel({ toast, env, base, adminKey, dbUrl, localScope }) {
    API_CHANGES.md §5). Here: the Claude key / model it uses, the employers it
    has learned (section names, form codes) and its form-template library.
    Routes: /admin/bid-agent/*. A 404 means the server doesn't have it yet. */
+/* Console chat with the Bid Agent on any tender (by its server row id), to test
+   answers and training. It reads and answers only; saving is done in the apps. */
+function BidAgentConsoleChat({ base, adminKey, toast }) {
+  const [tid, setTid] = useState('');
+  const [active, setActive] = useState(0);
+  const [chat, setChat] = useState({ messages: [], status: 'idle', progress: '', partial: '' });
+  const [msg, setMsg] = useState('');
+  const [busy, setBusy] = useState(false);
+  const path = (id) => `/admin/bid-agent/tenders/${Number(id)}/chat`;
+  const refresh = useCallback(async (id) => {
+    const r = await apiFetch(base, path(id), { adminKey });
+    setChat(r);
+    return r;
+  }, [base, adminKey]);
+  useEffect(() => {
+    if (!active || chat.status !== 'working') return undefined;
+    const t = setInterval(() => { refresh(active).catch(() => {}); }, 1000);
+    return () => clearInterval(t);
+  }, [active, chat.status, refresh]);
+  const open = async () => {
+    const id = Number(tid);
+    if (!id) return;
+    try { await refresh(id); setActive(id); } catch (e) { toast(`Tender ${id}: ${e.message}`); }
+  };
+  const send = async () => {
+    if (!msg.trim() || !active) return;
+    setBusy(true);
+    try { setChat(await apiFetch(base, path(active), { method: 'POST', adminKey, body: { message: msg.trim() } })); setMsg(''); } catch (e) { toast(`Failed: ${e.message}`); } finally { setBusy(false); }
+  };
+  const clear = async () => {
+    try { setChat(await apiFetch(base, path(active), { method: 'DELETE', adminKey })); } catch (e) { toast(`Failed: ${e.message}`); }
+  };
+  const working = chat.status === 'working';
+  return (
+    <Panel code="ASK" title="Try the agent" note="Chat on any tender to test answers and instructions (read only)">
+      <Card>
+        <div className="flex flex-wrap items-end gap-2">
+          <Field label="Tender row id" stacked><TextIn value={tid} onChange={setTid} placeholder="e.g. 501" w={120} /></Field>
+          <Btn icon={MessageSquare} onClick={open}>Open</Btn>
+          {active > 0 && chat.messages.length > 0 && !working && <Btn variant="danger" icon={Trash2} onClick={clear}>Clear</Btn>}
+        </div>
+        {active > 0 && (
+          <div className="mt-3">
+            <div style={{ maxHeight: 420, overflow: 'auto', border: `1px solid ${c.ruleSoft}`, padding: 8, userSelect: 'text' }}>
+              {!chat.messages.length && <p style={{ fontSize: 12, color: c.ink60 }}>No messages yet.</p>}
+              {chat.messages.map((m) => (
+                <div key={m.id} style={{ marginBottom: 8, textAlign: m.role === 'user' ? 'right' : 'left' }}>
+                  <div style={{ display: 'inline-block', maxWidth: '85%', whiteSpace: 'pre-wrap', fontSize: 12.5, padding: '5px 8px', background: m.role === 'user' ? c.indigo : c.ruleSoft, color: m.role === 'user' ? '#fff' : c.ink, textAlign: 'left' }}>{m.text}</div>
+                  {(m.cards || []).filter((cd) => cd.type === 'table').map((cd, i) => (
+                    <div key={i} style={{ fontSize: 11.5, color: c.ink60, marginTop: 2 }}>[{cd.title}: {cd.rows.length} rows]</div>
+                  ))}
+                </div>
+              ))}
+              {working && <div style={{ fontSize: 12, color: c.ink60, whiteSpace: 'pre-wrap' }}>{chat.partial || chat.progress || 'Working…'}</div>}
+            </div>
+            <div className="mt-2 flex gap-2">
+              <input value={msg} onChange={(e) => setMsg(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') send(); }} disabled={working}
+                placeholder="Ask about this tender…" style={{ flex: 1, fontFamily: mono, fontSize: 12.5, padding: '5px 8px', color: c.ink, background: c.card, border: `1px solid ${c.rule}`, outline: 'none' }} />
+              <Btn variant="primary" onClick={send} busy={busy || working}>Send</Btn>
+            </div>
+          </div>
+        )}
+      </Card>
+    </Panel>
+  );
+}
+
 function BidAgentPanel({ toast, base, adminKey }) {
   const [state, setState] = useState({ loading: true, missing: false, error: '', config: null, employers: [], forms: [] });
   const [keyIn, setKeyIn] = useState('');
   const [modelIn, setModelIn] = useState('');
+  const [chatModelIn, setChatModelIn] = useState('');
+  const [rulesIn, setRulesIn] = useState('');
+  const [learned, setLearned] = useState([]);
   const [saving, setSaving] = useState(false);
   const [orgFilter, setOrgFilter] = useState('');
   const [busyOrg, setBusyOrg] = useState('');
@@ -3587,6 +3657,14 @@ function BidAgentPanel({ toast, base, adminKey }) {
       ]);
       setState({ loading: false, missing: false, error: '', config, employers: employers || [], forms: forms || [] });
       setModelIn(config?.model || '');
+      setChatModelIn(config?.chat_model || '');
+      // Training (newer servers only).
+      const [rules, notes] = await Promise.all([
+        apiFetch(base, '/admin/bid-agent/instructions', { adminKey }).catch(() => null),
+        apiFetch(base, '/admin/bid-agent/learnings', { adminKey }).catch(() => null),
+      ]);
+      setRulesIn(rules?.text || '');
+      setLearned(notes?.items || []);
     } catch (e) {
       const msg = String(e?.message || e);
       setState((s) => ({ ...s, loading: false, missing: /not found|404/i.test(msg), error: msg }));
@@ -3597,7 +3675,7 @@ function BidAgentPanel({ toast, base, adminKey }) {
   const save = async () => {
     setSaving(true);
     try {
-      const body = { model: modelIn.trim() };
+      const body = { model: modelIn.trim(), chat_model: chatModelIn.trim() };
       if (keyIn.trim()) body.api_key = keyIn.trim();
       const config = await apiFetch(base, '/admin/bid-agent/config', { method: 'PUT', adminKey, body });
       setState((s) => ({ ...s, config }));
@@ -3612,6 +3690,14 @@ function BidAgentPanel({ toast, base, adminKey }) {
       setState((s) => ({ ...s, config }));
       toast('API key removed');
     } catch (e) { toast(`Failed: ${e.message}`); } finally { setSaving(false); }
+  };
+  const saveRules = async () => {
+    setSaving(true);
+    try {
+      const r = await apiFetch(base, '/admin/bid-agent/instructions', { method: 'PUT', adminKey, body: { text: rulesIn } });
+      setRulesIn(r?.text || '');
+      toast('Global instructions saved');
+    } catch (e) { toast(`Save failed: ${e.message}`); } finally { setSaving(false); }
   };
   const forget = async (orgKey) => {
     if (!window.confirm('Forget this employer? Its learned section names and form templates are deleted; the next tender is read from scratch.')) return;
@@ -3650,16 +3736,49 @@ function BidAgentPanel({ toast, base, adminKey }) {
         <Card style={{ marginTop: 12 }}>
           <SubHead>Claude (Anthropic) access</SubHead>
           <RegisterRow label="API key" value={cfg.api_key_set ? `${cfg.api_key_hint || 'set'}${cfg.api_key_source === 'env' ? ' (from ANTHROPIC_API_KEY)' : ''}` : 'not set: keyword reading only'} tone={cfg.api_key_set ? c.seal : c.amber} />
-          <RegisterRow label="Model" value={cfg.model || cfg.default_model || '—'} />
+          <RegisterRow label="Document model" value={cfg.model || cfg.default_model || '—'} />
+          {cfg.default_chat_model && <RegisterRow label="Chat model" value={cfg.chat_model || cfg.default_chat_model} />}
           <div className="mt-3 flex flex-wrap items-end gap-2">
             <Field label="New API key" stacked><TextIn type="password" value={keyIn} onChange={setKeyIn} placeholder="sk-ant-…" w={280} /></Field>
-            <Field label="Model" stacked><TextIn value={modelIn} onChange={setModelIn} placeholder={cfg.default_model} w={200} /></Field>
+            <Field label="Document model (reads tenders)" stacked><TextIn value={modelIn} onChange={setModelIn} placeholder={cfg.default_model} w={200} /></Field>
+            {cfg.default_chat_model && <Field label="Chat model (answers)" stacked><TextIn value={chatModelIn} onChange={setChatModelIn} placeholder={cfg.default_chat_model} w={200} /></Field>}
             <Btn variant="primary" icon={Check} onClick={save} busy={saving}>Save</Btn>
             {cfg.api_key_source === 'settings' && <Btn variant="danger" icon={Trash2} onClick={clearKey} disabled={saving}>Remove key</Btn>}
           </div>
           <p className="mt-2" style={{ fontSize: 11.5, color: c.ink60 }}>The key is stored in app settings and never sent back to this console or to client apps.</p>
         </Card>
       </Panel>
+
+      {cfg.default_chat_model && (
+        <Panel code="TRN" title="Training" note="Instructions every chat follows, and what users taught the agent">
+          <Card>
+            <SubHead>Global instructions</SubHead>
+            <p style={{ fontSize: 11.5, color: c.ink60, marginBottom: 6 }}>Apply to every organisation, before their own instructions. Keep them short.</p>
+            <textarea value={rulesIn} onChange={(e) => setRulesIn(e.target.value)} rows={5} placeholder="One instruction per line"
+              style={{ width: '100%', fontFamily: mono, fontSize: 12.5, padding: '6px 8px', color: c.ink, background: c.card, border: `1px solid ${c.rule}`, outline: 'none' }} />
+            <div className="mt-2"><Btn variant="primary" icon={Check} onClick={saveRules} busy={saving}>Save instructions</Btn></div>
+          </Card>
+          <Card pad={false} style={{ marginTop: 12 }}>
+            {!learned.length ? <Empty icon={Sparkles} title="Nothing learned yet. Users teach the agent by saying “remember …” in a chat." /> : (
+              <table className="w-full" style={{ borderCollapse: 'collapse' }}>
+                <thead><tr><th style={th}>Learned</th><th style={th}>Owner</th><th style={th}>Employer</th><th style={th}>State</th></tr></thead>
+                <tbody>
+                  {learned.map((l) => (
+                    <tr key={l.id}>
+                      <td style={td}>{l.text}</td>
+                      <td style={td}><Mono>{l.owner}</Mono></td>
+                      <td style={{ ...td, color: c.ink60 }}>{l.employer_key || 'all'}</td>
+                      <td style={td}><Mono style={{ color: l.active ? c.seal : c.ink40 }}>{l.active ? 'active' : 'paused'}</Mono></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </Card>
+        </Panel>
+      )}
+
+      {cfg.default_chat_model && <BidAgentConsoleChat base={base} adminKey={adminKey} toast={toast} />}
 
       <Panel code="EMP" title="Employers learned" note="Section names and form codes remembered per tendering authority">
         <Card pad={false}>

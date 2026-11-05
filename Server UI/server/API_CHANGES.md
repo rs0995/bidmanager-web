@@ -255,6 +255,13 @@ There are no operator search routes: searches come from users. The operator only
   The same map is in the table `bid_agent_files`. All files are `client_project_files` rows, so they download through `POST /client/project-files/{id}/download-request`.
 - **Checklist rows and projects** the agent creates are written into the owner's `/client/sync` data (rows: `subfolder: "Ready Docs"`, `status: "Pending"`; files as `server_file`). Apps see them on their next pull. If the tender has no project yet, the agent creates it. Server-made ids start at 9,000,000.
 - **Company profile** (per owner) is used to pre-fill forms and to check criteria. Only org admins (or individuals) can edit it.
+- **Fast, short answers** (2026-11-05 update): chat turns run on the *chat model* (`bid_agent_chat_model`, default `claude-sonnet-5-5`, effort low); reading documents (criteria, forms, scanned pages) stays on the *document model* (`bid_agent_model`). The tender's key pages are given to the chat model as documents (uploaded once with the Files API, prompt-cached), and the reply **streams**: while `status == "working"`, GET chat returns `partial` = the reply so far. Show it as the assistant's bubble in progress; poll every ~0.9 s while working.
+- **Open anywhere**: the chat is per tender and works without a project (a project is made only when the agent saves files or checklist rows). `GET /client/bid-agent/recent` lists the tenders the owner chatted about.
+- **Training** (shared by the owner; members read, org admins / individuals edit; 403 `org_admin_only` otherwise):
+  - *Standing instructions*: free text added to every chat's instructions (after the operator's global instructions).
+  - *Learned*: when a user corrects the agent and says "remember …", the agent stores a note (for that employer's tenders or for all) and applies it in later chats. Users can pause or delete notes.
+  - *Reference documents*: files kept on Drive in `project-files/Bid Agent Library/<owner>/`; the agent lists them and attaches one to a Ready Docs row on request ("attach the GST certificate").
+  - *Checklist templates*: "prepare the checklist" starts from the owner's checklist template whose `organization` matches the employer, else a template named "Bid Agent default" (sync data `templates` / `templateItems`).
 
 ### Client routes (`x-client-key`; 403 `section_forbidden` without `projects`; 404 for tenders outside the account's sections)
 | Method | Path | Notes |
@@ -267,6 +274,13 @@ There are no operator search routes: searches come from users. The operator only
 | DELETE | `/client/tenders/{id}/bid-agent/prep-files/{file_id}` | Removes a Docs for Preparation file. |
 | GET / PUT | `/client/company-profile` | `{profile: {general, financials, experience, works_in_hand, personnel, equipment, certificates, litigation}, schema, can_edit}`; PUT by section; 403 `{reason:"org_admin_only"}` for members. |
 | GET | `/client/bid-agent/status` | `{ai_enabled, model, owner, can_edit_profile, roles}` |
+| GET | `/client/bid-agent/recent` | `{items: [{id, tender_id, title, organisation, closing_date, last, count, updated_at}]}` — newest first; `id` is the tender row id for the chat routes. |
+| GET / PUT | `/client/bid-agent/instructions` | `{text}` (≤ 8000 chars) → `{text, can_edit}` |
+| GET | `/client/bid-agent/learnings` | `{items: [{id, employer_key, text, source, tender_id, created_at, active}], can_edit}` |
+| PATCH / DELETE | `/client/bid-agent/learnings/{id}` | PATCH `{active?, text?}`; both return the list. 404 unknown id. |
+| GET | `/client/bid-agent/references` | `{items: [{file_id, name, label, created_at, size, type}]}` |
+| POST | `/client/bid-agent/references` | **multipart** `file` (optional query `label`) → the list. 413 too large, 400 empty. |
+| DELETE | `/client/bid-agent/references/{file_id}` | → the list. 404 unknown. |
 
 `message` = `{id, role: "user"|"assistant", text, at, cards?, error?}`; `cards`:
 - `{type: "table", title, columns, rows}` — e.g. the prequalification, eligibility check;
@@ -279,7 +293,10 @@ Older one-shot routes (still served): `POST/GET /client/tenders/{id}/bid-pack`, 
 ### Operator routes (`x-admin-key`)
 | Method | Path | Notes |
 |---|---|---|
-| GET / PUT | `/admin/bid-agent/config` | `{api_key?, model?}` → `{api_key_set, api_key_hint, api_key_source, model, default_model}`. The key is never returned |
+| GET / PUT | `/admin/bid-agent/config` | `{api_key?, model?, chat_model?}` → `{api_key_set, api_key_hint, api_key_source, model, default_model, chat_model, default_chat_model}`. The key is never returned |
+| GET / PUT | `/admin/bid-agent/instructions` | global instructions `{text}` for every chat |
+| GET | `/admin/bid-agent/learnings?owner=` | learned notes of one owner (`org:N` / `user:N`) or of everyone (`owner` field per item) |
+| GET / POST / DELETE | `/admin/bid-agent/tenders/{id}/chat` | console chat (owner `admin`), same shapes as the client chat; read and answer only (saving is refused: "done from the apps"); "remember …" here adds to the global instructions |
 | GET | `/admin/bid-agent/employers` | learned employers: `{org_key, org_name, aliases {role: [terms]}, form_codes, tender_count}` |
 | DELETE | `/admin/bid-agent/employers/{org_key}` | forget an employer (aliases + its form templates) |
 | GET | `/admin/bid-agent/forms?org_key=` | form template library |
