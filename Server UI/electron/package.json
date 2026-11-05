@@ -1,6 +1,6 @@
 {
   "name": "bidmanager-control-shell",
-  "version": "1.0.17",
+  "version": "1.0.18",
   "private": true,
   "description": "Electron wrapper for the BidManager Control admin console",
   "main": "main.cjs",

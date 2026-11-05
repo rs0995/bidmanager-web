@@ -3587,6 +3587,12 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
   // Rows this session already tried to share, so a row whose upload keeps
   // failing (no network, file too large) isn't retried on every render.
   const attemptedShareRef = useRef(new Set());
+  // Tender Documents modal: the linked tender's server-side files.
+  const [tenderDocsOpen, setTenderDocsOpen] = useState(false);
+  // Document id being downloaded by hand, or 'all' during Download all.
+  const [tenderDocBusy, setTenderDocBusy] = useState(null);
+  // server document id -> true when that file is already in Tender Docs.
+  const [tenderDocPresence, setTenderDocPresence] = useState({});
   // Name of the file whose target already exists, '' when the prompt is shut.
   const [nameClash, setNameClash] = useState('');
   const nameClashResolve = useRef(null);
@@ -3609,6 +3615,25 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
   const { data: project, isLoading: projectLoading } = useQuery({ queryKey: ['project', projectId], queryFn: () => api.getProject(projectId) });
   const { data: checklist, isLoading: checklistLoading, isFetching: checklistFetching } = useQuery({ queryKey: ['project-checklist', projectId], queryFn: () => api.listChecklist(projectId) });
   const { data: allTemplates } = useQuery({ queryKey: ['templates'], queryFn: () => api.listTemplates(), enabled: applyTemplateOpen });
+
+  // ── The linked tender's documents ──────────────────────────────────────
+  // The server keeps one global set of scraped files per tender, so files
+  // fetched by any other user or platform are already downloadable here —
+  // the Projects side just never asked for them before.
+  const sourceTenderId = String(project?.source_tender_id || '').trim();
+  const { data: tenderRowId } = useQuery({
+    // source_tender_id is the portal id; the documents routes need the
+    // server row id, which can be renumbered by a restore.
+    queryKey: ['project-tender-row', sourceTenderId],
+    queryFn: () => api.resolveTenderRowId({ tender_id: sourceTenderId }),
+    enabled: Boolean(sourceTenderId),
+  });
+  const { data: tenderDocsPage, isFetching: tenderDocsFetching } = useQuery({
+    queryKey: ['project-tender-docs', tenderRowId],
+    queryFn: () => api.listTenderDocuments(tenderRowId, { page_size: 100 }),
+    enabled: Boolean(tenderRowId),
+  });
+  const tenderDocs = tenderDocsPage?.items || [];
 
   const toastError = (label) => (error) => pushToast({ type: 'error', message: `${label}: ${error instanceof Error ? error.message : String(error)}` });
 
@@ -4057,6 +4082,84 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
     } catch (err) {
       pushToast({ type: 'error', message: `Download failed: ${err instanceof Error ? err.message : String(err)}` });
     } finally { setDownloadingFileId(null); }
+  };
+
+  // Where this project keeps the tender's own documents.
+  const tenderDocsDir = async () => {
+    const baseFolder = await resolveExistingProjectFolder();
+    return baseFolder ? folderForSubfolder(baseFolder, 'Tender Docs') : '';
+  };
+
+  // Which of the tender's documents are already sitting in Tender Docs, so a
+  // row can offer Open instead of Download. Read from disk rather than the
+  // shared `documents` ledger, which belongs to the Tenders page.
+  const refreshTenderDocPresence = async (docs) => {
+    if (!desktop?.pathExists || !docs?.length) return;
+    const dir = await tenderDocsDir();
+    if (!dir) return;
+    const found = {};
+    for (const doc of docs) {
+        const check = await desktop.pathExists(joinWorkspacePath(dir, sanitizeFileName(String(doc.name || ''))));
+      found[doc.id] = Boolean(check?.ok && check.exists && !check.isDir);
+    }
+    setTenderDocPresence(prev => ({ ...prev, ...found }));
+  };
+
+  // Pull one of the tender's documents into the project's Tender Docs folder.
+  // Overwrites in place on a repeat: it is the same server file, not a
+  // different document the user picked, so there is nothing to disambiguate.
+  const downloadTenderDoc = async (doc, { quiet = false } = {}) => {
+    const dir = await tenderDocsDir();
+    if (!dir) { pushToast({ type: 'error', message: 'Project folder is not available.' }); return false; }
+    try {
+      await api.downloadTenderDocumentTo({
+        tenderDbId: tenderRowId,
+        documentId: doc.id,
+        fileName: sanitizeFileName(String(doc.name || 'file')),
+        targetDir: dir,
+      });
+      setTenderDocPresence(prev => ({ ...prev, [doc.id]: true }));
+      if (!quiet) pushToast({ type: 'success', message: `Downloaded ${doc.name}` });
+      return true;
+    } catch (err) {
+      if (!quiet) pushToast({ type: 'error', message: `Could not download ${doc.name}: ${err instanceof Error ? err.message : String(err)}` });
+      return false;
+    }
+  };
+
+  const downloadAllTenderDocs = async () => {
+    const pending = tenderDocs.filter(d => d.downloadable !== false);
+    if (!pending.length || tenderDocBusy) return;
+    setTenderDocBusy('all');
+    let ok = 0;
+    let failed = 0;
+    try {
+      // Sequential on purpose — Chromium throttles rapid programmatic
+      // downloads, the same reason the Tenders page's bulk loop is serial.
+      for (const doc of pending) {
+        // eslint-disable-next-line no-await-in-loop
+        if (await downloadTenderDoc(doc, { quiet: true })) ok += 1; else failed += 1;
+      }
+      pushToast({
+        type: failed ? 'error' : 'success',
+        message: `Downloaded ${ok} of ${pending.length} tender document(s)${failed ? `, ${failed} failed` : ''}.`,
+      });
+    } finally { setTenderDocBusy(null); }
+  };
+
+  // Nothing scraped yet: ask the server to go and fetch them. Only offered
+  // when the list is genuinely empty — re-running a scrape for a tender whose
+  // files are already stored runs a real browser session and can raise a
+  // captcha for no gain.
+  const requestTenderDocs = async () => {
+    if (tenderDocBusy) return;
+    setTenderDocBusy('request');
+    try {
+      await api.requestTenderDownload({ id: tenderRowId, tender_id: sourceTenderId, title: project?.title || '' });
+      pushToast({ type: 'info', message: 'Requested. The documents will appear here once the server has fetched them.' });
+    } catch (err) {
+      pushToast({ type: 'error', message: `Could not request the documents: ${err instanceof Error ? err.message : String(err)}` });
+    } finally { setTenderDocBusy(null); }
   };
 
   // Tick/untick a row's "ready" checkbox. Status is the only field touched, so
@@ -4542,6 +4645,16 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
           <ToolBtn icon={FolderCog} label="Manage Folders" onClick={() => setManageFoldersOpen(true)} />
           <ToolBtn icon={RefreshCw} label={checklistFetching ? 'Refreshing…' : 'Refresh'} spinning={checklistFetching} disabled={checklistFetching} onClick={() => qc.invalidateQueries({ queryKey: ['project-checklist', projectId] })} />
           <ToolBtn icon={BookOpen} label="Apply Template" onClick={() => { setTemplateSearch(''); setApplyTemplateOpen(true); }} />
+          {/* The tender's own scraped documents — the server holds one global
+              set per tender, so files fetched on another device are here too. */}
+          <ToolBtn
+            icon={FileDown}
+            label={tenderDocs.length ? `Tender Docs (${tenderDocs.length})` : 'Tender Docs'}
+            spinning={tenderDocsFetching}
+            disabled={!sourceTenderId}
+            title={sourceTenderId ? undefined : 'This project has no tender ID'}
+            onClick={() => { setTenderDocsOpen(true); refreshTenderDocPresence(tenderDocs); }}
+          />
           <span className="mx-1 h-4 w-px bg-[var(--border)] shrink-0" />
           <ToolBtn icon={Save} label="Save Template" disabled={!(checklist || []).length} onClick={() => { setSaveTemplateForm(f => ({ ...f, template_name: String(project?.title || ''), organization: String(project?.client_name || '') })); setSaveTemplateOpen(true); }} />
         </div>
@@ -4753,6 +4866,77 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
           </aside>
         </div>
       </div>
+
+      {/* ── Tender Documents ────────────────────────────────────────────────── */}
+      {tenderDocsOpen && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+          <div className="w-full max-w-2xl rounded-xl border border-[var(--border)] bg-[var(--surface-0)] p-5 shadow-2xl">
+            <div className="mb-1 flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Tender Documents</h3>
+              <button onClick={() => setTenderDocsOpen(false)} className="text-[var(--text-muted)] hover:text-[var(--text)] transition-colors"><X size={16} /></button>
+            </div>
+            <p className="mb-4 text-[11px] text-[var(--text-muted)]">
+              Files the server has for {sourceTenderId || 'this tender'} — downloaded into this project's <span className="text-[var(--text)]">Tender Docs</span> folder.
+            </p>
+
+            {tenderDocsFetching && !tenderDocs.length ? (
+              <div className="flex items-center justify-center gap-2 py-10 text-xs text-[var(--text-muted)]">
+                <Spinner size={14} className="text-[var(--accent)]" />Loading documents…
+              </div>
+            ) : !tenderDocs.length ? (
+              <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-5 text-center">
+                <FileText size={22} className="mx-auto mb-2 opacity-30" />
+                <p className="mb-3 text-xs text-[var(--text-muted)]">The server has no documents for this tender yet.</p>
+                <button onClick={requestTenderDocs} disabled={Boolean(tenderDocBusy) || !tenderRowId} className="btn-primary gap-1 text-xs">
+                  {tenderDocBusy === 'request' ? <Spinner size={12} /> : <Download size={12} />}
+                  {tenderDocBusy === 'request' ? 'Requesting…' : 'Request download'}
+                </button>
+              </div>
+            ) : (
+              <>
+                <div className="max-h-80 overflow-auto rounded-lg border border-[var(--border)]">
+                  {tenderDocs.map((doc, i) => {
+                    const here = tenderDocPresence[doc.id];
+                    const busy = tenderDocBusy === doc.id || tenderDocBusy === 'all';
+                    return (
+                      <div key={doc.id} className={cn('flex items-center gap-3 px-3 py-2', i < tenderDocs.length - 1 && 'border-b border-[var(--border)]')}>
+                        <FileText size={14} className="shrink-0 text-[var(--text-muted)]" />
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm text-[var(--text)]">{doc.name}</p>
+                          <p className="text-[11px] text-[var(--text-muted)]">
+                            {[doc.type, doc.size_bytes ? formatBytes(doc.size_bytes) : '', doc.downloaded_at && String(doc.downloaded_at).slice(0, 10)].filter(Boolean).join(' · ')}
+                          </p>
+                        </div>
+                        {here && <span className="shrink-0 text-[10px] text-emerald-400/70">in project</span>}
+                        <button
+                          onClick={async () => {
+                            if (here) { await openPath(joinWorkspacePath(await tenderDocsDir(), sanitizeFileName(String(doc.name || '')))); return; }
+                            setTenderDocBusy(doc.id);
+                            try { await downloadTenderDoc(doc); } finally { setTenderDocBusy(null); }
+                          }}
+                          disabled={doc.downloadable === false || busy || !desktop}
+                          title={doc.downloadable === false ? 'The server cannot serve this file' : (here ? 'Open the downloaded file' : 'Download into Tender Docs')}
+                          className="btn-secondary shrink-0 gap-1 text-xs"
+                        >
+                          {busy ? <Spinner size={12} /> : (here ? <Link2 size={12} /> : <Download size={12} />)}
+                          {here ? 'Open' : 'Download'}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="mt-4 flex items-center justify-between gap-3">
+                  <span className="text-[11px] text-[var(--text-muted)]">{tenderDocs.length} document(s)</span>
+                  <button onClick={downloadAllTenderDocs} disabled={Boolean(tenderDocBusy) || !desktop} className="btn-primary gap-1 text-xs">
+                    {tenderDocBusy === 'all' ? <Spinner size={12} /> : <Download size={12} />}
+                    {tenderDocBusy === 'all' ? 'Downloading…' : 'Download all'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* ── File Name Clash ─────────────────────────────────────────────────── */}
       {nameClash && (

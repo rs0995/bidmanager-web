@@ -582,6 +582,25 @@ export const api = {
       overrides,
     );
   },
+  // Downloads a tender document to a caller-chosen folder — used by a project
+  // to pull its tender's files into <project>/Tender Docs. Deliberately does
+  // NOT touch the `documents` ledger: that store keeps one local_path per
+  // document and backs the Tenders page's durable "Downloaded" state, whose
+  // "Open folder" resolves Tender_Downloads/<tender_id> rather than
+  // local_path. Writing a project path in there would send that button to the
+  // wrong folder, so project-side presence is read from disk instead.
+  downloadTenderDocumentTo: async ({ tenderDbId, documentId, fileName, targetDir }, overrides = {}) => {
+    const bridge = desktop();
+    if (!bridge?.downloadFile) throw new Error('Downloading files is available in the desktop app.');
+    const dir = String(targetDir || '').trim();
+    if (!dir) throw new Error('Project folder is not available.');
+    const { url } = await api.requestDocumentDownload(tenderDbId, documentId, overrides);
+    if (!url) throw new Error('The server did not return a download link.');
+    const destinationPath = joinPath(dir, leaf(fileName));
+    const result = await bridge.downloadFile({ url, destinationPath });
+    if (!result?.ok || !result.path) throw new Error(result?.message || 'Download failed.');
+    return result.path;
+  },
   // Kicks off the server-side scrape/download job for a tender that has no
   // documents yet (see Server UI/server/client_api.py request-download).
   requestTenderDownloadJob: (tenderId, overrides = {}) => requestClient(
