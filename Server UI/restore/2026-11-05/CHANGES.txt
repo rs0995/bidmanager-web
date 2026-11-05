@@ -20,3 +20,5 @@ Backed up: server/api_server.py, server/requirements.txt, server/API_CHANGES.md
   - correction: the entry above is an UPDATE of server/bid_agent/, not a new package: tender ZIPs (also ZIPs inside ZIPs) are unpacked with size/depth limits; damaged or password-protected ZIPs, .rar/.7z and unreadable files are listed in the bid pack with the reason; .xls (xlrd) and .rtf (striprtf) are converted, .doc/.odt/.ods via LibreOffice only if it is installed.
   - server/bid_agent/: chat agent (bid_agent/chat.py, workspace.py): routes /client/tenders/{id}/bid-agent/chat, /files, /prep-files; saves into project-files/P - <tender>/<owner>/<project>/ (Docs for Preparation subfolder) with 'Bid Agent index.json' and table bid_agent_files; adds Ready Docs checklist rows to the sync data and attaches its files.
   - server/Dockerfile (backed up): LibreOffice headless Writer + Calc and fonts, for old .doc/.odt/.ods and PDF output.
+----
+03:03 2026-11-05 (Bid Agent session) - API_CHANGES.md section 5 rewritten for the chat agent (chat / files / prep-files routes, Drive layout, index file); section 4 to-do lines updated.

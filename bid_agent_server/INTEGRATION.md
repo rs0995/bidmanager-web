@@ -19,8 +19,13 @@ Then:
 4. In the console's Bid Agent tab, enter an Anthropic API key (or set `ANTHROPIC_API_KEY` on the container).
 
 ## What it adds
+- A **chat agent** per tender (`bid_agent/chat.py`): it shows / saves the prequalification, extracts tender
+  forms, checks eligibility and prepares the Ready Docs checklist, on instruction. Files go to the tender's
+  project folder on Drive (`workspace.py`): Ready Docs attachments and a `Docs for Preparation/` subfolder,
+  with `Bid Agent index.json` as the key; checklist rows go into the owner's sync data.
 - Tables (created on start-up, SQLite and Postgres): `bid_org_profiles`, `bid_doc_cache`, `bid_form_library`,
-  `bid_analyses`, `bid_company_profiles`.
+  `bid_analyses`, `bid_company_profiles`, `bid_agent_chats`, `bid_agent_files` (the file → folder → row key).
+- Dockerfile: LibreOffice (headless Writer + Calc) for old `.doc` files and PDF output.
 - Settings: `bid_agent_api_key`, `bid_agent_model` (in `app_settings`; not part of `ADMIN_CONFIG_KEYS`, so the
   generic config endpoint never returns the key).
 - Routes: see `API_CHANGES_section.md`.
@@ -46,6 +51,8 @@ Then:
 | `bid_agent/compliance.py` | automated checks against the profile |
 | `bid_agent/generate.py` | Word per form + Excel workbook |
 | `bid_agent/agent.py` | pipeline + on-demand outputs |
+| `bid_agent/chat.py` | the chat agent: tools, Claude tool loop, keyword router |
+| `bid_agent/workspace.py` | project / checklist rows in the sync data, files on Drive, manifest + index |
 | `bid_agent/store.py` | persistence (owner-scoped and shared tables) |
 | `bid_agent/server_routes.py` | FastAPI routers |
 | `tests/` | pipeline tests (standalone) + route tests (need `BID_AGENT_SERVER_DIR`) |

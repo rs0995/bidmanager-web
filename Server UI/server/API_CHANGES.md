@@ -201,7 +201,7 @@ There are no operator search routes: searches come from users. The operator only
 - [ ] A "Portal Search" page with search and history (§2), using the existing job/captcha patterns (`fetchTenderStatus` / poller / captcha in `lib/api.js`).
 - [ ] Checklist files (§3): `attachFile` (`App.jsx` ~L3542) uploads after the local copy. `pullUserData` (`api.js` ~L1567) keeps `linked_file_path`, but rows with a `server_file` that isn't on disk get a Download action. The checklist table and preview show `server_file.name`. Delete File calls `DELETE`. Add the one-off backfill of existing `linked_file_path` files. Uploads need a multipart `fetch` (`FormData`) from the Electron renderer.
 - [ ] Project tenders stay bookmarked (§1): bookmark the tender locally when a project is created; block un-bookmarking a project's tender with the warning "Tenders in projects can't be removed from bookmarks. Remove the project first."
-- [x] Bid packs (§5): Bid Agent panel in the project workspace and a Company Profile page (done on branch `feat/bid-agent`).
+- [x] Bid Agent (§5): chat above the Ready Docs checklist in the project workspace (agent files saved into the project's Working Docs folder), Company Profile page (done on branch `feat/bid-agent`).
 
 ### Bidwise (`Bidwise/src/`)
 - [ ] `lib/api.ts`: `me()`, org routes, portal search routes.
@@ -215,12 +215,12 @@ There are no operator search routes: searches come from users. The operator only
   - `removeAttachment` calls `DELETE`.
   - Add the one-off backfill of existing `attachment` files.
 - [ ] Project tenders stay bookmarked (§1): bookmark the tender locally when a project is created; block un-bookmarking a project's tender with the warning "Tenders in projects can't be removed from bookmarks. Remove the project first."
-- [x] Bid packs (§5): `BidPack` screen from tender/project detail (done on branch `feat/bid-agent`).
+- [x] Bid Agent (§5): chat card above Ready for Bid on tender/project detail; Docs for Preparation uploaded to / listed from Drive (done on branch `feat/bid-agent`).
 
 ### BM Pro (`Mobile App RN/src/`)
 - [ ] Checklist files (§3): the same as Bidwise, in `lib/projects.js` (`attachFile`, `getAttachedFile`, `mergeFromServer`) and `ChecklistItem.tsx`.
 - [ ] Project tenders stay bookmarked (§1): bookmark the tender locally when a project is created; block un-bookmarking a project's tender with the warning "Tenders in projects can't be removed from bookmarks. Remove the project first."
-- [ ] Bid packs (§5): optional; Bidwise's `BidPackScreen` + `lib/bidPack.ts` can be copied over.
+- [ ] Bid Agent (§5): optional; Bidwise's `components/project/AgentChat.tsx` + `data/bidAgent.tsx` + `lib/bidAgent.ts` can be copied over.
 
 ### Server UI console (`Server UI/BidManagerControl.jsx`)
 - [ ] `UsersPanel`: show org and role; **section toggles** (5, including Portal search) → `PUT /admin/users/{id}/permissions`.
@@ -236,32 +236,44 @@ There are no operator search routes: searches come from users. The operator only
 
 ---
 
-## 5. Bid packs: Bid Agent (READY since 2026-11-05)
+## 5. Bid Agent (READY since 2026-11-05)
 
 ### Concepts
-- A **bid pack** is prepared per tender from the documents already downloaded for it. The agent:
-  1. maps every file (or page range of a combined PDF) to a section type: ITB/ITT, Bid Data Sheet, qualification criteria, bidding forms, BOQ, GCC/PCC … whatever the employer calls them;
-  2. extracts the qualification criteria (single entity / JV columns, money thresholds, look-back periods, required forms, key personnel, key equipment);
-  3. converts every bidding form into an editable Word file and builds one Excel workbook (index, compliance, criteria, personnel, equipment, tabular forms);
-  4. checks turnover, net worth, liquidity, bid capacity, similar works and ISO certificates against the **company profile**.
-- **Owner**: an organisation's bid packs and company profile are shared by all its members (`org:<id>`); individuals own their own (`user:<id>`). Only org admins (or individuals) can edit the company profile.
-- Learned per **employer** and shared by everyone: section names, corrections and form templates. The second tender from the same employer reuses them without AI calls.
-- Word/Excel files are generated on download from the stored result, so they always reflect the latest company profile.
-- AI (Claude) is optional. Without a key the agent uses keyword and table parsing; `GET /client/bid-agent/status` says which is active.
+- **A chat per tender**, shared by everyone who owns the tender's project (the organisation, or an individual). Each message runs one agent turn on the server; the agent **does what it is asked**:
+  - "show / fetch the prequal(ification)" → the criteria table (single entity / JV, thresholds, forms), key personnel and equipment, shown in the chat;
+  - "save the prequal (as Excel / Word / PDF)" → saved to **Docs for Preparation**;
+  - "extract the tender forms" or a specific form ("FIN-3.2", "letter of bid") → editable files pre-filled from the company profile, saved to **Docs for Preparation** and attached to the matching Ready Docs row if there is one;
+  - "prepare the checklist (of documents required)" → **Ready Docs** rows for every form and evidence document the tender asks for (Pending), with the forms the agent prepares **attached automatically**;
+  - "can we qualify?" → criteria checked against the company profile.
+- With an Anthropic key (console → Bid Agent tab) Claude reads the documents and chooses the tools; without one a keyword router handles the same requests (basic mode; `ai_enabled: false`).
+- The tender's documents are read from `downloaded_files` (local or Drive). **ZIPs are unpacked** (also ZIPs inside ZIPs); old `.xls` / `.rtf` and, with LibreOffice in the image, `.doc` / `.odt` / `.ods` are converted; unreadable files are listed with the reason.
+- **Where files go** (Drive, same storage as checklist files §3):
+  `project-files/P - <tender id>/<owner>/<project>/` — files attached to Ready Docs rows
+  `project-files/P - <tender id>/<owner>/<project>/Docs for Preparation/` — prequal, extracted forms, users' prep docs
+  `project-files/P - <tender id>/<owner>/<project>/Bid Agent index.json` — the key: every file → kind, folder, checklist row
+  The same map is in the table `bid_agent_files`. All files are `client_project_files` rows, so they download through `POST /client/project-files/{id}/download-request`.
+- **Checklist rows and projects** the agent creates are written into the owner's `/client/sync` data (rows: `subfolder: "Ready Docs"`, `status: "Pending"`; files as `server_file`). Apps see them on their next pull. If the tender has no project yet, the agent creates it. Server-made ids start at 9,000,000.
+- **Company profile** (per owner) is used to pre-fill forms and to check criteria. Only org admins (or individuals) can edit it.
 
 ### Client routes (`x-client-key`; 403 `section_forbidden` without `projects`; 404 for tenders outside the account's sections)
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/client/bid-agent/status` | `{ai_enabled, model, owner: "organisation"\|"individual", can_edit_profile, roles: [{role,label}]}` |
-| GET | `/client/bid-agent/analyses` | `{items: [{tender_id, status, updated_at}]}` for the owner |
-| POST | `/client/tenders/{id}/bid-pack` | starts (or re-runs) preparation; returns the same shape as GET. Already running → returns current state |
-| GET | `/client/tenders/{id}/bid-pack?since=n` | `{status: "none"\|"running"\|"completed"\|"failed", error, updated_at, logs: [...from n], next, result, files: [{name, kind: "workbook"\|"form"\|"zip", code?, title?}]}`. Poll every 1–2 s while `running`, passing `since=next` |
-| PUT | `/client/tenders/{id}/bid-pack/documents` | `{file, segments: [{role, start_page, end_page}]}` — correct a file's sections; re-runs and teaches the employer profile |
-| GET | `/client/tenders/{id}/bid-pack/files/{name}` | streams the `.docx` / `.xlsx` / `.zip` named in `files` |
-| GET | `/client/company-profile` | `{profile: {general: {...}, financials: [...], experience: [...], works_in_hand, personnel, equipment, certificates, litigation}, schema, can_edit}` |
-| PUT | `/client/company-profile` | partial update by section (`general`, `financials`, …); 403 `{reason: "org_admin_only"}` for org members |
+| GET | `/client/tenders/{id}/bid-agent/chat?since=n` | `{messages: [... id > n], next, status: "idle"\|"working", progress, ai_enabled, suggestions}`. Poll every ~1.5 s while `working`. |
+| POST | `/client/tenders/{id}/bid-agent/chat?since=n` | `{message}` → same shape, `status: "working"`. **409 `{reason:"busy"}`** while the last request runs. |
+| DELETE | `/client/tenders/{id}/bid-agent/chat` | Clears the conversation. |
+| GET | `/client/tenders/{id}/bid-agent/files?folder=prep\|ready` | `{items: [{file_id, name, kind: "prequalification"\|"form"\|"user", folder, checklist_item_id, size, created_at}]}` |
+| POST | `/client/tenders/{id}/bid-agent/prep-files` | **multipart** `file` → `{file}`: a user's own Docs for Preparation file, stored beside the agent's. 413 too large, 400 empty. |
+| DELETE | `/client/tenders/{id}/bid-agent/prep-files/{file_id}` | Removes a Docs for Preparation file. |
+| GET / PUT | `/client/company-profile` | `{profile: {general, financials, experience, works_in_hand, personnel, equipment, certificates, litigation}, schema, can_edit}`; PUT by section; 403 `{reason:"org_admin_only"}` for members. |
+| GET | `/client/bid-agent/status` | `{ai_enabled, model, owner, can_edit_profile, roles}` |
 
-`result` fields used by the apps: `tender {employer, reference, title}`, `key_sections [{role, label, found, locations}]`, `documents [{file, pages, error, needs_ocr, segments, segments_source}]`, `criteria {criteria [...], personnel, equipment, similar_work_definition, notes}`, `forms [{code, title, file, start_page, end_page, source}]`, `missing_forms`, `compliance [{ref, subject, required, actual, status: Meets|Shortfall|Check|Data missing|Manual check, forms, remarks}]`, `llm {used, model, usage}`.
+`message` = `{id, role: "user"|"assistant", text, at, cards?, error?}`; `cards`:
+- `{type: "table", title, columns, rows}` — e.g. the prequalification, eligibility check;
+- `{type: "files", title, folder, files: [{file_id, name, kind}], attached: [{row, file}]}` — files just saved;
+- `{type: "checklist", title, folder: "Ready Docs", rows: [{id, name, added, file}]}` — rows added / already there, with the attached file name.
+After an answer with a `files` or `checklist` card, **pull `/client/sync`** so Ready Docs shows the new rows and files.
+
+Older one-shot routes (still served): `POST/GET /client/tenders/{id}/bid-pack`, `PUT .../bid-pack/documents` (correct a file's sections), `GET .../bid-pack/files/{name}`, `GET /client/bid-agent/analyses`.
 
 ### Operator routes (`x-admin-key`)
 | Method | Path | Notes |
