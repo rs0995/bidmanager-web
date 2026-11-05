@@ -1,6 +1,6 @@
 {
   "name": "bidmanager-client-ui",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "private": true,
   "description": "Local-first BidManager client for desktop and web",
   "main": "electron/main.cjs",
@@ -10,7 +10,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "desktop:dev": "concurrently -k \"vite --host localhost --port 3000 --strictPort\" \"wait-on http-get://localhost:3000 && cross-env ELECTRON_DEV=1 ELECTRON_RENDERER_URL=http://localhost:3000 electron .\"",
-    "desktop:dist": "npm run build && electron-builder --win nsis"
+    "desktop:dist": "node scripts/release.cjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.51.0",
@@ -37,11 +37,24 @@
   "build": {
     "appId": "com.bidmanager.client",
     "productName": "BidManager Client",
-    "directories": { "output": "dist-electron" },
-    "files": ["electron/**/*", "package.json"],
-    "extraResources": [{ "from": "dist", "to": "client/dist" }],
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "dist",
+        "to": "client/dist"
+      }
+    ],
     "win": {
-      "target": ["nsis"],
+      "target": [
+        "nsis"
+      ],
+      "icon": "assets/icon.ico",
       "artifactName": "BidManager-Client-Setup-${version}.${ext}"
     },
     "nsis": {

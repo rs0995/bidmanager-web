@@ -16,6 +16,10 @@ const valueNumber = (value) => Number(String(value || '').replace(/[^0-9.]/g, ''
 // use (api.resolveTenderRowId). Anything persisted (bookmarks, documents,
 // notifications, project links) is keyed by tender id so a server DB
 // restore that renumbers every row reconnects automatically.
+// Wording fixed by the server contract (API_CHANGES.md §1) so every platform
+// explains the same rule the same way.
+export const PROJECT_BOOKMARK_LOCKED = "Tenders in projects can't be removed from bookmarks. Remove the project first.";
+
 export const canonTenderId = (value) => String(value ?? '').split(/\s+/).filter(Boolean).join(' ').toUpperCase();
 export const tenderKey = (tender) => canonTenderId(tender?.tender_id);
 
@@ -1110,11 +1114,21 @@ export const api = {
         updates.set(project.id, { ...patch, tender_snapshot: snapshot });
       }
     }
-    if (!updates.size) return 0;
+    // Back-fill for projects created before project tenders were bookmarked
+    // (API_CHANGES.md §1). Runs on every sync, so one pass fixes the history.
+    const projectTenderIds = new Set((state.projects || []).map((p) => canonTenderId(p.source_tender_id)).filter(Boolean));
+    const needsBookmark = (state.tenders || []).some((row) => !row.is_bookmarked && projectTenderIds.has(tenderKey(row)));
+    if (!updates.size && !needsBookmark) return 0;
     await updateSyncedState((s) => {
       s.projects = s.projects.map((row) => (updates.has(row.id) ? { ...row, ...updates.get(row.id) } : row));
+      if (needsBookmark) {
+        s.tenders = s.tenders.map((row) => (
+          !row.is_bookmarked && projectTenderIds.has(tenderKey(row)) ? { ...row, is_bookmarked: true } : row
+        ));
+      }
       return s;
     });
+    if (needsBookmark) notifyTendersChanged();
     return updates.size;
   },
   listOrganizations: async () => (await getState()).organizations || [],
@@ -1130,7 +1144,14 @@ export const api = {
     });
     return result;
   },
-  countBookmarkedTenders: async () => (await getState()).tenders.filter((row) => row.is_bookmarked).length,
+  // Counts only bookmarks the user chose, for the 30-bookmark cap. A project's
+  // tender is bookmarked automatically (API_CHANGES.md §1), so counting those
+  // would let projects quietly eat the allowance for manual ones.
+  countBookmarkedTenders: async () => {
+    const state = await getState();
+    const projectTenderIds = new Set((state.projects || []).map((p) => canonTenderId(p.source_tender_id)).filter(Boolean));
+    return state.tenders.filter((row) => row.is_bookmarked && !projectTenderIds.has(tenderKey(row))).length;
+  },
   listTenders: async (websiteId, params = {}) => {
     let rows = (await getState()).tenders;
     if (websiteId != null) rows = rows.filter((row) => Number(row.website_id) === Number(websiteId));
@@ -1161,6 +1182,18 @@ export const api = {
     window.open(url, '_blank', 'noopener,noreferrer');
   },
   patchTender: async (id, patch) => {
+    // A project's tender is always bookmarked (API_CHANGES.md §1): the server
+    // re-adds it to bookmarkTenderIds on every push and pull and ignores a
+    // removal while the project exists, so letting the star be cleared here
+    // would just flip back on the next sync. Refuse it at the one choke point
+    // both toggles share instead.
+    if (patch && 'is_bookmarked' in patch && !patch.is_bookmarked) {
+      const state = await getState();
+      const row = state.tenders.find((t) => t.id === id);
+      if (row && (await api.tenderIsInProject(tenderKey(row), state))) {
+        throw new Error(PROJECT_BOOKMARK_LOCKED);
+      }
+    }
     let result;
     await updateSyncedState((state) => {
       state.tenders = state.tenders.map((row) => row.id === id ? (result = { ...row, ...patch }) : row);
@@ -1168,6 +1201,13 @@ export const api = {
     });
     notifyTendersChanged();
     return result;
+  },
+  // Is this canonical tender id the source of any project? Pass `state` when
+  // the caller already has one, to avoid a second IndexedDB read.
+  tenderIsInProject: async (canonicalTenderId, state = null) => {
+    if (!canonicalTenderId) return false;
+    const rows = (state || (await getState())).projects || [];
+    return rows.some((project) => canonTenderId(project.source_tender_id) === canonicalTenderId);
   },
 
   listProjects: async (search = '', status = '') => {
@@ -1185,8 +1225,17 @@ export const api = {
     await updateSyncedState((state) => {
       result = { id: nextId(state.projects), folder_path: null, ...data, status: data.status || 'Active' };
       state.projects.push(result);
+      // The server bookmarks a project's tender anyway (API_CHANGES.md §1);
+      // doing it here too means the star is right immediately and the bookmark
+      // rides along in the same push, instead of appearing a sync later.
+      if (sourceTenderId) {
+        state.tenders = state.tenders.map((row) => (
+          tenderKey(row) === sourceTenderId && !row.is_bookmarked ? { ...row, is_bookmarked: true } : row
+        ));
+      }
       return state;
     });
+    notifyTendersChanged();
     return result;
   },
   getProject: async (id) => {
@@ -1249,6 +1298,60 @@ export const api = {
     return state;
   }),
 
+  // ── Project checklist files (API_CHANGES.md §3) ───────────────────────────
+  // A row's uploaded file. The server owns `server_file` on the checklist row:
+  // a sync push can't set, change or clear it (client_api.py _keep_server_file),
+  // so these routes are the only way it ever changes. One file per row, and
+  // the first upload wins — a second device gets 409 file_exists carrying the
+  // winner, and is expected to adopt it.
+  uploadProjectFile: async ({ checklistItemId, projectId, filePath, contentType, device = 'desktop' }, overrides = {}) => {
+    const bridge = desktop();
+    // requestClient can't carry this: its body is always JSON.stringify'd, and
+    // a sandboxed renderer can't read the file's bytes to build a FormData.
+    if (!bridge?.uploadFile) throw new Error('Attaching files to the server is available in the desktop app.');
+    const config = await connection(overrides);
+    if (!config.auth_token) throw new AuthError('Sign in to continue.', 'unauthorized');
+    const result = await bridge.uploadFile({
+      baseUrl: config.server_url,
+      clientKey: config.auth_token,
+      route: '/client/project-files',
+      filePath: String(filePath || ''),
+      contentType: contentType || '',
+      fields: {
+        checklist_item_id: String(checklistItemId),
+        project_id: projectId === undefined || projectId === null ? '' : String(projectId),
+        device,
+      },
+    });
+    if (!result?.ok) {
+      if (result?.status === 401) throw new AuthError(result?.message || 'Sign in again.');
+      const error = new Error(result?.message || 'Could not upload the file.');
+      // Callers branch on these: 404 row_not_found (push /client/sync first),
+      // 409 file_exists (detail.file is the winner), 409 upload_in_progress.
+      error.status = result?.status;
+      error.detail = result?.detail;
+      throw error;
+    }
+    return result.data;
+  },
+  listProjectFiles: (projectId, overrides = {}) => requestClient(
+    `/client/project-files?project_id=${encodeURIComponent(String(projectId ?? ''))}`,
+    {},
+    overrides,
+  ),
+  // Same signed-URL handshake as tender documents: the URL needs no auth
+  // header and expires in ~15 min, so fetch it immediately.
+  requestProjectFileDownload: (fileId, overrides = {}) => {
+    const id = Number(fileId);
+    if (!Number.isInteger(id) || id <= 0) throw new Error('Invalid file id');
+    return requestClient(`/client/project-files/${id}/download-request`, { method: 'POST', body: {} }, overrides);
+  },
+  deleteProjectFile: (fileId, overrides = {}) => {
+    const id = Number(fileId);
+    if (!Number.isInteger(id) || id <= 0) throw new Error('Invalid file id');
+    return requestClient(`/client/project-files/${id}`, { method: 'DELETE' }, overrides);
+  },
+
   listTemplates: async (organization = '') => filterRows((await getState()).templates, organization, ['organization']),
   createTemplate: async (data) => {
     let result;
@@ -1287,45 +1390,89 @@ export const api = {
     state.templateItems = state.templateItems.filter((row) => row.id !== Number(id));
     return state;
   }),
+  // A template carries only the shape of a row — never the source row's
+  // identity, its on-disk path, or its uploaded file. `createTemplateItem` and
+  // `createChecklistItem` both spread `...data` LAST, over their own generated
+  // `id`, so anything left in here is copied verbatim: an un-stripped `id`
+  // would give the new row the source row's id, and an un-stripped
+  // `server_file` would make it claim another row's uploaded file (which the
+  // server would then refuse to overwrite — see project_files.py).
+  stripRowIdentity: ({ id, project_id, template_id, linked_file_path, server_file, status, ...rest }) => rest,
   saveProjectAsTemplate: async (projectId, data) => {
     const template = await api.createTemplate(data);
     const items = await api.listChecklist(projectId);
-    for (const item of items) await api.createTemplateItem(template.id, item);
+    for (const item of items) await api.createTemplateItem(template.id, api.stripRowIdentity(item));
     return template;
   },
   applyTemplateToProject: async (projectId, templateId) => {
     const items = await api.listTemplateItems(templateId);
-    for (const item of items) await api.createChecklistItem(projectId, item);
+    for (const item of items) await api.createChecklistItem(projectId, api.stripRowIdentity(item));
     return { ok: true, added: items.length };
   },
 
   dashboardStats: async () => {
     const state = await getState();
-    const active = state.tenders.filter((row) => !row.is_archived);
-    const activeProjects = state.projects.filter((row) => String(row.status || 'Active').toLowerCase() === 'active');
-    // Only surface deadlines for tenders the user has actually acted on
-    // (bookmarked, or already turned into a project) — not every closing
-    // tender, which is what the "Closing < 7 Days" stat card is for instead.
+    const permissions = state.settings?.permissions;
+    const canSeeAllTenders = permissions?.active !== false;
+    const canSeeArchived = permissions?.archived !== false;
+    const canSeeBookmarks = permissions?.bookmarks !== false;
+    const canSeeProjects = permissions?.projects !== false;
+
+    const allActiveProjects = state.projects.filter((row) => String(row.status || 'Active').toLowerCase() === 'active');
+    const activeProjects = canSeeProjects ? allActiveProjects : [];
     const activeProjectTenderIds = new Set(activeProjects.map((row) => canonTenderId(row.source_tender_id)).filter(Boolean));
-    const upcoming = active
-      .filter((row) => row.closing_date && (row.is_bookmarked || activeProjectTenderIds.has(tenderKey(row))))
+
+    // Without the `active` section the dashboard must not report totals the
+    // user can't reach. The server scopes its tender list too, but the local
+    // cache is replaced wholesale on sync while permissions refresh
+    // separately, so a revoked section would otherwise keep showing
+    // pre-revoke numbers until (and unless) the next sync lands.
+    const reachable = (row) => {
+      if (canSeeAllTenders) return true;
+      if (canSeeBookmarks && row.is_bookmarked) return true;
+      return canSeeProjects && activeProjectTenderIds.has(tenderKey(row));
+    };
+    const visibleTenders = canSeeAllTenders ? state.tenders : state.tenders.filter(reachable);
+    const active = visibleTenders.filter((row) => !row.is_archived);
+    const archivedCount = canSeeArchived ? visibleTenders.length - active.length : 0;
+
+    // Deadlines follow bookmarks when that section is on — which, since a
+    // project's tender is always bookmarked (API_CHANGES.md §1), still covers
+    // every active project — and fall back to project tenders otherwise.
+    const deadlineSource = canSeeBookmarks
+      ? active.filter((row) => row.is_bookmarked)
+      : (canSeeProjects ? active.filter((row) => activeProjectTenderIds.has(tenderKey(row))) : []);
+    const upcoming = deadlineSource
+      .filter((row) => row.closing_date)
       .slice().sort((a, b) => String(a.closing_date).localeCompare(String(b.closing_date))).slice(0, 12);
-    const bookmarkedItems = state.tenders.filter((row) => row.is_bookmarked).slice().sort((a, b) => String(a.closing_date || '').localeCompare(String(b.closing_date || ''))).slice(0, 6);
+
+    const bookmarkedRows = canSeeBookmarks ? visibleTenders.filter((row) => row.is_bookmarked) : [];
+    const bookmarkedItems = bookmarkedRows.slice().sort((a, b) => String(a.closing_date || '').localeCompare(String(b.closing_date || ''))).slice(0, 6);
     const closingSoon = active.filter((row) => {
       const r = timeRemaining(row.closing_date);
       return !r.expired && r.totalDays >= 0 && r.totalDays <= 7;
     }).length;
     return {
       active_tenders: active.length,
-      archived_tenders: state.tenders.length - active.length,
+      archived_tenders: archivedCount,
       active_projects: activeProjects.length,
-      bookmarked_tenders: state.tenders.filter((row) => row.is_bookmarked).length,
+      bookmarked_tenders: bookmarkedRows.length,
       closing_soon: closingSoon,
+      // Lets the dashboard label a restricted count honestly instead of
+      // showing a number that quietly means something narrower.
+      tender_scope: {
+        scoped: !canSeeAllTenders,
+        via: canSeeBookmarks && canSeeProjects ? 'both' : canSeeBookmarks ? 'bookmarks' : canSeeProjects ? 'projects' : 'none',
+      },
+      sections: { active: canSeeAllTenders, archived: canSeeArchived, bookmarks: canSeeBookmarks, projects: canSeeProjects },
       // Active only — an archived/removed project must stop counting instead
       // of leaving the total permanently inflated (state.projects here never
       // shrinks on archive, only on a hard delete from the Archived list).
       total_pipeline_value: activeProjects.reduce((sum, row) => sum + valueNumber(row.project_value), 0),
-      websites: state.websites.map((site) => {
+      // Coverage is an overview of the whole tender pool, so it belongs to the
+      // `active` section outright rather than being narrowed to a handful of
+      // bookmarks — the card is hidden without it.
+      websites: (canSeeAllTenders ? state.websites : []).map((site) => {
         const siteTenders = active.filter((row) => Number(row.website_id) === Number(site.id));
         const derivedOrgs = new Set(siteTenders.map((row) => String(row.org_chain || '').trim()).filter(Boolean)).size;
         return {
@@ -1370,6 +1517,13 @@ export const api = {
 
   syncFromServer: async (overrides = {}) => {
     const config = await connection(overrides);
+    // Refresh the account's sections first, so everything below — the tender
+    // snapshot, the notification scoping, and the dashboard that reads these
+    // settings — works from current permissions. Without this they only ever
+    // changed at sign-in, so an admin granting or revoking a section didn't
+    // reach an already-signed-in device until it signed out and back in.
+    // Never fatal: an older backend without /client/me must not break sync.
+    await api.getMe(overrides).catch(() => {});
     const snapshot = await downloadServerSnapshot(config);
     let result;
     let changesSince = 0;
@@ -1379,6 +1533,10 @@ export const api = {
     // org with a lot of activity) can collapse into one message instead of
     // one per tender — see the post-loop flush below.
     const newTendersByOrg = new Map();
+    // key -> the tender's post-sync values, so the /client/changes handler
+    // below can build the SAME dedupe keys the local diff uses. Without this
+    // a bookmarked tender's change is reported twice — once by each source.
+    const latestByKey = new Map();
     await updateState((state) => {
       // Keyed by tender id only — a row without one can't be matched across
       // syncs, so it's neither diffed nor carries a bookmark.
@@ -1386,21 +1544,47 @@ export const api = {
       const previousKeyByRowId = new Map(state.tenders.map((row) => [Number(row.id), tenderKey(row)]));
       const bookmarkedOrgsSet = new Set(state.bookmarkedOrgs || []);
       changesSince = Number(state.settings?.last_changes_at) || 0;
+      // Only notify about tenders this account can actually open. The server's
+      // /client/changes feed is bookmarks-only and goes silent entirely when
+      // the `bookmarks` section is off, so this local diff is what keeps a
+      // projects-only member informed about their own tenders.
+      const perms = state.settings?.permissions;
+      const canSeeBookmarks = perms?.bookmarks !== false;
+      const canSeeProjects = perms?.projects !== false;
+      const projectTenderIds = new Set((state.projects || []).map((p) => canonTenderId(p.source_tender_id)).filter(Boolean));
+      const watched = (row, previous) => (
+        (canSeeBookmarks && previous?.is_bookmarked) || (canSeeProjects && projectTenderIds.has(tenderKey(row)))
+      );
       state.websites = Array.isArray(snapshot.websites) ? snapshot.websites : state.websites;
       state.organizations = Array.isArray(snapshot.organizations) ? snapshot.organizations : state.organizations;
       state.tenders = snapshot.tenders.map((row) => {
         const key = tenderKey(row);
         if (!key) return { ...row, is_bookmarked: false };
+        latestByKey.set(key, {
+          closing_date: String(row.closing_date || ''),
+          status: String(row.status || ''),
+          corrigendum_count: Number(row.corrigendum_count) || 0,
+          prebid_count: Number(row.prebid_count) || 0,
+        });
         const previous = previousByKey.get(key);
-        if (previous?.is_bookmarked) {
-          // closing_date is covered by the /client/changes feed below; the
-          // local diff owns status + pre-bid/corrigendum, which the server's
-          // tender_history snapshot doesn't track.
+        if (previous && watched(row, previous)) {
+          const label = `"${row.title || row.tender_id}"`;
+          const ref = { tenderId: key, tenderDbId: row.id };
           if (previous.status !== row.status) {
-            notificationsToEmit.push({ type: 'status', message: `"${row.title || row.tender_id}" status changed to ${row.status || 'unknown'}.`, tenderId: key, tenderDbId: row.id });
+            notificationsToEmit.push({ ...ref, type: 'status', key: `status:${key}:${row.status || ''}`, message: `${label} status changed to ${row.status || 'unknown'}.` });
           }
-          if ((Number(previous.prebid_count) || 0) !== (Number(row.prebid_count) || 0) || (Number(previous.corrigendum_count) || 0) !== (Number(row.corrigendum_count) || 0)) {
-            notificationsToEmit.push({ type: 'prebid', message: `"${row.title || row.tender_id}" has a new pre-bid or corrigendum.`, tenderId: key, tenderDbId: row.id });
+          // Corrigendum and pre-bid used to share one ambiguous message —
+          // report whichever actually changed.
+          if ((Number(previous.corrigendum_count) || 0) !== (Number(row.corrigendum_count) || 0)) {
+            notificationsToEmit.push({ ...ref, type: 'corrigendum', key: `corrigendum:${key}:${row.corrigendum_count || 0}`, message: `${label} has a new corrigendum.` });
+          }
+          if ((Number(previous.prebid_count) || 0) !== (Number(row.prebid_count) || 0)) {
+            notificationsToEmit.push({ ...ref, type: 'prebid', key: `prebid:${key}:${row.prebid_count || 0}`, message: `${label} has a new pre-bid document.` });
+          }
+          // The feed covers closing dates, but only for bookmarks — a
+          // projects-only member would otherwise never hear about them.
+          if (String(previous.closing_date || '') !== String(row.closing_date || '')) {
+            notificationsToEmit.push({ ...ref, type: 'closing', key: `closing:${key}:${row.closing_date || ''}`, message: `${label} — closing date changed.` });
           }
         } else if (!previous && row.org_chain && bookmarkedOrgsSet.has(row.org_chain)) {
           const bucket = newTendersByOrg.get(row.org_chain) || [];
@@ -1430,9 +1614,11 @@ export const api = {
     await api.refreshLinkedProjects().catch(() => {});
     for (const [org, rows] of newTendersByOrg) {
       if (rows.length > 10) {
-        notificationsToEmit.push({ type: 'new', message: `${rows.length} new tenders added under ${org}.`, orgName: org });
+        notificationsToEmit.push({ type: 'new', key: `new-batch:${org}:${rows.length}`, message: `${rows.length} new tenders added under ${org}.`, orgName: org });
       } else {
-        rows.forEach((row) => notificationsToEmit.push({ type: 'new', message: `"${row.title || row.tender_id}" added under ${org}.`, tenderId: tenderKey(row), tenderDbId: row.id, orgName: org }));
+        // The `new:<id>` key is shared with the server feed below, which
+        // reports the same arrivals — whichever lands first wins.
+        rows.forEach((row) => notificationsToEmit.push({ type: 'new', key: `new:${tenderKey(row)}`, message: `"${row.title || row.tender_id}" added under ${org}.`, tenderId: tenderKey(row), tenderDbId: row.id, orgName: org }));
       }
     }
     // Server-recorded changes for this account's bookmarks (closing-date
@@ -1441,17 +1627,36 @@ export const api = {
     try {
       const changes = await requestClient(`/client/changes?since=${changesSince}`, {}, overrides);
       if (changesSince > 0) {
+        // The server reports every field in its alertable whitelist; acting
+        // only on closing_date threw the rest away.
         (changes?.tenders || []).forEach((t) => {
-          if ((t.changed_fields || []).includes('closing_date')) {
-            notificationsToEmit.push({ type: 'status', message: `"${t.title || t.tender_id || `Tender #${t.id}`}" — closing date changed.`, tenderId: canonTenderId(t.tender_id), tenderDbId: t.id });
+          const key = canonTenderId(t.tender_id);
+          const label = `"${t.title || t.tender_id || `Tender #${t.id}`}"`;
+          const ref = { tenderId: key, tenderDbId: t.id };
+          const fields = new Set(t.changed_fields || []);
+          // Keys are built from the tender's post-sync values so they match
+          // the local diff's exactly; whichever source reports first wins and
+          // the other is dropped as a duplicate.
+          const latest = latestByKey.get(key) || {};
+          if (fields.has('closing_date')) {
+            notificationsToEmit.push({ ...ref, type: 'closing', key: `closing:${key}:${latest.closing_date ?? ''}`, message: `${label} — closing date changed.` });
+          }
+          if (fields.has('status')) {
+            notificationsToEmit.push({ ...ref, type: 'status', key: `status:${key}:${latest.status ?? (t.status || '')}`, message: `${label} status changed to ${t.status || 'unknown'}.` });
+          }
+          if (fields.has('corrigendum_count') || fields.has('corrigendum_latest')) {
+            notificationsToEmit.push({ ...ref, type: 'corrigendum', key: `corrigendum:${key}:${latest.corrigendum_count ?? 0}`, message: `${label} has a new corrigendum.` });
+          }
+          if (fields.has('prebid_count')) {
+            notificationsToEmit.push({ ...ref, type: 'prebid', key: `prebid:${key}:${latest.prebid_count ?? 0}`, message: `${label} has a new pre-bid document.` });
           }
         });
         for (const [org, items] of Object.entries(changes?.new_by_org || {})) {
           const list = items || [];
           if (list.length > 10) {
-            notificationsToEmit.push({ type: 'new', message: `${list.length} new tenders added under ${org}.`, orgName: org });
+            notificationsToEmit.push({ type: 'new', key: `new-batch:${org}:${list.length}`, message: `${list.length} new tenders added under ${org}.`, orgName: org });
           } else {
-            list.forEach((t) => notificationsToEmit.push({ type: 'new', message: `"${t.title || t.tender_id}" added under ${org}.`, tenderId: canonTenderId(t.tender_id), tenderDbId: t.id, orgName: org }));
+            list.forEach((t) => notificationsToEmit.push({ type: 'new', key: `new:${canonTenderId(t.tender_id)}`, message: `"${t.title || t.tender_id}" added under ${org}.`, tenderId: canonTenderId(t.tender_id), tenderDbId: t.id, orgName: org }));
           }
         }
       }
@@ -1467,7 +1672,12 @@ export const api = {
       const time = new Date().toLocaleString();
       // tenderId is the canonical tender id (the identity); tenderDbId is only
       // an optional row-id hint for when the tender id is missing.
-      notificationsToEmit.forEach((n) => addNotification({ type: n.type, message: n.message, time, tenderId: n.tenderId || undefined, tenderDbId: n.tenderDbId, orgName: n.orgName }));
+      // `key` identifies the change so addNotification can drop a repeat —
+      // the local diff and the server feed report some of the same events.
+      notificationsToEmit.forEach((n) => addNotification({
+        type: n.type, message: n.message, time, key: n.key,
+        tenderId: n.tenderId || undefined, tenderDbId: n.tenderDbId, orgName: n.orgName,
+      }));
     }
     // Reconcile with whatever another device may have pushed since this
     // device's last sync. Runs after the notification diff above (which
@@ -1525,6 +1735,12 @@ export const api = {
       templates: state.templates,
       templateItems: state.templateItems,
       projects: state.projects.map(({ folder_path, ...rest }) => rest),
+      // linked_file_path is this device's own path and never leaves it. The
+      // row's `server_file` IS sent back untouched, deliberately: the server
+      // strips the echo and re-asserts its own copy (client_api.py
+      // _keep_server_file), so a push can neither fake nor clear it. Don't
+      // strip it here expecting that to delete the file — use
+      // api.deleteProjectFile.
       checklist: state.checklist.map(({ linked_file_path, ...rest }) => rest),
       // Tenders column show/hide/order/width — see TendersPage in App.jsx.
       // Kept alongside the rest of this account's synced preferences so a
@@ -1578,6 +1794,8 @@ export const api = {
     }
     const response = await requestClient('/client/sync', {}, overrides);
     const data = response?.data || {};
+    // Collected inside the updateState below, emitted after it commits.
+    const incomingProjects = [];
 
     // The server is the source of truth: a pull HARD-MIRRORS local user-data
     // to the server blob — every synced collection is set unconditionally,
@@ -1597,6 +1815,19 @@ export const api = {
       state.templates = Array.isArray(data.templates) ? data.templates : [];
       state.templateItems = Array.isArray(data.templateItems) ? data.templateItems : [];
       const localFolders = new Map(state.projects.map((row) => [row.id, row.folder_path]));
+      // Projects an org member added on another device arrive here and
+      // nowhere else — the server has no activity feed and records no author,
+      // so appearing in this pull is the only available signal. A project
+      // created on THIS device is already in local state before the pull, so
+      // it's excluded for free. Skipped before the first successful pull, or
+      // a fresh install would announce the entire back-catalogue.
+      if (state.settings?.has_synced_once && state.settings?.permissions?.projects !== false) {
+        const knownProjectIds = new Set(state.projects.map((row) => Number(row.id)));
+        for (const row of (Array.isArray(data.projects) ? data.projects : [])) {
+          if (knownProjectIds.has(Number(row.id))) continue;
+          incomingProjects.push(row);
+        }
+      }
       state.projects = (Array.isArray(data.projects) ? data.projects : []).map((row) => ({
         ...row, folder_path: localFolders.get(row.id) || row.folder_path || null,
       }));
@@ -1609,6 +1840,26 @@ export const api = {
       return state;
     });
     await saveSyncBaseline(data, response?.updated_at);
+    if (incomingProjects.length) {
+      const { addNotification } = useAppStore.getState();
+      const time = new Date().toLocaleString();
+      const announce = incomingProjects.slice(0, 5);
+      announce.forEach((row) => addNotification({
+        type: 'project',
+        key: `project:${row.id}`,
+        message: `Project "${row.title || row.source_tender_id || `#${row.id}`}" was added to your organisation.`,
+        time,
+        projectId: Number(row.id),
+      }));
+      if (incomingProjects.length > announce.length) {
+        addNotification({
+          type: 'project',
+          key: `project-batch:${incomingProjects.length}:${response?.updated_at || ''}`,
+          message: `${incomingProjects.length - announce.length} more projects were added to your organisation.`,
+          time,
+        });
+      }
+    }
     const columnPrefs = data.tenderColumnPrefs || {};
     const store = useAppStore.getState();
     store.setTendersHiddenColumns(Array.isArray(columnPrefs.hiddenColumns) ? columnPrefs.hiddenColumns : []);

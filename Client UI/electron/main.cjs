@@ -1,6 +1,7 @@
-const { app, BrowserWindow, dialog, ipcMain, net, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, net, protocol, shell } = require('electron');
 const fs = require('fs');
 const path = require('path');
+const { pathToFileURL } = require('url');
 
 const isDev = !app.isPackaged || process.env.ELECTRON_DEV === '1';
 const rendererUrl = process.env.ELECTRON_RENDERER_URL || 'http://localhost:3000';
@@ -8,6 +9,16 @@ const windowStateFile = () => path.join(app.getPath('userData'), 'window-state.j
 let mainWindow = null;
 
 if (!app.requestSingleInstanceLock()) app.quit();
+
+// Chromium refuses to load file:// subresources from the renderer — in dev the
+// page is served from http://localhost, and a packaged file:// page is an
+// opaque origin — so the checklist preview's <img>, <iframe> and fetch() all
+// came back empty. This scheme hands those bytes over through the main
+// process instead. Must be declared before the app is ready.
+protocol.registerSchemesAsPrivileged([{
+  scheme: 'bmfile',
+  privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, bypassCSP: true },
+}]);
 
 function safeResult(fn) {
   try { return fn(); } catch (error) { return { ok: false, message: String(error?.message || error) }; }
@@ -35,6 +46,10 @@ function createWindow(projectId = null) {
     minHeight: 650,
     show: false,
     autoHideMenuBar: true,
+    // The packaged .exe carries the icon itself, so this mainly fixes the
+    // window/taskbar icon in development. Lives beside this file because
+    // electron-builder's `files` list only packages electron/**/*.
+    icon: path.join(__dirname, 'icon.png'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -229,6 +244,70 @@ ipcMain.handle('desktop:client-api-request', async (_event, payload = {}) => {
   }
 });
 
+// Multipart sibling of desktop:client-api-request. That handler is JSON-only,
+// and an IPC payload is structured-cloned so a renderer File/FormData can't
+// survive the hop — with sandbox:true the renderer can't read the bytes at all.
+// So the main process reads the file and posts it, through the same net.fetch
+// (not CORS-constrained) and returning the same result shape, because callers
+// branch on detail.reason for the server's 409 "first upload wins".
+ipcMain.handle('desktop:upload-file', async (_event, payload = {}) => {
+  try {
+    const baseUrl = new URL(String(payload.baseUrl || '').trim());
+    if (!['https:', 'http:'].includes(baseUrl.protocol)) throw new Error('Backend URL must use HTTP or HTTPS.');
+    const route = String(payload.route || '');
+    if (!route.startsWith('/client/')) throw new Error('Only /client/* API routes are allowed.');
+    const clientKey = String(payload.clientKey || '').trim();
+    if (!clientKey) throw new Error('Please sign in.');
+    const filePath = String(payload.filePath || '').trim();
+    if (!filePath) throw new Error('Upload file path is empty.');
+    const source = path.resolve(filePath);
+    if (!fs.existsSync(source) || !fs.statSync(source).isFile()) throw new Error('File to upload was not found.');
+
+    const form = new FormData();
+    for (const [key, value] of Object.entries(payload.fields || {})) {
+      if (value === undefined || value === null) continue;
+      form.append(key, String(value));
+    }
+    const bytes = fs.readFileSync(source);
+    form.append('file', new Blob([bytes], { type: String(payload.contentType || 'application/octet-stream') }), path.basename(source));
+
+    // Ten minutes, not download-file's 60s: the cap is the server's
+    // max_file_size_mb (80 MB by default) and an upload link is the slow one.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 600000);
+    let response;
+    try {
+      // No Content-Type here on purpose — net.fetch derives the multipart
+      // boundary from the FormData, and setting it by hand breaks parsing.
+      response = await net.fetch(`${baseUrl.toString().replace(/\/$/, '')}${route}`, {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'x-client-key': clientKey },
+        body: form,
+        signal: controller.signal,
+      });
+    } catch (fetchError) {
+      if (fetchError?.name === 'AbortError') throw new Error('Upload timed out.');
+      throw fetchError;
+    } finally {
+      clearTimeout(timeout);
+    }
+    const text = await response.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) { data = null; }
+    if (!response.ok) {
+      const detail = data?.detail;
+      const message = Array.isArray(detail)
+        ? detail.map((d) => d.msg || d.type).join('; ')
+        : (detail && typeof detail === 'object' ? detail.message : detail)
+          || `Upload failed with HTTP ${response.status}.`;
+      return { ok: false, status: response.status, message, detail };
+    }
+    return { ok: true, data, status: response.status };
+  } catch (error) {
+    return { ok: false, message: String(error?.message || error) };
+  }
+});
+
 ipcMain.handle('desktop:download-file', async (_event, payload = {}) => {
   try {
     const url = String(payload.url || '').trim();
@@ -266,7 +345,25 @@ ipcMain.handle('desktop:download-file', async (_event, payload = {}) => {
   }
 });
 
-app.whenReady().then(() => { mainWindow = createWindow(); });
+// bmfile://local/<absolute path> → the file's bytes. Streamed by net.fetch
+// rather than read into memory, so a large PDF previews without being
+// buffered. Only ever serves an existing regular file.
+function serveLocalFile(request) {
+  try {
+    const target = path.resolve(decodeURIComponent(new URL(request.url).pathname).replace(/^\//, ''));
+    if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {
+      return new Response('Not found', { status: 404 });
+    }
+    return net.fetch(pathToFileURL(target).toString());
+  } catch (error) {
+    return new Response(String(error?.message || error), { status: 400 });
+  }
+}
+
+app.whenReady().then(() => {
+  protocol.handle('bmfile', serveLocalFile);
+  mainWindow = createWindow();
+});
 app.on('second-instance', () => {
   if (!mainWindow) return;
   if (mainWindow.isMinimized()) mainWindow.restore();

@@ -14,7 +14,7 @@ import {
   LogOut, LogIn, UserPlus, KeyRound, ArrowLeft, ShieldQuestion,
   Users, Shield, UserMinus, Check, Ban,
 } from 'lucide-react';
-import { api, canonTenderId, tenderKey } from './lib/api';
+import { api, canonTenderId, tenderKey, PROJECT_BOOKMARK_LOCKED } from './lib/api';
 import { cn, formatINR, formatCrores, timeRemaining } from './lib/utils';
 import { useAppStore } from './lib/store';
 import {
@@ -366,6 +366,13 @@ function TenderDetailDrawer({ tenderRef, onClose }) {
     }
   };
 
+  // Mirrors the row star: a project's tender can't be un-bookmarked.
+  const { data: drawerProjects } = useQuery({ queryKey: ['projects', '', ''], queryFn: () => api.listProjects() });
+  const bookmarkLockedByProject = Boolean(
+    localTender?.is_bookmarked
+    && (drawerProjects || []).some((p) => canonTenderId(p.source_tender_id) === tenderKey(localTender)),
+  );
+
   const toggleBookmark = useMutation({
     mutationFn: async () => {
       if (!localTender) throw new Error('Sync tenders first to bookmark this one.');
@@ -479,7 +486,12 @@ function TenderDetailDrawer({ tenderRef, onClose }) {
                 ))}
               </div>
               <div className="flex flex-wrap gap-2">
-                <button onClick={() => toggleBookmark.mutate()} disabled={toggleBookmark.isPending} className="btn-ghost gap-1 text-xs">
+                <button
+                  onClick={() => toggleBookmark.mutate()}
+                  disabled={toggleBookmark.isPending || bookmarkLockedByProject}
+                  title={bookmarkLockedByProject ? PROJECT_BOOKMARK_LOCKED : undefined}
+                  className="btn-ghost gap-1 text-xs"
+                >
                   <Star size={12} fill={localTender?.is_bookmarked ? 'currentColor' : 'none'} />
                   {localTender?.is_bookmarked ? 'Bookmarked' : 'Bookmark'}
                 </button>
@@ -781,10 +793,31 @@ function sidebarKeyGatedOff(key, permissions) {
   if (key === 'portal_search') return permissions?.portal_search !== true;
   if (!permissions) return false;
   if (key === 'tenders') return permissions.active === false && permissions.archived === false;
-  if (key === 'organizations') return permissions.active === false && permissions.archived === false && permissions.bookmarks === false;
+  // The `active` section covers "active tenders AND the organisations list"
+  // (API_CHANGES.md §1), so Organizations follows it alone — it used to need
+  // archived and bookmarks to be off as well, which left the tab visible to a
+  // member who'd had only active revoked.
+  if (key === 'organizations') return permissions.active === false;
   if (key === 'bookmarks') return permissions.bookmarks === false;
   if (key === 'projects' || key === 'archived_projects' || key === 'templates') return permissions.projects === false;
   return false;
+}
+
+// A dashboard card jumps to a specific destination, sometimes a specific
+// sub-tab, so it needs its own permission rather than the page's rule: the
+// Online Tenders page stays visible while either sub-tab is permitted, but the
+// "Archived" card is only reachable with `archived`.
+const DASHBOARD_TARGET_SECTION = {
+  'tenders-active': 'active',
+  'tenders-closing-7d': 'active',
+  'tenders-archived': 'archived',
+  projects: 'projects',
+  bookmarks: 'bookmarks',
+};
+function dashboardTargetGatedOff(target, permissions) {
+  const section = DASHBOARD_TARGET_SECTION[target];
+  if (!section) return false;
+  return permissions?.[section] === false;
 }
 
 function Sidebar({ active, onNavigate, collapsed, onToggle, badges = {}, permissions }) {
@@ -850,9 +883,25 @@ function Sidebar({ active, onNavigate, collapsed, onToggle, badges = {}, permiss
   );
 }
 
+// "2h ago" for a notification's epoch stamp. Returns '' for notifications
+// saved before `at` existed, so the caller can fall back to their `time`.
+function relativeTime(at) {
+  const ms = Number(at);
+  if (!Number.isFinite(ms) || ms <= 0) return '';
+  const seconds = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (seconds < 60) return 'just now';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  return new Date(ms).toLocaleDateString();
+}
+
 // ── Notification Panel ────────────────────────────────────────────────────
-function NotificationPanel({ open, onClose, onOpenTender, onOpenOrg }) {
-  const { notifications, markRead, markAllRead } = useAppStore();
+function NotificationPanel({ open, onClose, onOpenTender, onOpenOrg, onOpenProject }) {
+  const { notifications, markRead, markAllRead, dismissNotification, clearNotifications } = useAppStore();
   if (!open) return null;
   return (
     <>
@@ -861,13 +910,18 @@ function NotificationPanel({ open, onClose, onOpenTender, onOpenOrg }) {
         <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border)]">
           <span className="text-sm font-semibold text-[var(--text)]">Notifications</span>
           <div className="flex items-center gap-2">
-            <button onClick={markAllRead} className="text-xs text-[var(--accent)] hover:underline">Mark all read</button>
+            {notifications.length > 0 && (
+              <>
+                <button onClick={markAllRead} className="text-xs text-[var(--accent)] hover:underline">Mark all read</button>
+                <button onClick={clearNotifications} className="text-xs text-[var(--text-muted)] hover:text-[var(--text)] hover:underline">Clear all</button>
+              </>
+            )}
             <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text)]"><X size={14} /></button>
           </div>
         </div>
         <div className="max-h-80 overflow-auto">
           {notifications.length === 0 && (
-            <p className="text-sm text-[var(--text-muted)] text-center py-8">No notifications</p>
+            <EmptyState icon={Bell} title="No notifications" description="Changes to your tenders and projects will appear here." />
           )}
           {notifications.map(n => {
             // tenderId is the canonical tender id; a numeric one (saved before
@@ -876,27 +930,38 @@ function NotificationPanel({ open, onClose, onOpenTender, onOpenOrg }) {
               ? { tender_id: n.tenderId, id: n.tenderDbId }
               : { tender_id: '', id: n.tenderDbId ?? n.tenderId };
             const opensTender = Boolean(tenderRef.tender_id || Number(tenderRef.id) > 0);
-            const navigable = opensTender || Boolean(n.orgName);
+            const opensProject = Number(n.projectId) > 0;
+            const navigable = opensTender || opensProject || Boolean(n.orgName);
             return (
             <div
               key={n.id}
               onClick={() => {
                 markRead(n.id);
-                if (opensTender) { onClose(); onOpenTender?.(tenderRef); }
+                if (opensProject) { onClose(); onOpenProject?.(Number(n.projectId)); }
+                else if (opensTender) { onClose(); onOpenTender?.(tenderRef); }
                 else if (n.orgName) { onClose(); onOpenOrg?.(n.orgName); }
               }}
               className={cn(
-                'flex items-start gap-3 px-4 py-3 border-b border-[var(--border)] last:border-0 transition-colors cursor-pointer hover:bg-[var(--surface-1)]',
+                'group/notif flex items-start gap-3 px-4 py-3 border-b border-[var(--border)] last:border-0 transition-colors',
+                // Only a row that actually goes somewhere should look clickable.
+                navigable ? 'cursor-pointer hover:bg-[var(--surface-1)]' : 'cursor-default',
                 !n.read && 'bg-[var(--accent-bg)]/20'
               )}
             >
               <NotificationIcon type={n.type} />
               <div className="flex-1 min-w-0">
                 <p className="text-sm text-[var(--text)]">{n.message}</p>
-                <p className="text-xs text-[var(--text-muted)] mt-0.5">{n.time}</p>
+                <p className="text-xs text-[var(--text-muted)] mt-0.5">{relativeTime(n.at) || n.time}</p>
               </div>
               {!n.read && <div className="w-2 h-2 rounded-full bg-[var(--accent)] mt-1.5 shrink-0" />}
               {navigable && <ChevronRight size={14} className="text-[var(--text-muted)] shrink-0 mt-0.5" />}
+              <button
+                onClick={(event) => { event.stopPropagation(); dismissNotification(n.id); }}
+                title="Dismiss"
+                className="shrink-0 rounded p-0.5 text-[var(--text-muted)] opacity-0 transition-opacity hover:text-[var(--text)] group-hover/notif:opacity-100"
+              >
+                <X size={12} />
+              </button>
             </div>
             );
           })}
@@ -946,6 +1011,20 @@ function DashboardPage({ onNavigate, onOpenProjectWorkspace, onOpenWebsiteOrgani
   });
   const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
   const { data: activeProjects } = useQuery({ queryKey: ['projects', 'Active', ''], queryFn: () => api.listProjects('', 'Active') });
+  // Same source the sidebar gates on, so the dashboard can't offer a route
+  // into a section this account has had switched off.
+  const permissions = settings?.permissions;
+  const orgsGatedOff = sidebarKeyGatedOff('organizations', permissions);
+  // api.dashboardStats has already narrowed every number to what this account
+  // can reach and reports here which sections applied.
+  const sections = stats?.sections || {};
+  const scope = stats?.tender_scope || {};
+  // A scoped tender card counts bookmarked / in-project tenders, so it should
+  // open wherever those live rather than the tender list it can't reach.
+  const scopedTarget = sections.bookmarks !== false ? 'bookmarks' : (sections.projects !== false ? 'projects' : '');
+  const scopedNote = scope.via === 'both' ? 'in your bookmarks & projects'
+    : scope.via === 'bookmarks' ? 'in your bookmarks'
+      : scope.via === 'projects' ? 'in your projects' : '';
 
   if (isLoading) {
     return (
@@ -971,7 +1050,20 @@ function DashboardPage({ onNavigate, onOpenProjectWorkspace, onOpenWebsiteOrgani
     { label: 'Bookmarked', value: stats.bookmarked_tenders, icon: Bookmark, color: 'text-amber-400', bg: 'bg-amber-500/10', target: 'bookmarks' },
     { label: 'Closing < 7 Days', value: stats.closing_soon, icon: Clock, color: 'text-rose-400', bg: 'bg-rose-500/10', target: 'tenders-closing-7d' },
     { label: 'Archived', value: stats.archived_tenders, icon: AlertTriangle, color: 'text-rose-400', bg: 'bg-rose-500/10', target: 'tenders-archived' },
-  ];
+    // Pipeline Value is the same shape as these — one number — and used to sit
+    // alone in a third of the row below, leaving a hole beside it whenever
+    // Website Coverage was hidden. It belongs up here.
+    { label: 'Pipeline Value', value: formatCrores(stats.total_pipeline_value), icon: IndianRupee, color: 'text-[var(--accent)]', bg: 'bg-[var(--accent-bg)]', target: 'projects' },
+  ]
+    // Bookmarked and Active Projects have nothing left to say once their own
+    // section is off, so they go. The tender cards stay: their numbers are
+    // already narrowed to what this account can reach (api.dashboardStats),
+    // and they re-point at wherever those tenders actually live.
+    .filter((card) => !(card.target === 'bookmarks' && sections.bookmarks === false))
+    .filter((card) => !(card.target === 'projects' && sections.projects === false))
+    .map((card) => (dashboardTargetGatedOff(card.target, permissions)
+      ? { ...card, target: scopedTarget, note: scopedNote }
+      : card));
 
   // ── "Needs attention" (item 5) ────────────────────────────────────────────
   const daysUntil = (dateStr) => {
@@ -980,7 +1072,9 @@ function DashboardPage({ onNavigate, onOpenProjectWorkspace, onOpenWebsiteOrgani
     return Math.floor((target.getTime() - Date.now()) / 86400000);
   };
   const projectTenderIds = new Set((activeProjects || []).map((p) => canonTenderId(p.source_tender_id)).filter(Boolean));
-  const urgentUnclaimedBookmarks = (stats.bookmarked_items || []).filter((t) => {
+  // These rows link into Bookmarks, so they're pointless (and unreachable)
+  // without that section.
+  const urgentUnclaimedBookmarks = (permissions?.bookmarks === false ? [] : (stats.bookmarked_items || [])).filter((t) => {
     const days = daysUntil(t.closing_date);
     return days !== null && days >= 0 && days <= 2 && !projectTenderIds.has(tenderKey(t));
   });
@@ -1046,37 +1140,45 @@ function DashboardPage({ onNavigate, onOpenProjectWorkspace, onOpenWebsiteOrgani
         </div>
       )}
 
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+      {/* Was a fixed 5-column grid, which left an empty cell whenever a card
+          was filtered out by permissions. Flex-wrap lets however many remain
+          share the width evenly. */}
+      <div className="flex flex-wrap gap-4 items-stretch">
         {statCards.map((s, i) => (
           <button
             key={i}
             type="button"
-            onClick={() => onNavigate?.(s.target)}
-            className="card p-4 flex items-center gap-4 text-left transition-colors hover:bg-[var(--surface-1)]"
+            onClick={() => s.target && onNavigate?.(s.target)}
+            disabled={!s.target}
+            title={s.note ? `Counting only the tenders ${s.note}` : undefined}
+            className={cn(
+              // min-w keeps a card readable; flex-1 shares out the rest.
+              'card p-4 flex flex-1 min-w-[190px] items-center gap-4 text-left transition-colors',
+              s.target ? 'hover:bg-[var(--surface-1)]' : 'cursor-default',
+            )}
           >
-            <div className={cn('w-11 h-11 rounded-xl flex items-center justify-center', s.bg)}>
+            <div className={cn('w-11 h-11 rounded-xl flex items-center justify-center shrink-0', s.bg)}>
               <s.icon size={20} className={s.color} />
             </div>
-            <div>
+            <div className="min-w-0">
               <p className="text-2xl font-bold text-[var(--text)]">{s.value}</p>
               <p className="text-xs text-[var(--text-muted)]">{s.label}</p>
+              {/* Says out loud that this is a narrowed count, so the figure
+                  can't be mistaken for the whole pool. */}
+              {s.note && <p className="text-[10px] text-[var(--text-muted)]/70 truncate">{s.note}</p>}
             </div>
           </button>
         ))}
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-stretch">
-        <div className="flex flex-col gap-4">
-          <div className="card p-3">
-            <div className="flex items-center gap-2 mb-1">
-              <IndianRupee size={12} className="text-[var(--accent)]" />
-              <h3 className="text-sm font-semibold text-[var(--text)]">Pipeline Value</h3>
-            </div>
-            <p className="text-xl font-bold text-[var(--text)]">{formatCrores(stats.total_pipeline_value)}</p>
-            <p className="text-xs text-[var(--text-muted)]">across selected tenders</p>
-          </div>
-
-          <div className="card p-4 flex-1">
+      {/* Flex-wrap, not a fixed column count: whatever cards survive the
+          permission filters grow to fill the row, so hiding one never leaves a
+          gap where its column used to be. */}
+      <div className="flex flex-wrap gap-4 items-stretch">
+          {/* Website Coverage summarises the whole tender pool, so it belongs
+              to `active`. */}
+          {sections.active !== false && (
+          <div className="card p-4 flex-1 min-w-[280px]">
             <div className="flex items-center gap-2 mb-3">
               <Activity size={15} className="text-[var(--accent)]" />
               <h3 className="text-sm font-semibold text-[var(--text)]">Website Coverage</h3>
@@ -1092,7 +1194,13 @@ function DashboardPage({ onNavigate, onOpenProjectWorkspace, onOpenWebsiteOrgani
                     type="button"
                     key={website.id}
                     onClick={() => onOpenWebsiteOrganizations?.(website.name)}
-                    className="w-full rounded-lg bg-[var(--surface-1)] px-3 py-2 text-left transition-colors hover:bg-[var(--surface-2)]"
+                    // These open the Organizations page; without that section
+                    // the counts still inform, but the tile mustn't navigate.
+                    disabled={orgsGatedOff}
+                    className={cn(
+                      'w-full rounded-lg bg-[var(--surface-1)] px-3 py-2 text-left transition-colors',
+                      orgsGatedOff ? 'cursor-default' : 'hover:bg-[var(--surface-2)]',
+                    )}
                   >
                     <p className="text-sm font-semibold text-[var(--text)] truncate">{website.name}</p>
                     <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-[var(--text-muted)]">
@@ -1105,9 +1213,13 @@ function DashboardPage({ onNavigate, onOpenProjectWorkspace, onOpenWebsiteOrgani
               </div>
             )}
           </div>
-        </div>
+          )}
 
-        <div className="card p-5 lg:col-span-2">
+        {/* Deadlines come from bookmarks, else projects (api.dashboardStats),
+            so with neither there is nothing to show. Twice the basis of the
+            coverage card beside it, and full width when that one is hidden. */}
+        {(sections.bookmarks !== false || sections.projects !== false) && (
+        <div className="card p-5 flex-[2] min-w-[420px]">
           <div className="flex items-center gap-2 mb-3">
             <Calendar size={16} className="text-[var(--accent)]" />
             <h3 className="text-sm font-semibold text-[var(--text)]">Upcoming Deadlines</h3>
@@ -1135,10 +1247,12 @@ function DashboardPage({ onNavigate, onOpenProjectWorkspace, onOpenWebsiteOrgani
             ))}
           </div>
         </div>
+        )}
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div className="card p-5">
+      <div className="flex flex-wrap gap-4 items-stretch">
+        {sections.bookmarks !== false && (
+        <div className="card p-5 flex-1 min-w-[340px]">
           <div className="flex items-center justify-between gap-3 mb-3">
             <div className="flex items-center gap-2">
               <Bookmark size={16} className="text-amber-400" />
@@ -1167,8 +1281,10 @@ function DashboardPage({ onNavigate, onOpenProjectWorkspace, onOpenWebsiteOrgani
             ))}
           </div>
         </div>
+        )}
 
-        <div className="card p-5">
+        {sections.projects !== false && (
+        <div className="card p-5 flex-1 min-w-[340px]">
           <div className="flex items-center justify-between gap-3 mb-3">
             <div className="flex items-center gap-2">
               <FolderCog size={16} className="text-emerald-400" />
@@ -1197,6 +1313,7 @@ function DashboardPage({ onNavigate, onOpenProjectWorkspace, onOpenWebsiteOrgani
             ))}
           </div>
         </div>
+        )}
       </div>
     </div>
   );
@@ -1701,6 +1818,7 @@ function OrganizationTable({ rows, isLoading, emptyState, sortCol, sortDir, onTo
 // behaves identically wherever it's shown.
 function useTenderRowActions() {
   const qc = useQueryClient();
+  const pushToast = useAppStore((s) => s.pushToast);
   const { data: allDocuments } = useQuery({ queryKey: ['client-documents'], queryFn: api.listAllDocuments });
   // Both sets hold canonical tender ids — documents belong to a tender by
   // tender_id, not by the (restore-unstable) row id.
@@ -1717,6 +1835,14 @@ function useTenderRowActions() {
     [allDocuments]
   );
 
+  // Any project — not just active ones — locks its tender's bookmark, which is
+  // the same rule the server enforces on push and pull (API_CHANGES.md §1).
+  const { data: allProjectsForBookmarks } = useQuery({ queryKey: ['projects', '', ''], queryFn: () => api.listProjects() });
+  const projectTenderIds = useMemo(
+    () => new Set((allProjectsForBookmarks || []).map((p) => canonTenderId(p.source_tender_id)).filter(Boolean)),
+    [allProjectsForBookmarks],
+  );
+
   const toggleBookmark = useMutation({
     mutationFn: async (t) => {
       if (!t.is_bookmarked) {
@@ -1726,7 +1852,7 @@ function useTenderRowActions() {
       return api.patchTender(t.id, { is_bookmarked: !t.is_bookmarked });
     },
     onSuccess: () => qc.invalidateQueries(),
-    onError: (err) => alert(err instanceof Error ? err.message : String(err)),
+    onError: (err) => pushToast({ type: 'error', message: err instanceof Error ? err.message : String(err) }),
   });
 
   // Fetches every document available for a tender and saves them all in one
@@ -1859,11 +1985,19 @@ function useTenderRowActions() {
       );
     }
     if (column.key === 'is_bookmarked') {
+      // A project's tender stays bookmarked, so show the star as locked rather
+      // than letting the click fail — the server would re-add it anyway.
+      const lockedByProject = projectTenderIds.has(tenderKey(tender));
       return (
         <button
-          onClick={(event) => { event.stopPropagation(); toggleBookmark.mutate(tender); }}
-          className={cn('inline-flex h-7 w-7 items-center justify-center rounded transition-colors', tender.is_bookmarked ? 'text-amber-400' : 'text-[var(--text-muted)] hover:text-amber-400')}
-          title={tender.is_bookmarked ? 'Remove bookmark' : 'Bookmark tender'}
+          onClick={(event) => { event.stopPropagation(); if (!lockedByProject) toggleBookmark.mutate(tender); }}
+          disabled={lockedByProject}
+          className={cn(
+            'inline-flex h-7 w-7 items-center justify-center rounded transition-colors',
+            tender.is_bookmarked ? 'text-amber-400' : 'text-[var(--text-muted)] hover:text-amber-400',
+            lockedByProject && 'cursor-default opacity-70',
+          )}
+          title={lockedByProject ? PROJECT_BOOKMARK_LOCKED : (tender.is_bookmarked ? 'Remove bookmark' : 'Bookmark tender')}
         >
           <Star size={18} fill={tender.is_bookmarked ? 'currentColor' : 'none'} />
         </button>
@@ -2451,12 +2585,21 @@ function OrganizationsPage({ onOpenOrgTenders }) {
    ═══════════════════════════════════════════════════════════════════════════ */
 function BookmarksPage({ onOpenOrgTenders }) {
   const qc = useQueryClient();
+  // This page's Organizations sub-tab renders the same org list as the
+  // Organizations page, so it has to honour the same permission — otherwise
+  // hiding that page just moves the back door here.
+  const { data: bookmarkSettings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
+  const orgsGatedOff = sidebarKeyGatedOff('organizations', bookmarkSettings?.permissions);
   const [tab, setTab] = useState(() => {
     try { return sessionStorage.getItem(BOOKMARKS_LAST_TAB_KEY) || 'organizations'; } catch { return 'organizations'; }
   });
   useEffect(() => {
     try { sessionStorage.setItem(BOOKMARKS_LAST_TAB_KEY, tab); } catch { /* ignore storage failures */ }
   }, [tab]);
+  // A remembered 'organizations' tab would otherwise reopen the hidden list.
+  useEffect(() => {
+    if (orgsGatedOff && tab === 'organizations') setTab('tenders');
+  }, [orgsGatedOff, tab]);
 
   // ── Tenders sub-tab ────────────────────────────────────────────────────
   const [sortCol, setSortCol] = useState('closing_date');
@@ -2613,7 +2756,9 @@ function BookmarksPage({ onOpenOrgTenders }) {
           </div>
         )}
         <div className="-mx-6 -mb-3 mt-2 flex border-t border-[var(--border)] px-6">
-          {[{ key: 'organizations', label: 'Organizations' }, { key: 'tenders', label: 'Tenders' }].map((t) => (
+          {[{ key: 'organizations', label: 'Organizations' }, { key: 'tenders', label: 'Tenders' }]
+            .filter((t) => t.key !== 'organizations' || !orgsGatedOff)
+            .map((t) => (
             <button
               key={t.key}
               onClick={() => setTab(t.key)}
@@ -2625,7 +2770,7 @@ function BookmarksPage({ onOpenOrgTenders }) {
         </div>
       </div>
       <div className="flex-1 overflow-auto">
-        {tab === 'organizations' ? (
+        {tab === 'organizations' && !orgsGatedOff ? (
           <OrganizationTable
             rows={bookmarkedOrgRows}
             isLoading={orgsLoading}
@@ -3218,7 +3363,12 @@ function ProjectsPage({ onOpenProjectWorkspace, archived = false }) {
                   {visibleProjectCols.map(c => {
                     if (c.key === '_sr') return <td key={c.key} className="text-[var(--text-muted)] text-center">{i + 1}</td>;
                     if (c.key === 'source_tender_id') return <td key={c.key} className="font-mono text-xs text-[var(--accent)]">{p.source_tender_id || '—'}</td>;
-                    if (c.key === 'title') return <td key={c.key}><p className="text-sm font-medium text-[var(--text)] truncate">{p.title}</p>{p.description && <p className="mt-0.5 max-w-[300px] truncate text-[11px] text-[var(--text-muted)]">{p.description}</p>}</td>;
+                    // One line only: a project made from a tender gets its
+                    // description seeded from that tender, so the two lines
+                    // were near-duplicates. The description moves to the
+                    // cell's tooltip, falling back to the title so a
+                    // truncated name still reveals in full on hover.
+                    if (c.key === 'title') return <td key={c.key} title={p.description || p.title || ''}><p className="text-[13px] leading-snug font-medium text-[var(--text)] line-clamp-2">{p.title}</p></td>;
                     if (c.key === 'client_name') return <td key={c.key} className="text-sm text-[var(--text-muted)] truncate">{p.client_name || '—'}</td>;
                     if (c.key === 'project_value') return <td key={c.key} className="font-mono text-sm">{formatINR(p.project_value)}</td>;
                     if (c.key === '_time_left') return <td key={c.key}><TimeBadge dateStr={p.deadline} /></td>;
@@ -3305,8 +3455,19 @@ function sanitizeFileName(name) {
   return String(name || '').replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').replace(/\s+/g, ' ').trim();
 }
 
+// Chromium blocks file:// subresources from the renderer, so in the desktop
+// app local previews go through the bmfile:// scheme registered in
+// electron/main.cjs. The plain file:// form is kept for the browser build,
+// which has no local attachments anyway.
 function toFileUrl(localPath) {
-  return `file:///${encodeURI(localPath.replace(/\\/g, '/'))}`;
+  const forward = String(localPath || '').replace(/\\/g, '/');
+  // Per segment, because encodeURI leaves '#' and '?' alone: a file called
+  // "Annexure #2.pdf" would be truncated at the '#' and the preview would
+  // silently 404. encodeURIComponent escapes them, and splitting on '/'
+  // keeps the separators intact.
+  const encoded = forward.split('/').map(encodeURIComponent).join('/');
+  if (window.bidmanagerDesktop) return `bmfile://local/${encoded}`;
+  return `file:///${encoded}`;
 }
 
 function parseDeadlineText(input) {
@@ -3362,7 +3523,7 @@ function InfoField({ label, children }) {
   );
 }
 
-function ToolBtn({ icon: Icon, label, onClick, disabled, danger, active }) {
+function ToolBtn({ icon: Icon, label, onClick, disabled, danger, active, spinning }) {
   return (
     <button
       onClick={onClick}
@@ -3373,7 +3534,7 @@ function ToolBtn({ icon: Icon, label, onClick, disabled, danger, active }) {
         danger ? 'text-rose-400 hover:bg-rose-500/10' : active ? 'text-[var(--accent)] bg-[var(--accent-bg)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'
       )}
     >
-      <Icon size={12} className="shrink-0" />{label}
+      <Icon size={12} className={cn('shrink-0', spinning && 'animate-spin')} />{label}
     </button>
   );
 }
@@ -3398,42 +3559,142 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
   const [deleteFolderName, setDeleteFolderName] = useState('');
   const [textPreview, setTextPreview] = useState('');
   const [textPreviewError, setTextPreviewError] = useState('');
+  // Why the image/PDF preview couldn't be fetched, '' when it's fine.
+  const [previewLoadError, setPreviewLoadError] = useState('');
   const [saveTemplateOpen, setSaveTemplateOpen] = useState(false);
   const [saveTemplateForm, setSaveTemplateForm] = useState({ template_no: '', organization: '', template_name: '', description: '', notes: '' });
   const [savingTemplate, setSavingTemplate] = useState(false);
   const [applyTemplateOpen, setApplyTemplateOpen] = useState(false);
   const [templateSearch, setTemplateSearch] = useState('');
+  // The project header fields as they were when loaded (already normalized —
+  // see infoFromProject below), so "has the user actually changed anything?"
+  // is a straight comparison and the Save button can stay hidden until then.
+  const [pristineInfo, setPristineInfo] = useState(null);
+  // Attach File spans a native dialog + a disk copy + two writes; without this
+  // the button looks inert and can be double-clicked into a duplicate row.
+  const [attaching, setAttaching] = useState(false);
+  // Re-renders the deadline countdown so it actually ticks down while the
+  // workspace sits open.
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  // Checklist row id whose shared file is downloading right now, so only that
+  // row's button spins.
+  const [downloadingFileId, setDownloadingFileId] = useState(null);
+  // Rows this session already tried to share, so a row whose upload keeps
+  // failing (no network, file too large) isn't retried on every render.
+  const attemptedShareRef = useRef(new Set());
+  // Name of the file whose target already exists, '' when the prompt is shut.
+  const [nameClash, setNameClash] = useState('');
+  const nameClashResolve = useRef(null);
+  // row id -> why its file couldn't be shared. Drives the warning triangle in
+  // the Attachment cell; a failure was otherwise only an 8-second toast.
+  const [shareErrors, setShareErrors] = useState({});
+  // Row whose upload is being retried by hand right now.
+  const [retryingShareId, setRetryingShareId] = useState(null);
+  // Row whose ready checkbox is mid-write, so it can't be double-toggled.
+  const [togglingStatusId, setTogglingStatusId] = useState(null);
+  // row id -> true when that row's linked_file_path was confirmed on disk.
+  // Checked with the desktop bridge because a path synced from nowhere, a
+  // moved folder or a file deleted outside the app all look identical in the
+  // row itself.
+  const [localFilePresence, setLocalFilePresence] = useState({});
 
   const desktop = window.bidmanagerDesktop;
+  const pushToast = useAppStore((s) => s.pushToast);
 
   const { data: project, isLoading: projectLoading } = useQuery({ queryKey: ['project', projectId], queryFn: () => api.getProject(projectId) });
-  const { data: checklist, isLoading: checklistLoading } = useQuery({ queryKey: ['project-checklist', projectId], queryFn: () => api.listChecklist(projectId) });
+  const { data: checklist, isLoading: checklistLoading, isFetching: checklistFetching } = useQuery({ queryKey: ['project-checklist', projectId], queryFn: () => api.listChecklist(projectId) });
   const { data: allTemplates } = useQuery({ queryKey: ['templates'], queryFn: () => api.listTemplates(), enabled: applyTemplateOpen });
+
+  const toastError = (label) => (error) => pushToast({ type: 'error', message: `${label}: ${error instanceof Error ? error.message : String(error)}` });
+
+  // Back to "adding a new item": no row selected, all three inputs blank.
+  // Every exit from an edit goes through this so the three never disagree.
+  const clearItemForm = useCallback(() => {
+    setSelectedId(null);
+    setDocName('');
+    setDesc('');
+    setFolder('Ready Docs');
+  }, []);
 
   const createItem = useMutation({
     mutationFn: () => api.createChecklistItem(projectId, { req_file_name: docName.trim(), description: desc.trim(), subfolder: folder, status: 'Pending' }),
-    onSuccess: () => { setDocName(''); setDesc(''); qc.invalidateQueries({ queryKey: ['project-checklist', projectId] }); },
+    onSuccess: () => { setDocName(''); setDesc(''); setFolder('Ready Docs'); qc.invalidateQueries({ queryKey: ['project-checklist', projectId] }); },
+    onError: toastError('Could not add the item'),
   });
   const updateItem = useMutation({
     mutationFn: (itemId) => api.updateChecklistItem(itemId, { req_file_name: docName.trim(), description: desc.trim(), subfolder: folder }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['project-checklist', projectId] }),
+    onError: toastError('Could not update the item'),
   });
   const deleteItem = useMutation({
     mutationFn: (itemId) => api.deleteChecklistItem(itemId),
-    onSuccess: () => { setSelectedId(null); setDocName(''); setDesc(''); qc.invalidateQueries({ queryKey: ['project-checklist', projectId] }); },
+    onSuccess: () => { clearItemForm(); qc.invalidateQueries({ queryKey: ['project-checklist', projectId] }); },
+    onError: toastError('Could not delete the item'),
   });
   const updateProjectInfo = useMutation({
     mutationFn: () => api.updateProject(projectId, { source_tender_id: infoForm.source_tender_id, title: infoForm.title, client_name: infoForm.client_name, project_value: infoForm.project_value, prebid: infoForm.prebid, deadline: infoForm.deadline }),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['project', projectId] }); qc.invalidateQueries({ queryKey: ['projects'] }); setInfoEditable(false); },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['project', projectId] });
+      qc.invalidateQueries({ queryKey: ['projects'] });
+      // The saved values are the new baseline, so Save hides again until the
+      // next real edit (the project query refetch would do this too, but not
+      // until it lands).
+      setPristineInfo(infoForm);
+      setInfoEditable(false);
+    },
+    onError: toastError('Could not save project details'),
   });
 
   const selectedItem = useMemo(() => (checklist || []).find(x => x.id === selectedId) || null, [checklist, selectedId]);
 
-  useEffect(() => { if (!selectedItem) return; setDocName(selectedItem.req_file_name || ''); setDesc(selectedItem.description || ''); setFolder(selectedItem.subfolder || 'Ready Docs'); }, [selectedItem?.id]);
+  // Selecting a row loads it into the toolbar inputs for editing; losing the
+  // selection empties them again, so the next Add Item starts blank instead of
+  // silently reusing the last row's text.
+  useEffect(() => {
+    if (!selectedItem) { setDocName(''); setDesc(''); setFolder('Ready Docs'); return; }
+    setDocName(selectedItem.req_file_name || '');
+    setDesc(selectedItem.description || '');
+    setFolder(selectedItem.subfolder || 'Ready Docs');
+  }, [selectedItem?.id]);
+
+  // The form shows normalized values (2dp amounts, widened date/time gaps),
+  // so the pristine baseline has to be the normalized object too — comparing
+  // against the raw project row would read "dirty" the instant it loads.
+  const infoFromProject = (row) => ({
+    source_tender_id: String(row.source_tender_id || ''),
+    title: String(row.title || ''),
+    client_name: String(row.client_name || ''),
+    project_value: normalizeValue2dp(String(row.project_value || '')),
+    prebid: widenDateTimeGap(String(row.prebid || '')),
+    deadline: String(row.deadline || ''),
+  });
   useEffect(() => {
     if (!project || infoEditable) return;
-    setInfoForm({ source_tender_id: String(project.source_tender_id || ''), title: String(project.title || ''), client_name: String(project.client_name || ''), project_value: normalizeValue2dp(String(project.project_value || '')), prebid: widenDateTimeGap(String(project.prebid || '')), deadline: String(project.deadline || '') });
-  }, [project?.id, project?.deadline, project?.prebid, project?.project_value]);
+    const next = infoFromProject(project);
+    setInfoForm(next);
+    setPristineInfo(next);
+    // Every field the form shows is a dependency — leaving title/client_name/
+    // source_tender_id out meant a change made on another device never
+    // refreshed the form, and would now also leave the baseline stale.
+  }, [project?.id, project?.deadline, project?.prebid, project?.project_value, project?.title, project?.client_name, project?.source_tender_id]);
+
+  const isInfoDirty = useMemo(() => {
+    if (!pristineInfo) return false;
+    return Object.keys(infoForm).some((key) => String(infoForm[key] ?? '') !== String(pristineInfo[key] ?? ''));
+  }, [infoForm, pristineInfo]);
+
+  // Cancel throws the edits away rather than leaving them on screen in a
+  // read-only grid, where they'd look saved.
+  const cancelInfoEdit = useCallback(() => {
+    if (pristineInfo) setInfoForm(pristineInfo);
+    setInfoEditable(false);
+  }, [pristineInfo]);
+
+  // One tick a minute is enough for an "19h 49m" style countdown.
+  useEffect(() => {
+    const timer = setInterval(() => setNowTick(Date.now()), 60000);
+    return () => clearInterval(timer);
+  }, []);
 
   const folderOptions = useMemo(() => {
     const names = new Set(FOLDER_ORDER);
@@ -3505,13 +3766,13 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
   };
 
   const openProjectFolder = async () => {
-    if (!desktop?.openPath) { alert('Open Folder is available in the desktop app.'); return; }
+    if (!desktop?.openPath) { pushToast({ type: 'error', message: 'Open Folder is available in the desktop app.' }); return; }
     const existing = await resolveExistingProjectFolder();
     const candidates = Array.from(new Set([existing].map(x => String(x || '').trim()).filter(Boolean)));
-    if (!candidates.length) { alert('Project folder is not available.'); return; }
+    if (!candidates.length) { pushToast({ type: 'error', message: 'Project folder is not available.' }); return; }
     let msg = '';
     for (const c of candidates) { const res = await desktop.openPath(c); if (res?.ok) return; msg = String(res?.message || ''); }
-    alert(msg ? `Open folder failed: ${msg}` : 'Project folder is not available.');
+    pushToast({ type: 'error', message: msg ? `Open folder failed: ${msg}` : 'Project folder is not available.' });
   };
 
   const uf = (k, v) => setInfoForm(prev => ({ ...prev, [k]: v }));
@@ -3524,9 +3785,9 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
       setSaveTemplateOpen(false);
       setSaveTemplateForm({ template_no: '', organization: '', template_name: '', description: '', notes: '' });
       qc.invalidateQueries({ queryKey: ['templates'] });
-      alert('Template saved successfully.');
+      pushToast({ type: 'success', message: 'Template saved.' });
     } catch (err) {
-      alert(`Save template failed: ${err instanceof Error ? err.message : String(err)}`);
+      pushToast({ type: 'error', message: `Save template failed: ${err instanceof Error ? err.message : String(err)}` });
     } finally { setSavingTemplate(false); }
   };
 
@@ -3535,37 +3796,399 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
       const result = await api.applyTemplateToProject(projectId, templateId);
       setApplyTemplateOpen(false);
       qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
-      alert(`Template applied. ${result.added} item(s) added.`);
-    } catch (err) { alert(`Apply template failed: ${err instanceof Error ? err.message : String(err)}`); }
+      pushToast({ type: 'success', message: `Template applied — ${result.added} item(s) added.` });
+    } catch (err) { pushToast({ type: 'error', message: `Apply template failed: ${err instanceof Error ? err.message : String(err)}` }); }
+  };
+
+  // Where a row's file lives on disk: the project folder, or its subfolder.
+  // Shared by attachFile and downloadRowFile so a downloaded file lands
+  // exactly where an attached one would.
+  const folderForSubfolder = (baseFolder, subfolder) => {
+    const clean = String(subfolder || 'Ready Docs').trim() || 'Ready Docs';
+    if (clean === 'Main') return baseFolder;
+    return `${baseFolder}${baseFolder.endsWith('\\') || baseFolder.endsWith('/') ? '' : '\\'}${clean}`;
+  };
+
+  const joinWorkspacePath = (dir, name) => (
+    `${dir}${dir.endsWith('\\') || dir.endsWith('/') ? '' : '\\'}${name}`
+  );
+
+  // "report.pdf" -> "report (2).pdf", stepping until the name is free. Mirrors
+  // how the server stores same-named files in one project
+  // (project_files.name_candidates).
+  const uniqueFileName = async (targetDir, name) => {
+    const dot = name.lastIndexOf('.');
+    const stem = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : '';
+    for (let n = 2; n < 100; n += 1) {
+      const candidate = `${stem} (${n})${ext}`;
+      const check = await desktop.pathExists(joinWorkspacePath(targetDir, candidate));
+      if (!check?.ok || !check.exists) return candidate;
+    }
+    return `${stem} (${Date.now()})${ext}`;
+  };
+
+  // Resolves to 'overwrite' | 'keep-both' | 'cancel' once the user picks. The
+  // promise's resolver is parked in a ref so the modal's buttons can settle it.
+  const askNameClash = (name) => new Promise((resolve) => {
+    nameClashResolve.current = resolve;
+    setNameClash(name);
+  });
+  const settleNameClash = (choice) => {
+    setNameClash('');
+    const resolve = nameClashResolve.current;
+    nameClashResolve.current = null;
+    if (resolve) resolve(choice);
   };
 
   const attachFile = async () => {
-    if (!desktop?.pickPath || !desktop?.copyFileToFolder) { alert('File attachment is available in the desktop app.'); return; }
-    const baseFolder = await resolveExistingProjectFolder();
-    if (!baseFolder) { alert('Project folder is not available.'); return; }
-    const pick = await desktop.pickPath({ file: true, title: 'Select attachment file' });
-    if (!pick?.ok || !pick.path) return;
-    const subfolder = selectedItem?.subfolder || folder || 'Ready Docs';
-    const cleanSubfolder = String(subfolder || 'Ready Docs').trim();
-    const targetDir = cleanSubfolder === 'Main' ? baseFolder : `${baseFolder}${baseFolder.endsWith('\\') || baseFolder.endsWith('/') ? '' : '\\'}${cleanSubfolder}`;
-    const pickedName = fileNameOnly(pick.path || '');
-    const pickedExt = (pickedName.match(/(\.[^./\\]+)$/)?.[1]) || '';
-    let desiredName = sanitizeFileName((selectedItem?.req_file_name || docName || pickedName).trim() || pickedName);
-    if (desiredName && pickedExt && !desiredName.toLowerCase().endsWith(pickedExt.toLowerCase())) desiredName += pickedExt;
-    desiredName = sanitizeFileName(desiredName);
-    const copied = await desktop.copyFileToFolder({ sourcePath: pick.path, targetDir, targetName: desiredName || undefined });
-    if (!copied?.ok || !copied.path) { alert(`Attach failed: ${copied?.message || 'Unknown error'}`); return; }
-    if (selectedItem) {
-      await api.updateChecklistItem(selectedItem.id, { linked_file_path: copied.path, status: 'Completed', subfolder: cleanSubfolder });
-    } else {
-      const created = await api.createChecklistItem(projectId, { req_file_name: (docName || desiredName).trim(), description: desc.trim(), subfolder: cleanSubfolder, linked_file_path: copied.path, status: 'Completed' });
-      setSelectedId(created.id);
+    // The button is disabled without the desktop bridge, so this only guards
+    // against a stale render.
+    if (!desktop?.pickPath || !desktop?.copyFileToFolder || attaching) return;
+    setAttaching(true);
+    try {
+      const baseFolder = await resolveExistingProjectFolder();
+      if (!baseFolder) { pushToast({ type: 'error', message: 'Project folder is not available.' }); return; }
+      const pick = await desktop.pickPath({ file: true, title: 'Select attachment file' });
+      if (!pick?.ok || !pick.path) return;
+      const subfolder = selectedItem?.subfolder || folder || 'Ready Docs';
+      const cleanSubfolder = String(subfolder || 'Ready Docs').trim();
+      const targetDir = folderForSubfolder(baseFolder, cleanSubfolder);
+      // Keep the file's own name. It used to be renamed to the row's
+      // req_file_name, which lost the original and could produce odd results
+      // like "Bid Form.pdf.jpg" when the row name carried its own extension.
+      const pickedName = fileNameOnly(pick.path || '');
+      let desiredName = sanitizeFileName(pickedName);
+      const existing = desktop.pathExists ? await desktop.pathExists(joinWorkspacePath(targetDir, desiredName)) : null;
+      if (existing?.ok && existing.exists) {
+        // Original names collide far more readily than row names did, and
+        // copyFileToFolder overwrites without asking — so ask.
+        const choice = await askNameClash(desiredName);
+        if (choice === 'cancel') return;
+        if (choice === 'keep-both') desiredName = await uniqueFileName(targetDir, desiredName);
+      }
+      const copied = await desktop.copyFileToFolder({ sourcePath: pick.path, targetDir, targetName: desiredName || undefined });
+      if (!copied?.ok || !copied.path) { pushToast({ type: 'error', message: `Attach failed: ${copied?.message || 'Unknown error'}` }); return; }
+      let rowId = selectedItem?.id;
+      if (selectedItem) {
+        await api.updateChecklistItem(selectedItem.id, { linked_file_path: copied.path, status: 'Completed', subfolder: cleanSubfolder });
+      } else {
+        const created = await api.createChecklistItem(projectId, { req_file_name: (docName || desiredName).trim(), description: desc.trim(), subfolder: cleanSubfolder, linked_file_path: copied.path, status: 'Completed' });
+        rowId = created.id;
+        setSelectedId(created.id);
+      }
+      qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+      // The local copy is done and the row is correct. Sharing it is a second,
+      // independent step: if it fails the file is still attached here, so the
+      // error is reported but nothing is rolled back.
+      await uploadRowFile(rowId, copied.path, targetDir);
+    } catch (err) {
+      pushToast({ type: 'error', message: `Attach failed: ${err instanceof Error ? err.message : String(err)}` });
+    } finally { setAttaching(false); }
+  };
+
+  // Caches the server's view of a row's file locally so the UI reflects it at
+  // once. `server_file` is server-owned; this is a copy, never a claim.
+  // `invalidate: false` is for the catch-up pass: refetching after every row
+  // would restart the effect mid-run and emit one summary toast per file.
+  const markRowServerFile = async (rowId, serverFile, { invalidate = true } = {}) => {
+    await api.updateChecklistItem(rowId, { server_file: serverFile || null });
+    if (invalidate) qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+  };
+
+  // Pushes a row's local file to the server so every platform on this account
+  // can open it (API_CHANGES.md §3). One file per row, first upload wins.
+  // `quiet` suppresses the per-row toasts for the catch-up pass, which would
+  // otherwise fire one per row; it reports a single summary instead. Returns
+  // 'shared' | 'adopted' | 'failed' so the caller can count.
+  const uploadRowFile = async (rowId, localPath, targetDir, { quiet = false } = {}) => {
+    if (!rowId || !localPath) return 'failed';
+    const toast = (payload) => { if (!quiet) pushToast(payload); };
+    // The catch-up pass marks a row attempted before trying it, so a failure
+    // that is really "not yet" — offline, the project hasn't synced, another
+    // device mid-upload — must clear that mark or the row sits unshared until
+    // the app restarts.
+    const retryLater = (id) => attemptedShareRef.current.delete(id);
+    // Remembered so the row can show a warning triangle long after the toast
+    // has gone, and so the quiet catch-up pass doesn't swallow failures.
+    const noteFailure = (message) => setShareErrors((prev) => ({ ...prev, [rowId]: message }));
+    const clearFailure = () => setShareErrors((prev) => {
+      if (!(rowId in prev)) return prev;
+      const next = { ...prev };
+      delete next[rowId];
+      return next;
+    });
+    const upload = async () => api.uploadProjectFile({
+      checklistItemId: rowId,
+      projectId,
+      filePath: localPath,
+      device: 'desktop',
+    });
+    try {
+      // The server can only attach to a row it already has, so flush the
+      // debounced /client/sync push that createChecklistItem just armed.
+      try { await api.flushPendingSyncPush(); } catch { /* reported below if it matters */ }
+      let result;
+      try {
+        result = await upload();
+      } catch (err) {
+        // Belt and braces: the row still wasn't there, so push and retry once.
+        if (err?.status === 404 && err?.detail?.reason === 'row_not_found') {
+          const pushed = await api.pushUserData();
+          // A push before the first successful pull is a silent no-op
+          // (has_synced_once is false), so the retry would 404 again and the
+          // row would never be shared. Pull first — that sets the flag — then
+          // push for real.
+          if (pushed?.skipped) {
+            await api.pullUserData();
+            await api.pushUserData();
+          }
+          result = await upload();
+        } else throw err;
+      }
+      // Record the server's file on the row now. Without this the row can't
+      // show that it is shared until the next /client/sync pull — up to a
+      // whole sync interval later — so a successful upload and a failed one
+      // look identical. Writing it locally is only a cache: the next push
+      // echoes it back and the server replaces it with its own copy
+      // (client_api.py _keep_server_file), so this can't fake or clobber it.
+      // Caching it must not be able to turn a successful upload into a
+      // reported failure: the bytes are already on the server by this point,
+      // so a local write error is worth a line in the console and nothing
+      // more. (Without its own catch, an IndexedDB failure here fell into the
+      // catch below and told the user sharing had failed — which then made
+      // the catch-up pass re-upload and take the 409 "adopt" path.)
+      if (result?.file) {
+        try {
+          await markRowServerFile(rowId, result.file, { invalidate: !quiet });
+        } catch (cacheError) {
+          console.warn('Shared the file but could not cache server_file locally:', cacheError);
+        }
+      }
+      clearFailure();
+      toast({ type: 'success', message: `Attached ${fileNameOnly(localPath)} and shared with your other devices.` });
+      return 'shared';
+    } catch (err) {
+      const reason = err?.detail?.reason;
+      const localName = fileNameOnly(localPath);
+      if (err?.status === 409 && reason === 'file_exists') {
+        // Another platform got there first. Server-side that file is now the
+        // row's one and only file, so adopt it rather than leaving the two
+        // platforms showing different documents.
+        const winner = err.detail?.file;
+        const replaced = winner ? await adoptServerFile(rowId, winner, targetDir) : false;
+        // The copy made moments ago is now superseded and nothing points at
+        // it, so don't leave it behind as a duplicate in the project folder.
+        if (replaced && desktop?.deleteFile && fileNameOnly(localPath).toLowerCase() !== String(winner.name || '').toLowerCase()) {
+          try { await desktop.deleteFile(localPath); } catch { /* leaving it is harmless */ }
+        }
+        toast({
+          type: 'info',
+          message: replaced
+            ? `Another device attached a file to this row first — using that one (${winner.name}) instead of ${localName}.`
+            : 'Another device attached a file to this row first. Use Download File to get it.',
+        });
+        if (replaced) clearFailure(); else noteFailure('Another device attached a file to this row first. Use Download File to get it.');
+        return replaced ? 'adopted' : 'failed';
+      }
+      if (err?.status === 409 && reason === 'upload_in_progress') {
+        toast({ type: 'info', message: `Attached ${localName}. Another device is uploading a file for this row — try sharing again in a few seconds.` });
+        noteFailure('Another device is uploading a file for this row. Try again in a few seconds.');
+        retryLater(rowId);
+      } else if (err?.status === 413) {
+        // Genuinely permanent: retrying the same oversized file is pointless.
+        toast({ type: 'error', message: `Attached ${localName} on this device only: ${err.message || 'the file is too large to share.'}` });
+        noteFailure(err.message || 'The file is too large to share.');
+      } else if (err?.status === 404 && reason === 'row_not_found') {
+        toast({ type: 'info', message: `Attached ${localName}. It will be shared once the project has synced.` });
+        noteFailure('This item isn\'t on the server yet — it will share once the project syncs.');
+        retryLater(rowId);
+      } else {
+        const detail = err instanceof Error ? err.message : String(err);
+        toast({ type: 'error', message: `Attached ${localName} on this device only — could not share it: ${detail}` });
+        noteFailure(`${err?.status ? `HTTP ${err.status}${reason ? ` ${reason}` : ''} — ` : ''}${detail}`);
+        retryLater(rowId);
+      }
+      return 'failed';
     }
-    qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+  };
+
+  // Downloads a server file over its signed URL and points the row at it,
+  // replacing whatever was there. Returns true when the file is on disk.
+  const adoptServerFile = async (rowId, serverFile, targetDir) => {
+    if (!desktop?.downloadFile || !serverFile?.id || !targetDir) return false;
+    try {
+      const { url } = await api.requestProjectFileDownload(serverFile.id);
+      if (!url) return false;
+      const name = sanitizeFileName(String(serverFile.name || 'file')) || 'file';
+      const destinationPath = `${targetDir}${targetDir.endsWith('\\') || targetDir.endsWith('/') ? '' : '\\'}${name}`;
+      const result = await desktop.downloadFile({ url, destinationPath });
+      if (!result?.ok || !result.path) return false;
+      // Stamp server_file too: on the 409 "first upload wins" path this row
+      // may not carry it yet, and without it the row would keep offering a
+      // Download for the file it just downloaded.
+      await api.updateChecklistItem(rowId, { linked_file_path: result.path, status: 'Completed', server_file: serverFile });
+      qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+      return true;
+    } catch { return false; }
+  };
+
+  // The Download action for a row whose file was uploaded from another
+  // platform. Takes the row so the table's per-row button and the toolbar
+  // button for the selected row share one implementation.
+  const downloadRowFile = async (item) => {
+    const serverFile = item?.server_file;
+    if (!item || !serverFile || downloadingFileId) return;
+    if (!desktop?.downloadFile) { pushToast({ type: 'error', message: 'Downloading files is available in the desktop app.' }); return; }
+    setDownloadingFileId(item.id);
+    try {
+      const baseFolder = await resolveExistingProjectFolder();
+      if (!baseFolder) { pushToast({ type: 'error', message: 'Project folder is not available.' }); return; }
+      const targetDir = folderForSubfolder(baseFolder, item.subfolder);
+      const ok = await adoptServerFile(item.id, serverFile, targetDir);
+      pushToast(ok
+        ? { type: 'success', message: `Downloaded ${serverFile.name}` }
+        : { type: 'error', message: `Could not download ${serverFile.name}.` });
+    } catch (err) {
+      pushToast({ type: 'error', message: `Download failed: ${err instanceof Error ? err.message : String(err)}` });
+    } finally { setDownloadingFileId(null); }
+  };
+
+  // Tick/untick a row's "ready" checkbox. Status is the only field touched, so
+  // this never disturbs the attachment or the toolbar inputs.
+  const toggleItemStatus = async (item) => {
+    if (!item || togglingStatusId) return;
+    setTogglingStatusId(item.id);
+    try {
+      await api.updateChecklistItem(item.id, { status: item.status === 'Completed' ? 'Pending' : 'Completed' });
+      qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+    } catch (err) {
+      pushToast({ type: 'error', message: `Could not update the status: ${err instanceof Error ? err.message : String(err)}` });
+    } finally { setTogglingStatusId(null); }
+  };
+
+  // Re-upload on demand after a failed share, from the row's warning triangle.
+  const retryRowShare = async (item) => {
+    const localPath = String(item?.linked_file_path || '').trim();
+    if (!item || !localPath || retryingShareId) return;
+    setRetryingShareId(item.id);
+    try {
+      const baseFolder = await resolveExistingProjectFolder();
+      if (!baseFolder) { pushToast({ type: 'error', message: 'Project folder is not available.' }); return; }
+      // Lets the automatic catch-up pass consider it again too.
+      attemptedShareRef.current.delete(item.id);
+      await uploadRowFile(item.id, localPath, folderForSubfolder(baseFolder, item.subfolder));
+    } finally { setRetryingShareId(null); }
+  };
+
+  // The row failed to share and still has only a local copy. Mid-upload rows
+  // have no recorded failure, so no warning flashes during a normal attach.
+  const rowShareFailed = (item) => Boolean(
+    shareErrors[item?.id] && String(item?.linked_file_path || '').trim() && !item?.server_file,
+  );
+
+  // Does this row's shared file differ from what's on this disk? Same test as
+  // serverFileNeedsDownload, per row, for the table's Download button.
+  const rowNeedsDownload = (item) => {
+    const serverFile = item?.server_file;
+    if (!serverFile) return false;
+    const localPath = String(item.linked_file_path || '').trim();
+    if (!localPath) return true;
+    if (localFilePresence[item.id] === false) return true;
+    return fileNameOnly(localPath).toLowerCase() !== String(serverFile.name || '').toLowerCase();
   };
 
   const attachmentPath = String(selectedItem?.linked_file_path || '').trim();
   const attachmentName = fileNameOnly(attachmentPath);
+  // The server's copy of the selected row's file, if any. The server owns this
+  // field — see api.js uploadProjectFile.
+  const selectedServerFile = selectedItem?.server_file || null;
+  // "The shared file isn't the one on this disk": either nothing is attached
+  // here, or what is attached has a different name. A content comparison isn't
+  // possible (the renderer can't read the bytes), and §3 suggests the name.
+  const serverFileNeedsDownload = Boolean(
+    selectedServerFile && (
+      !attachmentPath
+      || localFilePresence[selectedItem?.id] === false
+      || fileNameOnly(attachmentPath).toLowerCase() !== String(selectedServerFile.name || '').toLowerCase()
+    )
+  );
+  // The row claims a path but the disk check says it isn't there.
+  const fileMissingOnDisk = Boolean(attachmentPath && localFilePresence[selectedItem?.id] === false);
+  // Safe to point an <img>/<iframe> at it: a local path, confirmed present
+  // (undefined means the check hasn't run yet, which is fine), and not
+  // superseded by a different file on the server.
+  const canPreviewLocal = Boolean(attachmentPath && !fileMissingOnDisk && !serverFileNeedsDownload);
+
+  // Every refetch hands back a fresh array, so key the disk check on the
+  // id:path pairs themselves — otherwise it re-runs a full sweep of IPC calls
+  // on each poll even when nothing about the paths changed.
+  const attachmentPathSignature = useMemo(
+    () => (checklist || []).map(row => `${row.id}:${String(row.linked_file_path || '').trim()}`).filter(entry => !entry.endsWith(':')).join('|'),
+    [checklist],
+  );
+
+  // Confirm on disk the paths the rows claim, so a row can't offer "Open File"
+  // for a file that isn't there, and does offer Download when the shared copy
+  // is the only one left (folder moved, file deleted outside the app).
+  useEffect(() => {
+    if (!desktop?.pathExists || !attachmentPathSignature) return undefined;
+    let cancelled = false;
+    (async () => {
+      const found = {};
+      for (const entry of attachmentPathSignature.split('|')) {
+        const split = entry.indexOf(':');
+        const id = Number(entry.slice(0, split));
+        const check = await desktop.pathExists(entry.slice(split + 1));
+        if (cancelled) return;
+        found[id] = Boolean(check?.ok && check.exists && !check.isDir);
+      }
+      if (!cancelled) setLocalFilePresence(prev => ({ ...prev, ...found }));
+    })();
+    return () => { cancelled = true; };
+  }, [attachmentPathSignature]);
+
+  // Share anything still local-only: a row whose file is on this disk but has
+  // no server_file, because its upload failed earlier or it was attached
+  // before files were shared at all. Runs once the on-disk check has settled,
+  // one row at a time so a folder of attachments can't saturate the uplink.
+  useEffect(() => {
+    if (!desktop?.uploadFile || !checklist?.length) return undefined;
+    const pending = checklist.filter(row => (
+      !row.server_file
+      && String(row.linked_file_path || '').trim()
+      && localFilePresence[row.id] === true
+      && !attemptedShareRef.current.has(row.id)
+    ));
+    if (!pending.length) return undefined;
+    let cancelled = false;
+    (async () => {
+      const baseFolder = await resolveExistingProjectFolder();
+      if (cancelled || !baseFolder) return;
+      let shared = 0;
+      for (const row of pending) {
+        if (cancelled) return;
+        // Mark before attempting, so a row that keeps failing is tried once
+        // per session rather than on every checklist refetch.
+        attemptedShareRef.current.add(row.id);
+        const outcome = await uploadRowFile(
+          row.id,
+          String(row.linked_file_path).trim(),
+          folderForSubfolder(baseFolder, row.subfolder),
+          { quiet: true },
+        );
+        if (outcome === 'shared' || outcome === 'adopted') shared += 1;
+      }
+      if (cancelled) return;
+      if (shared > 0) {
+        // One refetch for the whole pass, so every row's marker appears at once.
+        qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+        pushToast({ type: 'success', message: `Shared ${shared} already-attached file(s) with your other devices.` });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [checklist, localFilePresence, projectId]);
+
   const isImage = /\.(png|jpg|jpeg|gif|bmp|webp|svg)$/i.test(attachmentName);
   const isPdf = /\.pdf$/i.test(attachmentName);
   const isTextLike = /\.(txt|log|csv|json|md|xml|html|css|js|ts|tsx|py)$/i.test(attachmentName);
@@ -3578,6 +4201,28 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
     fetch(toFileUrl(attachmentPath)).then(r => r.text()).then(txt => { if (cancelled) return; setTextPreview(txt.slice(0, 4000)); }).catch(() => { if (cancelled) return; setTextPreviewError('Text preview is not available here. Use Open File.'); });
     return () => { cancelled = true; };
   }, [attachmentPath, isTextLike]);
+
+  // An <img>/<iframe> that can't load its source just draws an empty box —
+  // no error, nothing to act on. Ask for the bytes first and keep the reason
+  // if they don't come, so the pane can explain itself instead of going blank.
+  useEffect(() => {
+    let cancelled = false;
+    setPreviewLoadError('');
+    if (!canPreviewLocal || !(isImage || isPdf)) return undefined;
+    fetch(toFileUrl(attachmentPath))
+      .then((res) => { if (!cancelled && !res.ok) setPreviewLoadError(`The file could not be read (HTTP ${res.status}).`); })
+      .catch((err) => {
+        if (cancelled) return;
+        // The desktop bridge is present but the bmfile:// scheme isn't
+        // answering — which is what a hot-reloaded renderer on an
+        // already-running Electron looks like, since electron/main.cjs only
+        // registers that scheme at startup.
+        setPreviewLoadError(desktop
+          ? 'Preview could not load. If the app was updated while running, restart it.'
+          : `Preview is not available here: ${err?.message || err}`);
+      });
+    return () => { cancelled = true; };
+  }, [attachmentPath, canPreviewLocal, isImage, isPdf]);
 
   const startPreviewResize = (startX) => {
     const startW = previewWidth;
@@ -3594,17 +4239,37 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
     const dir = attachmentPath.replace(/[\\\/][^\\\/]+$/, '');
     const newPath = `${dir}${dir.endsWith('\\') || dir.endsWith('/') ? '' : '\\'}${nextName}`;
     const result = await desktop.renamePath({ oldPath: attachmentPath, newPath });
-    if (!result?.ok || !result.path) { alert(`Rename file failed: ${result?.message || 'Unknown error'}`); return; }
+    if (!result?.ok || !result.path) { pushToast({ type: 'error', message: `Rename file failed: ${result?.message || 'Unknown error'}` }); return; }
     await api.updateChecklistItem(selectedItem.id, { linked_file_path: result.path });
     qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
   };
 
   const deleteAttachedFile = async () => {
-    if (!selectedItem || !attachmentPath || !desktop?.deleteFile) return;
-    if (!window.confirm(`Delete attached file?\n${attachmentName}`)) return;
-    const result = await desktop.deleteFile(attachmentPath);
-    if (!result?.ok) { alert(`Delete file failed: ${result?.message || 'Unknown error'}`); return; }
-    await api.updateChecklistItem(selectedItem.id, { linked_file_path: '', status: 'Pending' });
+    if (!selectedItem || (!attachmentPath && !selectedServerFile)) return;
+    const label = attachmentName || selectedServerFile?.name || 'this file';
+    if (!window.confirm(selectedServerFile
+      ? `Delete attached file?\n${label}\n\nThis removes it from the server too, for every device on this account.`
+      : `Delete attached file?\n${label}`)) return;
+    // Server first: if that fails the row keeps a shared file, and clearing
+    // the local copy would leave this device unable to see or remove it.
+    if (selectedServerFile?.id) {
+      try {
+        await api.deleteProjectFile(selectedServerFile.id);
+      } catch (err) {
+        pushToast({ type: 'error', message: `Could not remove the shared file: ${err instanceof Error ? err.message : String(err)}` });
+        return;
+      }
+    }
+    if (attachmentPath && desktop?.deleteFile && localFilePresence[selectedItem.id] !== false) {
+      const result = await desktop.deleteFile(attachmentPath);
+      // The server copy is already gone, so a missing local file is no longer
+      // a reason to stop — just clear the row.
+      if (!result?.ok) pushToast({ type: 'info', message: `Removed from the server. The local file could not be deleted: ${result?.message || 'unknown error'}` });
+    }
+    // Clear the cached server_file as well, or the row would still advertise a
+    // shared file (and offer to download it) until the next pull.
+    await api.updateChecklistItem(selectedItem.id, { linked_file_path: '', status: 'Pending', server_file: null });
+    attemptedShareRef.current.delete(selectedItem.id);
     qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
   };
 
@@ -3657,7 +4322,7 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
   const deleteFolder = async () => {
     const name = String(deleteFolderName || '').trim();
     if (!name) return;
-    if (FOLDER_ORDER.some(x => x.toLowerCase() === name.toLowerCase())) { alert('Default folder cannot be deleted.'); return; }
+    if (FOLDER_ORDER.some(x => x.toLowerCase() === name.toLowerCase())) { pushToast({ type: 'error', message: 'Default folders cannot be deleted.' }); return; }
     const hits = (checklist || []).filter(x => String(x.subfolder || '').trim().toLowerCase() === name.toLowerCase());
     if (hits.length > 0) { const target = folderOptions.find(x => x.toLowerCase() !== name.toLowerCase()) || 'Ready Docs'; await Promise.all(hits.map(x => api.updateChecklistItem(x.id, { subfolder: target }))); }
     saveFolders(managedFolders.filter(x => x.toLowerCase() !== name.toLowerCase()));
@@ -3668,8 +4333,13 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
 
   useEffect(() => {
     if (!embedded) return;
-    const onEditToggle = () => setInfoEditable(v => !v);
-    const onSave = () => { if (!infoEditable || updateProjectInfo.isPending) return; updateProjectInfo.mutate(); };
+    // Leaving edit mode is a cancel: put the loaded values back rather than
+    // leaving unsaved edits sitting there read-only.
+    const onEditToggle = () => {
+      if (infoEditable) cancelInfoEdit();
+      else setInfoEditable(true);
+    };
+    const onSave = () => { if (!infoEditable || !isInfoDirty || updateProjectInfo.isPending) return; updateProjectInfo.mutate(); };
     const onOpenFolder = () => { void openProjectFolder(); };
     window.addEventListener('bm-workspace-edit-toggle', onEditToggle);
     window.addEventListener('bm-workspace-save', onSave);
@@ -3679,7 +4349,17 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
       window.removeEventListener('bm-workspace-save', onSave);
       window.removeEventListener('bm-workspace-open-folder', onOpenFolder);
     };
-  }, [embedded, infoEditable, updateProjectInfo.isPending, projectFolderPath]);
+  }, [embedded, infoEditable, isInfoDirty, cancelInfoEdit, updateProjectInfo.isPending, projectFolderPath]);
+
+  // The drawer header lives in App() and can only learn about this component
+  // through events — same one-way channel the countdown already uses. Without
+  // this it can't tell whether Save has anything to save.
+  useEffect(() => {
+    if (!embedded) return undefined;
+    const detail = { editable: infoEditable, dirty: isInfoDirty, saving: updateProjectInfo.isPending };
+    window.dispatchEvent(new CustomEvent('bm-workspace-state', { detail }));
+    return () => { window.dispatchEvent(new CustomEvent('bm-workspace-state', { detail: { editable: false, dirty: false, saving: false } })); };
+  }, [embedded, infoEditable, isInfoDirty, updateProjectInfo.isPending]);
 
   useEffect(() => {
     try {
@@ -3690,7 +4370,9 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
       if (typeof saved.folder === 'string' && saved.folder.trim()) setFolder(saved.folder.trim());
       if (typeof saved.previewWidth === 'number' && Number.isFinite(saved.previewWidth)) setPreviewWidth(Math.max(240, Math.min(680, saved.previewWidth)));
       if (typeof saved.previewCollapsed === 'boolean') setPreviewCollapsed(saved.previewCollapsed);
-      if (typeof saved.infoEditable === 'boolean') setInfoEditable(saved.infoEditable);
+      // infoEditable is deliberately NOT restored — reopening straight into
+      // edit mode around a form loaded from a since-changed project is how
+      // stale values get saved over fresh ones.
       if (Array.isArray(saved.managedFolders)) setManagedFolders(saved.managedFolders.map((x) => String(x || '').trim()).filter(Boolean));
     } catch { /* ignore */ }
   }, [projectId]);
@@ -3711,15 +4393,17 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
   }, [project?.id, JSON.stringify(project?.checklist_folders || [])]);
 
   useEffect(() => {
-    localStorage.setItem(WORKSPACE_VIEW_KEY(projectId), JSON.stringify({ selectedId, folder, previewWidth, previewCollapsed, infoEditable, managedFolders }));
-  }, [projectId, selectedId, folder, previewWidth, previewCollapsed, infoEditable, managedFolders]);
+    localStorage.setItem(WORKSPACE_VIEW_KEY(projectId), JSON.stringify({ selectedId, folder, previewWidth, previewCollapsed, managedFolders }));
+  }, [projectId, selectedId, folder, previewWidth, previewCollapsed, managedFolders]);
 
-  const timeRemaining = useMemo(() => getTimeRemaining(infoForm.deadline), [infoForm.deadline]);
+  // nowTick (one minute) is what actually re-runs this — the deadline itself
+  // rarely changes, so without it the countdown froze at its first value.
+  const timeRemaining = useMemo(() => getTimeRemaining(infoForm.deadline), [infoForm.deadline, nowTick]);
 
   useEffect(() => {
     const label = timeRemaining.expired ? 'Expired' : timeRemaining.label !== '—' ? `Time Remaining: ${timeRemaining.label}` : 'Time Remaining: -';
-    window.dispatchEvent(new CustomEvent('bm-workspace-time-remaining', { detail: { label } }));
-    return () => { window.dispatchEvent(new CustomEvent('bm-workspace-time-remaining', { detail: { label: '' } })); };
+    window.dispatchEvent(new CustomEvent('bm-workspace-time-remaining', { detail: { label, urgent: Boolean(timeRemaining.urgent), expired: Boolean(timeRemaining.expired) } }));
+    return () => { window.dispatchEvent(new CustomEvent('bm-workspace-time-remaining', { detail: { label: '', urgent: false, expired: false } })); };
   }, [timeRemaining]);
 
   if (projectLoading) return <div className="flex h-full items-center justify-center"><Spinner size={24} className="text-[var(--accent)]" /></div>;
@@ -3791,16 +4475,21 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
               </div>
               <p className="mt-1 text-[10px] text-[var(--text-muted)]">{completedItems} of {totalItems} docs ready</p>
             </div>
-            {!infoEditable ? (
+            {/* In the drawer the header already carries Edit/Save, so this
+                second copy is hidden; the standalone window has no header
+                and keeps it. */}
+            {!embedded && (!infoEditable ? (
               <button onClick={() => setInfoEditable(true)} className="btn-secondary gap-1.5 text-xs w-full justify-center"><Pencil size={12} />Edit Info</button>
             ) : (
               <div className="flex gap-1.5">
-                <button onClick={() => setInfoEditable(false)} className="btn-ghost text-xs flex-1 justify-center">Cancel</button>
-                <button onClick={() => updateProjectInfo.mutate()} disabled={updateProjectInfo.isPending} className="btn-primary gap-1 text-xs flex-1 justify-center">
-                  <Save size={12} />{updateProjectInfo.isPending ? 'Saving…' : 'Save'}
-                </button>
+                <button onClick={cancelInfoEdit} className="btn-ghost text-xs flex-1 justify-center">Cancel</button>
+                {isInfoDirty && (
+                  <button onClick={() => updateProjectInfo.mutate()} disabled={updateProjectInfo.isPending} className="btn-primary gap-1 text-xs flex-1 justify-center">
+                    <Save size={12} />{updateProjectInfo.isPending ? 'Saving…' : 'Save'}
+                  </button>
+                )}
               </div>
-            )}
+            ))}
           </div>
         </div>
       </div>
@@ -3815,28 +4504,50 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
           </select>
           <div className="flex items-center gap-1.5 shrink-0">
             <button disabled={!docName.trim() || createItem.isPending} onClick={() => createItem.mutate()} className="btn-primary gap-1 text-xs h-9"><Plus size={13} />Add Item</button>
-            <button onClick={attachFile} className="btn-secondary gap-1 text-xs h-9"><Paperclip size={13} />Attach File</button>
+            <button
+              onClick={attachFile}
+              disabled={!desktop || attaching}
+              title={desktop ? 'Copy a file into the project folder, link it, and share it with your other devices' : 'Available in the desktop app only'}
+              className="btn-secondary gap-1 text-xs h-9"
+            >
+              {attaching ? <Spinner size={13} /> : <Paperclip size={13} />}{attaching ? 'Attaching…' : 'Attach File'}
+            </button>
             <button disabled={!selectedItem || updateItem.isPending} onClick={() => selectedItem && updateItem.mutate(selectedItem.id)} className="btn-secondary text-xs h-9 px-3">Update</button>
             <button disabled={!selectedItem || deleteItem.isPending} onClick={deleteSelectedItem} className="btn-danger gap-1 text-xs h-9"><Trash2 size={13} />Delete Item</button>
           </div>
         </div>
 
+
         <div className="mt-2 flex items-center gap-0.5 flex-wrap">
-          <ToolBtn icon={Link2} label="Open File" disabled={!attachmentPath} onClick={() => openPath(attachmentPath)} />
-          <ToolBtn icon={Pencil} label="Rename File" disabled={!attachmentPath} onClick={renameAttachedFile} />
-          <ToolBtn icon={Trash2} label="Delete File" disabled={!attachmentPath} onClick={deleteAttachedFile} danger />
+          {/* localFilePresence === false means the path is recorded but the
+              file isn't there, so Open/Rename would both fail. */}
+          <ToolBtn icon={Link2} label="Open File" disabled={!attachmentPath || localFilePresence[selectedItem?.id] === false} onClick={() => openPath(attachmentPath)} />
+          <ToolBtn icon={Pencil} label="Rename File" disabled={!attachmentPath || localFilePresence[selectedItem?.id] === false} onClick={renameAttachedFile} />
+          {serverFileNeedsDownload && (
+            <ToolBtn
+              icon={Download}
+              label={downloadingFileId === selectedItem?.id ? 'Downloading…' : 'Download File'}
+              spinning={downloadingFileId === selectedItem?.id}
+              disabled={Boolean(downloadingFileId) || !desktop}
+              onClick={() => downloadRowFile(selectedItem)}
+            />
+          )}
+          <ToolBtn icon={Trash2} label="Delete File" disabled={!attachmentPath && !selectedServerFile} onClick={deleteAttachedFile} danger />
           <span className="mx-1 h-4 w-px bg-[var(--border)] shrink-0" />
           <ToolBtn icon={FolderCog} label="Manage Folders" onClick={() => setManageFoldersOpen(true)} />
-          <ToolBtn icon={RefreshCw} label="Refresh" onClick={() => qc.invalidateQueries({ queryKey: ['project-checklist', projectId] })} />
+          <ToolBtn icon={RefreshCw} label={checklistFetching ? 'Refreshing…' : 'Refresh'} spinning={checklistFetching} disabled={checklistFetching} onClick={() => qc.invalidateQueries({ queryKey: ['project-checklist', projectId] })} />
           <ToolBtn icon={BookOpen} label="Apply Template" onClick={() => { setTemplateSearch(''); setApplyTemplateOpen(true); }} />
           <span className="mx-1 h-4 w-px bg-[var(--border)] shrink-0" />
-          <ToolBtn icon={Save} label="Save Template" onClick={() => { setSaveTemplateForm(f => ({ ...f, template_name: String(project?.title || ''), organization: String(project?.client_name || '') })); setSaveTemplateOpen(true); }} />
+          <ToolBtn icon={Save} label="Save Template" disabled={!(checklist || []).length} onClick={() => { setSaveTemplateForm(f => ({ ...f, template_name: String(project?.title || ''), organization: String(project?.client_name || '') })); setSaveTemplateOpen(true); }} />
         </div>
       </div>
 
       {/* ── Main Content ────────────────────────────────────────────────────── */}
       <div className="flex min-h-0 flex-1">
-        <div className="min-w-0 flex-1 overflow-auto">
+        {/* Clicking the empty space below the rows deselects — "click out to
+            clear" should work by clicking away, not only by clicking the
+            selected row again. Row clicks stopPropagation so they win. */}
+        <div className="min-w-0 flex-1 overflow-auto" onClick={() => setSelectedId(null)}>
           {checklistLoading ? (
             <div className="flex flex-col items-center justify-center py-16 gap-3">
               <Spinner size={18} className="text-[var(--accent)]" />
@@ -3845,44 +4556,101 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
           ) : (
             <table className="data-table">
               <thead>
-                <tr><th className="w-12">SR</th><th>Document Name</th><th>Description</th><th className="w-32">Status</th><th>Attachment</th></tr>
+                <tr><th className="w-12">SR</th><th className="w-10" /><th>Document Name</th><th>Description</th><th className="w-32">Status</th><th>Attachment</th></tr>
               </thead>
               <tbody>
                 {grouped.map((g, gidx) => (
                   <Fragment key={`group-${g.name}-${gidx}`}>
                     <tr className="group/folder">
-                      <td className="bg-[var(--surface-2)]/60 py-1.5"><span className="text-[10px] font-bold text-[var(--text-muted)]">{gidx + 1}</span></td>
-                      <td colSpan={4} className="bg-[var(--surface-2)]/60 py-1.5">
+                      {/* No number here — item numbering restarts at 1 inside
+                          each folder, so a group number in the same column
+                          just reads as a stray item. */}
+                      <td className="bg-[var(--surface-2)]/60 py-1.5" />
+                      <td colSpan={5} className="bg-[var(--surface-2)]/60 py-1.5">
                         <div className="flex items-center gap-2">
                           <FolderOpen size={13} className="text-[var(--accent)]/60 shrink-0" />
                           <span className="text-xs font-semibold text-[var(--text)]">{g.name}</span>
-                          <span className="text-[10px] text-[var(--text-muted)] ml-1">{g.rows.filter(r => r.status === 'Completed').length}/{g.rows.length}</span>
+                          {g.rows.length === 0 ? (
+                            // Cheaper than a whole "No items in this folder"
+                            // row per empty folder, which pre-seeding every
+                            // known folder name produced a wall of.
+                            <span className="text-[10px] text-[var(--text-muted)]/50 italic ml-1">empty</span>
+                          ) : (
+                            <span className="text-[10px] text-[var(--text-muted)] ml-1">{g.rows.filter(r => r.status === 'Completed').length}/{g.rows.length}</span>
+                          )}
                         </div>
                       </td>
                     </tr>
                     {g.rows.map((item, i) => (
-                      <tr key={item.id} onClick={() => setSelectedId(item.id === selectedId ? null : item.id)} className={cn('cursor-pointer group/row', item.id === selectedId && 'row-selected')}>
+                      <tr key={item.id} onClick={(event) => { event.stopPropagation(); setSelectedId(item.id === selectedId ? null : item.id); }} className={cn('cursor-pointer group/row', item.id === selectedId && 'row-selected')}>
                         <td className="text-center text-[var(--text-muted)] text-xs">{i + 1}</td>
+                        {/* Tick to mark the document ready, same gesture as the
+                            Bidwise checklist. Doesn't select the row. */}
+                        <td className="text-center">
+                          <input
+                            type="checkbox"
+                            checked={item.status === 'Completed'}
+                            onChange={() => toggleItemStatus(item)}
+                            onClick={(event) => event.stopPropagation()}
+                            disabled={togglingStatusId === item.id}
+                            title={item.status === 'Completed' ? 'Mark as pending' : 'Mark as completed'}
+                            aria-label={`${item.req_file_name || 'Item'} ready`}
+                            className="h-4 w-4 cursor-pointer accent-[var(--accent)] align-middle"
+                          />
+                        </td>
                         <td><p className={cn('text-sm', item.status === 'Completed' && 'text-[var(--text-muted)]')}>{item.req_file_name || '-'}</p></td>
                         <td className="text-xs text-[var(--text-muted)]">{item.description || '-'}</td>
                         <td><Badge variant={item.status === 'Completed' ? 'success' : 'muted'}>{item.status}</Badge></td>
                         <td>
-                          {item.linked_file_path ? (
+                          {/* Three states: the shared file needs fetching,
+                              a local file is here, or nothing is attached. */}
+                          {rowNeedsDownload(item) ? (
+                            <div className="flex items-center gap-1.5">
+                              <FileText size={11} className="shrink-0 text-[var(--text-muted)]/50" />
+                              <span className="truncate text-xs text-[var(--text-muted)]/70 max-w-[150px]" title={`Attached from another device (${item.server_file.device || 'unknown'})`}>{item.server_file.name}</span>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); downloadRowFile(item); }}
+                                disabled={Boolean(downloadingFileId) || !desktop}
+                                title={desktop ? 'Download this file to the project folder' : 'Available in the desktop app only'}
+                                className="inline-flex shrink-0 items-center gap-1 rounded-full bg-sky-500/15 px-2 py-0.5 text-[11px] font-medium text-sky-400 transition-colors hover:bg-sky-500/25 disabled:opacity-50"
+                              >
+                                {downloadingFileId === item.id ? <Spinner size={10} /> : <Download size={10} />}
+                                {downloadingFileId === item.id ? 'Downloading…' : 'Download'}
+                              </button>
+                            </div>
+                          ) : item.linked_file_path ? (
                             <div className="flex items-center gap-1.5">
                               <FileText size={11} className="shrink-0 text-[var(--accent)]/60" />
-                              <span className="truncate text-xs text-[var(--text-muted)] max-w-[200px]">{fileNameOnly(item.linked_file_path)}</span>
+                              <span className="truncate text-xs text-[var(--text-muted)] max-w-[180px]">{fileNameOnly(item.linked_file_path)}</span>
+                              {item.server_file && (
+                                <span title="Shared with your other devices" className="shrink-0 text-[10px] text-emerald-400/70">synced</span>
+                              )}
+                              {/* The file is on this PC but never reached the
+                                  server. The toast that said so is long gone,
+                                  so the row carries the warning and the retry. */}
+                              {rowShareFailed(item) && (
+                                <>
+                                  <AlertTriangle size={12} className="shrink-0 text-amber-400" title={`Not shared: ${shareErrors[item.id]}`} />
+                                  <button
+                                    onClick={(e) => { e.stopPropagation(); retryRowShare(item); }}
+                                    disabled={Boolean(retryingShareId) || !desktop}
+                                    title={desktop ? `Not shared: ${shareErrors[item.id]}` : 'Available in the desktop app only'}
+                                    className="inline-flex shrink-0 items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-400 transition-colors hover:bg-amber-500/25 disabled:opacity-50"
+                                  >
+                                    {retryingShareId === item.id ? <Spinner size={10} /> : <RefreshCw size={10} />}
+                                    {retryingShareId === item.id ? 'Retrying…' : 'Retry'}
+                                  </button>
+                                </>
+                              )}
                             </div>
                           ) : <span className="text-xs text-[var(--text-muted)]/40">—</span>}
                         </td>
                       </tr>
                     ))}
-                    {g.rows.length === 0 && (
-                      <tr><td /><td colSpan={4} className="py-2 text-xs text-[var(--text-muted)]/50 italic">No items in this folder</td></tr>
-                    )}
                   </Fragment>
                 ))}
                 {(checklist || []).length === 0 && (
-                  <tr><td colSpan={5}><EmptyState icon={FolderOpen} title="No items" description="Add first document item above." /></td></tr>
+                  <tr><td colSpan={6}><EmptyState icon={FolderOpen} title="No items" description="Add first document item above." /></td></tr>
                 )}
               </tbody>
             </table>
@@ -3890,45 +4658,77 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
         </div>
 
         <div className="relative shrink-0 border-l border-[var(--border)] bg-[var(--surface-0)]" style={{ width: previewCollapsed ? 16 : previewWidth }}>
-          <button onClick={() => setPreviewCollapsed(v => !v)} className="absolute -left-3 top-1/2 z-10 flex h-10 w-3 -translate-y-1/2 items-center justify-center rounded-l border border-[var(--border)] bg-[var(--surface-1)] text-[var(--text-muted)] hover:text-[var(--text)] transition-colors" title={previewCollapsed ? 'Show preview' : 'Hide preview'}>
-            {previewCollapsed ? <ChevronLeft size={11} /> : <ChevronRight size={11} />}
+          {/* z-20 and the wider box put this above the resize strip below —
+              at 3px wide the two overlapped and the toggle was hard to hit. */}
+          <button onClick={() => setPreviewCollapsed(v => !v)} className="absolute -left-4 top-1/2 z-20 flex h-14 w-4 -translate-y-1/2 items-center justify-center rounded-l border border-[var(--border)] bg-[var(--surface-1)] text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)] transition-colors" title={previewCollapsed ? 'Show preview' : 'Hide preview'}>
+            {previewCollapsed ? <ChevronLeft size={13} /> : <ChevronRight size={13} />}
           </button>
           {!previewCollapsed && (
-            <div className="absolute -left-1 top-0 h-full w-2 cursor-col-resize hover:bg-[var(--accent)]/20 transition-colors" onMouseDown={e => { e.preventDefault(); startPreviewResize(e.clientX); }} title="Resize preview" />
+            <div className="absolute -left-2 top-0 z-10 h-full w-4 cursor-col-resize hover:bg-[var(--accent)]/20 transition-colors" onMouseDown={e => { e.preventDefault(); startPreviewResize(e.clientX); }} title="Resize preview" />
           )}
-          <aside className={cn('h-full overflow-auto p-4', previewCollapsed && 'hidden')}>
-            <h4 className="mb-3 text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)]">Preview</h4>
+          {/* The pane shows the file itself — the row's own fields are already
+              on screen in the table and the toolbar inputs. Only the file name
+              is kept, so it's clear what is being previewed. */}
+          <aside className={cn('flex h-full min-h-0 flex-col p-4', previewCollapsed && 'hidden')}>
+            <h4 className="mb-3 shrink-0 text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)]">Preview</h4>
             {!selectedItem ? (
-              <p className="text-xs text-[var(--text-muted)]">Select a row to preview details.</p>
+              <p className="text-xs text-[var(--text-muted)]">Select a row to preview its file.</p>
             ) : (
-              <div className="space-y-3">
-                {[
-                  { label: 'Document', value: selectedItem.req_file_name },
-                  { label: 'Description', value: selectedItem.description },
-                  { label: 'Folder', value: selectedItem.subfolder },
-                  { label: 'Attachment', value: attachmentName },
-                ].map(({ label, value }) => (
-                  <div key={label} className="rounded-lg border border-[var(--border)] bg-[var(--surface-1)] px-3 py-2">
-                    <p className="text-[10px] font-medium uppercase tracking-wider text-[var(--text-muted)] mb-0.5">{label}</p>
-                    <p className="text-xs text-[var(--text)] break-all">{value || '—'}</p>
+              <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-auto">
+                {(attachmentName || selectedServerFile?.name) && (
+                  <p className="shrink-0 text-xs font-medium text-[var(--text)] break-all">{attachmentName || selectedServerFile?.name}</p>
+                )}
+                {!attachmentPath && !selectedServerFile && (
+                  <p className="text-xs text-[var(--text-muted)]">No file attached to this item.</p>
+                )}
+                {/* The shared copy, when this device doesn't have it: there is
+                    nothing to render a preview from, so offer the download. */}
+                {serverFileNeedsDownload && (
+                  <div className="shrink-0 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3">
+                    <p className="mb-1 text-[10px] font-medium uppercase tracking-wider text-[var(--text-muted)]">On the server</p>
+                    <p className="mb-1 text-xs text-[var(--text)] break-all">{selectedServerFile.name}</p>
+                    <p className="mb-2 text-[11px] text-[var(--text-muted)]">
+                      {[formatBytes(selectedServerFile.size), selectedServerFile.device ? `from ${selectedServerFile.device}` : ''].filter(Boolean).join(' · ')}
+                    </p>
+                    <button
+                      onClick={() => downloadRowFile(selectedItem)}
+                      disabled={Boolean(downloadingFileId) || !desktop}
+                      className="btn-secondary gap-1 text-xs w-full justify-center"
+                    >
+                      {downloadingFileId === selectedItem.id ? <Spinner size={12} /> : <Download size={12} />}
+                      {downloadingFileId === selectedItem.id ? 'Downloading…' : 'Download to project folder'}
+                    </button>
                   </div>
-                ))}
-                <div className="flex items-center gap-2">
-                  <Badge variant={selectedItem.status === 'Completed' ? 'success' : 'muted'}>{selectedItem.status}</Badge>
-                </div>
-                {isImage && attachmentPath && (
-                  <img src={toFileUrl(attachmentPath)} alt="Attachment" className="max-h-56 w-full rounded-lg border border-[var(--border)] object-contain" />
                 )}
-                {isPdf && attachmentPath && (
-                  <iframe src={toFileUrl(attachmentPath)} className="h-64 w-full rounded-lg border border-[var(--border)] bg-white" title="PDF preview" />
+                {/* Only render a preview for a file confirmed on disk. An
+                    <img>/<iframe> pointed at a moved or deleted file drew a
+                    bordered empty box with no explanation — the commonest
+                    "preview is broken" report. */}
+                {canPreviewLocal && isImage && !previewLoadError && (
+                  <img src={toFileUrl(attachmentPath)} alt={attachmentName} className="min-h-[10rem] w-full flex-1 rounded-lg border border-[var(--border)] object-contain" />
                 )}
-                {isTextLike && (
-                  <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-2">
-                    {textPreview ? <pre className="max-h-64 overflow-auto whitespace-pre-wrap text-[11px] text-[var(--text)]">{textPreview}</pre> : <p className="text-xs text-[var(--text-muted)]">{textPreviewError || 'Loading preview…'}</p>}
+                {canPreviewLocal && isPdf && !previewLoadError && (
+                  <iframe src={toFileUrl(attachmentPath)} className="min-h-[14rem] w-full flex-1 rounded-lg border border-[var(--border)] bg-white" title="PDF preview" />
+                )}
+                {canPreviewLocal && (isImage || isPdf) && previewLoadError && (
+                  <div className="shrink-0 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3 text-xs text-[var(--text-muted)] text-center">
+                    <AlertTriangle size={22} className="mx-auto mb-1 text-amber-400/70" />
+                    {previewLoadError}<br />Use <em>Open File</em> to open it outside the app.
                   </div>
                 )}
-                {!isImage && !isPdf && !isTextLike && attachmentPath && (
-                  <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3 text-xs text-[var(--text-muted)] text-center">
+                {canPreviewLocal && isTextLike && (
+                  <div className="flex min-h-[10rem] flex-1 flex-col rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-2">
+                    {textPreview ? <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap text-[11px] text-[var(--text)]">{textPreview}</pre> : <p className="text-xs text-[var(--text-muted)]">{textPreviewError || 'Loading preview…'}</p>}
+                  </div>
+                )}
+                {fileMissingOnDisk && (
+                  <div className="shrink-0 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3 text-xs text-[var(--text-muted)] text-center">
+                    <AlertTriangle size={22} className="mx-auto mb-1 text-amber-400/70" />
+                    This file is no longer at its saved location.<br />It may have been moved, renamed or deleted outside the app.
+                  </div>
+                )}
+                {canPreviewLocal && !isImage && !isPdf && !isTextLike && (
+                  <div className="shrink-0 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3 text-xs text-[var(--text-muted)] text-center">
                     <FileText size={24} className="mx-auto mb-1 opacity-30" />
                     Preview not available for <code>.{ext || 'file'}</code><br />Use <em>Open File</em> instead.
                   </div>
@@ -3938,6 +4738,27 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
           </aside>
         </div>
       </div>
+
+      {/* ── File Name Clash ─────────────────────────────────────────────────── */}
+      {nameClash && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+          <div className="w-full max-w-md rounded-xl border border-[var(--border)] bg-[var(--surface-0)] p-5 shadow-2xl">
+            <div className="mb-3 flex items-center gap-2">
+              <AlertTriangle size={16} className="text-amber-400 shrink-0" />
+              <h3 className="text-sm font-semibold">That file name is already in this folder</h3>
+            </div>
+            <p className="mb-1 text-sm text-[var(--text)] break-all">{nameClash}</p>
+            <p className="mb-4 text-xs text-[var(--text-muted)]">
+              Overwriting replaces the existing file, which another checklist row may be pointing at.
+            </p>
+            <div className="flex flex-wrap justify-end gap-2">
+              <button onClick={() => settleNameClash('cancel')} className="btn-ghost text-xs">Cancel</button>
+              <button onClick={() => settleNameClash('overwrite')} className="btn-danger text-xs">Overwrite</button>
+              <button onClick={() => settleNameClash('keep-both')} className="btn-primary text-xs">Keep both</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Save Template Modal ─────────────────────────────────────────────── */}
       {saveTemplateOpen && (
@@ -4023,7 +4844,10 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
                 { title: 'Add Folder', content: (
                   <div className="flex gap-2">
                     <input value={newFolderName} onChange={e => setNewFolderName(e.target.value)} placeholder="Folder name" className="input-field h-8 flex-1 text-xs" />
-                    <button onClick={addFolder} className="btn-primary text-xs px-3">Add</button>
+                    {/* Each of these four mirrors the guard its handler
+                        already has, which until now just made the click do
+                        nothing at all. */}
+                    <button onClick={addFolder} disabled={!newFolderName.trim()} className="btn-primary text-xs px-3">Add</button>
                   </div>
                 ) },
                 { title: 'Rename Folder', content: (
@@ -4032,7 +4856,7 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
                       <select value={renameFrom} onChange={e => setRenameFrom(e.target.value)} className="input-field h-8 text-xs"><option value="">From…</option>{folderOptions.map(f => <option key={`rf-${f}`}>{f}</option>)}</select>
                       <input value={renameTo} onChange={e => setRenameTo(e.target.value)} placeholder="New name" className="input-field h-8 text-xs" />
                     </div>
-                    <button onClick={renameFolder} className="btn-secondary mt-2 text-xs">Rename</button>
+                    <button onClick={renameFolder} disabled={!renameFrom.trim() || !renameTo.trim() || renameFrom.trim().toLowerCase() === renameTo.trim().toLowerCase()} className="btn-secondary mt-2 text-xs">Rename</button>
                   </>
                 ) },
                 { title: 'Move Items Between Folders', content: (
@@ -4041,14 +4865,14 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
                       <select value={moveFrom} onChange={e => setMoveFrom(e.target.value)} className="input-field h-8 text-xs"><option value="">From…</option>{folderOptions.map(f => <option key={`mf-${f}`}>{f}</option>)}</select>
                       <select value={moveTo} onChange={e => setMoveTo(e.target.value)} className="input-field h-8 text-xs"><option value="">To…</option>{folderOptions.map(f => <option key={`mt-${f}`}>{f}</option>)}</select>
                     </div>
-                    <button onClick={moveFolderItems} className="btn-secondary mt-2 text-xs">Move</button>
+                    <button onClick={moveFolderItems} disabled={!moveFrom.trim() || !moveTo.trim() || moveFrom.trim().toLowerCase() === moveTo.trim().toLowerCase()} className="btn-secondary mt-2 text-xs">Move</button>
                   </>
                 ) },
                 { title: 'Delete Folder', content: (
                   <>
                     <div className="flex gap-2">
                       <select value={deleteFolderName} onChange={e => setDeleteFolderName(e.target.value)} className="input-field h-8 flex-1 text-xs"><option value="">Select folder…</option>{folderOptions.map(f => <option key={`df-${f}`}>{f}</option>)}</select>
-                      <button onClick={deleteFolder} className="btn-danger text-xs px-3">Delete</button>
+                      <button onClick={deleteFolder} disabled={!deleteFolderName.trim() || FOLDER_ORDER.some(x => x.toLowerCase() === deleteFolderName.trim().toLowerCase())} className="btn-danger text-xs px-3">Delete</button>
                     </div>
                     <p className="mt-1.5 text-[11px] text-[var(--text-muted)]">Items will be moved to another available folder.</p>
                   </>
@@ -4654,9 +5478,12 @@ function OrganisationCard({ settings }) {
       {isOrg && !isAdmin && (
         <div className="border-t border-[var(--border)] pt-3 space-y-2">
           <p className="text-sm text-[var(--text)]">{settings.org?.name}</p>
-          <p className="text-[11px] text-[var(--text-muted)]">You're a member. Your sections:</p>
-          <SectionToggles permissions={settings.permissions} onChange={() => {}} disabled />
-          <p className="text-[11px] text-[var(--text-muted)]">Only an organisation admin can change this or remove you.</p>
+          <p className="text-[11px] text-[var(--text-muted)]">You're a member.</p>
+          {/* No section list here on purpose: a member shouldn't be shown
+              which sections exist, or that any are being withheld from them.
+              The sidebar already reflects what they can reach. Only an admin
+              sees the full matrix (SectionToggles, in the branch below). */}
+          <p className="text-[11px] text-[var(--text-muted)]">Only an organisation admin can change your access or remove you.</p>
         </div>
       )}
 
@@ -5051,12 +5878,13 @@ function SettingsPage() {
                     onChange={(event) => uf('sync_interval_minutes', Number(event.target.value))}
                     className="input-field h-9 w-auto max-w-[180px] text-xs"
                   >
+                    <option value={1}>Every minute</option>
                     <option value={5}>Every 5 minutes</option>
                     <option value={15}>Every 15 minutes</option>
                     <option value={30}>Every 30 minutes</option>
                     <option value={60}>Every hour</option>
                   </select>
-                  <p className="mt-1 text-[11px] text-[var(--text-muted)]">The app also always syncs once on every launch, and immediately when the network reconnects.</p>
+                  <p className="mt-1 text-[11px] text-[var(--text-muted)]">The app also always syncs once on every launch, and immediately when the network reconnects. Every minute keeps changes the most current, at the cost of constant background traffic.</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <button onClick={() => connectionMut.mutate()} disabled={connectionMut.isPending || !settings?.auth_token} className="btn-secondary text-xs gap-1.5">
@@ -5254,6 +6082,10 @@ export default function App() {
     return Number.isFinite(value) && value > 0 ? value : null;
   });
   const [workspaceTimeRemaining, setWorkspaceTimeRemaining] = useState('');
+  const [workspaceDeadlineTone, setWorkspaceDeadlineTone] = useState(''); // '' | 'urgent' | 'expired'
+  // Mirrors ProjectWorkspacePage's edit state so the header's Edit/Save pair
+  // can reflect it (Save only appears once something actually changed).
+  const [workspaceInfoState, setWorkspaceInfoState] = useState({ editable: false, dirty: false, saving: false });
   // { tenderId (canonical portal id), id (row-id hint) } of the open drawer.
   const [tenderDetailRef, setTenderDetailRef] = useState(null);
   const { data: pendingCaptcha } = useQuery({
@@ -5289,9 +6121,21 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
-    const onTime = (evt) => setWorkspaceTimeRemaining(String(evt.detail?.label || ''));
+    const onTime = (evt) => {
+      setWorkspaceTimeRemaining(String(evt.detail?.label || ''));
+      setWorkspaceDeadlineTone(evt.detail?.expired ? 'expired' : evt.detail?.urgent ? 'urgent' : '');
+    };
+    const onState = (evt) => setWorkspaceInfoState({
+      editable: Boolean(evt.detail?.editable),
+      dirty: Boolean(evt.detail?.dirty),
+      saving: Boolean(evt.detail?.saving),
+    });
     window.addEventListener('bm-workspace-time-remaining', onTime);
-    return () => window.removeEventListener('bm-workspace-time-remaining', onTime);
+    window.addEventListener('bm-workspace-state', onState);
+    return () => {
+      window.removeEventListener('bm-workspace-time-remaining', onTime);
+      window.removeEventListener('bm-workspace-state', onState);
+    };
   }, []);
 
   // Keeps the offline cache current without relying on the user remembering
@@ -5371,8 +6215,6 @@ export default function App() {
     qc.invalidateQueries({ queryKey: ['client-tenders-bookmarked'] });
   }), [qc]);
 
-  if (!authLoading && !authSettings?.auth_token) return <SignInScreen />;
-
   // Clears the "came from Organizations" flag, then navigates — used by
   // every navigation path except openOrgTenders itself, so a stale "Back to
   // Organizations" button can't linger once the user has gone somewhere else.
@@ -5385,10 +6227,15 @@ export default function App() {
   // or a stale saved "last page" is no longer reachable) while the gated
   // page is still open, bounce to Dashboard instead of leaving a blocked
   // page on screen.
+  // Must stay ABOVE the SignInScreen return below: that return skips every
+  // hook after it, and when a signed-out launch flips authLoading true ->
+  // false React sees fewer hooks on the second render and throws.
   useEffect(() => {
     if (!authSettings?.permissions) return;
     if (sidebarKeyGatedOff(page, authSettings.permissions)) navigate('dashboard');
   }, [page, authSettings?.permissions]);
+
+  if (!authLoading && !authSettings?.auth_token) return <SignInScreen />;
 
   // Websites are now a mandatory single-select filter (no "All" option), so
   // an org's own website must be preset explicitly — otherwise a different
@@ -5489,6 +6336,7 @@ export default function App() {
           onClose={() => setShowNotifications(false)}
           onOpenTender={openTenderDetails}
           onOpenOrg={(orgName) => openOrgTenders(orgName)}
+          onOpenProject={(projectId) => setWorkspaceProjectId(projectId)}
         />
         <ToastHost />
       </header>
@@ -5507,11 +6355,31 @@ export default function App() {
             <div className="flex h-11 items-center justify-between border-b border-[var(--border)] bg-[var(--surface-0)] px-3">
               <div className="flex items-center gap-3">
                 <h3 className="text-sm font-semibold text-[var(--text)]">Project Workspace</h3>
-                {workspaceTimeRemaining && <span className="text-xs text-[var(--text-muted)]">{workspaceTimeRemaining}</span>}
+                {workspaceTimeRemaining && (
+                  <span className={cn(
+                    'text-xs',
+                    workspaceDeadlineTone === 'expired' ? 'text-[var(--danger)]'
+                      : workspaceDeadlineTone === 'urgent' ? 'text-amber-400'
+                        : 'text-[var(--text-muted)]',
+                  )}>
+                    {workspaceTimeRemaining}
+                  </span>
+                )}
               </div>
               <div className="flex items-center gap-2">
-                <button onClick={() => window.dispatchEvent(new CustomEvent('bm-workspace-edit-toggle'))} className="btn-ghost gap-1 text-xs"><Edit3 size={12} />Edit Info</button>
-                <button onClick={() => window.dispatchEvent(new CustomEvent('bm-workspace-save'))} className="btn-primary gap-1 text-xs"><Save size={12} />Save</button>
+                <button onClick={() => window.dispatchEvent(new CustomEvent('bm-workspace-edit-toggle'))} className="btn-ghost gap-1 text-xs">
+                  {workspaceInfoState.editable ? <X size={12} /> : <Edit3 size={12} />}{workspaceInfoState.editable ? 'Cancel' : 'Edit Info'}
+                </button>
+                {/* Only shown once there is an actual unsaved change. */}
+                {workspaceInfoState.editable && workspaceInfoState.dirty && (
+                  <button
+                    onClick={() => window.dispatchEvent(new CustomEvent('bm-workspace-save'))}
+                    disabled={workspaceInfoState.saving}
+                    className="btn-primary gap-1 text-xs"
+                  >
+                    {workspaceInfoState.saving ? <Spinner size={12} /> : <Save size={12} />}{workspaceInfoState.saving ? 'Saving…' : 'Save'}
+                  </button>
+                )}
                 <button onClick={() => window.dispatchEvent(new CustomEvent('bm-workspace-open-folder'))} className="btn-ghost gap-1 text-xs"><FolderOpen size={12} />Open Folder</button>
                 <button onClick={() => setWorkspaceProjectId(null)} className="rounded p-1 text-[var(--text-muted)] hover:bg-[var(--surface-1)] hover:text-[var(--text)]"><X size={16} /></button>
               </div>

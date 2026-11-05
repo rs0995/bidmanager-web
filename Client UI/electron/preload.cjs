@@ -14,5 +14,6 @@ contextBridge.exposeInMainWorld("bidmanagerDesktop", {
   writeJsonFile: (payload) => ipcRenderer.invoke("desktop:write-json-file", payload),
   clientApiRequest: (payload) => ipcRenderer.invoke("desktop:client-api-request", payload),
   downloadFile: (payload) => ipcRenderer.invoke("desktop:download-file", payload),
+  uploadFile: (payload) => ipcRenderer.invoke("desktop:upload-file", payload),
   openTenderUrl: (tenderUrl, listingUrl) => ipcRenderer.invoke("desktop:open-tender-url", { tenderUrl, listingUrl }),
 });

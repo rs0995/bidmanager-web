@@ -1,7 +1,7 @@
 import React from 'react';
 import {
   Clock, AlertTriangle, CheckCircle2, Activity, Eye, CircleDot,
-  Calendar, Zap, Bell
+  Calendar, Zap, Bell, FileWarning, FolderPlus
 } from 'lucide-react';
 import { cn, timeRemaining } from '../../lib/utils';
 
@@ -98,6 +98,8 @@ export function NotificationIcon({ type }: { type: string }) {
     new: { icon: Zap, color: 'text-sky-400' },
     status: { icon: Activity, color: 'text-emerald-400' },
     prebid: { icon: Calendar, color: 'text-violet-400' },
+    corrigendum: { icon: FileWarning, color: 'text-orange-400' },
+    project: { icon: FolderPlus, color: 'text-emerald-400' },
     info: { icon: Bell, color: 'text-[var(--text-muted)]' },
   };
   const { icon: Ic, color } = map[type] || map.info;

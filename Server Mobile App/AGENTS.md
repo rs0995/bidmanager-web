@@ -80,7 +80,7 @@ server directly.
 `npm run typecheck`, `npm test` (renders every screen on fixtures), `npm run lint`.
 
 ## Server API changes
-Before working on accounts, organisations, tab visibility (section permissions) or portal tender search, read `../Server UI/server/API_CHANGES.md`. It lists the live and ready server routes and this app's to-do (section 3). Don't edit `Server UI/server/` from here; ask the server session for any API change.
+Before working on accounts, organisations, tab visibility (section permissions) or portal tender search or checklist file sharing, read `../Server UI/server/API_CHANGES.md`. It lists the live and ready server routes and this app's to-do (section 4). Don't edit `Server UI/server/` from here; ask the server session for any API change.
 
 Status against API_CHANGES.md (2026-10-24): §1 organisations and section permissions are done in this app
 (Users → People/Organisations, OrgDetail, user Access card). §2 portal search needs only the

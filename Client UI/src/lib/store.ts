@@ -1,12 +1,25 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
+// Keep the newest N; a notification centre that grows without limit would
+// bloat the persisted blob forever.
+export const MAX_NOTIFICATIONS = 200;
+
 export interface Notification {
   id: string;
-  type: 'closing' | 'new' | 'status' | 'prebid' | 'info';
+  type: 'closing' | 'new' | 'status' | 'prebid' | 'corrigendum' | 'project' | 'info';
   message: string;
   time: string;
+  // Epoch ms, for relative timestamps ("2h ago"). `time` stays the formatted
+  // string that older stored notifications already carry.
+  at?: number;
   read: boolean;
+  // Identifies the underlying change, so the same one can't be added twice —
+  // the local tender diff and the server's /client/changes feed overlap, and
+  // a repeated sync must not re-announce what's already here.
+  key?: string;
+  // Project notifications open the workspace instead of a tender.
+  projectId?: number;
   // Optional navigation target — clicking the notification jumps to this
   // tender (preferred) or, failing that, this org's tender list. Mirrors
   // Mobile App's alert shape (lib/alerts.js: tenderId/orgName). tenderId is
@@ -65,6 +78,8 @@ interface AppState {
   addNotification: (n: Omit<Notification, 'id'>) => void;
   markRead: (id: string) => void;
   markAllRead: () => void;
+  dismissNotification: (id: string) => void;
+  clearNotifications: () => void;
   // Small floating auto-dismissing card (ToastHost in App.jsx) — for direct
   // feedback on a user-initiated action, distinct from the notifications
   // bell (addNotification), which is for passive background events the
@@ -131,9 +146,18 @@ export const useAppStore = create<AppState>()(
       toggleTheme: () => set((s) => ({ theme: s.theme === 'dark' ? 'light' : 'dark' })),
       toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
       addNotification: (n) =>
-        set((s) => ({
-          notifications: [{ ...n, id: Date.now().toString() }, ...s.notifications],
-        })),
+        set((s) => {
+          // A sync emits its whole batch in one synchronous loop, so
+          // Date.now() alone handed several notifications the same id —
+          // marking one read then marked them all, and React saw duplicate
+          // keys. Pair it with a random suffix.
+          const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          // Same change arriving twice (the local diff and the server feed
+          // overlap, and a re-run sync can repeat itself) is dropped.
+          if (n.key && s.notifications.some((existing) => existing.key === n.key)) return s;
+          const next = [{ ...n, id, at: n.at ?? Date.now() }, ...s.notifications];
+          return { notifications: next.slice(0, MAX_NOTIFICATIONS) };
+        }),
       markRead: (id) =>
         set((s) => ({
           notifications: s.notifications.map((n) => (n.id === id ? { ...n, read: true } : n)),
@@ -142,6 +166,9 @@ export const useAppStore = create<AppState>()(
         set((s) => ({
           notifications: s.notifications.map((n) => ({ ...n, read: true })),
         })),
+      dismissNotification: (id) =>
+        set((s) => ({ notifications: s.notifications.filter((n) => n.id !== id) })),
+      clearNotifications: () => set({ notifications: [] }),
       pushToast: ({ type = 'info', message, duration = 8000 }) => {
         const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
         set((s) => ({ toasts: [...s.toasts, { id, type, message }] }));
@@ -238,6 +265,10 @@ export const useAppStore = create<AppState>()(
       partialize: (state) => ({
         theme: state.theme,
         sidebarCollapsed: state.sidebarCollapsed,
+        // The notification centre has to outlive a reload: the
+        // /client/changes cursor is stored in IndexedDB and keeps advancing,
+        // so anything dropped here could never be shown again.
+        notifications: state.notifications,
         tendersTable: state.tendersTable,
         projectsTable: state.projectsTable,
         serverStorageTable: state.serverStorageTable,
