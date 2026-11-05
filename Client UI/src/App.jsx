@@ -12,7 +12,7 @@ import {
   Paperclip, FolderCog, Link2, BookOpen, Pencil,
   Palette, RotateCcw, Home, Download, Upload, Rows3, Type, Info, Filter,
   LogOut, LogIn, UserPlus, KeyRound, ArrowLeft, ShieldQuestion,
-  Users, Shield, UserMinus, Check, Ban, Sparkles, Briefcase,
+  Users, Shield, UserMinus, Check, Ban, Briefcase,
 } from 'lucide-react';
 import { api, canonTenderId, tenderKey, PROJECT_BOOKMARK_LOCKED } from './lib/api';
 import { cn, formatINR, formatCrores, timeRemaining } from './lib/utils';
@@ -20,7 +20,7 @@ import { useAppStore } from './lib/store';
 import {
   Badge, TimeBadge, StatusBadge, EmptyState, Spinner, NotificationIcon,
 } from './components/ui/shared';
-import BidAgentPanel from './components/BidAgentPanel';
+import AgentChatPanel from './components/AgentChatPanel';
 import CompanyProfilePage from './components/CompanyProfilePage';
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -3544,7 +3544,6 @@ function ToolBtn({ icon: Icon, label, onClick, disabled, danger, active, spinnin
 
 function ProjectWorkspacePage({ projectId, embedded = false }) {
   const qc = useQueryClient();
-  const [bidAgentOpen, setBidAgentOpen] = useState(false);
   const [docName, setDocName] = useState('');
   const [desc, setDesc] = useState('');
   const [folder, setFolder] = useState('Ready Docs');
@@ -4542,11 +4541,19 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
           <ToolBtn icon={RefreshCw} label={checklistFetching ? 'Refreshing…' : 'Refresh'} spinning={checklistFetching} disabled={checklistFetching} onClick={() => qc.invalidateQueries({ queryKey: ['project-checklist', projectId] })} />
           <ToolBtn icon={BookOpen} label="Apply Template" onClick={() => { setTemplateSearch(''); setApplyTemplateOpen(true); }} />
           <span className="mx-1 h-4 w-px bg-[var(--border)] shrink-0" />
-          <ToolBtn icon={Sparkles} label="Bid Agent" active={bidAgentOpen} disabled={!project?.source_tender_id} onClick={() => setBidAgentOpen(true)} />
-          <span className="mx-1 h-4 w-px bg-[var(--border)] shrink-0" />
           <ToolBtn icon={Save} label="Save Template" disabled={!(checklist || []).length} onClick={() => { setSaveTemplateForm(f => ({ ...f, template_name: String(project?.title || ''), organization: String(project?.client_name || '') })); setSaveTemplateOpen(true); }} />
         </div>
       </div>
+
+      {/* ── Bid Agent chat (above the Ready Docs checklist) ─────────────────── */}
+      {project && (
+        <AgentChatPanel
+          project={project}
+          resolveProjectFolder={resolveExistingProjectFolder}
+          folderFor={folderForSubfolder}
+          pushToast={pushToast}
+        />
+      )}
 
       {/* ── Main Content ────────────────────────────────────────────────────── */}
       <div className="flex min-h-0 flex-1">
@@ -4803,8 +4810,6 @@ function ProjectWorkspacePage({ projectId, embedded = false }) {
           </div>
         </div>
       )}
-
-      {bidAgentOpen && project && <BidAgentPanel project={project} onClose={() => setBidAgentOpen(false)} />}
 
       {/* ── Apply Template Modal ────────────────────────────────────────────── */}
       {applyTemplateOpen && (

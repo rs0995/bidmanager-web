@@ -326,11 +326,7 @@ ipcMain.handle('desktop:download-file', async (_event, payload = {}) => {
     const timeout = setTimeout(() => controller.abort(), 60000);
     let response;
     try {
-      // Only the client token may be forwarded (bid-pack files need it); any
-      // other header from the renderer is ignored.
-      const clientKey = String(payload.headers?.['x-client-key'] || '').trim();
-      const headers = clientKey ? { 'x-client-key': clientKey } : undefined;
-      response = await net.fetch(url, { signal: controller.signal, headers });
+      response = await net.fetch(url, { signal: controller.signal });
     } catch (fetchError) {
       if (fetchError?.name === 'AbortError') throw new Error('Download timed out.');
       throw fetchError;
