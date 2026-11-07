@@ -15,3 +15,5 @@ Fixed project file uploads failing with "HTTP 500" (file label too long for Goog
 10:09 Console Bid Agent tab: set the chat model, write global instructions, see what users taught the agent, and try the agent on any tender.
 ----
 02:48 Bid Agent is faster: it reads only what a request needs (e.g. forms without the criteria) and does independent jobs at the same time.
+----
+03:08 Qualification criteria are now found and read by Claude from the actual tender pages; the agent says when it had to fall back to the basic reader.

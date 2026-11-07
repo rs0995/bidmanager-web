@@ -2,3 +2,6 @@
 02:48 2026-11-07 (Bid Agent session) - Request: run independent Bid Agent work in parallel and skip what wasn't asked.
 - server/bid_agent/: files are read/classified in parallel; criteria and forms are read only when a request needs them, in parallel when both are; form batches are converted and forms filled in parallel; tools in one request run together (checklist after the forms); per-owner lock for parallel saves; stored analysis records 'parts'.
 - server/API_CHANGES.md (backed up): section 5 note. No route or response changes.
+----
+03:08 2026-11-07 (Bid Agent session) - Request: qualification criteria should be read by Claude, not code.
+- server/bid_agent/: with a key Claude locates the criteria pages and reads them as PDF pages; basic-reader results are flagged (source/ai_error), reported in the chat and re-read by Claude when a key works (pages the user named are kept). API_CHANGES.md section 5 note.

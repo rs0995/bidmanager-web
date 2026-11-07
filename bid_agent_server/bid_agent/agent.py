@@ -24,7 +24,8 @@ from typing import Callable
 
 from . import compliance, generate
 from .classify import classify_document
-from .criteria import criteria_pages, extract_criteria, form_codes_in, page_criteria_score, referenced_form_codes
+from .criteria import (criteria_pages, extract_criteria, form_codes_in, llm_criteria_pages, page_criteria_score,
+                       referenced_form_codes)
 from .docreader import Document, display_name, ensure_tables, list_tender_files, load_document
 from .forms import extract_forms, missing_forms
 from .llm import LLM
@@ -131,8 +132,10 @@ def analyze_files(
                 for d in documents for s in d.get("segments", []) if s["role"] in roles and d["file"] in docs]
 
     # Criteria and forms don't depend on each other: read the ones asked for, at the same time.
+    use_ai = llm is not None and llm.available
+    # Without a key, rules pick the criteria pages; with one, Claude picks them (in read_criteria).
     crit_src = (criteria_pages(list(docs.values()), segments_of("qualification_criteria"))
-                or segments_of("bds", "nit")) if "criteria" in parts else []
+                or segments_of("bds", "nit")) if "criteria" in parts and not use_ai else []
     form_src: list[tuple[Document, int, int]] = []
     if "forms" in parts:
         form_src = segments_of("bidding_forms")
@@ -143,7 +146,31 @@ def analyze_files(
     for doc, s, e in crit_src + form_src:
         ensure_tables(doc, s, e)
 
+    def locate_criteria() -> list[tuple[Document, int, int]]:
+        """Claude reads an outline of every page and says where the criteria are."""
+        rule_pages = criteria_pages(list(docs.values()), segments_of("qualification_criteria")) or segments_of("bds", "nit")
+        key = "critloc:" + ",".join(sorted(d.sha1 for d in docs.values()))
+        cached = store.get_doc_cache(key)
+        if cached and cached.get("ranges"):
+            found = [(docs[r["file"]], r["start_page"], r["end_page"]) for r in cached["ranges"] if r["file"] in docs]
+            if found:
+                return found
+        try:
+            found = llm_criteria_pages(list(docs.values()), segments_of("qualification_criteria"), llm, log)
+        except Exception as e:
+            log(f"Claude couldn't locate the criteria ({str(e)[:200]}); using the section map.")
+            return rule_pages
+        if not found:
+            return rule_pages
+        store.put_doc_cache(key, "criteria pages", {"ranges": [
+            {"file": _rel_of(d, documents, docs), "start_page": a, "end_page": b} for d, a, b in found]})
+        return found
+
     def read_criteria() -> dict:
+        if use_ai:
+            crit_src[:] = locate_criteria()
+            for doc, s, e in crit_src:
+                ensure_tables(doc, s, e)  # for the basic reader, should Claude fail
         log(f"Reading qualification criteria from {len(crit_src)} section(s)…")
         crit_key = "crit:" + ",".join(f"{d.sha1}:{s}-{e}" for d, s, e in crit_src)
         cached_crit = store.get_doc_cache(crit_key) if crit_src else None

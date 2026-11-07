@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -217,10 +218,18 @@ def load_document(path: str, with_tables: bool = True, max_pages: int | None = N
     return doc
 
 
+_TABLES_LOCK = threading.RLock()
+
+
 def ensure_tables(doc: Document, start: int, end: int) -> None:
     """Extract tables for pages [start, end] of a PDF loaded without tables."""
     if doc.ext != ".pdf":
         return
+    with _TABLES_LOCK:  # criteria and forms may ask for the same file's tables at once
+        _ensure_tables(doc, start, end)
+
+
+def _ensure_tables(doc: Document, start: int, end: int) -> None:
     need = [p for p in doc.pages[start - 1:end] if not getattr(p, "_tables_done", False)]
     if not need:
         return

@@ -33,9 +33,13 @@ class FakeLLM(LLM):
         self.calls = []
 
     def json_call(self, system, content, schema, **kw):
-        text = content if isinstance(content, str) else content[0]["text"]
+        text = content if isinstance(content, str) else [b for b in content if b.get("type") == "text"][-1]["text"]
+        self.blocks = [] if isinstance(content, str) else [b for b in content if b.get("type") == "document"]
         props = schema["properties"]
         self.calls.append(sorted(props))
+        if "ranges" in props:  # where are the criteria? -> the PQ volume
+            name = next(ln.split("FILE: ")[1].split(" (")[0] for ln in text.splitlines() if "PQ Criteria" in ln)
+            return {"ranges": [{"file": name, "start_page": 1, "end_page": 1, "what": "criteria"}]}
         if "segments" in props:
             first = text.splitlines()[0]
             n = int(text.split("PAGES: ")[1].split()[0])
@@ -123,6 +127,33 @@ class PipelineTests(unittest.TestCase):
         r2 = agent.analyze_files(self.src, self.tender, store, llm2, PROFILE, log=lambda m: None)
         self.assertEqual(llm2.calls, [])  # section maps, criteria and forms all reused
         self.assertTrue(all(f["source"] == "library" for f in r2["forms"]))
+
+    def test_claude_finds_and_reads_the_criteria(self):
+        store = new_store(self.tmp)
+        llm = FakeLLM()
+        r = agent.analyze_files(self.src, self.tender, store, llm, PROFILE, log=lambda m: None, parts=("criteria",))
+        self.assertIn(["ranges"], llm.calls)  # Claude chose the pages
+        self.assertEqual(r["criteria_pages"], [{"file": "Volume 2 - PQ Criteria.docx", "start_page": 1, "end_page": 1}])
+        self.assertEqual(r["criteria"]["source"], "ai")
+
+    def test_claude_failure_is_reported_not_hidden(self):
+        from types import SimpleNamespace as NS
+
+        from bid_agent import chat
+
+        class Failing(FakeLLM):
+            def json_call(self, system, content, schema, **kw):
+                if "criteria" in schema["properties"]:
+                    raise RuntimeError("overloaded")
+                return super().json_call(system, content, schema, **kw)
+
+        r = agent.analyze_files(self.src, self.tender, new_store(self.tmp), Failing(), PROFILE, log=lambda m: None,
+                                parts=("criteria",))
+        self.assertEqual(r["criteria"]["source"], "heuristic")
+        self.assertIn("overloaded", r["criteria"]["ai_error"])
+        out = chat.Turn(NS(tender={"id": 7}), lambda: r, lambda: PROFILE).call("show_prequalification", {})
+        self.assertIn("basic (rule-based) reader", out)
+        self.assertIn("overloaded", out)
 
     def test_schema_upgrade_adds_new_columns(self):
         db = os.path.join(self.tmp, "old.db")
@@ -442,6 +473,19 @@ class IndianNitTests(unittest.TestCase):
                          ("avg_annual_turnover", 45.0, 3))
         self.assertTrue(r["criteria_pages"])
         self.assertEqual(r["pipeline_version"], agent.PIPELINE_VERSION)
+
+    def test_claude_gets_the_pdf_pages_themselves(self):
+        from bid_agent.criteria import extract_criteria
+        from bid_agent.docreader import load_document
+
+        doc = load_document(self.nit)
+        if doc.ext != ".pdf":
+            self.skipTest("LibreOffice missing: fixture is DOCX")
+        llm = FakeLLM()
+        crit = extract_criteria([(doc, 1, 2)], llm)
+        self.assertEqual(crit["source"], "ai")
+        self.assertEqual(len(llm.blocks), 1)
+        self.assertEqual(llm.blocks[0]["source"]["media_type"], "application/pdf")
 
     def test_criteria_from_pages_the_user_names(self):
         from bid_agent.docreader import load_document

@@ -356,32 +356,94 @@ def _guess_metric(text: str) -> str:
     return "other"
 
 
+LOCATE_CRITERIA_SCHEMA = strict_schema({
+    "ranges": {
+        "type": "array",
+        "items": strict_schema({"file": {"type": "string"}, "start_page": {"type": "integer"},
+                                "end_page": {"type": "integer"}, "what": {"type": "string"}}),
+    }
+})
+
+LOCATE_CRITERIA_SYSTEM = (
+    "You find where a tender states the bidder's qualification / eligibility / evaluation criteria "
+    "(minimum turnover, net worth, liquidity, bid capacity, similar works, experience, key personnel, "
+    "equipment, certificates, JV rules). Indian tenders often put them in an 'Eligibility Criteria' or "
+    "'Qualifying Requirements' list inside the NIT; World-Bank style tenders in Section III. Return every page "
+    "range that holds them (include the start of each list and its continuation pages), not the bidding forms, "
+    "contract conditions or the index."
+)
+
+MAX_AI_CRITERIA_PAGES = 60
+
+
+def llm_criteria_pages(docs: list[Document], classified: list[tuple], llm: LLM,
+                       log: Callable[[str], None] = lambda _m: None) -> list[tuple]:
+    """Claude picks the pages with the qualification criteria from an outline of every page
+    (its first lines, plus where the section map and keyword scores point). -> (doc, start, end)."""
+    hint = {(d.name, n) for d, a, b in classified for n in range(a, b + 1)}
+    lines = []
+    for doc in docs:
+        lines.append(f"### FILE: {doc.name} ({doc.page_count} pages)")
+        for p in doc.pages:
+            head = " / ".join(ln.strip()[:90] for ln in p.text.splitlines() if ln.strip())[:220]
+            score = page_criteria_score(p.text)
+            flag = (" [section map: criteria]" if (doc.name, p.number) in hint else "") + \
+                (f" [criteria words: {score}]" if score else "")
+            lines.append(f"p{p.number}: {head}{flag}")
+    outline = "\n".join(lines)
+    if len(outline) > 400_000:
+        outline = outline[:400_000]
+    data = llm.json_call(LOCATE_CRITERIA_SYSTEM, "Outline of the tender's files, one line per page:\n\n" + outline,
+                         LOCATE_CRITERIA_SCHEMA, effort="low", max_tokens=4000)
+    by_name = {d.name: d for d in docs}
+    out: list[tuple] = []
+    budget = MAX_AI_CRITERIA_PAGES
+    for r in data.get("ranges", []):
+        doc = by_name.get(r.get("file")) or next((d for d in docs if r.get("file") and r["file"] in d.name), None)
+        if not doc or budget <= 0:
+            continue
+        a = max(1, min(int(r["start_page"]), doc.page_count))
+        b = max(a, min(int(r["end_page"]), doc.page_count, a + budget - 1))
+        if not any(d is doc and not (b < x or a > y) for d, x, y in out):
+            out.append((doc, a, b))
+            budget -= b - a + 1
+    log(f"Claude found the criteria on: " + ("; ".join(f"{d.name} p{a}-{b}" for d, a, b in out) or "no pages"))
+    return out
+
+
 def extract_criteria(
     sources: list[tuple[Document, int, int]],
     llm: LLM | None,
     log: Callable[[str], None] = lambda _m: None,
 ) -> dict:
-    """``sources`` = (document, start_page, end_page) segments with criteria."""
+    """``sources`` = (document, start_page, end_page) segments with criteria.
+
+    With an API key Claude reads them: PDF pages are sent as the pages themselves (text,
+    tables and layout, scanned or not), other files as text. Without a key, or if Claude
+    fails, a rule-based reader is used and the result says so (``source``/``ai_error``)."""
     if not sources:
         return {"criteria": [], "personnel": [], "equipment": [], "similar_work_definition": "",
-                "financial_year_cutoff": "", "notes": []}
+                "financial_year_cutoff": "", "notes": [], "source": "ai" if llm is not None and llm.available else "none"}
+    ai_error = ""
     if llm is not None and llm.available:
+        from .llm import pdf_pages_block
+
         parts = []
         blocks: list[dict] = []
+        pdf_pages = 0
         for doc, s, e in sources:
-            body = doc.text_range(s, e)
-            chars = sum(len(p.text.strip()) for p in doc.pages[s - 1:e])
-            if doc.ext == ".pdf" and chars < 300 * (e - s + 1):
-                # Scanned (or nearly empty) pages: let Claude read the page images.
-                from .llm import pdf_pages_block
-
+            if doc.ext == ".pdf" and pdf_pages < MAX_AI_CRITERIA_PAGES:
+                last = min(e, s + (MAX_AI_CRITERIA_PAGES - pdf_pages) - 1)
                 try:
-                    blocks.append(pdf_pages_block(doc.path, s, min(e, s + 39)))
-                    parts.append(f"===== FILE: {doc.name} (pages {s}-{e}) is attached as PDF pages (scanned) =====")
+                    blocks.append(pdf_pages_block(doc.path, s, last))
+                    pdf_pages += last - s + 1
+                    parts.append(f"FILE {doc.name}: pages {s}-{last} attached as PDF pages (in the order listed).")
+                    if last < e:
+                        parts.append(f"===== FILE: {doc.name} (pages {last + 1}-{e}) =====\n" + doc.text_range(last + 1, e))
                     continue
                 except Exception as ex:
-                    log(f"Couldn't attach scanned pages of {doc.name}: {ex}")
-            parts.append(f"===== FILE: {doc.name} (pages {s}-{e}) =====\n" + body)
+                    log(f"Couldn't attach the pages of {doc.name} ({ex}); sending their text.")
+            parts.append(f"===== FILE: {doc.name} (pages {s}-{e}) =====\n" + doc.text_range(s, e))
         text = "\n\n".join(parts)
         if len(text) > 600_000:
             log("Criteria section is very large; sending first 600k characters.")
@@ -392,7 +454,8 @@ def extract_criteria(
             data["source"] = "ai"
             return data
         except Exception as e:
-            log(f"AI criteria extraction failed ({e}); using table parser.")
+            ai_error = str(e)[:300]
+            log(f"Claude couldn't read the criteria ({ai_error}); using the basic reader.")
     merged = None
     for doc, s, e in sources:
         part = heuristic_criteria(doc, s, e)
@@ -402,6 +465,8 @@ def extract_criteria(
             merged["criteria"].extend(part["criteria"])
     merged = merged or {}
     merged["source"] = "heuristic"
+    if ai_error:
+        merged["ai_error"] = ai_error
     return merged
 
 

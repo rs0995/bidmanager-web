@@ -372,6 +372,21 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
                 current = bool(a and a.get("status") == "completed" and res and
                                res.get("pipeline_version", 1) >= agent.PIPELINE_VERSION)
                 have = agent.parts_of(res) if current else set()
+                # Criteria read by the basic reader (before an API key was set, or when Claude
+                # failed) are read again by Claude: the pages a user named, else Claude finds them.
+                if current and "criteria" in parts and "criteria" in have and \
+                        (res.get("criteria") or {}).get("source") != "ai" and make_llm(lambda m: None).available:
+                    named = [c for c in res.get("criteria_pages", []) if c.get("by") == "user"]
+                    if named:
+                        progress("Reading the qualification criteria with Claude…")
+                        c0 = named[0]
+                        _name, crit = pages.criteria(c0.get("file", ""), int(c0["start_page"]), int(c0["end_page"]))
+                        if crit.get("source") == "ai":
+                            res = dict(res, criteria=crit, compliance=agent.compliance.check(crit, store.get_company_profile(owner)))
+                            store.save_analysis(owner, tid, status="completed", result=res, error="")
+                    else:
+                        have = have - {"criteria"}
+                        res = dict(res, parts=sorted(have))
                 missing = [p for p in agent.PARTS if p in set(parts) - have]
                 if current and not missing:
                     return res

@@ -273,7 +273,13 @@ class Turn:
                  + (f" [{r.get('threshold_inr_cr')} Cr]" if r.get("threshold_inr_cr") else "") for r in rows]
         if crit.get("similar_work_definition"):
             brief.append("Similar work: " + crit["similar_work_definition"])
-        return (f"Shown to the user as a table ({len(rows)} criteria). Reply in one line; don't repeat them.\n"
+        how = ""
+        if crit.get("source") == "heuristic":
+            how = ("NOTE: read by the basic (rule-based) reader, not Claude"
+                   + (f", because Claude failed: {crit['ai_error']}" if crit.get("ai_error") else
+                      " (no API key on the server)")
+                   + ". Tell the user in one short sentence that rows may be incomplete.\n")
+        return (how + f"Shown to the user as a table ({len(rows)} criteria). Reply in one line; don't repeat them.\n"
                 + "\n".join(brief))
 
     def _save(self, path: str, name: str, kind: str, label: str, folder: str = "prep", match: str = "") -> dict:
