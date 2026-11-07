@@ -12,6 +12,7 @@ import base64
 import io
 import json
 import os
+import threading
 from typing import Any, Callable
 
 DEFAULT_MODEL = "claude-opus-5-5"
@@ -29,6 +30,7 @@ class LLM:
         self.log = log or (lambda _m: None)
         self._client = None
         self.usage = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+        self._lock = threading.Lock()  # tender parts are read in parallel threads
 
     @property
     def available(self) -> bool:
@@ -44,6 +46,16 @@ class LLM:
                 raise LLMUnavailable("No Claude API key configured. Add it in Settings -> Bid Agent.")
             self._client = anthropic.Anthropic(api_key=self.api_key or None, max_retries=3)
         return self._client
+
+    def count(self, msg=None) -> None:
+        """Adds one call (and its tokens) to ``usage``; safe from several threads."""
+        with self._lock:
+            self.usage["calls"] += 1
+            try:
+                self.usage["input_tokens"] += int(msg.usage.input_tokens or 0)
+                self.usage["output_tokens"] += int(msg.usage.output_tokens or 0)
+            except Exception:
+                pass
 
     def json_call(
         self,
@@ -68,12 +80,7 @@ class LLM:
             output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
         ) as stream:
             msg = stream.get_final_message()
-        self.usage["calls"] += 1
-        try:
-            self.usage["input_tokens"] += int(msg.usage.input_tokens or 0)
-            self.usage["output_tokens"] += int(msg.usage.output_tokens or 0)
-        except Exception:
-            pass
+        self.count(msg)
         if msg.stop_reason == "refusal":
             raise RuntimeError("Claude declined to process this document section.")
         if msg.stop_reason == "max_tokens":

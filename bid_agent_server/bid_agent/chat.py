@@ -17,8 +17,11 @@ import json
 import os
 import re
 import shutil
+import inspect
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 from . import compliance, generate
@@ -142,14 +145,37 @@ class Turn:
         self.pages = pages
         self.save_result = save_result
         self._remember = remember
-        self.cards: list[dict] = []
+        self._cards: list[dict] = []
+        self._local = threading.local()
         self._result: dict | None = None
+        self._have: set[str] = set()
+        self._lock = threading.RLock()
+        # get_result(parts) reads only those parts; older callers take no argument.
+        try:
+            self._takes_parts = len(inspect.signature(get_result).parameters) > 0
+        except (TypeError, ValueError):
+            self._takes_parts = False
+
+    @property
+    def cards(self) -> list[dict]:
+        """Cards of the tool running in this thread (merged in order after a parallel step)."""
+        return getattr(self._local, "cards", None) if getattr(self._local, "cards", None) is not None else self._cards
+
+    def need(self, parts) -> dict:
+        """The tender analysis with at least ``parts`` ("criteria", "forms") read."""
+        want = set(parts or ())
+        with self._lock:
+            if self._result is None or not want <= self._have:
+                if self._takes_parts:
+                    self._result = self._get_result(tuple(sorted(want | self._have)))
+                else:
+                    self._result = self._get_result()
+                self._have = set(self._result.get("parts", ("criteria", "forms")))
+            return self._result
 
     @property
     def result(self) -> dict:
-        if self._result is None:
-            self._result = self._get_result()
-        return self._result
+        return self._result if self._result is not None else self.need(())
 
     # ------------------------------------------------------------- tools
     def call(self, name: str, args: dict) -> str:
@@ -157,9 +183,51 @@ class Turn:
         if not fn:
             return f"Unknown tool {name}."
         try:
+            if name in TOOL_PARTS:
+                self.need(TOOL_PARTS[name])
             return fn(**(args or {}))
         except Exception as e:  # tell the model, let it explain
             return f"Error: {e}"
+
+    def run_tools(self, calls: list[tuple[str, dict]]) -> list[str]:
+        """Runs one step's tool calls; independent ones at the same time.
+
+        Calls that change what the others read (re-reading criteria from named pages, a
+        "remember") go first; calls that build on the others' files (the checklist,
+        attaching reference documents) go last; everything else runs in parallel. The
+        tender parts the step needs are read once, in parallel, before it starts."""
+        out: list[str | None] = [None] * len(calls)
+        stages = [[i for i, (n, _a) in enumerate(calls) if TOOL_STAGE.get(n, 1) == st] for st in (0, 1, 2)]
+        for idx in stages:
+            if not idx:
+                continue
+            need = set().union(*(TOOL_PARTS.get(calls[i][0], ()) for i in idx))
+            if need or any(calls[i][0] not in NO_RESULT_TOOLS for i in idx):
+                try:
+                    self.need(need)
+                except Exception as e:
+                    for i in idx:
+                        out[i] = f"Error: {e}"
+                    continue
+            for i in idx:
+                self.progress(TOOL_PROGRESS.get(calls[i][0], "Working…"))
+
+            def run(i: int) -> tuple[str, list[dict]]:
+                self._local.cards = []
+                try:
+                    return self.call(*calls[i]), self._local.cards
+                finally:
+                    self._local.cards = None
+
+            if len(idx) > 1:
+                with ThreadPoolExecutor(max_workers=min(4, len(idx))) as pool:
+                    results = list(pool.map(run, idx))
+            else:
+                results = [run(idx[0])]
+            for i, (text, cards) in zip(idx, results):
+                out[i] = text
+                self._cards.extend(cards)
+        return [o or "" for o in out]
 
     def tool_show_tender_sections(self) -> str:
         secs = self.result.get("key_sections", [])
@@ -298,11 +366,19 @@ class Turn:
                 generate.write_workbook(path, forms, {}, [], self.get_profile(), self.result.get("tender", {}), {})
                 saved.append(self._save(path, os.path.basename(path), "form", "Tender forms"))
             else:
-                for i, f in enumerate(forms, start=1):
-                    self.progress(f"Preparing {f.get('code')} ({i}/{len(forms)})…")
-                    path = self._form_file(f, format, tmp)
-                    saved.append(self._save(path, os.path.basename(path), "form", f.get("title", ""),
-                                            match=f.get("code", "")))
+                # Each form is filled and saved on its own: do them at the same time.
+                self.progress(f"Preparing {len(forms)} form(s)…")
+
+                def one(f: dict) -> dict:
+                    sub = tempfile.mkdtemp(dir=tmp)
+                    path = self._form_file(f, format, sub)
+                    return self._save(path, os.path.basename(path), "form", f.get("title", ""), match=f.get("code", ""))
+
+                if len(forms) > 1:
+                    with ThreadPoolExecutor(max_workers=min(4, len(forms))) as pool:
+                        saved = list(pool.map(one, forms))
+                else:
+                    saved = [one(forms[0])]
             attached = self.ws.attach_matching(saved)
             self._files_card("Saved to Docs for Preparation", saved, attached)
             msg = f"Saved {len(saved)} file(s) to Docs for Preparation"
@@ -337,21 +413,28 @@ class Turn:
         tmp = tempfile.mkdtemp(prefix="bidattach_")
         attached = []
         try:
+            todo = []
             for row in rows:
                 if row.get("server_file"):
                     continue
                 codes = form_codes_in(row["req_file_name"])
-                forms, _ = self._pick_forms(codes) if codes else ([], [])
-                if not forms:
-                    continue
-                f = forms[0]
-                self.progress(f"Attaching {f.get('code')}…")
-                path = self._form_file(f, "docx", tmp)
+                forms, _ = self._pick_forms(codes) if codes and self.result.get("forms") else ([], [])
+                if forms:
+                    todo.append((row, forms[0]))
+
+            def attach(job) -> None:
+                row, f = job
+                path = self._form_file(f, "docx", tempfile.mkdtemp(dir=tmp))
                 r = self.ws.save_file(path, os.path.basename(path), kind="form", folder="ready",
                                       checklist_item_id=row["id"], label=f.get("title", ""))
                 if r.get("attached"):
-                    attached.append({"row": row["req_file_name"], "file": r["file"]["name"]})
                     row["attached_file"] = r["file"]["name"]
+
+            if todo:
+                self.progress(f"Attaching {len(todo)} form(s)…")
+                with ThreadPoolExecutor(max_workers=min(4, len(todo))) as pool:
+                    list(pool.map(attach, todo))
+            attached = [{"row": r["req_file_name"], "file": r["attached_file"]} for r, _f in todo if r.get("attached_file")]
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         self.cards.append({"type": "checklist", "title": "Ready Docs checklist", "folder": READY_SUBFOLDER,
@@ -395,7 +478,9 @@ class Turn:
         result["criteria"] = crit
         result["criteria_pages"] = [{"file": name, "start_page": int(start_page), "end_page": int(end_page), "by": "user"}]
         result["compliance"] = compliance.check(crit, self.get_profile())
-        self._result = result
+        with self._lock:
+            result["parts"] = sorted(set(result.get("parts", ("criteria", "forms"))) | {"criteria"})
+            self._result, self._have = result, set(result["parts"])
         self.save_result(result)
         out = self.tool_show_prequalification(False)
         return f"Read {len(crit['criteria'])} criteria from {name} pages {start_page}-{end_page} and saved them. " + out
@@ -532,6 +617,26 @@ def route_without_ai(text: str) -> tuple[str, dict] | None:
     return None
 
 
+SPLIT_RE = re.compile(r"\s*(?:[,;]|\band then\b|\bthen\b|\band also\b|\balso\b|\bplus\b|\band\b)\s*", re.I)
+
+
+def route_many_without_ai(text: str) -> list[tuple[str, dict]]:
+    """Every request in one message ("show the prequal and extract the forms"), in order."""
+    whole = route_without_ai(text)
+    if not whole or whole[0] in ("remember", "extract_criteria_from_pages"):
+        return [whole] if whole else []
+    fmt = "pdf" if re.search(r"\bpdf\b", text, re.I) else ""
+    out: list[tuple[str, dict]] = []
+    for clause in [c for c in SPLIT_RE.split(text or "") if c and c.strip()]:
+        r = route_without_ai(clause)
+        if not r or any(r[0] == n for n, _a in out):
+            continue
+        if fmt and "format" in r[1] and not re.search(r"pdf|excel|xlsx|sheet|word|docx", clause, re.I):
+            r = (r[0], {**r[1], "format": fmt})
+        out.append(r)
+    return out if len(out) > 1 else [whole]
+
+
 def run_turn(turn: Turn, history: list[dict], message: str, llm, *, model: str = "", effort: str = "low",
              system_extra: str = "", grounding: list[dict] | None = None,
              on_partial: Callable[[str], None] | None = None, max_steps: int = 5) -> str:
@@ -542,16 +647,19 @@ def run_turn(turn: Turn, history: list[dict], message: str, llm, *, model: str =
     tender's key pages, sent as a fixed first turn so follow-ups are answered from them (prompt-cached).
     ``on_partial``: receives the reply text as it streams."""
     if llm is None or not llm.available:
-        routed = route_without_ai(message)
-        if not routed:
+        routes = route_many_without_ai(message)
+        if not routes:
             return HELP
-        name, args = routed
-        out = turn.call(name, args)
-        if name == "extract_criteria_from_pages":
-            return out.split(" Shown to the user.")[0]
-        if name.startswith("show_") or name in ("list_tender_forms", "check_eligibility", "list_tender_documents"):
-            return "Here it is." if not out.startswith("Error") else out
-        return out
+        outs = turn.run_tools(routes)
+        replies = []
+        for (name, _args), out in zip(routes, outs):
+            if name == "extract_criteria_from_pages":
+                out = out.split(" Shown to the user.")[0]
+            elif name.startswith("show_") or name in ("list_tender_forms", "check_eligibility", "list_tender_documents"):
+                out = "Here it is." if not out.startswith("Error") else out
+            if out not in replies:
+                replies.append(out)
+        return "\n".join(replies)
 
     client = llm._get_client()
     tender = turn.ws.tender
@@ -585,7 +693,7 @@ def run_turn(turn: Turn, history: list[dict], message: str, llm, *, model: str =
                 if on_partial and step_text.strip():
                     on_partial(step_text.strip())  # the bubble shows the step being written
             resp = stream.get_final_message()
-        llm.usage["calls"] += 1
+        llm.count(resp)
         if resp.stop_reason == "refusal":
             return "I can't help with that request."
         msgs.append({"role": "assistant", "content": resp.content})
@@ -597,13 +705,27 @@ def run_turn(turn: Turn, history: list[dict], message: str, llm, *, model: str =
             return text or text_so_far.strip() or "Done."
         if text:
             text_so_far += text + "\n\n"
-        results = []
-        for u in uses:
-            turn.progress(TOOL_PROGRESS.get(u.name, "Working…"))
-            results.append({"type": "tool_result", "tool_use_id": u.id, "content": turn.call(u.name, dict(u.input))})
-        msgs.append({"role": "user", "content": results})
+        outs = turn.run_tools([(u.name, dict(u.input)) for u in uses])  # independent calls run in parallel
+        msgs.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": u.id, "content": o}
+                                                 for u, o in zip(uses, outs)]})
     return text_so_far.strip() or "Done."
 
+
+# Which tender parts a tool needs read first ("criteria" / "forms"); others need only the section map.
+TOOL_PARTS = {
+    "show_prequalification": ("criteria",),
+    "save_prequalification": ("criteria",),
+    "check_eligibility": ("criteria",),
+    "list_tender_forms": ("forms",),
+    "extract_tender_forms": ("forms",),
+    "prepare_checklist": ("criteria", "forms"),
+}
+# Tools that don't need the tender analysis at all.
+NO_RESULT_TOOLS = {"remember", "list_reference_documents", "list_saved_files", "read_tender_pages",
+                   "extract_criteria_from_pages", "attach_reference_document"}
+# Order inside one step: 0 changes what others read, 1 independent (parallel), 2 builds on the others.
+TOOL_STAGE = {"extract_criteria_from_pages": 0, "remember": 0,
+              "prepare_checklist": 2, "attach_reference_document": 2}
 
 TOOL_PROGRESS = {
     "show_tender_sections": "Looking through the tender…",

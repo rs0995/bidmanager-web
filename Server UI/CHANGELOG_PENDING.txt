@@ -13,3 +13,5 @@ Fixed project file uploads failing with "HTTP 500" (file label too long for Goog
 09:48 Bid Agent replies faster and shorter (streamed, fast chat model, grounded on the tender pages). It can be taught: standing instructions, 'remember …' corrections, reference documents, checklist templates; console can chat with any tender.
 ----
 10:09 Console Bid Agent tab: set the chat model, write global instructions, see what users taught the agent, and try the agent on any tender.
+----
+02:48 Bid Agent is faster: it reads only what a request needs (e.g. forms without the criteria) and does independent jobs at the same time.

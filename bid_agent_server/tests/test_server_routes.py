@@ -201,6 +201,24 @@ class BidPackRouteTests(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/client/tenders/1/bid-agent/prep-files/{fid}", headers=self.h).status_code, 200)
         self.assertEqual(self.client.get("/client/tenders/1/bid-agent/files", headers=self.h).json()["items"], [])
 
+    def test_chat_reads_only_what_is_asked(self):
+        import sqlite3
+
+        def parts():
+            conn = sqlite3.connect(self.db_path)
+            row = conn.execute("SELECT result_json FROM bid_analyses WHERE tender_db_id=1").fetchone()
+            conn.close()
+            import json
+            return json.loads(row[0]).get("parts")
+
+        m = self._say("list the tender forms")
+        self.assertTrue(m["cards"] and m["cards"][0]["title"].startswith("Tender forms"), m)
+        self.assertEqual(parts(), ["forms"])  # the criteria weren't read
+        m = self._say("show the prequalification and save the prequal as excel")
+        self.assertEqual([c["type"] for c in m["cards"]][:1], ["table"], m)
+        self.assertEqual(parts(), ["criteria", "forms"])
+        self.assertTrue(any(c["type"] == "files" for c in m["cards"]), m)
+
     def test_training_and_open_anywhere(self):
         # remember from a chat correction -> learned notes, editable
         m = self._say("remember: always name the EMD row 'EMD - Bank Guarantee'")

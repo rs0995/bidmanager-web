@@ -152,8 +152,10 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
                 continue
         return n
 
-    def analyse(owner: str, tender: dict, overrides: dict, log: Callable[[str], None]) -> dict:
-        """Reads the tender's documents and stores the result for the owner."""
+    def analyse(owner: str, tender: dict, overrides: dict, log: Callable[[str], None],
+                parts=agent.PARTS, previous: Optional[dict] = None) -> dict:
+        """Reads the tender's documents (only ``parts`` after the section map), merges the
+        result with the parts read before (``previous``) and stores it for the owner."""
         work = tempfile.mkdtemp(prefix="bidpack_")
         try:
             log("Collecting the tender’s documents…")
@@ -161,7 +163,9 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
             if not n:
                 raise RuntimeError("No downloaded documents are available for this tender yet. Request the documents first.")
             profile = store.get_company_profile(owner)
-            result = agent.analyze_files(work, tender, store, make_llm(log), profile, log=log, overrides=overrides)
+            result = agent.analyze_files(work, tender, store, make_llm(log), profile, log=log, overrides=overrides,
+                                         parts=parts)
+            result = agent.merge_results(previous, result)
             store.save_analysis(owner, tender["id"], status="completed", result=result, error="")
             return result
         finally:
@@ -361,14 +365,21 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
         try:
             ws = _AdminWorkspace(tender) if admin else Workspace(connect, user_id, tender)
 
-            def get_result() -> dict:
+            def get_result(parts=()) -> dict:
+                """The stored analysis, reading only the parts this request needs and lacks."""
                 a = store.get_analysis(owner, tid)
                 res = (a or {}).get("result") or {}
-                if a and a.get("status") == "completed" and res and \
-                        res.get("pipeline_version", 1) >= agent.PIPELINE_VERSION:
+                current = bool(a and a.get("status") == "completed" and res and
+                               res.get("pipeline_version", 1) >= agent.PIPELINE_VERSION)
+                have = agent.parts_of(res) if current else set()
+                missing = [p for p in agent.PARTS if p in set(parts) - have]
+                if current and not missing:
                     return res
-                progress("Reading the tender documents (the first time takes a minute)…")
-                return analyse(owner, tender, res.get("overrides") or {}, lambda m: progress(m))
+                what = " and ".join({"criteria": "qualification criteria", "forms": "tender forms"}[p] for p in missing)
+                progress(f"Reading the {what}…" if current and what else
+                         f"Reading the tender ({what or 'sections'})…")
+                return analyse(owner, tender, res.get("overrides") or {}, lambda m: progress(m),
+                               parts=missing if current else list(parts), previous=res if current else None)
 
             class Pages:
                 """The tender's files, copied once per turn for page-level requests."""

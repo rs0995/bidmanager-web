@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 from . import company
@@ -288,13 +289,22 @@ def extract_forms(
                 size = 0
             batches[-1].append(f)
             size += len(f["text"])
-        for batch in batches:
-            structured: list[dict] = []
-            if use_ai:
-                try:
-                    structured = llm_structure_forms(batch, llm, doc.name)
-                except Exception as e:
-                    log(f"AI form conversion failed ({e}); using layout-based templates.")
+        # Batches are independent: convert them at the same time, keep their order.
+        def convert(batch: list[dict]) -> list[dict]:
+            if not use_ai:
+                return []
+            try:
+                return llm_structure_forms(batch, llm, doc.name)
+            except Exception as e:
+                log(f"AI form conversion failed ({e}); using layout-based templates.")
+                return []
+
+        if len(batches) > 1:
+            with ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:
+                converted = list(pool.map(convert, batches))
+        else:
+            converted = [convert(b) for b in batches]
+        for batch, structured in zip(batches, converted):
             for i, bf in enumerate(batch):
                 if i < len(structured):
                     schema, source = structured[i], "ai"

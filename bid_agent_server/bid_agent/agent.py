@@ -1,6 +1,11 @@
 """Bid-preparation pipeline for one tender on the BidManager server.
 
-    tender files -> classify (section map) -> criteria -> forms -> compliance
+    tender files -> classify (section map) -> criteria  } in parallel
+                                           -> forms     }   -> compliance
+
+Files are read and classified in parallel. ``parts`` picks what to read after the
+section map: a request for forms doesn't wait for the criteria, and the other way
+round. A later request for a missing part reads only that part (``merge_results``).
 
 The result is plain JSON stored in ``bid_analyses``. Word/Excel files are built
 from it on demand (``build_outputs``), so nothing has to live on the server's
@@ -14,11 +19,12 @@ import re
 import time
 import zipfile
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 from . import compliance, generate
 from .classify import classify_document
-from .criteria import criteria_pages, extract_criteria, page_criteria_score, referenced_form_codes
+from .criteria import criteria_pages, extract_criteria, form_codes_in, page_criteria_score, referenced_form_codes
 from .docreader import Document, display_name, ensure_tables, list_tender_files, load_document
 from .forms import extract_forms, missing_forms
 from .llm import LLM
@@ -27,6 +33,10 @@ from .store import Store, employer_from_org_chain, org_key_for
 
 # Bump when extraction changes enough that stored results should be redone.
 PIPELINE_VERSION = 2
+
+# What the tender reading can produce after the section map.
+PARTS = ("criteria", "forms")
+MAX_FILE_WORKERS = 4
 
 REF_RE = re.compile(
     r"\b(?:IFB|NIT|ICB|NCB|RFP|Bid|Tender|E-?Tender)\s*(?:No|Number|Ref)\.?\s*[:.\-]?\s*([A-Z0-9][A-Z0-9/\-_.()]{5,60})",
@@ -42,8 +52,11 @@ def analyze_files(
     profile: dict,
     log: Callable[[str], None] = print,
     overrides: dict | None = None,
+    parts: tuple[str, ...] | list[str] = PARTS,
 ) -> dict:
-    """``tender`` = server tender row (id, tender_id, title, org_chain ...)."""
+    """``tender`` = server tender row (id, tender_id, title, org_chain ...).
+    ``parts``: which of "criteria" / "forms" to read; the section map is always made."""
+    parts = tuple(p for p in PARTS if p in set(parts or ()))
     t0 = time.time()
     overrides = overrides or {}
     skipped: list[dict] = []
@@ -64,30 +77,41 @@ def analyze_files(
     docs: dict[str, Document] = {}
     documents: list[dict] = []
     meta = {"employer": employer, "reference": str(tender.get("tender_id") or ""), "title": str(tender.get("title") or "")}
-    for path in files:
+    def read_one(path: str) -> tuple[str, Document, dict]:
+        """Loads and classifies one file (files are independent: run in parallel)."""
         doc = load_document(path, with_tables=False)
         rel = display_name(path, src_dir)
         entry = {"file": rel, "pages": doc.page_count, "error": doc.error, "needs_ocr": doc.needs_ocr, "segments": []}
+        if doc.error or not doc.pages:
+            return rel, doc, entry
+        if rel in overrides:
+            entry["segments"], entry["segments_source"] = overrides[rel], "manual"
+            return rel, doc, entry
+        cached = store.get_doc_cache("seg:" + doc.sha1)
+        if cached and cached.get("segments"):
+            info, entry["segments_source"] = cached, "cache"
+        else:
+            info = classify_document(doc, llm, org.get("aliases"), log)
+            entry["segments_source"] = "ai" if any(s["source"] == "ai" for s in info["segments"]) else "heuristic"
+            if entry["segments_source"] == "ai":
+                store.put_doc_cache("seg:" + doc.sha1, doc.name, info)
+        entry["segments"] = info["segments"]
+        entry["_info"] = info
+        return rel, doc, entry
+
+    workers = max(1, min(MAX_FILE_WORKERS, len(files)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        read = list(pool.map(read_one, files))  # keeps the files' order
+    for rel, doc, entry in read:
+        info = entry.pop("_info", None)
         if doc.error or not doc.pages:
             documents.append(entry)
             log(f"  ! {rel}: {doc.error or 'no readable text'}")
             continue
         docs[rel] = doc
-        if rel in overrides:
-            entry["segments"], entry["segments_source"] = overrides[rel], "manual"
-        else:
-            cached = store.get_doc_cache("seg:" + doc.sha1)
-            if cached and cached.get("segments"):
-                info, entry["segments_source"] = cached, "cache"
-            else:
-                info = classify_document(doc, llm, org.get("aliases"), log)
-                entry["segments_source"] = "ai" if any(s["source"] == "ai" for s in info["segments"]) else "heuristic"
-                if entry["segments_source"] == "ai":
-                    store.put_doc_cache("seg:" + doc.sha1, doc.name, info)
-            entry["segments"] = info["segments"]
-            for k_src, k_dst in (("employer", "employer"), ("tender_reference", "reference"), ("tender_title", "title")):
-                if info.get(k_src) and not meta.get(k_dst):
-                    meta[k_dst] = info[k_src]
+        for k_src, k_dst in (("employer", "employer"), ("tender_reference", "reference"), ("tender_title", "title")):
+            if info and info.get(k_src) and not meta.get(k_dst):
+                meta[k_dst] = info[k_src]
         documents.append(entry)
         log(f"  {rel}: " + ", ".join(f"{role_label(s['role'])} p{s['start_page']}-{s['end_page']}" for s in entry["segments"]))
 
@@ -106,35 +130,54 @@ def analyze_files(
         return [(docs[d["file"]], int(s["start_page"]), int(s["end_page"]))
                 for d in documents for s in d.get("segments", []) if s["role"] in roles and d["file"] in docs]
 
-    # criteria
-    # Classified criteria sections + pages anywhere that read like criteria (Indian NITs
-    # often keep them in an "Eligibility Criteria" list inside the NIT).
-    crit_src = criteria_pages(list(docs.values()), segments_of("qualification_criteria")) \
-        or segments_of("bds", "nit")
-    for doc, s, e in crit_src:
+    # Criteria and forms don't depend on each other: read the ones asked for, at the same time.
+    crit_src = (criteria_pages(list(docs.values()), segments_of("qualification_criteria"))
+                or segments_of("bds", "nit")) if "criteria" in parts else []
+    form_src: list[tuple[Document, int, int]] = []
+    if "forms" in parts:
+        form_src = segments_of("bidding_forms")
+        if not form_src:
+            log("No bidding-forms section identified; looking for annexures in the other documents.")
+            form_src = segments_of("nit", "itb", "bds", "other")
+    # Tables first, in this thread (both parts can use the same file).
+    for doc, s, e in crit_src + form_src:
         ensure_tables(doc, s, e)
-    log(f"Reading qualification criteria from {len(crit_src)} section(s)…")
-    crit_key = "crit:" + ",".join(f"{d.sha1}:{s}-{e}" for d, s, e in crit_src)
-    cached_crit = store.get_doc_cache(crit_key) if crit_src else None
-    if cached_crit and cached_crit.get("source") == "ai":
-        criteria = cached_crit
-        log("  (reusing criteria read earlier for these pages)")
-    else:
-        criteria = extract_criteria(crit_src, llm, log)
-        if criteria.get("source") == "ai":
-            store.put_doc_cache(crit_key, "criteria", criteria)
-    expected = referenced_form_codes(criteria)
-    log(f"  {len(criteria.get('criteria', []))} criteria; forms referenced: {', '.join(expected) or 'none'}")
 
-    # forms
-    form_src = segments_of("bidding_forms")
-    if not form_src:
-        log("No bidding-forms section identified; looking for annexures in the other documents.")
-        form_src = segments_of("nit", "itb", "bds", "other")
-    for doc, s, e in form_src:
-        ensure_tables(doc, s, e)
-    forms = extract_forms(form_src, llm, store, org_key, expected, log)
-    missing = missing_forms(expected, forms)
+    def read_criteria() -> dict:
+        log(f"Reading qualification criteria from {len(crit_src)} section(s)…")
+        crit_key = "crit:" + ",".join(f"{d.sha1}:{s}-{e}" for d, s, e in crit_src)
+        cached_crit = store.get_doc_cache(crit_key) if crit_src else None
+        if cached_crit and cached_crit.get("source") == "ai":
+            log("  (reusing criteria read earlier for these pages)")
+            return cached_crit
+        crit = extract_criteria(crit_src, llm, log)
+        if crit.get("source") == "ai":
+            store.put_doc_cache(crit_key, "criteria", crit)
+        log(f"  {len(crit.get('criteria', []))} criteria")
+        return crit
+
+    def read_forms() -> list[dict]:
+        # Form codes the criteria pages cite help find the forms; taken from the page text
+        # so the forms needn't wait for the criteria to be read.
+        hints = list(dict.fromkeys(
+            c for d, s, e in criteria_pages(list(docs.values()), segments_of("qualification_criteria"))
+            for c in form_codes_in(d.text_range(s, e, max_chars=200000))))
+        return extract_forms(form_src, llm, store, org_key, hints, log)
+
+    jobs = {"criteria": read_criteria, "forms": read_forms}
+    wanted = [p for p in parts if p in jobs]
+    if len(wanted) > 1:
+        with ThreadPoolExecutor(max_workers=len(wanted)) as pool:
+            futures = {p: pool.submit(jobs[p]) for p in wanted}
+            done = {p: f.result() for p, f in futures.items()}
+    else:
+        done = {p: jobs[p]() for p in wanted}
+    criteria = done.get("criteria", {})
+    forms = done.get("forms", [])
+    expected = referenced_form_codes(criteria) if "criteria" in parts else []
+    missing = missing_forms(expected, forms) if len(wanted) == len(PARTS) else []
+    if expected:
+        log(f"  Forms referenced in the criteria: {', '.join(expected)}")
     if missing:
         log(f"  Forms referenced in the criteria but not found: {', '.join(missing)}")
 
@@ -154,6 +197,7 @@ def analyze_files(
         "llm": {"model": llm.model if llm else "", "used": bool(llm and llm.available), "usage": llm.usage if llm else {}},
         "elapsed_sec": round(time.time() - t0, 1),
         "pipeline_version": PIPELINE_VERSION,
+        "parts": list(parts),
         "criteria_pages": [{"file": _rel_of(d, documents, docs), "start_page": s, "end_page": e} for d, s, e in crit_src],
     }
 
@@ -172,8 +216,35 @@ def analyze_files(
                 if term.lower() not in [a.lower() for a in lst]:
                     lst.append(term[:120])
     store.save_org(org)
-    log(f"Done in {result['elapsed_sec']} s: {len(forms)} form(s), {len(criteria.get('criteria', []))} criteria.")
+    log(f"Done in {result['elapsed_sec']} s: " + ", ".join(
+        [f"{len(forms)} form(s)"] * ("forms" in parts) + [f"{len(criteria.get('criteria', []))} criteria"] * ("criteria" in parts))
+        if parts else f"Done in {result['elapsed_sec']} s: section map only.")
     return result
+
+
+def parts_of(result: dict | None) -> set[str]:
+    """Parts a stored result already has (results made before parts existed have both)."""
+    if not result:
+        return set()
+    return set(result.get("parts", PARTS))
+
+
+def merge_results(prev: dict | None, new: dict) -> dict:
+    """``new`` (read for the missing parts) on top of ``prev``: keeps the parts read before."""
+    if not prev:
+        return new
+    have = parts_of(prev)
+    merged = dict(new)
+    if "criteria" in have and "criteria" not in parts_of(new):
+        for k in ("criteria", "criteria_pages", "compliance"):
+            merged[k] = prev.get(k, merged.get(k))
+    if "forms" in have and "forms" not in parts_of(new):
+        merged["forms"] = prev.get("forms", [])
+    merged["parts"] = [p for p in PARTS if p in have | parts_of(new)]
+    if set(merged["parts"]) == set(PARTS):
+        merged["expected_forms"] = referenced_form_codes(merged.get("criteria") or {})
+        merged["missing_forms"] = missing_forms(merged["expected_forms"], merged.get("forms") or [])
+    return merged
 
 
 def _rel_of(doc: Document, documents: list[dict], docs: dict) -> str:

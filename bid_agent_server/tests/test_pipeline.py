@@ -249,6 +249,130 @@ class FakeStreamClient:
         return _S()
 
 
+class ParallelTests(unittest.TestCase):
+    """Independent work runs at the same time, and only what was asked for is read."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.src = os.path.join(self.tmp, "docs")
+        build_tender(self.src)
+        self.tender = {"id": 7, "tender_id": "2026_ABC_1", "title": "Works", "org_chain": "ABC Authority||Projects"}
+
+    def test_reads_only_the_parts_asked_for_and_merges_later_ones(self):
+        store = new_store(self.tmp)
+        forms_only = agent.analyze_files(self.src, self.tender, store, None, PROFILE, log=lambda m: None, parts=("forms",))
+        self.assertEqual(forms_only["parts"], ["forms"])
+        self.assertTrue(forms_only["forms"])
+        self.assertEqual(forms_only["criteria"], {})
+        crit_only = agent.analyze_files(self.src, self.tender, store, None, PROFILE, log=lambda m: None,
+                                        parts=("criteria",))
+        self.assertEqual(crit_only["forms"], [])
+        self.assertTrue(crit_only["criteria"]["criteria"])
+        both = agent.merge_results(forms_only, crit_only)
+        self.assertEqual(both["parts"], ["criteria", "forms"])
+        self.assertEqual(both["forms"], forms_only["forms"])
+        self.assertEqual(both["criteria"], crit_only["criteria"])
+        self.assertIn("missing_forms", both)
+        self.assertEqual(agent.parts_of({"criteria": {}}), {"criteria", "forms"})  # old results had both
+
+    def test_criteria_and_forms_run_at_the_same_time(self):
+        import threading
+        import time
+        from unittest import mock
+
+        seen = []
+
+        def slow(name, value):
+            def fn(*a, **k):
+                seen.append((name, threading.get_ident()))
+                time.sleep(0.4)
+                return value
+            return fn
+
+        crit = {"criteria": [], "personnel": [], "equipment": []}
+        with mock.patch.object(agent, "extract_criteria", slow("criteria", crit)), \
+                mock.patch.object(agent, "extract_forms", slow("forms", [])):
+            t0 = time.time()
+            r = agent.analyze_files(self.src, self.tender, new_store(self.tmp), None, PROFILE, log=lambda m: None)
+            took = time.time() - t0
+        self.assertEqual(sorted(n for n, _t in seen), ["criteria", "forms"])
+        self.assertNotEqual(seen[0][1], seen[1][1])
+        self.assertLess(took, 0.75)  # one after the other would take 0.8 s
+        self.assertEqual(r["parts"], ["criteria", "forms"])
+
+    def test_independent_tools_run_in_parallel_and_the_checklist_waits(self):
+        import threading
+        import time
+        from types import SimpleNamespace as NS
+
+        from bid_agent import chat
+
+        log = []
+        asked = []
+
+        class T(chat.Turn):
+            def _slow(self, name):
+                log.append(("start", name, time.time()))
+                time.sleep(0.3)
+                self.cards.append({"type": "table", "title": name, "columns": [], "rows": []})
+                log.append(("end", name, time.time()))
+                return name
+
+            def tool_show_prequalification(self, include_our_position=False):
+                return self._slow("prequal")
+
+            def tool_extract_tender_forms(self, codes=None, format="docx"):
+                return self._slow("forms")
+
+            def tool_prepare_checklist(self, items=None):
+                return self._slow("checklist")
+
+        def get_result(parts):
+            asked.append(tuple(parts))
+            return {"parts": list(parts), "criteria": {}, "forms": []}
+
+        turn = T(NS(tender={"id": 1}), get_result, lambda: PROFILE)
+        t0 = time.time()
+        out = turn.run_tools([("prepare_checklist", {}), ("show_prequalification", {}), ("extract_tender_forms", {})])
+        took = time.time() - t0
+        self.assertEqual(out, ["checklist", "prequal", "forms"])
+        self.assertLess(took, 0.85)  # prequal and forms together (0.3) + checklist (0.3)
+        ends = {n: t for k, n, t in log if k == "end"}
+        starts = {n: t for k, n, t in log if k == "start"}
+        self.assertLess(abs(starts["prequal"] - starts["forms"]), 0.15)
+        self.assertGreaterEqual(starts["checklist"], max(ends["prequal"], ends["forms"]) - 0.01)
+        # cards in call order of each stage; both parts read once, before the step
+        self.assertEqual([c["title"] for c in turn.cards], ["prequal", "forms", "checklist"])
+        self.assertEqual(asked, [("criteria", "forms")])
+
+    def test_only_the_needed_part_is_requested(self):
+        from types import SimpleNamespace as NS
+
+        from bid_agent import chat
+
+        asked = []
+
+        def get_result(parts):
+            asked.append(tuple(parts))
+            return {"parts": list(parts), "forms": [], "criteria": {}}
+
+        turn = chat.Turn(NS(tender={"id": 1}), get_result, lambda: PROFILE)
+        turn.run_tools([("list_tender_forms", {})])
+        turn.run_tools([("show_prequalification", {})])
+        turn.run_tools([("list_tender_forms", {})])
+        self.assertEqual(asked, [("forms",), ("criteria", "forms")])
+
+    def test_keyword_mode_splits_several_requests(self):
+        from bid_agent import chat
+
+        r = chat.route_many_without_ai("show the prequalification and extract all the forms as pdf")
+        self.assertEqual([n for n, _a in r], ["show_prequalification", "extract_tender_forms"])
+        self.assertEqual(r[1][1]["format"], "pdf")
+        self.assertEqual([n for n, _a in chat.route_many_without_ai("the criteria are on pages 12 and 14")],
+                         ["extract_criteria_from_pages"])
+        self.assertEqual(len(chat.route_many_without_ai("prepare the checklist")), 1)
+
+
 class ChatLoopTests(unittest.TestCase):
     """Claude chooses the tools; the loop feeds results back until it answers."""
 

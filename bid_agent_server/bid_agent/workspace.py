@@ -30,6 +30,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from typing import Any, Optional
@@ -40,6 +41,16 @@ INDEX_NAME = "Bid Agent index.json"
 LIBRARY_FOLDER = "Reference documents"
 LIBRARY_ROOT = "Bid Agent Library"
 SERVER_ID_FLOOR = 9_000_000
+
+# The agent saves several files at once (forms are filled in parallel). Each owner's sync
+# data and file slots are changed under that owner's lock so parallel saves can't clash.
+_SCOPE_LOCKS: dict[str, threading.RLock] = {}
+_SCOPE_LOCKS_GUARD = threading.Lock()
+
+
+def _scope_lock(scope: str) -> threading.RLock:
+    with _SCOPE_LOCKS_GUARD:
+        return _SCOPE_LOCKS.setdefault(scope or "", threading.RLock())
 
 MANIFEST_SCHEMA = [
     """CREATE TABLE IF NOT EXISTS bid_agent_files (
@@ -91,16 +102,26 @@ class Workspace:
 
     # ---------------------------------------------------------------- db
     def _db(self):
+        lock = _scope_lock(getattr(self, "scope", "") or f"user:{self.user_id}")
+
         class _Ctx:
             def __init__(s, f):
                 s.f = f
 
             def __enter__(s):
-                s.c = s.f()
+                lock.acquire()
+                try:
+                    s.c = s.f()
+                except BaseException:
+                    lock.release()
+                    raise
                 return s.c
 
             def __exit__(s, *exc):
-                s.c.close()
+                try:
+                    s.c.close()
+                finally:
+                    lock.release()
 
         return _Ctx(self.connect)
 

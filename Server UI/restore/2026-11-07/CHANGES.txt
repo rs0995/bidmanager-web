@@ -1,0 +1,4 @@
+----
+02:48 2026-11-07 (Bid Agent session) - Request: run independent Bid Agent work in parallel and skip what wasn't asked.
+- server/bid_agent/: files are read/classified in parallel; criteria and forms are read only when a request needs them, in parallel when both are; form batches are converted and forms filled in parallel; tools in one request run together (checklist after the forms); per-owner lock for parallel saves; stored analysis records 'parts'.
+- server/API_CHANGES.md (backed up): section 5 note. No route or response changes.
