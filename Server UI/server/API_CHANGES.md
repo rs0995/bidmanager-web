@@ -227,6 +227,7 @@ There are no operator search routes: searches come from users. The operator only
 - [ ] A new **Orgs** panel: list, detail (members, requests, sync view), create for a user, rename, regenerate code, add member, approve/reject, member permissions/role, de-link (retain/clear), dissolve.
 - [ ] Follow the `Server UI/restore/<date>/` backup rule and the `CHANGELOG_PENDING.txt` note.
 - [x] Bid Agent tab (§5): API key / model, learned employers, form library (done on branch `feat/bid-agent`).
+- [x] Bid Agent AI provider (§5, 2026-11-07): provider + model dropdowns, `keys` per provider, `POST /admin/bid-agent/models` (server side live once deployed).
 
 ### Server Mobile App (`Server Mobile App/src/`)
 - [ ] `lib/api.ts`: `setUserPermissions`, org routes.
@@ -246,7 +247,8 @@ There are no operator search routes: searches come from users. The operator only
   - "prepare the checklist (of documents required)" → **Ready Docs** rows for every form and evidence document the tender asks for (Pending), with the forms the agent prepares **attached automatically**;
   - "can we qualify?" → criteria checked against the company profile.
   - "the criteria are on pages 12–14 (of <file>)" → re-reads the criteria from those pages and keeps them for later saves; "which files are in the tender" lists files, pages and sections. Criteria are found under any heading ("Eligibility Criteria", "Qualifying requirements", tables or numbered paragraphs; scanned pages are read as images when AI is on).
-- With an Anthropic key (console → Bid Agent tab) Claude reads the documents and chooses the tools; without one a keyword router handles the same requests (basic mode; `ai_enabled: false`).
+- With an AI key (console → Bid Agent tab) the AI reads the documents and chooses the tools; without one a keyword router handles the same requests (basic mode; `ai_enabled: false`).
+- **AI provider** (2026-11-07): the operator picks **Claude** (`anthropic`, default), **Gemini** (`gemini`) or **ChatGPT** (`openai`) and its models in the console; every provider keeps its own key and models, so switching loses nothing. All features work on all three: structured reading of criteria / forms (JSON schema), scanned pages sent as PDF, and the chat's tools with streamed replies. Only Claude caches the tender's key pages between turns (Files API); Gemini / ChatGPT get them inline each turn. Apps need no change: `ai_enabled` and `partial` behave the same, and `/client/bid-agent/status` also returns `provider`.
 - The tender's documents are read from `downloaded_files` (local or Drive). **ZIPs are unpacked** (also ZIPs inside ZIPs); old `.xls` / `.rtf` and, with LibreOffice in the image, `.doc` / `.odt` / `.ods` are converted; unreadable files are listed with the reason.
 - **Where files go** (Drive, same storage as checklist files §3):
   `project-files/P - <tender id>/<owner>/<project>/` — files attached to Ready Docs rows
@@ -273,7 +275,7 @@ There are no operator search routes: searches come from users. The operator only
 | POST | `/client/tenders/{id}/bid-agent/prep-files` | **multipart** `file` → `{file}`: a user's own Docs for Preparation file, stored beside the agent's. 413 too large, 400 empty. |
 | DELETE | `/client/tenders/{id}/bid-agent/prep-files/{file_id}` | Removes a Docs for Preparation file. |
 | GET / PUT | `/client/company-profile` | `{profile: {general, financials, experience, works_in_hand, personnel, equipment, certificates, litigation}, schema, can_edit}`; PUT by section; 403 `{reason:"org_admin_only"}` for members. |
-| GET | `/client/bid-agent/status` | `{ai_enabled, model, owner, can_edit_profile, roles}` |
+| GET | `/client/bid-agent/status` | `{ai_enabled, provider, model, owner, can_edit_profile, roles}` |
 | GET | `/client/bid-agent/recent` | `{items: [{id, tender_id, title, organisation, closing_date, last, count, updated_at}]}` — newest first; `id` is the tender row id for the chat routes. |
 | GET / PUT | `/client/bid-agent/instructions` | `{text}` (≤ 8000 chars) → `{text, can_edit}` |
 | GET | `/client/bid-agent/learnings` | `{items: [{id, employer_key, text, source, tender_id, created_at, active}], can_edit}` |
@@ -293,7 +295,8 @@ Older one-shot routes (still served): `POST/GET /client/tenders/{id}/bid-pack`, 
 ### Operator routes (`x-admin-key`)
 | Method | Path | Notes |
 |---|---|---|
-| GET / PUT | `/admin/bid-agent/config` | `{api_key?, model?, chat_model?}` → `{api_key_set, api_key_hint, api_key_source, model, default_model, chat_model, default_chat_model}`. The key is never returned |
+| GET / PUT | `/admin/bid-agent/config` | PUT `{provider?, api_key?, model?, chat_model?}` → `{provider, providers, provider_labels, keys: {anthropic\|gemini\|openai: {set, hint, source: "settings"\|"env"\|""}}, api_key_set, api_key_hint, api_key_source, model, default_model, chat_model, default_chat_model}`. `providers` = the ones this server can run. The `api_key_*`, `model` and `chat_model` fields describe the **active** provider. PUT: `api_key` / `model` / `chat_model` apply to `provider` (else the active one); `""` removes the key / restores that provider's default model. A PUT with `provider` **makes it active**, except one that only removes a key (`{provider, api_key: ""}`). 400 `{reason: "unknown_provider"}`. Defaults: Claude `claude-opus-5-5` / `claude-sonnet-5-5`, Gemini `gemini-2.5-pro` / `gemini-2.5-flash`, ChatGPT `gpt-5` / `gpt-5-mini`. Env keys: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), `OPENAI_API_KEY`. Keys are never returned |
+| POST | `/admin/bid-agent/models` | `{provider, api_key?}` → `{models: [{id, label}], source: "live"}`, listed live from the provider with the given key (else the saved / env key): Claude all models, Gemini the `generateContent` models (no embedding / image / TTS), ChatGPT chat models (no audio / realtime / image / embedding). No key → `{models: [], source: "none", error}`; provider error → `{models: [], source: "error", error}` (always 200, never echoes the key) |
 | GET / PUT | `/admin/bid-agent/instructions` | global instructions `{text}` for every chat |
 | GET | `/admin/bid-agent/learnings?owner=` | learned notes of one owner (`org:N` / `user:N`) or of everyone (`owner` field per item) |
 | GET / POST / DELETE | `/admin/bid-agent/tenders/{id}/chat` | console chat (owner `admin`), same shapes as the client chat; read and answer only (saving is refused: "done from the apps"); "remember …" here adds to the global instructions |

@@ -38,8 +38,13 @@ class BidPackRouteTests(unittest.TestCase):
         from bid_agent import server_routes
         from fixtures import build_tender
 
+        import app_core
+
         test_client_api.ClientApiTests.setUp(self)  # temp DB, user + token, patched paths
         self.addCleanup(lambda: [p.stop() for p in self.patches])
+        # Settings are cached per process; don't let one test's AI provider / key reach the next.
+        app_core.ScraperBackend.invalidate_settings_cache()
+        self.addCleanup(app_core.ScraperBackend.invalidate_settings_cache)
         conn = sqlite3.connect(self.db_path)
         org_access.ensure_schema(conn)
         conn.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)")
@@ -116,6 +121,64 @@ class BidPackRouteTests(unittest.TestCase):
         self.assertNotIn("123456789", cfg["api_key_hint"][:-4])
         cfg = self.client.put("/admin/bid-agent/config", headers=ah, json={"api_key": ""}).json()
         self.assertFalse(cfg["api_key_set"])
+
+    def test_provider_config_contract(self):
+        from unittest import mock
+
+        from bid_agent import providers
+
+        ah = {"x-admin-key": "admin-secret"}
+        env = {"ANTHROPIC_API_KEY": "", "GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "OPENAI_API_KEY": ""}
+        with mock.patch.dict(os.environ, env):
+            cfg = self.client.get("/admin/bid-agent/config", headers=ah).json()
+            self.assertEqual(cfg["provider"], "anthropic")
+            self.assertEqual(set(cfg["providers"]), {"anthropic", "gemini", "openai"})
+            self.assertEqual(cfg["keys"]["gemini"], {"set": False, "hint": "", "source": ""})
+            self.assertEqual((cfg["model"], cfg["chat_model"]), ("claude-opus-5-5", "claude-sonnet-5-5"))
+
+            # Claude key stays when switching to Gemini; Gemini gets its own key and models.
+            self.client.put("/admin/bid-agent/config", headers=ah, json={"api_key": "sk-ant-test-123456789"})
+            cfg = self.client.put("/admin/bid-agent/config", headers=ah, json={
+                "provider": "gemini", "api_key": "AIza-test-987654321", "model": "", "chat_model": "gemini-2.5-flash-lite"}).json()
+            self.assertEqual(cfg["provider"], "gemini")
+            self.assertTrue(cfg["api_key_set"])
+            self.assertTrue(cfg["api_key_hint"].endswith("4321"))
+            self.assertTrue(cfg["keys"]["anthropic"]["set"])
+            self.assertEqual(cfg["model"], providers.DEFAULT_MODELS["gemini"][0])  # "" = provider default
+            self.assertEqual(cfg["chat_model"], "gemini-2.5-flash-lite")
+            st = self.client.get("/client/bid-agent/status", headers=self.h).json()
+            self.assertEqual((st["provider"], st["ai_enabled"]), ("gemini", True))
+
+            # Removing another provider's key doesn't switch the active provider.
+            cfg = self.client.put("/admin/bid-agent/config", headers=ah, json={"provider": "anthropic", "api_key": ""}).json()
+            self.assertEqual(cfg["provider"], "gemini")
+            self.assertFalse(cfg["keys"]["anthropic"]["set"])
+            self.assertEqual(self.client.put("/admin/bid-agent/config", headers=ah,
+                                             json={"provider": "mistral"}).status_code, 400)
+
+            # Live model list: body key, else the saved key; errors come back as an empty list.
+            r = self.client.post("/admin/bid-agent/models", headers=ah, json={"provider": "openai"}).json()
+            self.assertEqual((r["models"], r["source"]), ([], "none"))
+            seen = []
+
+            def fake_list(p, key):
+                seen.append((p, key))
+                return [{"id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro"}]
+
+            with mock.patch.object(providers, "list_models", fake_list):
+                r = self.client.post("/admin/bid-agent/models", headers=ah, json={"provider": "gemini"}).json()
+                self.client.post("/admin/bid-agent/models", headers=ah, json={"provider": "openai", "api_key": "sk-typed"})
+            self.assertEqual((r["source"], r["models"][0]["id"]), ("live", "gemini-2.5-pro"))
+            self.assertEqual(seen, [("gemini", "AIza-test-987654321"), ("openai", "sk-typed")])
+
+            def broken(p, key):
+                raise RuntimeError(f"HTTP 401: bad key {key}")
+
+            with mock.patch.object(providers, "list_models", broken):
+                r = self.client.post("/admin/bid-agent/models", headers=ah,
+                                     json={"provider": "openai", "api_key": "sk-secret-1"}).json()
+            self.assertEqual((r["models"], r["source"]), ([], "error"))
+            self.assertNotIn("sk-secret-1", r["error"])
 
 
     # ------------------------------------------------------------ chat agent

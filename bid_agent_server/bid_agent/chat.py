@@ -553,6 +553,10 @@ def run_turn(turn: Turn, history: list[dict], message: str, llm, *, model: str =
             return "Here it is." if not out.startswith("Error") else out
         return out
 
+    if getattr(llm, "provider", "anthropic") != "anthropic":
+        return _run_turn_other(turn, history, message, llm, model=model, system_extra=system_extra,
+                               grounding=grounding, on_partial=on_partial, max_steps=max_steps)
+
     client = llm._get_client()
     tender = turn.ws.tender
     msgs: list[Any] = []
@@ -602,6 +606,48 @@ def run_turn(turn: Turn, history: list[dict], message: str, llm, *, model: str =
             turn.progress(TOOL_PROGRESS.get(u.name, "Working…"))
             results.append({"type": "tool_result", "tool_use_id": u.id, "content": turn.call(u.name, dict(u.input))})
         msgs.append({"role": "user", "content": results})
+    return text_so_far.strip() or "Done."
+
+
+def _run_turn_other(turn: Turn, history: list[dict], message: str, llm, *, model: str, system_extra: str,
+                    grounding: list[dict] | None, on_partial: Callable[[str], None] | None, max_steps: int) -> str:
+    """run_turn for Gemini / ChatGPT: the same tools and streaming, through providers.py."""
+    from . import providers
+
+    tender = turn.ws.tender
+    convo: list[dict] = []
+    for h in history[-12:]:
+        if h.get("role") in ("user", "assistant") and h.get("text"):
+            convo.append({"role": h["role"], "content": h["text"]})
+    while convo and convo[0]["role"] != "user":
+        convo.pop(0)
+    convo.append({"role": "user", "content": message})
+    system = SYSTEM + (f"\n{system_extra.strip()}\n" if system_extra.strip() else "") + \
+        f"\nTender: {tender.get('tender_id')} - {tender.get('title')} ({str(tender.get('org_chain', '')).split('||')[0]})."
+    session = providers.chat_session(llm.provider, llm.api_key, model or llm.model, system, TOOLS,
+                                     grounding, convo, usage=llm.usage)
+
+    def partial(text: str) -> None:
+        if on_partial and text.strip():
+            on_partial(text.strip())  # the bubble shows the step being written
+
+    text_so_far = ""
+    for _step in range(max_steps):
+        try:
+            text, calls = session.step(partial)
+        except providers.Declined:
+            return "I can't help with that request."
+        llm.usage["calls"] += 1
+        text = text.strip()
+        if not calls:
+            return text or text_so_far.strip() or "Done."
+        if text:
+            text_so_far += text + "\n\n"
+        results = []
+        for c in calls:
+            turn.progress(TOOL_PROGRESS.get(c["name"], "Working…"))
+            results.append((c, turn.call(c["name"], dict(c["input"] or {}))))
+        session.add_results(results)
     return text_so_far.strip() or "Done."
 
 

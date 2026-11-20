@@ -19,15 +19,13 @@
     "appId": "com.bidmanager.control",
     "productName": "BidManager Control",
     "electronVersion": "33.4.11",
-    "icon": "assets/icon.png",
     "directories": {
       "output": "../installer/current"
     },
     "files": [
       "main.cjs",
       "preload.cjs",
-      "package.json",
-      "assets/icon.png"
+      "package.json"
     ],
     "extraResources": [
       {

@@ -1,9 +1,11 @@
-"""Thin wrapper around the Claude API for structured (JSON) extraction.
+"""Thin wrapper around the AI provider for structured (JSON) extraction.
 
-Configuration (first match wins):
+Claude (provider "anthropic", the default) runs on the anthropic SDK below; Gemini and
+ChatGPT run through providers.py. Configuration for Claude (first match wins):
   * API key: ``app_settings.anthropic_api_key`` -> env ``ANTHROPIC_API_KEY``
     (the SDK also honours ``ANTHROPIC_AUTH_TOKEN`` / ``ant auth login`` profiles)
   * Model:   ``app_settings.bid_agent_model`` -> env ``BID_AGENT_MODEL`` -> claude-opus-5-5
+Gemini: env ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY``; ChatGPT: env ``OPENAI_API_KEY``.
 """
 
 from __future__ import annotations
@@ -14,6 +16,8 @@ import json
 import os
 from typing import Any, Callable
 
+from . import providers
+
 DEFAULT_MODEL = "claude-opus-5-5"
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
@@ -23,18 +27,34 @@ class LLMUnavailable(RuntimeError):
 
 
 class LLM:
-    def __init__(self, api_key: str = "", model: str = "", log: Callable[[str], None] | None = None):
-        self.api_key = (api_key or os.getenv("ANTHROPIC_API_KEY", "")).strip()
-        self.model = (model or os.getenv("BID_AGENT_MODEL", "") or DEFAULT_MODEL).strip()
+    def __init__(self, api_key: str = "", model: str = "", log: Callable[[str], None] | None = None,
+                 provider: str = "anthropic"):
+        self.provider = provider if provider in providers.PROVIDERS else "anthropic"
+        if self.provider == "anthropic":
+            self.api_key = (api_key or os.getenv("ANTHROPIC_API_KEY", "")).strip()
+            self.model = (model or os.getenv("BID_AGENT_MODEL", "") or DEFAULT_MODEL).strip()
+        else:
+            env = next((os.getenv(k, "") for k in providers.ENV_KEYS[self.provider] if os.getenv(k, "")), "")
+            self.api_key = (api_key or env).strip()
+            self.model = (model or providers.DEFAULT_MODELS[self.provider][0]).strip()
         self.log = log or (lambda _m: None)
         self._client = None
         self.usage = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
 
     @property
+    def label(self) -> str:
+        return providers.LABELS[self.provider]
+
+    @property
     def available(self) -> bool:
+        if self.provider != "anthropic":
+            return bool(self.api_key)
         return bool(self.api_key or os.getenv("ANTHROPIC_AUTH_TOKEN", "").strip())
 
     def _get_client(self):
+        """The anthropic SDK client (Claude only; other providers have no SDK client)."""
+        if self.provider != "anthropic":
+            raise LLMUnavailable(f"{self.label} has no Claude client.")
         if self._client is None:
             try:
                 import anthropic
@@ -55,6 +75,13 @@ class LLM:
         max_tokens: int = 32000,
     ) -> Any:
         """Run one request whose answer must match ``schema``; returns parsed JSON."""
+        if self.provider != "anthropic":
+            if not self.available:
+                raise LLMUnavailable(f"No {self.label} API key configured. Add it in Settings -> Bid Agent.")
+            data = providers.json_call(self.provider, self.api_key, self.model, system, content, schema,
+                                       max_tokens, self.usage)
+            self.usage["calls"] += 1
+            return data
         client = self._get_client()
         if isinstance(content, str):
             content = [{"type": "text", "text": content}]

@@ -37,3 +37,5 @@ Backed up: server/api_server.py, server/requirements.txt, server/API_CHANGES.md
 - New routes: /client/bid-agent/recent, /instructions, /learnings[/id], /references[/id]; /admin/bid-agent/instructions, /learnings, /tenders/{id}/chat; /admin/bid-agent/config gains chat_model.
 ----
 10:09 2026-11-05 (Bid Agent session) - BidManagerControl.jsx (backed up): Bid Agent tab gains the chat model field, Training panel (global instructions, learned notes of every owner) and 'Try the agent' (chat on a tender by row id, read only). server/API_CHANGES.md section 5: fast/streamed chat ('partial'), open anywhere, training routes.
+----
+2026-11-05 (OCI Server Manager) - Status: pulled server changes up to f51bb37 (Bid Agent streamed chat, training, recent/console chat routes). Server tests 324 passed. Deployed from the PC (full rebuild), health OK, Bid Agent routes live.

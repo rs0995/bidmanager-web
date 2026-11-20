@@ -1,0 +1,31 @@
+----
+09:34 — Request: desktop icon became flat; restore the previous one.
+Files backed up (pre-change) and change:
+ - electron/package.json : removed build.icon and assets/icon.png from "files" (exe, shortcut and installer go back to the default icon used up to 1.0.16).
+ - electron/main.cjs     : removed the BrowserWindow icon (window/taskbar back to default).
+Kept: the BM Server logo in the console header and the browser-tab favicon. electron/assets/icon.png left on disk, unused.
+Status: done 2026-11-07. Takes effect with the next installer build.
+
+----
+09:45 — Request: Bid Agent AI access card: provider (Claude/Gemini/ChatGPT) and model as dropdowns, models listed live from the provider; Save / Remove key centred in line with the inputs.
+Files backed up (pre-change) and change:
+ - BidManagerControl.jsx : Select supports disabled options; new BID_AGENT_PROVIDERS, BID_AGENT_FALLBACK_MODELS and ModelPick (dropdown + "Other…" free text); BidAgentPanel gets a provider dropdown, document/chat model dropdowns, per-provider key status, POST /admin/bid-agent/models with built-in fallback, and a two-row grid so labels sit above and every control (inputs + buttons) is centred on one line.
+Server side (not done here): handed to the OCI Server Manager session — config.provider/providers/keys, provider on PUT config, new POST /admin/bid-agent/models, and Gemini/OpenAI paths in server/bid_agent (llm.py, chat.py, criteria.py, forms.py, agent.py). Until then the console stays Claude-only (other providers shown disabled) with the built-in Claude model list.
+Status: done 2026-11-07. vite build OK. Not checked in a running console yet.
+
+----
+10:06 2026-11-07 (OCI Server Manager) - Request (from the Server UI console session): Bid Agent on Gemini and ChatGPT as well as Claude; provider + model picked in the console, models listed live.
+Files backed up (pre-change): server/bid_agent/llm.py, chat.py, agent.py, server_routes.py; server/API_CHANGES.md
+ - server/bid_agent/providers.py (new): Gemini + OpenAI over REST (httpx, no new packages): JSON-schema calls with fallbacks, PDF pages inline, streamed function-calling chat, live model lists.
+ - llm.py: LLM(provider=...) - Claude path unchanged; Gemini / ChatGPT json_call via providers.py.
+ - chat.py: run_turn sends Gemini / ChatGPT through the same tools + streaming (Claude loop unchanged).
+ - server_routes.py: setting bid_agent_provider; per-provider keys/models (Claude keeps bid_agent_api_key / bid_agent_model / bid_agent_chat_model); GET/PUT /admin/bid-agent/config adds provider, providers, keys; new POST /admin/bid-agent/models; status returns provider; Claude-only page cache kept for Claude.
+ - agent.py: bid pack result records the provider.
+ - API_CHANGES.md section 5: provider contract; console to-do ticked.
+ - bid_agent_server/bid_agent/ kept identical; tests: bid_agent_server/tests/test_providers.py (new), test_server_routes.py (provider contract; settings cache cleared per test).
+Status: server tests 324 passed; Bid Agent tests 34 passed, 1 skipped, 2 failed (the known .rtf tests: striprtf not installed on this PC). Not deployed.
+----
+10:07 — Follow-up: server multi-provider contract received from the OCI Server Manager session (built, not deployed). Console checked against it (config.provider/providers/keys, models route source none/error -> built-in list, key-only removal does not switch provider). Added built-in fallback models for Gemini (gemini-2.5-pro/flash) and ChatGPT (gpt-5/gpt-5-mini). vite build OK.
+
+----
+10:16 2026-11-07 (OCI Server Manager) - Status: Bid Agent multi-provider (Claude / Gemini / ChatGPT) deployed from the PC (full rebuild), health OK; providers on the server: anthropic, gemini, openai; /admin/bid-agent/config and /models live (401 without key).

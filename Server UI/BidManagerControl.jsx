@@ -755,7 +755,7 @@ function Select({ value, onChange, options, w = 160, disabled = false }) {
       value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}
       style={{ width: w, fontFamily: mono, fontSize: 12.5, padding: '5px 8px', color: c.ink, background: c.card, border: `1px solid ${c.rule}`, outline: 'none', ...(disabled ? DISABLED_STYLE : {}) }}
     >
-      {options.map((o) => <option key={o.value ?? o} value={o.value ?? o}>{o.label ?? o}</option>)}
+      {options.map((o) => <option key={o.value ?? o} value={o.value ?? o} disabled={!!o.disabled}>{o.label ?? o}</option>)}
     </select>
   );
 }
@@ -3636,11 +3636,48 @@ function BidAgentConsoleChat({ base, adminKey, toast }) {
   );
 }
 
+// AI providers for the Bid Agent. The server lists the ones it can run in config.providers
+// (older servers: Claude only); the rest show as disabled.
+const BID_AGENT_PROVIDERS = [
+  { value: 'anthropic', label: 'Claude (Anthropic)', keyHint: 'sk-ant-…' },
+  { value: 'gemini', label: 'Gemini (Google)', keyHint: 'AIza…' },
+  { value: 'openai', label: 'ChatGPT (OpenAI)', keyHint: 'sk-…' },
+];
+// Used when the server can't list models live (no key yet, or an older server).
+const BID_AGENT_FALLBACK_MODELS = {
+  anthropic: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-1'],
+  gemini: ['gemini-2.5-pro', 'gemini-2.5-flash'],
+  openai: ['gpt-5', 'gpt-5-mini'],
+};
+const MODEL_OTHER = '__other__';
+
+// Model dropdown with an "Other…" escape to type a model id the list doesn't have.
+function ModelPick({ value, onChange, models, placeholder, w = 220 }) {
+  const [typing, setTyping] = useState(false);
+  const ids = value && !models.includes(value) ? [value, ...models] : models;
+  if (typing || !ids.length) {
+    return (
+      <span className="inline-flex items-center gap-1">
+        <TextIn value={value} onChange={onChange} placeholder={placeholder} w={w - (ids.length ? 30 : 0)} />
+        {ids.length > 0 && <Btn variant="ghost" size="sm" icon={ChevronDown} onClick={() => setTyping(false)} />}
+      </span>
+    );
+  }
+  const options = [
+    ...(value ? [] : [{ value: '', label: placeholder ? `Default (${placeholder})` : 'Choose…' }]),
+    ...ids.map((m) => ({ value: m, label: m })),
+    { value: MODEL_OTHER, label: 'Other…' },
+  ];
+  return <Select value={value} options={options} w={w} onChange={(v) => (v === MODEL_OTHER ? setTyping(true) : onChange(v))} />;
+}
+
 function BidAgentPanel({ toast, base, adminKey }) {
   const [state, setState] = useState({ loading: true, missing: false, error: '', config: null, employers: [], forms: [] });
   const [keyIn, setKeyIn] = useState('');
   const [modelIn, setModelIn] = useState('');
   const [chatModelIn, setChatModelIn] = useState('');
+  const [providerIn, setProviderIn] = useState('anthropic');
+  const [models, setModels] = useState({ provider: '', list: [], source: '' });
   const [rulesIn, setRulesIn] = useState('');
   const [learned, setLearned] = useState([]);
   const [saving, setSaving] = useState(false);
@@ -3658,6 +3695,7 @@ function BidAgentPanel({ toast, base, adminKey }) {
       setState({ loading: false, missing: false, error: '', config, employers: employers || [], forms: forms || [] });
       setModelIn(config?.model || '');
       setChatModelIn(config?.chat_model || '');
+      setProviderIn(config?.provider || 'anthropic');
       // Training (newer servers only).
       const [rules, notes] = await Promise.all([
         apiFetch(base, '/admin/bid-agent/instructions', { adminKey }).catch(() => null),
@@ -3672,10 +3710,27 @@ function BidAgentPanel({ toast, base, adminKey }) {
   }, [base, adminKey]);
   useEffect(() => { load(); }, [load]);
 
+  // Models the provider offers for the saved (or just typed) key. Servers without the
+  // models route, or without a key, fall back to the built-in list.
+  const loadModels = useCallback(async (provider, apiKey = '') => {
+    const fallback = BID_AGENT_FALLBACK_MODELS[provider] || [];
+    try {
+      const body = { provider };
+      if (apiKey) body.api_key = apiKey;
+      const r = await apiFetch(base, '/admin/bid-agent/models', { method: 'POST', adminKey, body });
+      const list = (r?.models || []).map((m) => (typeof m === 'string' ? m : m.id)).filter(Boolean);
+      setModels({ provider, list: list.length ? list : fallback, source: list.length ? 'live' : 'builtin' });
+    } catch {
+      setModels({ provider, list: fallback, source: 'builtin' });
+    }
+  }, [base, adminKey]);
+  useEffect(() => { if (state.config) loadModels(providerIn); }, [state.config, providerIn, loadModels]);
+
   const save = async () => {
     setSaving(true);
     try {
       const body = { model: modelIn.trim(), chat_model: chatModelIn.trim() };
+      if (state.config?.providers) body.provider = providerIn;
       if (keyIn.trim()) body.api_key = keyIn.trim();
       const config = await apiFetch(base, '/admin/bid-agent/config', { method: 'PUT', adminKey, body });
       setState((s) => ({ ...s, config }));
@@ -3686,7 +3741,9 @@ function BidAgentPanel({ toast, base, adminKey }) {
   const clearKey = async () => {
     setSaving(true);
     try {
-      const config = await apiFetch(base, '/admin/bid-agent/config', { method: 'PUT', adminKey, body: { api_key: '' } });
+      const body = { api_key: '' };
+      if (state.config?.providers) body.provider = providerIn;
+      const config = await apiFetch(base, '/admin/bid-agent/config', { method: 'PUT', adminKey, body });
       setState((s) => ({ ...s, config }));
       toast('API key removed');
     } catch (e) { toast(`Failed: ${e.message}`); } finally { setSaving(false); }
@@ -3718,6 +3775,20 @@ function BidAgentPanel({ toast, base, adminKey }) {
     );
   }
   const cfg = state.config || {};
+  const activeProvider = cfg.provider || 'anthropic';
+  const supported = cfg.providers || ['anthropic'];
+  const providerMeta = BID_AGENT_PROVIDERS.find((p) => p.value === providerIn) || BID_AGENT_PROVIDERS[0];
+  const providerLabel = (v) => (BID_AGENT_PROVIDERS.find((p) => p.value === v) || { label: v }).label;
+  // Key status for the provider in the dropdown (cfg.keys on multi-provider servers).
+  const keyState = cfg.keys?.[providerIn]
+    || (providerIn === activeProvider ? { set: cfg.api_key_set, hint: cfg.api_key_hint, source: cfg.api_key_source } : { set: false });
+  const pickProvider = (v) => {
+    setProviderIn(v);
+    // Saved models belong to the active provider; another provider starts on its defaults.
+    setModelIn(v === activeProvider ? (cfg.model || '') : '');
+    setChatModelIn(v === activeProvider ? (cfg.chat_model || '') : '');
+  };
+  const fieldLabel = { fontSize: 13, color: c.ink, fontWeight: 500 };
   const forms = orgFilter ? state.forms.filter((f) => f.org_key === orgFilter) : state.forms;
   const th = { fontFamily: mono, fontSize: 10.5, letterSpacing: '0.09em', color: c.ink60, textTransform: 'uppercase', textAlign: 'left', padding: '6px 8px', borderBottom: `1px solid ${c.rule}` };
   const td = { fontSize: 12.5, padding: '6px 8px', borderBottom: `1px solid ${c.ruleSoft}`, verticalAlign: 'top' };
@@ -3734,18 +3805,32 @@ function BidAgentPanel({ toast, base, adminKey }) {
           ['Template reuses', state.forms.reduce((n, f) => n + Math.max(0, (f.use_count || 1) - 1), 0), c.ink],
         ]} />
         <Card style={{ marginTop: 12 }}>
-          <SubHead>Claude (Anthropic) access</SubHead>
-          <RegisterRow label="API key" value={cfg.api_key_set ? `${cfg.api_key_hint || 'set'}${cfg.api_key_source === 'env' ? ' (from ANTHROPIC_API_KEY)' : ''}` : 'not set: keyword reading only'} tone={cfg.api_key_set ? c.seal : c.amber} />
-          <RegisterRow label="Document model" value={cfg.model || cfg.default_model || '—'} />
-          {cfg.default_chat_model && <RegisterRow label="Chat model" value={cfg.chat_model || cfg.default_chat_model} />}
-          <div className="mt-3 flex flex-wrap items-end gap-2">
-            <Field label="New API key" stacked><TextIn type="password" value={keyIn} onChange={setKeyIn} placeholder="sk-ant-…" w={280} /></Field>
-            <Field label="Document model (reads tenders)" stacked><TextIn value={modelIn} onChange={setModelIn} placeholder={cfg.default_model} w={200} /></Field>
-            {cfg.default_chat_model && <Field label="Chat model (answers)" stacked><TextIn value={chatModelIn} onChange={setChatModelIn} placeholder={cfg.default_chat_model} w={200} /></Field>}
-            <Btn variant="primary" icon={Check} onClick={save} busy={saving}>Save</Btn>
-            {cfg.api_key_source === 'settings' && <Btn variant="danger" icon={Trash2} onClick={clearKey} disabled={saving}>Remove key</Btn>}
+          <SubHead>AI access</SubHead>
+          <RegisterRow label="Provider" value={providerLabel(activeProvider)} />
+          <RegisterRow label="API key" value={keyState.set ? `${keyState.hint || 'set'}${keyState.source === 'env' ? ' (from environment)' : ''}` : 'not set: keyword reading only'} tone={keyState.set ? c.seal : c.amber} />
+          {providerIn === activeProvider && <RegisterRow label="Document model" value={cfg.model || cfg.default_model || '—'} />}
+          {providerIn === activeProvider && cfg.default_chat_model && <RegisterRow label="Chat model" value={cfg.chat_model || cfg.default_chat_model} />}
+          {/* Labels on row 1, controls on row 2: every control (inputs and buttons) is centred on the same line. */}
+          <div className="mt-3 overflow-x-auto">
+            <div style={{ display: 'grid', gridAutoFlow: 'column', gridTemplateRows: 'auto auto', justifyContent: 'start', alignItems: 'center', columnGap: 12, rowGap: 6 }}>
+              <span style={fieldLabel}>Provider</span>
+              <Select value={providerIn} w={180} onChange={pickProvider}
+                options={BID_AGENT_PROVIDERS.map((p) => ({ value: p.value, label: supported.includes(p.value) ? p.label : `${p.label} (server update pending)`, disabled: !supported.includes(p.value) }))} />
+              <span style={fieldLabel}>New API key</span>
+              <TextIn type="password" value={keyIn} onChange={setKeyIn} placeholder={providerMeta.keyHint} w={240} />
+              <span style={fieldLabel}>Document model (reads tenders){models.source === 'live' ? '' : ' · built-in list'}</span>
+              <ModelPick key={`doc-${providerIn}`} value={modelIn} onChange={setModelIn} models={models.provider === providerIn ? models.list : []} placeholder={providerIn === activeProvider ? cfg.default_model : ''} />
+              {cfg.default_chat_model && <span style={fieldLabel}>Chat model (answers)</span>}
+              {cfg.default_chat_model && <ModelPick key={`chat-${providerIn}`} value={chatModelIn} onChange={setChatModelIn} models={models.provider === providerIn ? models.list : []} placeholder={providerIn === activeProvider ? cfg.default_chat_model : ''} />}
+              <span />
+              <div className="flex items-center gap-2">
+                <Btn variant="primary" icon={Check} onClick={save} busy={saving}>Save</Btn>
+                {keyState.source === 'settings' && <Btn variant="danger" icon={Trash2} onClick={clearKey} disabled={saving}>Remove key</Btn>}
+                {keyIn.trim() && <Btn variant="ghost" icon={RefreshCw} onClick={() => loadModels(providerIn, keyIn.trim())}>List models for this key</Btn>}
+              </div>
+            </div>
           </div>
-          <p className="mt-2" style={{ fontSize: 11.5, color: c.ink60 }}>The key is stored in app settings and never sent back to this console or to client apps.</p>
+          <p className="mt-3" style={{ fontSize: 11.5, color: c.ink60 }}>The key is stored in app settings and never sent back to this console or to client apps.</p>
         </Card>
       </Panel>
 

@@ -7,3 +7,7 @@
 09:48 Bid Agent replies faster and shorter (streamed, fast chat model, grounded on the tender pages). It can be taught: standing instructions, 'remember …' corrections, reference documents, checklist templates; console can chat with any tender.
 ----
 10:09 Console Bid Agent tab: set the chat model, write global instructions, see what users taught the agent, and try the agent on any tender.
+Desktop app icon (exe, desktop shortcut, taskbar, installer) restored to the previous default icon; the flat BM Server tile from 1.0.17 is no longer used there.
+Bid Agent: AI provider and model are now dropdowns (models listed live from the provider when the server supports it, built-in Claude list otherwise); Save / Remove key line up with the inputs. Gemini / ChatGPT become selectable once the server adds them.
+----
+10:06 Bid Agent can run on Claude, Gemini or ChatGPT: pick the provider and models in the console (Bid Agent tab); each provider keeps its own key; models are listed live from the provider.

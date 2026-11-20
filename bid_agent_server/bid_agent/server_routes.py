@@ -28,18 +28,36 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from . import agent, chat, company
+from . import agent, chat, company, providers
 from .docreader import load_document
 from .llm import DEFAULT_MODEL, LLM
 from .roles import ROLES
 from .store import Store, org_key_for
 from .workspace import Workspace
 
+PROVIDER_SETTING = "bid_agent_provider"      # anthropic (default) | gemini | openai
 API_KEY_SETTING = "bid_agent_api_key"
 MODEL_SETTING = "bid_agent_model"            # reads documents (criteria, forms, scanned pages)
 CHAT_MODEL_SETTING = "bid_agent_chat_model"  # answers in the chat
 DEFAULT_CHAT_MODEL = "claude-sonnet-5-5"
 STALE_RUN_SEC = 45 * 60
+
+
+def _key_setting(provider: str) -> str:
+    """Claude keeps the original setting names; the others get their own."""
+    return API_KEY_SETTING if provider == "anthropic" else f"bid_agent_{provider}_api_key"
+
+
+def _model_setting(provider: str) -> str:
+    return MODEL_SETTING if provider == "anthropic" else f"bid_agent_{provider}_model"
+
+
+def _chat_model_setting(provider: str) -> str:
+    return CHAT_MODEL_SETTING if provider == "anthropic" else f"bid_agent_{provider}_chat_model"
+
+
+def _hint(key: str) -> str:
+    return (key[:7] + "…" + key[-4:]) if len(key) > 12 else ""
 
 _runs: dict[tuple[str, int], threading.Thread] = {}
 _runs_lock = threading.Lock()
@@ -71,9 +89,15 @@ class LearningIn(BaseModel):
 
 
 class ConfigIn(BaseModel):
+    provider: Optional[str] = None
     api_key: Optional[str] = None
     model: Optional[str] = None
     chat_model: Optional[str] = None
+
+
+class ModelsIn(BaseModel):
+    provider: str = "anthropic"
+    api_key: Optional[str] = Field(default=None, max_length=500)
 
 
 def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRouter]:
@@ -102,9 +126,29 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
         except Exception:
             return default
 
+    def provider() -> str:
+        p = setting(PROVIDER_SETTING).strip().lower()
+        return p if p in providers.PROVIDERS else "anthropic"
+
+    def provider_key(p: str) -> tuple[str, str]:
+        """(key, source) for a provider: the console setting, else the container env."""
+        key = setting(_key_setting(p)).strip()
+        if key:
+            return key, "settings"
+        for env in providers.ENV_KEYS[p]:
+            if os.getenv(env, "").strip():
+                return os.getenv(env, "").strip(), "env"
+        return "", ""
+
+    def doc_model(p: str) -> str:
+        m = setting(_model_setting(p)).strip()
+        if not m and p == "anthropic":
+            m = os.getenv("BID_AGENT_MODEL", "").strip()
+        return m or providers.DEFAULT_MODELS[p][0]
+
     def make_llm(log: Callable[[str], None]) -> LLM:
-        return LLM(api_key=setting(API_KEY_SETTING) or os.getenv("ANTHROPIC_API_KEY", ""),
-                   model=setting(MODEL_SETTING) or os.getenv("BID_AGENT_MODEL", ""), log=log)
+        p = provider()
+        return LLM(api_key=provider_key(p)[0], model=doc_model(p), log=log, provider=p)
 
     def account(user_id: int) -> dict:
         with client_api._get_db() as conn:
@@ -219,8 +263,9 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
     def client_bid_status(user_id: int = Depends(client_api.require_client_user)) -> dict:
         acc = account(user_id)
         return {
-            "ai_enabled": bool(setting(API_KEY_SETTING) or os.getenv("ANTHROPIC_API_KEY")),
-            "model": setting(MODEL_SETTING) or DEFAULT_MODEL,
+            "ai_enabled": make_llm(lambda m: None).available,
+            "provider": provider(),
+            "model": doc_model(provider()),
             "owner": "organisation" if acc.get("org_id") is not None else "individual",
             "can_edit_profile": acc.get("org_id") is None or acc.get("role") == "admin",
             "roles": [{"role": k, "label": v["label"]} for k, v in ROLES.items()],
@@ -299,8 +344,12 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
     # The Bid Agent works as a chat: each message runs one agent turn in the
     # background; the apps poll GET .../chat?since=n for new messages and, while
     # it works, for ``partial`` (the reply as it is being written).
-    def chat_model() -> str:
-        return setting(CHAT_MODEL_SETTING) or os.getenv("BID_AGENT_CHAT_MODEL", "") or DEFAULT_CHAT_MODEL
+    def chat_model(p: str = "") -> str:
+        p = p or provider()
+        m = setting(_chat_model_setting(p)).strip()
+        if not m and p == "anthropic":
+            m = os.getenv("BID_AGENT_CHAT_MODEL", "").strip()
+        return m or providers.DEFAULT_MODELS[p][1]
 
     def training_text(owner: str, employer: str) -> str:
         """Standing instructions (global, then the owner's) and learned notes, for the prompt."""
@@ -439,19 +488,21 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
         store.set_chat_partial(owner, tid, "")
 
     def grounding_for(tender: dict, result: dict, pages, llm, progress) -> list | None:
-        """The tender's key pages for the chat model, uploaded once (Files API) and reused."""
+        """The tender's key pages for the chat model. Claude: uploaded once (Files API) and reused;
+        Gemini / ChatGPT: sent inline each turn (the cached Claude file ids don't work there)."""
         if not result.get("criteria_pages"):
             return None
+        claude = llm.provider == "anthropic"
         key = agent.grounding_key(int(tender["id"]), result)
-        cached = store.get_doc_cache(key)
+        cached = store.get_doc_cache(key) if claude else None
         if cached:
             return cached
         try:
             progress("Opening the tender pages…")
-            blocks = agent.grounding_blocks(pages._src(), result, llm._get_client())
+            blocks = agent.grounding_blocks(pages._src(), result, llm._get_client() if claude else None)
         except Exception:
             return None
-        if blocks and all(b["source"]["type"] in ("file", "text") for b in blocks):
+        if claude and blocks and all(b["source"]["type"] in ("file", "text") for b in blocks):
             store.put_doc_cache(key, "grounding", blocks)
         return blocks or None
 
@@ -465,7 +516,7 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
             "status": "working" if working else "idle",
             "progress": c["progress"] if working else "",
             "partial": store.get_chat_partial(owner, tid) if working else "",
-            "ai_enabled": bool(setting(API_KEY_SETTING) or os.getenv("ANTHROPIC_API_KEY")),
+            "ai_enabled": make_llm(lambda m: None).available,
             "suggestions": chat.suggestions(True),
         }
 
@@ -664,23 +715,57 @@ def create_routers(require_admin: Callable[..., Any]) -> tuple[APIRouter, APIRou
         return client_company_profile(user_id)
 
     # ------------------------------------------------------------- admin
+    def key_info(p: str) -> dict:
+        key, source = provider_key(p)
+        return {"set": bool(key), "hint": _hint(key), "source": source}
+
     @admin.get("/config")
     def admin_bid_config() -> dict:
-        key = setting(API_KEY_SETTING) or os.getenv("ANTHROPIC_API_KEY", "")
-        return {"api_key_set": bool(key), "api_key_hint": (key[:7] + "…" + key[-4:]) if len(key) > 12 else "",
-                "api_key_source": "settings" if setting(API_KEY_SETTING) else ("env" if key else ""),
-                "model": setting(MODEL_SETTING) or DEFAULT_MODEL, "default_model": DEFAULT_MODEL,
-                "chat_model": chat_model(), "default_chat_model": DEFAULT_CHAT_MODEL}
+        p = provider()
+        active = key_info(p)
+        return {"provider": p, "providers": providers.runnable(), "provider_labels": providers.LABELS,
+                "keys": {q: key_info(q) for q in providers.PROVIDERS},
+                "api_key_set": active["set"], "api_key_hint": active["hint"], "api_key_source": active["source"],
+                "model": doc_model(p), "default_model": providers.DEFAULT_MODELS[p][0],
+                "chat_model": chat_model(p), "default_chat_model": providers.DEFAULT_MODELS[p][1]}
+
+    def checked_provider(value: Optional[str]) -> str:
+        p = (value or "").strip().lower()
+        if p not in providers.runnable():
+            raise HTTPException(400, detail={"reason": "unknown_provider",
+                                             "message": f"Unknown or unavailable AI provider: {value}"})
+        return p
 
     @admin.put("/config")
     def admin_bid_config_save(body: ConfigIn) -> dict:
+        """``provider`` names the provider the key / models are for. It also becomes the active
+        provider, unless the request only removes a key (``api_key: ""`` and nothing else)."""
+        p = provider()
+        if body.provider is not None:
+            p = checked_provider(body.provider)
+            only_removing_key = body.api_key == "" and body.model is None and body.chat_model is None
+            if not only_removing_key:
+                core.ScraperBackend.set_setting(PROVIDER_SETTING, p)
         if body.api_key is not None:
-            core.ScraperBackend.set_setting(API_KEY_SETTING, body.api_key.strip())
+            core.ScraperBackend.set_setting(_key_setting(p), body.api_key.strip())
         if body.model is not None:
-            core.ScraperBackend.set_setting(MODEL_SETTING, body.model.strip())
+            core.ScraperBackend.set_setting(_model_setting(p), body.model.strip())
         if body.chat_model is not None:
-            core.ScraperBackend.set_setting(CHAT_MODEL_SETTING, body.chat_model.strip())
+            core.ScraperBackend.set_setting(_chat_model_setting(p), body.chat_model.strip())
         return admin_bid_config()
+
+    @admin.post("/models")
+    def admin_bid_models(body: ModelsIn) -> dict:
+        """The provider's models, listed live with the given key (else the saved / env key)."""
+        p = checked_provider(body.provider)
+        key = (body.api_key or "").strip() or provider_key(p)[0]
+        if not key:
+            return {"models": [], "source": "none", "error": "No API key for this provider."}
+        try:
+            return {"models": providers.list_models(p, key), "source": "live"}
+        except Exception as e:
+            msg = str(e).replace(key, "…")[:300]
+            return {"models": [], "source": "error", "error": msg}
 
     @admin.get("/employers")
     def admin_bid_employers() -> list:
