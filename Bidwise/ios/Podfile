@@ -34,5 +34,13 @@ target 'Bidwise' do
       :mac_catalyst_enabled => false,
       # :ccache_enabled => true
     )
+    # Xcode 27 refuses targets below iOS 15; lift pods that still declare 11–13.
+    installer.pods_project.targets.each do |t|
+      t.build_configurations.each do |c|
+        if c.build_settings['IPHONEOS_DEPLOYMENT_TARGET'].to_f < 15.5
+          c.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.5'
+        end
+      end
+    end
   end
 end
