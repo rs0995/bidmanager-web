@@ -1,6 +1,6 @@
 {
   "name": "bidmanager-client-ui",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "Local-first BidManager client for desktop and web",
   "main": "electron/main.cjs",
