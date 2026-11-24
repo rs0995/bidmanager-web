@@ -13,3 +13,5 @@ Bid Agent: AI provider and model are now dropdowns (models listed live from the 
 10:06 Bid Agent can run on Claude, Gemini or ChatGPT: pick the provider and models in the console (Bid Agent tab); each provider keeps its own key; models are listed live from the provider.
 ----
 2026-11-24 12:25  Downloads no longer save the portal page as a document when the CAPTCHA is not solved; such jobs now fail with the reason, and every saved ZIP/PDF is checked before it is stored.
+----
+2026-11-24 10:02  Tender lists sort by value and EMD across all tenders on the server (not just the loaded page), with tenders without a value last; the server can also filter by a value range.

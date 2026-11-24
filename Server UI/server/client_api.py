@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 import admin_providers
 import app_core as core
+import db_compat
 import org_access
 import project_files
 import security
@@ -42,6 +43,7 @@ TENDER_SORT_COLUMNS = {
     "title": "t.title",
     "organization": "t.org_chain",
     "tender_value": "t.tender_value",
+    "emd": "t.emd",
     "closing_date": "t.closing_date",
     "opening_date": "t.opening_date",
     "published_date": "t.published_date",
@@ -1558,16 +1560,109 @@ def _list_tender_payload(
     sort_column = TENDER_SORT_COLUMNS[sort_by]
     direction = "DESC" if sort_order == "desc" else "ASC"
     offset = (page - 1) * page_size
+    min_cr = filters.pop("min_value_cr", None)
+    max_cr = filters.pop("max_value_cr", None)
     with _get_db() as conn:
         conditions, params = _tender_filters(**filters, scope=_tender_scope(conn, user_id))
         where_sql = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-        total = int(conn.execute(f"SELECT COUNT(*) FROM tenders t{where_sql}", params).fetchone()[0])
-        rows = conn.execute(
-            f"{_tender_select()}{where_sql} "
-            f"ORDER BY {sort_column} {direction},t.id {direction} LIMIT ? OFFSET ?",
-            [*params, page_size, offset],
-        ).fetchall()
+        if sort_by in _AMOUNT_SORTS or min_cr is not None or max_cr is not None:
+            ids, total = _amount_sorted_page(
+                conn, where_sql, params, sort_by, direction, min_cr, max_cr, page_size, offset
+            )
+            rows = []
+            if ids:
+                by_id = {
+                    int(row["id"]): row
+                    for row in conn.execute(
+                        f"{_tender_select()} WHERE t.id IN ({','.join('?' for _ in ids)})", ids
+                    ).fetchall()
+                }
+                rows = [by_id[i] for i in ids if i in by_id]
+        else:
+            total = int(conn.execute(f"SELECT COUNT(*) FROM tenders t{where_sql}", params).fetchone()[0])
+            rows = conn.execute(
+                f"{_tender_select()}{where_sql} "
+                f"ORDER BY {sort_column} {direction},t.id {direction} LIMIT ? OFFSET ?",
+                [*params, page_size, offset],
+            ).fetchall()
     return {"items": [_public_tender(row, base_url) for row in rows], **_page_meta(page, page_size, total)}
+
+
+# Value and EMD are stored as text ("34,57,94,756", "NA"), so the database can't
+# sort or range-filter them as numbers. These sorts (and the value range) run in
+# a throwaway in-memory SQLite database built per request from the filtered
+# rows; the main database only ever sees SELECTs.
+_AMOUNT_SORTS = {"tender_value": "value_rupees", "emd": "emd_rupees"}
+_CRORE = 1e7
+
+
+def _amount_rupees(text: Any) -> Optional[float]:
+    """Rupees in a stored amount, or None when it has no figure ("NA", "N/A", "")."""
+    raw = str(text or "")
+    digits = re.sub(r"[^0-9.]", "", raw)
+    try:
+        amount = float(digits)
+    except ValueError:
+        return None
+    lowered = raw.lower()
+    if "cr" in lowered:
+        return amount * _CRORE
+    if re.search(r"lakh|lac|\bl\b", lowered):
+        return amount * 1e5
+    return amount
+
+
+def _amount_sorted_page(
+    conn: Any, where_sql: str, params: list[Any], sort_by: str, direction: str,
+    min_cr: Optional[float], max_cr: Optional[float], page_size: int, offset: int,
+) -> tuple[list[int], int]:
+    """(ids of the requested page, total after the value range) via the temp DB."""
+    source = conn.execute(
+        f"SELECT t.id,COALESCE(t.tender_value,'') AS tender_value,COALESCE(t.emd,'') AS emd,"
+        f"{TENDER_SORT_COLUMNS[sort_by]} AS sort_text FROM tenders t{where_sql}",
+        params,
+    ).fetchall()
+    temp = db_compat._ORIGINAL_CONNECT(":memory:")  # real SQLite, never the Postgres shim
+    try:
+        temp.execute(
+            "CREATE TABLE rows (id INTEGER, sort_text TEXT, value_rupees REAL, emd_rupees REAL)"
+        )
+        temp.executemany(
+            "INSERT INTO rows VALUES (?,?,?,?)",
+            [
+                (
+                    int(r["id"]), None if r["sort_text"] is None else str(r["sort_text"]),
+                    _amount_rupees(r["tender_value"]), _amount_rupees(r["emd"]),
+                )
+                for r in source
+            ],
+        )
+        # A missing value counts as 0 for the range, as the apps already treat it.
+        range_conditions: list[str] = []
+        range_params: list[Any] = []
+        if min_cr is not None:
+            range_conditions.append("COALESCE(value_rupees,0)>=?")
+            range_params.append(float(min_cr) * _CRORE)
+        if max_cr is not None:
+            range_conditions.append("COALESCE(value_rupees,0)<=?")
+            range_params.append(float(max_cr) * _CRORE)
+        range_sql = f" WHERE {' AND '.join(range_conditions)}" if range_conditions else ""
+        total = int(temp.execute(f"SELECT COUNT(*) FROM rows{range_sql}", range_params).fetchone()[0])
+        amount = _AMOUNT_SORTS.get(sort_by)
+        # No figure (NA) sorts after every number, 0.00 included, in both directions.
+        order_sql = (
+            f"({amount} IS NULL),{amount} {direction},id {direction}" if amount
+            else f"sort_text {direction},id {direction}"
+        )
+        ids = [
+            int(r[0]) for r in temp.execute(
+                f"SELECT id FROM rows{range_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
+                [*range_params, page_size, offset],
+            ).fetchall()
+        ]
+    finally:
+        temp.close()
+    return ids, total
 
 
 class DownloadRequest(BaseModel):
@@ -1595,6 +1690,8 @@ def client_tenders(
     location: str = Query("", max_length=200),
     category: str = Query("", max_length=200),
     has_documents: Optional[bool] = None,
+    min_value_cr: Optional[float] = Query(None, ge=0),
+    max_value_cr: Optional[float] = Query(None, ge=0),
     sort_by: Literal[tuple(TENDER_SORT_COLUMNS)] = "closing_date",
     sort_order: Literal["asc", "desc"] = "asc",
     page: int = Query(1, ge=1),
@@ -1604,7 +1701,8 @@ def client_tenders(
     return _list_tender_payload(
         query=q, website_id=website_id, archived=archived, status=status,
         organization=organization, location=location, category=category,
-        has_documents=has_documents, sort_by=sort_by, sort_order=sort_order,
+        has_documents=has_documents, min_value_cr=min_value_cr, max_value_cr=max_value_cr,
+        sort_by=sort_by, sort_order=sort_order,
         page=page, page_size=page_size, base_url=_public_base_url(request), user_id=user_id,
     )
 
@@ -1615,6 +1713,8 @@ def client_search(
     q: str = Query(..., min_length=1, max_length=200),
     website_id: Optional[int] = Query(None, gt=0),
     archived: Optional[bool] = None,
+    min_value_cr: Optional[float] = Query(None, ge=0),
+    max_value_cr: Optional[float] = Query(None, ge=0),
     sort_by: Literal[tuple(TENDER_SORT_COLUMNS)] = "closing_date",
     sort_order: Literal["asc", "desc"] = "asc",
     page: int = Query(1, ge=1),
@@ -1622,7 +1722,8 @@ def client_search(
     user_id: int = Depends(require_client_user),
 ) -> dict[str, Any]:
     return _list_tender_payload(
-        query=q, website_id=website_id, archived=archived, sort_by=sort_by,
+        query=q, website_id=website_id, archived=archived,
+        min_value_cr=min_value_cr, max_value_cr=max_value_cr, sort_by=sort_by,
         sort_order=sort_order, page=page, page_size=page_size, base_url=_public_base_url(request),
         user_id=user_id,
     )

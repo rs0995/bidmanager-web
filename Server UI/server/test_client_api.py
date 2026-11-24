@@ -327,6 +327,101 @@ class ClientApiTests(unittest.TestCase):
         self.assertNotIn("folder_path", payload["items"][0])
         self.assertNotIn("drive_file_id", payload["items"][0])
 
+    def _seed_amount_tenders(self):
+        # (id, tender_value, emd, closing_date); every row is active under "Amount Org".
+        rows = [
+            (10, "34,57,94,756", "17,28,974", "2026-12-05"),
+            (11, "9,98,980", "9,990", "2026-12-01"),
+            (12, "8,44,099", "2646", "2026-12-04"),
+            (13, "NA", "13,800", "2026-12-02"),
+            (14, "0.00", "N/A", "2026-12-03"),
+        ]
+        conn = sqlite3.connect(self.db_path)
+        conn.executemany(
+            "INSERT INTO tenders (id,website_id,org_chain,tender_id,title,tender_value,emd,"
+            "closing_date,is_archived) VALUES (?,1,'Amount Org',?,'Works',?,?,?,0)",
+            [(i, f"A-{i}", value, emd, closing) for i, value, emd, closing in rows],
+        )
+        conn.commit()
+        conn.close()
+
+    def _amount_ids(self, query, page_size=25):
+        ids, page = [], 1
+        while True:
+            response = self.client.get(
+                f"/client/tenders?organization=Amount%20Org&{query}&page={page}&page_size={page_size}",
+                headers=self.headers,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            payload = response.json()
+            ids += [item["id"] for item in payload["items"]]
+            if page >= payload["pages"]:
+                return ids, payload["total"]
+            page += 1
+
+    def test_value_sort_is_numeric_across_pages_with_na_after_zero(self):
+        self._seed_amount_tenders()
+        desc, total = self._amount_ids("sort_by=tender_value&sort_order=desc", page_size=2)
+        self.assertEqual(desc, [10, 11, 12, 14, 13])  # ... 0.00, then NA
+        self.assertEqual(total, 5)
+        asc, _ = self._amount_ids("sort_by=tender_value&sort_order=asc", page_size=2)
+        self.assertEqual(asc, [14, 12, 11, 10, 13])  # NA never at the top
+
+    def test_emd_sort_is_accepted_and_numeric(self):
+        self._seed_amount_tenders()
+        desc, _ = self._amount_ids("sort_by=emd&sort_order=desc")
+        self.assertEqual(desc, [10, 13, 11, 12, 14])  # N/A last
+        asc, _ = self._amount_ids("sort_by=emd&sort_order=asc")
+        self.assertEqual(asc, [12, 11, 13, 10, 14])
+
+    def test_value_range_covers_every_tender_and_sets_total(self):
+        self._seed_amount_tenders()
+        # 0.09 Cr = 9,00,000 rupees; 1 Cr = 1,00,00,000.
+        ids, total = self._amount_ids("min_value_cr=0.09&max_value_cr=1&sort_by=tender_value&sort_order=desc")
+        self.assertEqual((ids, total), ([11], 1))
+        # With the default closing-date sort the range keeps that order; NA counts as 0.
+        ids, total = self._amount_ids("max_value_cr=0.09")
+        self.assertEqual((ids, total), ([13, 14, 12], 3))
+
+    def test_amount_sort_keeps_filters_and_section_scope(self):
+        self._seed_amount_tenders()
+        with mock.patch.object(client_api, "_tender_scope", return_value=("t.id IN (?,?)", [11, 13])):
+            ids, total = self._amount_ids("sort_by=tender_value&sort_order=desc")
+        self.assertEqual((ids, total), ([11, 13], 2))
+        response = self.client.get(
+            "/client/tenders?archived=true&sort_by=tender_value&sort_order=desc", headers=self.headers
+        )
+        self.assertEqual([item["id"] for item in response.json()["items"]], [2])
+
+    def test_amount_parsing(self):
+        parse = client_api._amount_rupees
+        self.assertEqual(parse("34,57,94,756"), 345794756)
+        self.assertEqual(parse("0.00"), 0)
+        self.assertEqual(parse("₹42.80 Cr"), 42.8e7)
+        self.assertEqual(parse("12 Lakh"), 12e5)
+        for empty in ("NA", "N/A", "", None, "Refer Document"):
+            self.assertIsNone(parse(empty))
+
+    def test_amount_sort_leaves_the_main_database_unchanged(self):
+        self._seed_amount_tenders()
+
+        def snapshot():
+            # Sign-in bookkeeping (last_seen_at, activity log) may write; the
+            # tender data and the schema must not change.
+            conn = sqlite3.connect(self.db_path)
+            try:
+                return (
+                    conn.execute("SELECT * FROM tenders ORDER BY id").fetchall(),
+                    conn.execute("SELECT name,sql FROM sqlite_master ORDER BY name").fetchall(),
+                )
+            finally:
+                conn.close()
+
+        before = snapshot()
+        self._amount_ids("sort_by=emd&sort_order=desc&min_value_cr=0")
+        self._amount_ids("sort_by=tender_value&sort_order=asc", page_size=2)
+        self.assertEqual(snapshot(), before)
+
     def test_documents_hide_storage_references(self):
         response = self.client.get("/client/tenders/1/documents", headers=self.headers)
         self.assertEqual(response.status_code, 200)

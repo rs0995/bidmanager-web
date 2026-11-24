@@ -216,6 +216,7 @@ There are no operator search routes: searches come from users. The operator only
   - Add the one-off backfill of existing `attachment` files.
 - [ ] Project tenders stay bookmarked (§1): bookmark the tender locally when a project is created; block un-bookmarking a project's tender with the warning "Tenders in projects can't be removed from bookmarks. Remove the project first."
 - [x] Bid Agent (§5): chat card above Ready for Bid on tender/project detail; Docs for Preparation uploaded to / listed from Drive (done on branch `feat/bid-agent`).
+- [ ] Value range on the server (§7): `data/tenderSource.tsx` `useTenderList` sends the Filter sheet's `minCr` / `maxCr` as `min_value_cr` / `max_value_cr`. Drop the client-side range check and `clientFiltered` for server-paged lists, so `total` comes from the server. Keep the client check for the saved-only list. The value and EMD sorts need no app change: the `sort_by=tender_value` / `emd` the app already sends now sort numerically across every tender.
 
 ### BM Pro (`Mobile App RN/src/`)
 - [ ] Checklist files (§3): the same as Bidwise, in `lib/projects.js` (`attachFile`, `getAttachedFile`, `mergeFromServer`) and `ChecklistItem.tsx`.
@@ -314,3 +315,16 @@ No route or response shape changes. What changes is when a download job fails:
 - **Not-real files:** every saved file is checked before it is stored. A `.zip`/`.xlsx`/`.docx` must start with `PK`, a `.rar` with `Rar!`, a `.pdf` must contain `%PDF` in its first 1 KB, and none of them may be an HTML page. Empty files of any type are refused. `.xls`/`.doc` only get the empty check, because portals serve real HTML-table versions. A refused file isn't stored on Drive or logged complete, and the tender's job fails with "the portal sent a page instead of the real file for <name>".
 - On failure, the tender row gets `download_status='failed'` and `last_download_error` set to the reason.
 - `mode: "redownload"` is unchanged: it re-fetches every file, and now refuses a portal page in place of the real file.
+
+---
+
+## 7. Tender list: numeric value/EMD sort and value range (READY since 2026-11-24)
+
+`GET /client/tenders` and `GET /client/search`:
+- **`sort_by=tender_value`** now sorts by the amount, not the text. Before, "9,98,980" sorted above "34,57,94,756".
+- **`sort_by=emd`** is new; before, it was rejected with 422. It sorts by the EMD amount.
+- **No figure:** a tender with no figure ("NA", "N/A", empty) always comes after every number, `0.00` included, in both `asc` and `desc`.
+- **New `min_value_cr` / `max_value_cr`** (numbers ≥ 0, in crores; either one or both): keep tenders whose value is in the range, inclusive. A tender with no figure counts as 0, as the apps' `parseCrores` treats it. `total` / `pages` count the rows after the range.
+- **Scope:** the sort and the range cover every tender that matches the other filters (search, portal, organisation, archived, category, location, section permissions), not just one page. Other sorts and their filters behave as before.
+- **How it runs:** the server sorts and filters in a temporary in-memory database built for each request. The main database is only read, never changed.
+- Values are stored as text such as "34,57,94,756". Units "Cr" and "Lakh" are understood when present.
