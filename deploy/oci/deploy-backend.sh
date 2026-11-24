@@ -41,18 +41,26 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 cd "$repo_root"
 
+# macOS tar: no AppleDouble ._* files or Apple xattr headers in the copy.
+tar_mac=()
+if [ "$(uname -s)" = "Darwin" ]; then
+  export COPYFILE_DISABLE=1
+  tar_mac=(--no-xattrs --no-mac-metadata)
+fi
+
 echo "==> repo:   $repo_root"
 echo "==> remote: $REMOTE:$REMOTE_DIR"
 echo "==> health: $health_url"
 echo "==> build:  $([ "$do_build" -eq 1 ] && echo yes || echo 'no (file-only restart)')"
 
 echo "==> copying Server UI/server -> VM"
-tar -cf - --exclude=__pycache__ --exclude='*.pyc' --exclude='*.db' -C "Server UI/server" . \
+tar -cf - ${tar_mac[@]+"${tar_mac[@]}"} --exclude=__pycache__ --exclude='*.pyc' --exclude='*.db' \
+  --exclude=.DS_Store --exclude='._*' -C "Server UI/server" . \
   | ssh "$REMOTE" "mkdir -p \"$REMOTE_DIR/Server UI/server\" && cd \"$REMOTE_DIR/Server UI/server\" && tar -xf -"
 
 if [ "$with_compose" -eq 1 ]; then
   echo "==> copying deploy/oci/compose.yaml -> VM"
-  tar -cf - -C deploy/oci compose.yaml \
+  tar -cf - ${tar_mac[@]+"${tar_mac[@]}"} -C deploy/oci compose.yaml \
     | ssh "$REMOTE" "cd \"$REMOTE_DIR/deploy/oci\" && tar -xf -"
 fi
 

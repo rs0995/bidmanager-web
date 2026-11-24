@@ -1,0 +1,3 @@
+----
+2026-11-24 12:03  CLAUDE.md (OCI Server Manager session)
+  Server rule: deploys and server edits may now run from the Windows PC or the Mac mini (whole repo moved to the Mac); keep the two in step through git. Backup: restore/2026-11-24/CLAUDE.md.
