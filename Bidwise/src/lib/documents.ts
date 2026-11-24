@@ -44,6 +44,8 @@ export type LocalDoc = {
   downloaded_at: string | null;
   updated_at: string;
   error: string | null;
+  /** Saved at full size but won't open (a ZIP that isn't one): treated as broken. */
+  unreadable?: boolean;
 };
 
 export type JobKind = 'request' | 'redownload' | 'update';
@@ -158,9 +160,13 @@ export const docsForTender = (tenderId: number) =>
   byTender.get(tenderId) ?? EMPTY;
 const EMPTY: LocalDoc[] = [];
 
-/** Downloaded but empty or under half the server's size: usually a portal error page. */
+/**
+ * Downloaded but empty, under half the server's size, or found unreadable when opened:
+ * usually a portal error page saved while its CAPTCHA went unsolved.
+ */
 export function isCorrupt(d: LocalDoc): boolean {
   if (d.status !== 'downloaded') return false;
+  if (d.unreadable) return true;
   const actual = d.local_size ?? 0;
   if (actual === 0) return true;
   return d.size_bytes > 0 && actual < d.size_bytes * 0.5;
@@ -224,12 +230,15 @@ export async function downloadDocument(
     const { url } = await api.downloadRequest(doc.tender_db_id, doc.id);
     const rel = relPathFor(doc.id, doc.file_name);
     const size = await files.download(signedUrl(url), files.abs(rel));
+    // A new copy of a ZIP is unpacked afresh, not from the old copy's folder.
+    await files.remove(files.abs(`${ZIP_DIR}/${doc.id}`)).catch(() => {});
     return upsert(doc.id, {
       status: 'downloaded',
       local_rel: rel,
       local_size: size,
       downloaded_at: nowIso(),
       error: null,
+      unreadable: false,
     });
   } catch (e) {
     upsert(doc.id, {
@@ -272,11 +281,21 @@ export async function zipEntries(d: LocalDoc) {
   const dest = files.abs(`${ZIP_DIR}/${d.id}`);
   let entries = await files.walk(dest);
   if (!entries.length) {
-    await files.unzip(zip, dest);
+    try {
+      await files.unzip(zip, dest);
+    } catch {
+      // Not a real ZIP (often the portal's page saved while its CAPTCHA was unsolved):
+      // flag it so the tender's Re-download picks it up.
+      await files.remove(dest).catch(() => {});
+      upsert(d.id, { unreadable: true });
+      throw new Error(UNREADABLE_ZIP);
+    }
     entries = await files.walk(dest);
   }
   return entries.sort((a, b) => a.name.localeCompare(b.name));
 }
+
+export const UNREADABLE_ZIP = 'This ZIP didn’t download properly.';
 
 /**
  * Saves the given files that aren't on this device yet. `items` may be a subset (new
@@ -342,7 +361,7 @@ export function canCheckNow(tenderId: number) {
 
 /**
  * Starts a server job for a tender and polls it. `request`: fetch its documents for the
- * first time. `redownload`: fetch fresh copies of files that came out broken.
+ * first time. `redownload`: fetch fresh copies of all its files (some came out broken).
  * `update`: look for new corrigendum / pre-bid files. New files are saved to the device.
  */
 export async function startJob(
@@ -380,10 +399,18 @@ async function finishJob(tid: number, job: DocJob) {
     const fresh = items.filter(d => !known.has(d.id));
     newDocuments = job.kind === 'update' ? fresh.length : items.length;
     if (job.kind === 'redownload') {
-      for (const d of docsForTender(tid).filter(isCorrupt)) {
+      // The server fetched every file again, so replace every copy on this device:
+      // one that looks fine may still be a page saved while the CAPTCHA was unsolved.
+      for (const d of docsForTender(tid)) {
         const abs = await localPath(d);
         if (abs) await files.remove(abs).catch(() => {});
-        upsert(d.id, { status: 'synced', local_rel: null, local_size: null });
+        await files.remove(files.abs(`${ZIP_DIR}/${d.id}`)).catch(() => {});
+        upsert(d.id, {
+          status: 'synced',
+          local_rel: null,
+          local_size: null,
+          unreadable: false,
+        });
       }
     }
     // Save to the device what isn't here yet, so it shows on the Downloads page.
@@ -526,6 +553,13 @@ export const useActiveDownloads = () =>
     subscribe,
     () => active,
     () => active,
+  );
+/** One document's row in any state (the history leaves out ones not on the device). */
+export const useLocalDoc = (id: number) =>
+  useSyncExternalStore(
+    subscribe,
+    () => state.docs.find(d => d.id === id) ?? null,
+    () => state.docs.find(d => d.id === id) ?? null,
   );
 export const useDocJob = (tenderId: number) =>
   useSyncExternalStore(

@@ -217,17 +217,16 @@ const matches = (field: string, needle: string) =>
 
 /**
  * Whether a tender passes the sheet's filters. `serverSide` skips the ones the server
- * already applied (category, location) to a live page of results.
+ * already applied to a live page of results (category, location, value range).
  */
 export function passesSheetFilters(
   t: Tender,
   f: SheetFilters,
   serverSide = false,
 ): boolean {
-  if (!serverSide) {
-    if (!matches(t.category, f.category) || !matches(t.location, f.location))
-      return false;
-  }
+  if (serverSide) return true;
+  if (!matches(t.category, f.category) || !matches(t.location, f.location))
+    return false;
   const min = parseLimit(f.minCr);
   const max = parseLimit(f.maxCr);
   if (min !== null || max !== null) {

@@ -57,6 +57,10 @@ it('filters by a typed value range in crores', () => {
   expect(range('10', '40')).toBe(true);
   expect(range('31', '')).toBe(false);
   expect(range('', '')).toBe(true);
+  // Live pages: the server applied the range to every tender, so it isn't re-checked.
+  expect(
+    passesSheetFilters(t, { ...NO_SHEET_FILTERS, maxCr: '10' }, true),
+  ).toBe(true);
 });
 
 it('lists only the locations in the data, most tenders first', () => {

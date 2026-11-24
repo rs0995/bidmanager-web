@@ -2,7 +2,7 @@ import React, { useCallback, useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { useRoute } from '@react-navigation/native';
 import type { RouteProp } from '@react-navigation/native';
-import { Globe, RefreshCw } from 'lucide-react-native';
+import { DownloadCloud, Globe, RefreshCw } from 'lucide-react-native';
 import { TenderListPage } from '../../components/tender/TenderListPage';
 import { useDebounced } from '../../components/feedback/ListStatus';
 import { Button, Card, IconButton, useToast } from '../../components/ui';
@@ -119,9 +119,10 @@ export function OrgTendersScreen() {
               <View style={styles.emptyAction}>
                 <Button
                   label={pending ? 'Requesting…' : 'Request tenders'}
-                  variant="secondary"
+                  variant="outline"
                   size="sm"
-                  disabled={pending}
+                  loading={pending}
+                  icon={<DownloadCloud size={15} color={t.colors.accentInk} />}
                   onPress={request}
                 />
               </View>

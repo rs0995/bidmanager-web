@@ -23,6 +23,7 @@ import {
   useDocJob,
   useDocsForTender,
   useDownloadHistory,
+  useLocalDoc,
   zipEntries,
   lastCheckedAt,
 } from '../lib/documents';
@@ -91,6 +92,13 @@ export type DocsSource = {
     entries: ZipEntry[];
     loading: boolean;
     error: string | null;
+    /** The saved ZIP won't open: offer fresh copies of all the tender's files. */
+    broken: boolean;
+    /** A request / re-download / update job is running for its tender. */
+    job: boolean;
+    /** Why the last re-download from this page failed, if it did. */
+    jobError: string | null;
+    redownload: () => Promise<string>;
   };
   openFile: (path: string) => Promise<void>;
   /** Writes the chosen tenders as CSV and opens the share sheet; resolves the count. */
@@ -191,6 +199,10 @@ const demoSource: DocsSource = {
     ],
     loading: false,
     error: null,
+    broken: false,
+    job: false,
+    jobError: null,
+    redownload: async () => 'Fresh copies requested from the portal',
   }),
   openFile: async () => {},
   exportCsv: async scope => {
@@ -381,22 +393,52 @@ function useLiveDownloads() {
 }
 
 function useLiveZip(docId: string) {
-  const history = useDownloadHistory();
-  const doc = history.find(d => String(d.id) === docId);
+  const qc = useQueryClient();
+  const doc = useLocalDoc(Number(docId));
+  const tid = doc?.tender_db_id ?? NaN;
+  const job = useDocJob(tid);
+  // Why the last re-download failed (e.g. the portal's CAPTCHA went unsolved again).
+  const [jobError, setJobError] = useState<string | null>(null);
+  // Unpack once a fresh copy is on the device (a re-download resets the row).
+  const ready = doc?.status === 'downloaded';
   const res = useQuery({
-    queryKey: ['zip', docId],
-    enabled: Boolean(doc),
+    queryKey: ['zip', docId, doc?.downloaded_at],
+    enabled: Boolean(doc) && ready,
     staleTime: Infinity,
+    retry: false,
     queryFn: () => zipEntries(doc!),
   });
   return {
     entries: res.data ?? [],
-    loading: res.isLoading,
-    error: res.error
+    loading: res.isLoading || (Boolean(job) && !res.data?.length),
+    error: job
+      ? null
+      : res.error
       ? (res.error as Error).message
-      : doc
+      : ready
       ? null
       : 'Download the ZIP first.',
+    broken: Boolean(doc?.unreadable) && !job,
+    job: Boolean(job),
+    jobError: job ? null : jobError,
+    redownload: async () => {
+      if (!doc) throw new Error('Download the ZIP first.');
+      setJobError(null);
+      await startJob(
+        {
+          id: doc.tender_db_id,
+          tender_id: doc.tender_ref,
+          title: doc.tender_title,
+        },
+        'redownload',
+        r => {
+          if (!r.ok) setJobError(r.error);
+          qc.invalidateQueries({ queryKey: ['zip', docId] });
+          qc.invalidateQueries({ queryKey: ['tender-docs', String(tid)] });
+        },
+      );
+      return 'Fresh copies requested from the portal';
+    },
   };
 }
 
@@ -408,7 +450,7 @@ const liveSource: DocsSource = {
   exportCsv: (scope, onProgress) => exportTenders(scope, onProgress),
 };
 
-const DocsContext = createContext<DocsSource>(demoSource);
+export const DocsContext = createContext<DocsSource>(demoSource);
 
 export function DocsProvider({
   mode,

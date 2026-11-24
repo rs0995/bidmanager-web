@@ -12,6 +12,8 @@ import {
   startJob,
   syncTenderDocuments,
   toCsv,
+  UNREADABLE_ZIP,
+  zipEntries,
 } from '../src/lib/documents';
 import { files } from '../src/platform/files';
 import { push } from '../src/platform/push';
@@ -101,6 +103,22 @@ describe('document store', () => {
     ).rejects.toThrow('no longer on this device');
   });
 
+  it('flags a full-size ZIP that won’t open, and clears it on a fresh copy', async () => {
+    syncTenderDocuments(tender, [item(3, 'Tender.zip')]);
+    fetchMock.mockReturnValue(ok({ url: '/client/documents/3/download?token=t' }));
+    const row = await downloadDocument({ id: 3, tender_db_id: 42, file_name: 'Tender.zip', size_bytes: 2048 });
+    expect(isCorrupt(row)).toBe(false);
+    (files.unzip as jest.Mock).mockRejectedValueOnce(new Error('failed to open zip file'));
+    await expect(zipEntries(row)).rejects.toThrow(UNREADABLE_ZIP);
+    const flagged = docsForTender(42).find(d => d.id === 3)!;
+    expect(flagged.unreadable).toBe(true);
+    expect(isCorrupt(flagged)).toBe(true);
+    expect(files.remove).toHaveBeenCalledWith('/Docs/zip-extracted/3');
+    const fresh = await downloadDocument(flagged);
+    expect(fresh.unreadable).toBe(false);
+    expect(isCorrupt(fresh)).toBe(false);
+  });
+
   it('keeps local download state when the server list is refreshed', async () => {
     syncTenderDocuments(tender, [item(1, 'NIT.pdf')]);
     fetchMock.mockReturnValueOnce(ok({ url: '/client/documents/1/download?token=t' }));
@@ -138,6 +156,29 @@ describe('server jobs', () => {
     );
     const badge = (push.notify as jest.Mock).mock.calls.at(-1)[3];
     expect(badge).toBeGreaterThan(0);
+  });
+
+  it('a re-download replaces every copy on the device, not only the broken ones', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url.includes('/request-download')) return ok({ job_id: 'j3' });
+      if (url.includes('/download-status')) return ok({ status: 'completed' });
+      if (url.includes('/documents?')) return ok({ items: [item(1, 'NIT.pdf'), item(3, 'Tender.zip')], page: 1, page_size: 100, total: 2, pages: 1 });
+      if (url.includes('/download-request')) return ok({ url: '/client/documents/x/download?token=t' });
+      return ok({});
+    });
+    syncTenderDocuments(tender, [item(1, 'NIT.pdf'), item(3, 'Tender.zip')]);
+    await downloadDocument({ id: 1, tender_db_id: 42, file_name: 'NIT.pdf', size_bytes: 2048 });
+    await downloadDocument({ id: 3, tender_db_id: 42, file_name: 'Tender.zip', size_bytes: 2048 });
+    (files.download as jest.Mock).mockClear();
+    (files.remove as jest.Mock).mockClear();
+    const done = jest.fn();
+    await startJob(tender, 'redownload', done);
+    for (let i = 0; i < 20 && !done.mock.calls.length; i++) await new Promise(r => setTimeout(r, 0));
+    expect(done).toHaveBeenCalledWith({ ok: true, newDocuments: 2 });
+    const removed = (files.remove as jest.Mock).mock.calls.map(c => c[0]);
+    expect(removed).toEqual(expect.arrayContaining(['/Docs/documents/1/NIT.pdf', '/Docs/documents/3/Tender.zip']));
+    expect(files.download).toHaveBeenCalledTimes(2);
+    expect(docsForTender(42).every(d => d.status === 'downloaded' && !d.unreadable)).toBe(true);
   });
 
   it('update checks save only new files and start the hourly cooldown', async () => {

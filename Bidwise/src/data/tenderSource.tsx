@@ -291,6 +291,23 @@ function useWebsiteId(portal: string | null) {
   return portal ? data?.find(w => w.name === portal)?.id : undefined;
 }
 
+/**
+ * Organisations as each portal lists them: still on the portal first, grouped by portal,
+ * then the portal's own position (`site_order`, its S.No). Rows the server hasn't
+ * numbered yet follow, most tenders first, then A–Z (the order before site_order).
+ */
+export function byPortalOrder(a: ServerOrg, b: ServerOrg) {
+  const pos = (o: ServerOrg) =>
+    typeof o.site_order === 'number' ? o.site_order : Infinity;
+  return (
+    Number(b.is_available) - Number(a.is_available) ||
+    a.website_name.localeCompare(b.website_name) ||
+    pos(a) - pos(b) ||
+    b.tender_count - a.tender_count ||
+    a.name.localeCompare(b.name)
+  );
+}
+
 /** Every organisation of a portal: page 1 says how many pages, the rest load 4 at a time. */
 export async function fetchAllOrgs(websiteId?: number, archived?: boolean) {
   const get = (page: number) =>
@@ -338,6 +355,9 @@ const liveSource: TenderSource = {
     const websiteId = useWebsiteId(q.portal);
     const saved = useBookmarkIds();
     const savedIds = q.savedOnly && !q.paused ? [...saved] : [];
+    // The value range (crores) is applied by the server across every tender.
+    const minCr = q.filters ? parseLimit(q.filters.minCr) : null;
+    const maxCr = q.filters ? parseLimit(q.filters.maxCr) : null;
     const paged = useInfiniteQuery({
       queryKey: [
         'tenders',
@@ -349,6 +369,8 @@ const liveSource: TenderSource = {
         q.archived,
         q.filters?.category.trim() ?? '',
         q.filters?.location.trim() ?? '',
+        minCr,
+        maxCr,
       ],
       enabled:
         !q.paused && !q.savedOnly && (!q.portal || websiteId !== undefined),
@@ -362,6 +384,8 @@ const liveSource: TenderSource = {
           archived: q.archived ? 'true' : 'false',
           category: q.filters?.category.trim(),
           location: q.filters?.location.trim(),
+          min_value_cr: minCr,
+          max_value_cr: maxCr,
           sort_by:
             q.sort === 'value'
               ? 'tender_value'
@@ -419,14 +443,10 @@ const liveSource: TenderSource = {
     }
     if (q.closingSoon)
       rows = rows.filter(t => t.closeIn !== 'Closed' && closesWithinDays(t, 5));
-    // The server applies category and location to a page; the value range (and every
-    // filter on the saved list) is applied here.
+    // The server applies category, location and the value range across every tender
+    // (so its total stands); the saved list is filtered here.
     const f = q.filters;
-    const clientFiltered =
-      f &&
-      (q.savedOnly ||
-        parseLimit(f.minCr) !== null ||
-        parseLimit(f.maxCr) !== null);
+    const clientFiltered = Boolean(f) && q.savedOnly;
     if (f) rows = rows.filter(t => passesSheetFilters(t, f, !q.savedOnly));
     if (!q.archived && q.sort === 'closing') rows = [...rows].sort(openFirst);
 
@@ -492,12 +512,7 @@ const liveSource: TenderSource = {
         (res.data ?? [])
           .filter(o => !needle || o.name.toLowerCase().includes(needle))
           .filter(o => !bookmarkedOnly || isOrgBookmarked(o.name))
-          .sort(
-            (a, b) =>
-              Number(b.is_available) - Number(a.is_available) ||
-              b.tender_count - a.tender_count ||
-              a.name.localeCompare(b.name),
-          )
+          .sort(byPortalOrder)
           .map(o => ({
             name: o.name,
             portals: [o.website_name],

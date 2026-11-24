@@ -42,6 +42,8 @@ export type ServerOrg = {
   has_saved_job: boolean;
   last_scraped_at: number;
   is_available: boolean;
+  /** Position in the portal's own organisation list (its S.No); null until listed. */
+  site_order?: number | null;
 };
 
 export type ServerDocument = {
