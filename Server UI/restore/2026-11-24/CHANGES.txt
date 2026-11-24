@@ -1,3 +1,6 @@
 ----
 2026-11-24 12:03  CLAUDE.md (OCI Server Manager session)
   Server rule: deploys and server edits may now run from the Windows PC or the Mac mini (whole repo moved to the Mac); keep the two in step through git. Backup: restore/2026-11-24/CLAUDE.md.
+----
+2026-11-24 12:25  server/app_core.py, server/API_CHANGES.md, new server/test_download_integrity.py (OCI Server Manager session, asked by the Bidwise app session)
+  Downloads: after an unsolved document CAPTCHA the Tender Notice and Zip file are no longer fetched, and the job fails with the reason (job_b830 had stored the portal page as 2026_DTEDM_1350593_1.zip). Each saved file is checked (PK / Rar! / %PDF, no HTML page, not empty) before it is stored or logged complete. API_CHANGES section 6. Backups: restore/2026-11-24/server/. Tests 335/335. NOT deployed.

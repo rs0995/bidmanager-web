@@ -11,3 +11,5 @@ Desktop app icon (exe, desktop shortcut, taskbar, installer) restored to the pre
 Bid Agent: AI provider and model are now dropdowns (models listed live from the provider when the server supports it, built-in Claude list otherwise); Save / Remove key line up with the inputs. Gemini / ChatGPT become selectable once the server adds them.
 ----
 10:06 Bid Agent can run on Claude, Gemini or ChatGPT: pick the provider and models in the console (Bid Agent tab); each provider keeps its own key; models are listed live from the provider.
+----
+2026-11-24 12:25  Downloads no longer save the portal page as a document when the CAPTCHA is not solved; such jobs now fail with the reason, and every saved ZIP/PDF is checked before it is stored.

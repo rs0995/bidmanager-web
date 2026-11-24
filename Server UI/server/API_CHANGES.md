@@ -303,3 +303,14 @@ Older one-shot routes (still served): `POST/GET /client/tenders/{id}/bid-pack`, 
 | GET | `/admin/bid-agent/employers` | learned employers: `{org_key, org_name, aliases {role: [terms]}, form_codes, tender_count}` |
 | DELETE | `/admin/bid-agent/employers/{org_key}` | forget an employer (aliases + its form templates) |
 | GET | `/admin/bid-agent/forms?org_key=` | form template library |
+
+---
+
+## 6. Tender document downloads: CAPTCHA and file checks (READY since 2026-11-24)
+
+No route or response shape changes. What changes is when a download job fails:
+- **Unsolved CAPTCHA:** if the portal's document CAPTCHA isn't solved (AI tries and manual tries used up, or the manual request timed out), the Tender Notice and Zip file are no longer fetched. Pre-bid and corrigendum files, which have no CAPTCHA, are still checked. The job then **fails** instead of "completed", and `GET /client/tenders/{id}/download-status` returns `status: "failed"` with an `error` such as "Download failed for <tender_id>: the portal CAPTCHA was not solved, so the Tender Notice and Zip file could not be downloaded. Retry limit (3) reached." If both files are already stored, an unsolved CAPTCHA doesn't fail the job.
+- **Retries first:** a failed job is retried up to the `retry_attempts` setting (3 by default), so the client sees `queued`/`running` again before the final `failed`. Each retry asks for the CAPTCHA again.
+- **Not-real files:** every saved file is checked before it is stored. A `.zip`/`.xlsx`/`.docx` must start with `PK`, a `.rar` with `Rar!`, a `.pdf` must contain `%PDF` in its first 1 KB, and none of them may be an HTML page. Empty files of any type are refused. `.xls`/`.doc` only get the empty check, because portals serve real HTML-table versions. A refused file isn't stored on Drive or logged complete, and the tender's job fails with "the portal sent a page instead of the real file for <name>".
+- On failure, the tender row gets `download_status='failed'` and `last_download_error` set to the reason.
+- `mode: "redownload"` is unchanged: it re-fetches every file, and now refuses a portal page in place of the real file.

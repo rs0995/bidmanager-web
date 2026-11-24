@@ -3816,6 +3816,39 @@ class ScraperBackend:
         conn.close()
         return {"complete": main_complete, "missing": missing, "folder_path": durable_folder}
 
+    # Leading bytes a stored file of each type must start with. xls/doc are left
+    # out: portals do serve real HTML-table .xls and HTML .doc files.
+    _FILE_SIGNATURES = {
+        "zip": (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"),
+        "rar": (b"Rar!",),
+        "xlsx": (b"PK\x03\x04",),
+        "docx": (b"PK\x03\x04",),
+    }
+
+    @staticmethod
+    def downloaded_file_problem(file_path):
+        """Why a just-saved file is not the real document, or None if it looks right.
+        An unsolved/expired CAPTCHA makes the portal answer with its HTML page,
+        which would otherwise be stored under the .zip/.pdf name."""
+        extension = os.path.splitext(str(file_path or ""))[1].lower().lstrip(".")
+        try:
+            with open(file_path, "rb") as f:
+                head = f.read(1024)
+        except OSError as e:
+            return f"could not read the saved file ({e})"
+        if not head:
+            return "the portal sent an empty file"
+        signatures = ScraperBackend._FILE_SIGNATURES.get(extension)
+        if extension == "pdf" or signatures:
+            text = head.lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+            if text.startswith((b"<!doctype", b"<html")):
+                return "the portal returned a web page instead of the file"
+        if extension == "pdf" and b"%PDF" not in head:
+            return "not a PDF file"
+        if signatures and not head.startswith(signatures):
+            return f"not a {extension.upper()} file"
+        return None
+
     @staticmethod
     def download_file_with_requests(url, file_path, cookies, tender_id=None, file_type="document"):
         if not ensure_scraper_dependencies():
@@ -3863,6 +3896,13 @@ class ScraperBackend:
                         )
                     f.write(chunk)
                     digest.update(chunk)
+
+            problem = ScraperBackend.downloaded_file_problem(file_path)
+            if problem:
+                rejected = getattr(_job_runtime, "rejected_downloads", None)
+                if rejected is not None:
+                    rejected.append(os.path.basename(file_path))
+                raise ValueError(f"{problem}; not stored")
 
             fetched_ok = True
             digest_hex = digest.hexdigest()
@@ -4740,6 +4780,11 @@ class ScraperBackend:
             ScraperBackend.close_download_session()
             return False
 
+        # Files download_file_with_requests refused as "not the real document",
+        # and per-tender failures that make the job fail instead of "finished".
+        _job_runtime.rejected_downloads = rejected = []
+        failed_tenders = []
+
         for db_id, t_id, title, url, last_dl, existing_folder in to_download:
             requested_mode = mode_override if mode_override else "update"
             
@@ -4759,7 +4804,10 @@ class ScraperBackend:
             download_mode = ScraperBackend._resolve_download_mode(requested_mode, t_id, save_dir)
             log_to_gui(f"Processing: {t_id} (Mode: {download_mode})...")
             any_new_download = False
-            
+            docs_locked = False      # the shared CAPTCHA gate stayed unsolved
+            locked_files = []        # gated files still needed but not fetched
+            rejected_start = len(rejected)
+
             try:
                 if not ScraperBackend.open_tender_page_with_recovery(driver, base_url, url):
                     log_to_gui(f"Could not recover session for {t_id}. Skipping.")
@@ -4791,6 +4839,11 @@ class ScraperBackend:
                                     _, unlocked_href = ScraperBackend._wait_for_href(driver, by, locator, timeout=15)
                                     if unlocked_href:
                                         break
+                            else:
+                                # Behind an unsolved CAPTCHA the portal serves its own
+                                # page, not the notice/zip — don't fetch and log that.
+                                docs_locked = True
+                                log_to_gui("  CAPTCHA not solved: the Tender Notice and Zip file stay locked.")
                     except Exception as e:
                         log_to_gui(f"  Could not unlock tender documents: {e}")
 
@@ -4799,9 +4852,12 @@ class ScraperBackend:
                     try:
                         notice_filename = f"Tendernotice_{safe_id}.pdf"
                         notice_path = os.path.join(save_dir, notice_filename)
-                        if not ScraperBackend.should_skip_file(
+                        notice_done = ScraperBackend.should_skip_file(
                             t_id, notice_filename, notice_path, file_type="notice"
-                        ):
+                        )
+                        if not notice_done and docs_locked:
+                            locked_files.append("Tender Notice")
+                        elif not notice_done:
                             log_to_gui("  Checking Tender Notice...")
                             # Re-open the tender page first, the same way sections 3 & 4
                             # (and backend/'s per-section download flow) do. The shared
@@ -4851,9 +4907,12 @@ class ScraperBackend:
                     try:
                         zip_filename = f"{safe_id}.zip"
                         zip_path = os.path.join(save_dir, zip_filename)
-                        if not ScraperBackend.should_skip_file(
+                        zip_done = ScraperBackend.should_skip_file(
                             t_id, zip_filename, zip_path, file_type="zip"
-                        ):
+                        )
+                        if not zip_done and docs_locked:
+                            locked_files.append("Zip file")
+                        elif not zip_done:
                             log_to_gui("  Checking Zip File...")
                             # Re-open the tender page first (see the Tender Notice block) —
                             # the shared section-0 CAPTCHA step can leave the driver off the
@@ -4957,6 +5016,29 @@ class ScraperBackend:
                     db_id, t_id, save_dir, any_new_download=any_new_download
                 )
 
+                problems = []
+                if locked_files:
+                    problems.append(
+                        f"the portal CAPTCHA was not solved, so the {' and '.join(locked_files)} "
+                        "could not be downloaded"
+                    )
+                if len(rejected) > rejected_start:
+                    problems.append(
+                        "the portal sent a page instead of the real file for "
+                        + ", ".join(rejected[rejected_start:])
+                    )
+                if problems:
+                    error = "; ".join(problems)
+                    failed_tenders.append(f"{t_id}: {error}")
+                    log_to_gui(f"  Download incomplete for {t_id}: {error}.")
+                    conn = sqlite3.connect(DB_FILE)
+                    conn.execute(
+                        "UPDATE tenders SET download_status='failed', last_download_error=? WHERE id=?",
+                        (error, db_id),
+                    )
+                    conn.commit()
+                    conn.close()
+
             except Exception as e:
                 log_to_gui(f"Error accessing {url}: {e}")
                 conn = sqlite3.connect(DB_FILE)
@@ -4980,7 +5062,12 @@ class ScraperBackend:
 
         # The browser session is kept alive on purpose — see _acquire_download_driver.
         ScraperBackend._download_driver_last_used = time.time()
+        _job_runtime.rejected_downloads = None
         log_to_gui("Download process finished.")
+        if failed_tenders:
+            # The job's last log line becomes its error, so the client sees why.
+            log_to_gui("Download failed for " + " | ".join(failed_tenders) + ".")
+            return False
         return True
 
     @staticmethod
