@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Pressable,
   StyleSheet,
+  Switch,
   Text,
   View,
 } from 'react-native';
@@ -43,6 +44,12 @@ import {
 } from '../../components/project/ReadyChecklist';
 import { leftLabel } from '../../lib/deadlines';
 import { useBookmarks } from '../../fixtures/bookmarks';
+import { useNotifySettings } from '../../fixtures/notifySettings';
+import { prebidTime } from '../../lib/serverTender';
+import {
+  getPushPermission,
+  requestPushPermission,
+} from '../../lib/pushRegistration';
 import {
   OpenResult,
   Project,
@@ -152,31 +159,46 @@ function StackedRow({
   label,
   value,
   last,
+  right,
 }: {
   label: string;
   value: string;
   last?: boolean;
+  /** Shown at the right of the row (the pre-bid meeting's "Remind me" switch). */
+  right?: React.ReactNode;
 }) {
   const t = useTheme();
   return (
     <View
       style={[
         styles.stacked,
+        right ? styles.stackedRight : null,
         !last && {
           borderBottomWidth: StyleSheet.hairlineWidth * 2,
           borderBottomColor: t.colors.hair,
         },
       ]}
     >
-      <Text style={[styles.fieldLabel, { color: t.colors.muted }]}>
-        {label}
-      </Text>
-      <Text style={[styles.fieldValue, { color: t.colors.ink }]}>
-        {value || '—'}
-      </Text>
+      <View style={styles.flex}>
+        <Text style={[styles.fieldLabel, { color: t.colors.muted }]}>
+          {label}
+        </Text>
+        <Text style={[styles.fieldValue, { color: t.colors.ink }]}>
+          {value || '—'}
+        </Text>
+      </View>
+      {right}
     </View>
   );
 }
+
+/** "1 day and 2 h before" for the pre-bid toast. */
+const leadsText = (leads: number[]) =>
+  [...leads]
+    .sort((a, b) => b - a)
+    .map(m => (m >= 1440 ? `${m / 1440} day` : `${m / 60} h`))
+    .join(' and ')
+    .replace(/ and (?=.* and )/g, ', ');
 
 export function DetailScreen() {
   const t = useTheme();
@@ -206,6 +228,7 @@ export function DetailScreen() {
   const { isBookmarked, toggle } = useBookmarks();
   // Sections the organisation turned off for this member are left out of the page.
   const access = useAccess();
+  const notify = useNotifySettings();
 
   const source = useTenderSource();
   const tenderId = fromProjects
@@ -250,6 +273,32 @@ export function DetailScreen() {
   }
 
   const saved = isBookmarked(tender.id);
+  // Pre-bid reminder: keyed by portal tender ID, shown for a meeting still ahead with a
+  // time of day (the server can't remind on time without one).
+  const prebidRef = tender.refId || tender.id;
+  const prebidAt = tender.prebidAt ?? prebidTime(tender.prebid);
+  const canRemind =
+    access.bookmarks && prebidAt !== null && prebidAt > Date.now();
+  const remindOn = canRemind && notify.prebidOn(prebidRef, saved);
+  const setRemind = (on: boolean) => {
+    notify.setPrebid(prebidRef, on);
+    if (!on) {
+      toast.show('Pre-bid reminder off');
+      return;
+    }
+    const leads = notify.settings.prebidLeads;
+    const org = access.account.org?.name;
+    toast.show(
+      leads.length
+        ? `Pre-bid reminder on: ${leadsText(leads)} before${
+            org ? ` for everyone in ${org}` : ''
+          }`
+        : 'Pre-bid reminder on. Choose the times in Push notifications & Alerts.',
+    );
+    getPushPermission()
+      .then(p => (p === 'undetermined' ? requestPushPermission() : null))
+      .catch(() => {});
+  };
   const ready = project?.checklist.find(f => f.name === READY_FOLDER)?.items;
   // A tender that isn't a project yet starts with an empty checklist; adding the
   // first item (or a prep doc) starts the project.
@@ -408,7 +457,30 @@ export function DetailScreen() {
           right={['Bid opening date', tender.opening ?? '—']}
         />
         <StackedRow label="Closing" value={tender.closing} />
-        <StackedRow label="Pre-bid meeting" value={tender.prebid} />
+        <StackedRow
+          label="Pre-bid meeting"
+          value={tender.prebid}
+          right={
+            canRemind ? (
+              <View style={styles.remind}>
+                <Text style={[styles.remindText, { color: t.colors.muted }]}>
+                  Remind me
+                </Text>
+                <Switch
+                  accessibilityLabel="Remind me before the pre-bid meeting"
+                  value={remindOn}
+                  onValueChange={setRemind}
+                  trackColor={{
+                    true: t.colors.accent,
+                    false: t.colors.surfaceSunk,
+                  }}
+                  thumbColor="#ffffff"
+                  ios_backgroundColor={t.colors.surfaceSunk}
+                />
+              </View>
+            ) : undefined
+          }
+        />
         <StackedRow
           label="Organisation chain"
           value={`${tender.org} · ${tender.location}`}
@@ -670,7 +742,6 @@ export function DetailScreen() {
         }
       />
 
-
       {access.projects ? (
         <DocGroup
           title="Docs for Preparation"
@@ -682,7 +753,12 @@ export function DetailScreen() {
             })),
             // On Drive but not on this phone yet (saved by the Bid Agent or a teammate).
             ...agentPrep.files
-              .filter(f => !(project?.prepDocs ?? []).some(d => d.serverFileId === f.file_id))
+              .filter(
+                f =>
+                  !(project?.prepDocs ?? []).some(
+                    d => d.serverFileId === f.file_id,
+                  ),
+              )
               .map(f => ({
                 key: `drive:${f.file_id}`,
                 name: f.name,
@@ -695,7 +771,9 @@ export function DetailScreen() {
             if (p) addPrepDoc(p.id);
           }}
           onRowPress={r => {
-            const drive = agentPrep.files.find(f => `drive:${f.file_id}` === r.key);
+            const drive = agentPrep.files.find(
+              f => `drive:${f.file_id}` === r.key,
+            );
             if (drive) {
               agentPrep
                 .open(project ? Number(project.id) : null, drive)
@@ -712,7 +790,9 @@ export function DetailScreen() {
             icon: <Trash2 size={17} color={t.colors.muted} />,
             label: r => `Remove ${r.name}`,
             onPress: r => {
-              const drive = agentPrep.files.find(f => `drive:${f.file_id}` === r.key);
+              const drive = agentPrep.files.find(
+                f => `drive:${f.file_id}` === r.key,
+              );
               if (drive) {
                 agentPrep
                   .remove(drive)
@@ -794,6 +874,9 @@ const styles = StyleSheet.create({
   gridRow: { flexDirection: 'row' },
   cell: { width: '50%', paddingVertical: 10, paddingHorizontal: 12 },
   stacked: { paddingVertical: 10, marginHorizontal: 12 },
+  stackedRight: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  remind: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  remindText: { fontFamily: fonts.medium, fontSize: 12 },
   fieldLabel: { fontFamily: fonts.regular, fontSize: 12 },
   fieldValue: { fontFamily: fonts.medium, fontSize: 13.5, marginTop: 3 },
   buttons: { gap: 8, marginBottom: 16 },

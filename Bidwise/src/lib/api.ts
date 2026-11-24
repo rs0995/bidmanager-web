@@ -181,9 +181,17 @@ export type SyncBlob = {
     notifyOrgAlertsOn: boolean;
     notifyTenderAlertsOn: boolean;
     reminderDays: number[];
+    /** Pre-bid reminder times, minutes before the meeting (Bidwise). */
+    prebidLeads?: number[];
+    /** Pre-bid reminders on for every bookmarked tender unless switched off. */
+    prebidAutoBookmarked?: boolean;
     /** When the preferences were last changed (ms). The newer copy wins. */
     updatedAt?: number;
   };
+  /** Portal tender IDs whose pre-bid reminder is on (shared within an organisation). */
+  prebidReminderIds?: string[];
+  /** Portal tender IDs switched off by hand (matters with "Bookmarked tenders automatically"). */
+  prebidReminderOffIds?: string[];
   [key: string]: unknown;
 };
 

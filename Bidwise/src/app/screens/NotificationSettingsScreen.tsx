@@ -12,7 +12,9 @@ import { useNavigation } from '@react-navigation/native';
 import {
   Bell,
   BellOff,
+  BookmarkCheck,
   Building2,
+  CalendarClock,
   ChevronDown,
   ChevronLeft,
   ChevronUp,
@@ -37,6 +39,7 @@ import {
 } from '../../components/more/SettingsRow';
 import {
   DAY_THRESHOLDS,
+  PREBID_LEAD_OPTIONS,
   useNotifySettings,
 } from '../../fixtures/notifySettings';
 import { relativeTime, useActions } from '../../data/actions';
@@ -63,14 +66,35 @@ export function reminderSummary(days: number[]) {
   return `${list} days before`;
 }
 
+const LEAD_LABEL: Record<number, string> = {
+  1440: '1 day before',
+  240: '4 h before',
+  120: '2 h before',
+  60: '1 h before',
+};
+const leadShort = (m: number) =>
+  m >= 1440 ? `${m / 1440} day` : `${m / 60} h`;
+
+/** The pre-bid row's text: "Off", "2 h before", "1 day and 2 h before", ... */
+export function prebidSummary(leads: number[]) {
+  const l = [...leads].sort((a, b) => b - a);
+  if (!l.length) return 'Off';
+  if (l.length === 1) return LEAD_LABEL[l[0]] ?? `${leadShort(l[0])} before`;
+  const parts = l.map(leadShort);
+  return `${parts.slice(0, -1).join(', ')} and ${
+    parts[parts.length - 1]
+  } before`;
+}
+
 export function NotificationSettingsScreen() {
   const t = useTheme();
   const toast = useToast();
   const navigation = useNavigation();
-  const { settings, set, toggleDay } = useNotifySettings();
+  const { settings, set, toggleDay, togglePrebidLead } = useNotifySettings();
   const { sync, syncing, lastSyncAt } = useActions();
   const [permission, setPermission] = useState<PushPermission>('undetermined');
   const [daysOpen, setDaysOpen] = useState(false);
+  const [leadsOpen, setLeadsOpen] = useState(false);
 
   const refresh = useCallback(() => {
     getPushPermission()
@@ -158,7 +182,7 @@ export function NotificationSettingsScreen() {
           <ChevronLeft size={22} color={t.colors.ink} />
         </IconButton>
       </View>
-      <PageTitle>Push notifications</PageTitle>
+      <PageTitle>Push notifications & Alerts</PageTitle>
 
       <Card padding={14} radius="lg" elevation="sm">
         <View style={styles.statusRow}>
@@ -292,11 +316,78 @@ export function NotificationSettingsScreen() {
         ) : null}
       </SettingsSection>
 
+      <SettingsSection title="Pre-bid reminders">
+        {/* Times for the "Remind me" switch on a tender's pre-bid meeting. */}
+        <SettingsRow
+          icon={icon(CalendarClock)}
+          title="Pre-bid reminders"
+          sub="Remind me before a pre-bid meeting I've switched on (on the tender's page)."
+          value={prebidSummary(settings.prebidLeads)}
+          right={
+            leadsOpen ? (
+              <ChevronUp size={16} color={t.colors.muted} />
+            ) : (
+              <ChevronDown size={16} color={t.colors.muted} />
+            )
+          }
+          onPress={() => setLeadsOpen(o => !o)}
+        />
+        {leadsOpen ? (
+          <View
+            accessibilityLabel="Pre-bid reminder times"
+            style={[styles.days, { borderTopColor: t.colors.hair }]}
+          >
+            {PREBID_LEAD_OPTIONS.map(lead => {
+              const on = settings.prebidLeads.includes(lead);
+              const change = () => {
+                togglePrebidLead(lead, !on);
+                askIfNeeded(!on);
+              };
+              return (
+                <Pressable
+                  key={lead}
+                  accessibilityRole="checkbox"
+                  accessibilityState={{ checked: on }}
+                  accessibilityLabel={`Remind ${LEAD_LABEL[lead]}`}
+                  onPress={change}
+                  style={styles.dayRow}
+                >
+                  <Checkbox
+                    checked={on}
+                    label={`Remind ${LEAD_LABEL[lead]}`}
+                    onPress={change}
+                  />
+                  <Text style={[styles.dayText, { color: t.colors.ink }]}>
+                    {LEAD_LABEL[lead]}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        ) : null}
+        <SettingsRow
+          icon={icon(BookmarkCheck)}
+          title="Bookmarked tenders automatically"
+          sub="Turn the pre-bid reminder on for every bookmarked tender. You can still switch it off on a tender's page."
+          right={toggle(
+            settings.prebidAutoBookmarked,
+            v => {
+              set({ prebidAutoBookmarked: v });
+              askIfNeeded(v);
+            },
+            'Pre-bid reminders for bookmarked tenders',
+          )}
+          last
+        />
+      </SettingsSection>
+
       <Text style={[styles.footnote, { color: t.colors.muted }]}>
         The server sends these as they happen, even when the app is closed;
-        closing reminders go out once a day between 10:00 and 21:00. They follow
-        your account, so the same choices apply in BM Pro. New projects only
-        appears in Alerts. All options above can be on together.
+        closing reminders go out once a day between 10:00 and 21:00, and pre-bid
+        reminders at the times you choose. They follow your account, so the same
+        choices apply in BM Pro. A pre-bid reminder switched on for a tender is
+        shared with your organisation, so every member is reminded. New projects
+        only appears in Alerts. All options above can be on together.
       </Text>
     </Screen>
   );

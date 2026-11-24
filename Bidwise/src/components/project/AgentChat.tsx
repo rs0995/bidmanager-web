@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Animated,
@@ -21,7 +21,7 @@ import {
 } from 'lucide-react-native';
 import { Chip, useSurface } from '../ui';
 import { GlassBlur } from '../ui/GlassBlur';
-import { useReducedMotion } from '../ui/motion';
+import { useCycledHint } from '../ui/useCycledHint';
 import type { AgentChat } from '../../data/bidAgent';
 import type { ChatCard, ChatMessage } from '../../lib/bidAgent';
 import { share } from '../../platform/share';
@@ -31,34 +31,7 @@ type OpenFile = (file: { file_id: number; name: string }) => void;
 
 const ROWS_SHOWN = 4;
 
-const CYCLE_MS = 3200;
 const SWIPE_OPEN = 48;
-
-/**
- * Cycles through the suggested requests every few seconds (with a quick fade, none with
- * Reduce Motion) while not `paused`. Used by the one-line box and the chat's message box.
- */
-export function useCycledHint(suggestions: string[], paused: boolean) {
-  const reduced = useReducedMotion();
-  const [i, setI] = useState(0);
-  const fade = useRef(new Animated.Value(1)).current;
-  const count = suggestions.length;
-  useEffect(() => {
-    if (paused || count < 2) return;
-    const id = setInterval(() => {
-      if (reduced) {
-        setI(n => n + 1);
-        return;
-      }
-      Animated.timing(fade, { toValue: 0, duration: 160, useNativeDriver: true }).start(() => {
-        setI(n => n + 1);
-        Animated.timing(fade, { toValue: 1, duration: 220, useNativeDriver: true }).start();
-      });
-    }, CYCLE_MS);
-    return () => clearInterval(id);
-  }, [paused, count, reduced, fade]);
-  return { hint: count ? suggestions[i % count] : '', fade };
-}
 
 /** The message being typed and sending it; shared by the message box and the suggestions. */
 export function useChatSend(chat: AgentChat, initialText?: string) {

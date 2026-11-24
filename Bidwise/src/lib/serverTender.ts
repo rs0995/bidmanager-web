@@ -21,6 +21,16 @@ const MONTH_INDEX: Record<string, number> = {
 };
 
 /**
+ * A pre-bid meeting's time (ms), only when the text has a time of day: a bare date
+ * can't be reminded on time, so the server skips those and so does the switch.
+ */
+export function prebidTime(text: string | null | undefined): number | null {
+  if (!text || !/\d{1,2}:\d{2}/.test(text)) return null;
+  const d = parseFlexibleDate(text);
+  return d ? d.getTime() : null;
+}
+
+/**
  * ISO-8601, or portal text such as "08-Sep-2026 03:00 PM". The month lookup is spelled
  * out because Hermes can't parse "Oct 1, 2000" (BM Pro hit this: deadlines came up
  * empty on the phone while working on the web).
@@ -146,6 +156,7 @@ export function toTender(s: ServerTender, now = Date.now()): Tender {
     prebid: s.pre_bid_meeting_date
       ? formatDateTime(s.pre_bid_meeting_date)
       : '—',
+    prebidAt: prebidTime(s.pre_bid_meeting_date),
     docs: [],
     refId: s.tender_id,
     url: s.tender_url || s.website_url,

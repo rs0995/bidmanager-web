@@ -3,7 +3,7 @@ import { StyleSheet, Text, View } from 'react-native';
 import { Button, Field, Sheet } from '../ui';
 import { Dropdown } from '../ui/Dropdown';
 import { fonts, useTheme } from '../../theme';
-import type { LocationOption } from '../../data/tenderSource';
+import type { LocationOption, OrgItem } from '../../data/tenderSource';
 import {
   CATEGORIES,
   NO_SHEET_FILTERS,
@@ -13,6 +13,8 @@ import {
 type Props = {
   visible: boolean;
   value: SheetFilters;
+  /** The portal's organisations (departments), in the portal's order. */
+  departments: OrgItem[];
   /** The locations in the data, for the Location list. */
   locations: LocationOption[];
   onApply: (f: SheetFilters) => void;
@@ -21,21 +23,27 @@ type Props = {
 
 const CATEGORY_OPTIONS = CATEGORIES.map(c => ({ value: c, label: c }));
 
+type Which = 'department' | 'category' | 'location';
+/** How many department names the empty search box cycles through. */
+const HINT_COUNT = 8;
+
 /**
- * The Tenders tab's filters: category (Works, Services, Goods) and location chosen from
- * lists, and a tender value range typed in crores. Changes apply on Apply; Clear resets
- * everything.
+ * The Tenders tab's filters: department, category (Works, Services, Goods) and location
+ * chosen from lists (department and location searchable; the department search cycles
+ * through example names), and a tender value range typed in crores. Changes apply on
+ * Apply; Clear resets everything.
  */
 export function TenderFilterSheet({
   visible,
   value,
+  departments,
   locations,
   onApply,
   onClose,
 }: Props) {
   const t = useTheme();
   const [local, setLocal] = useState(value);
-  const [open, setOpen] = useState<'category' | 'location' | null>(null);
+  const [open, setOpen] = useState<Which | null>(null);
   // Start from the applied filters each time the sheet opens.
   useEffect(() => {
     if (visible) {
@@ -45,8 +53,7 @@ export function TenderFilterSheet({
   }, [visible, value]);
   const set = (patch: Partial<SheetFilters>) =>
     setLocal(prev => ({ ...prev, ...patch }));
-  const toggle = (which: 'category' | 'location') =>
-    setOpen(o => (o === which ? null : which));
+  const toggle = (which: Which) => setOpen(o => (o === which ? null : which));
   const locationOptions = useMemo(() => {
     const opts = locations.map(l => ({
       value: l.value,
@@ -59,8 +66,40 @@ export function TenderFilterSheet({
       : opts;
   }, [locations, local.location]);
 
+  const departmentOptions = useMemo(() => {
+    const opts = departments.map(d => ({
+      value: d.name,
+      label: d.name,
+      note: d.count ? String(d.count) : '',
+    }));
+    return local.department && !opts.some(o => o.value === local.department)
+      ? [
+          { value: local.department, label: local.department, note: '' },
+          ...opts,
+        ]
+      : opts;
+  }, [departments, local.department]);
+  // Spread the examples over the list, not just its first few rows.
+  const departmentHints = useMemo(() => {
+    const step = Math.max(1, Math.floor(departments.length / HINT_COUNT));
+    return departments
+      .filter((_, i) => i % step === 0)
+      .slice(0, HINT_COUNT)
+      .map(d => d.name);
+  }, [departments]);
+
   return (
     <Sheet visible={visible} onClose={onClose} title="Filters">
+      <Dropdown
+        label="Department"
+        value={local.department}
+        options={departmentOptions}
+        onChange={v => set({ department: v })}
+        searchable
+        hints={departmentHints}
+        open={open === 'department'}
+        onToggle={() => toggle('department')}
+      />
       <Dropdown
         label="Category"
         value={local.category}

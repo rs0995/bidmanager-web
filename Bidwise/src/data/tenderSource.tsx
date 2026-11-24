@@ -363,7 +363,7 @@ const liveSource: TenderSource = {
         'tenders',
         q.portal,
         websiteId,
-        q.org,
+        q.org ?? q.filters?.department ?? '',
         q.search,
         q.sort,
         q.archived,
@@ -380,7 +380,8 @@ const liveSource: TenderSource = {
         const res = await api.tenders({
           q: q.search.trim(),
           website_id: websiteId,
-          organization: q.org ?? undefined,
+          // An organisation page's own org, else the Filters sheet's department.
+          organization: q.org ?? (q.filters?.department || undefined),
           archived: q.archived ? 'true' : 'false',
           category: q.filters?.category.trim(),
           location: q.filters?.location.trim(),
@@ -443,7 +444,7 @@ const liveSource: TenderSource = {
     }
     if (q.closingSoon)
       rows = rows.filter(t => t.closeIn !== 'Closed' && closesWithinDays(t, 5));
-    // The server applies category, location and the value range across every tender
+    // The server applies department, category, location and the value range across every tender
     // (so its total stands); the saved list is filtered here.
     const f = q.filters;
     const clientFiltered = Boolean(f) && q.savedOnly;

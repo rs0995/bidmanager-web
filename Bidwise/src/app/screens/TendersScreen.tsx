@@ -183,6 +183,18 @@ export function TendersScreen() {
     isOrgBookmarked,
     paused: !ready,
   });
+  // Every organisation of the portal (the same cached list), for the Department filter.
+  const departments = source.useOrgList({
+    portal,
+    search: '',
+    bookmarkedOnly: false,
+    isOrgBookmarked,
+    paused: !ready,
+  }).items;
+  // A department belongs to one portal: switching portal drops it.
+  useEffect(() => {
+    setFilters(f => (f.department ? { ...f, department: '' } : f));
+  }, [portal]);
 
   const onToggleTender = useStable((id: string) => toggle(id));
   const onOpenTender = useStable((id: string) =>
@@ -407,6 +419,7 @@ export function TendersScreen() {
 
       <TenderFilterSheet
         visible={filterOpen}
+        departments={departments}
         locations={locations}
         value={filters}
         onApply={setFilters}

@@ -300,7 +300,7 @@ export function MoreScreen() {
         />
         <SettingsRow
           icon={icon(Bell)}
-          title="Push notifications"
+          title="Push notifications & Alerts"
           sub="New tenders, updates and closing reminders"
           right={chevron}
           onPress={() => navigation.navigate('NotificationSettings')}

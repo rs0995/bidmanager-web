@@ -75,6 +75,9 @@ describe('R1: notification preferences come from the server', () => {
       notifyOrgAlertsOn: true,
       notifyTenderAlertsOn: false,
       reminderDays: [],
+      // Bidwise's pre-bid reminder times travel with the same preferences.
+      prebidLeads: [1440, 120],
+      prebidAutoBookmarked: false,
       updatedAt: 1234,
     });
   });

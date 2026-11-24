@@ -1,9 +1,14 @@
 import { api, ServerTender } from './api';
 import { addAlert, upsertOrgAlert } from './alerts';
 import { getRaw, readJSON, setRaw, writeJSON } from './kv';
-import { getBookmarks, getSettings, setSettings } from './store';
+import {
+  getBookmarks,
+  getSettings,
+  prebidReminderOn,
+  setSettings,
+} from './store';
 import { getProjectsState, STATUS_ARCHIVED } from './sharedProjects';
-import { parseFlexibleDate } from './serverTender';
+import { parseFlexibleDate, prebidTime } from './serverTender';
 import { startJob } from './documents';
 import { queryClient } from './queryClient';
 
@@ -138,11 +143,14 @@ async function checkServerChanges(): Promise<number> {
 }
 
 /**
- * Closing reminders at the chosen days-before (Push notifications screen), once per
- * tender and threshold; and a "Documents pending" nudge for project tenders closing
+ * Closing reminders at the chosen days-before (Push notifications & Alerts screen), once
+ * per tender and threshold; pre-bid meetings at the chosen times; and a "Documents pending" nudge for project tenders closing
  * within 3 days whose Ready for Bid checklist isn't complete (once per project per day).
  */
-function checkReminders(tenders: ServerTender[], now = new Date()): number {
+export function checkReminders(
+  tenders: ServerTender[],
+  now = new Date(),
+): number {
   const fired = readJSON<Record<string, true>>(FIRED_KEY, {});
   const days = getSettings().reminderDays;
   const saved = getBookmarks();
@@ -171,6 +179,30 @@ function checkReminders(tenders: ServerTender[], now = new Date()): number {
         break; // one reminder per check, for the nearest threshold crossed
       }
     }
+  }
+
+  // Pre-bid meetings switched on (or auto for bookmarks): the server pushes these at the
+  // chosen times; this puts the same reminder in the Alerts tab, once per lead.
+  const leads = [...getSettings().prebidLeads].sort((a, b) => a - b);
+  for (const t of tenders) {
+    if (t.is_archived || !leads.length) continue;
+    if (!prebidReminderOn(t.tender_id, saved.has(t.id))) continue;
+    const at = prebidTime(t.pre_bid_meeting_date);
+    if (at === null || now.getTime() >= at) continue;
+    const mins = (at - now.getTime()) / 60_000;
+    const lead = leads.find(l => mins <= l);
+    if (lead === undefined) continue;
+    const key = `prebid:${t.tender_id}:${lead}:${at}`;
+    if (fired[key]) continue;
+    // The nearest time crossed stands for the earlier ones too.
+    for (const l of leads)
+      if (l >= lead) fired[`prebid:${t.tender_id}:${l}:${at}`] = true;
+    count += 1;
+    addAlert({
+      kind: 'deadline',
+      message: `Pre-bid meeting for “${title(t)}” in ${prebidIn(mins)}.`,
+      tenderId: String(t.id),
+    });
   }
 
   const { projects, checklist } = getProjectsState();
@@ -202,6 +234,17 @@ function checkReminders(tenders: ServerTender[], now = new Date()): number {
 
   writeJSON(FIRED_KEY, fired);
   return count;
+}
+
+/** "45 minutes", "2 hours", "1 day" until a pre-bid meeting. */
+export function prebidIn(mins: number) {
+  if (mins < 60) return `${Math.max(1, Math.round(mins))} minutes`;
+  if (mins < 1440) {
+    const h = Math.round(mins / 60);
+    return `${h} ${h === 1 ? 'hour' : 'hours'}`;
+  }
+  const d = Math.round(mins / 1440);
+  return `${d} ${d === 1 ? 'day' : 'days'}`;
 }
 
 let inFlight: Promise<number> | null = null;

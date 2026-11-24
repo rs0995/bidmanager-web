@@ -50,11 +50,15 @@ import {
   useProjectsState,
 } from '../lib/sharedProjects';
 import {
+  prebidReminderOn,
+  setPrebidReminder,
   setSettings,
   toggleBookmark,
   toggleOrgBookmark,
   useBookmarkIds,
   useBookmarkedOrgNames,
+  usePrebidOff,
+  usePrebidOn,
   useSettings,
 } from '../lib/store';
 import { pushNow, syncUserData } from '../lib/sync';
@@ -77,7 +81,7 @@ import {
   PROJECT_BOOKMARK_MESSAGE,
 } from '../fixtures/bookmarks';
 import { CaptchaContext, CaptchaCtx } from '../fixtures/captcha';
-import { NotifyContext, NotifyCtx } from '../fixtures/notifySettings';
+import { NotifyContext, NotifyCtx, toggleIn } from '../fixtures/notifySettings';
 import {
   Project,
   ProjectsContext,
@@ -267,7 +271,9 @@ export function toProject(
       serverFileId: d.serverFileId,
       meta: `${
         d.size ? `${Math.max(1, Math.round(d.size / 1024))} KB · ` : ''
-      }${d.id.startsWith('srv') ? 'From Drive' : 'Added by you'}${d.serverFileId && !d.id.startsWith('srv') ? ' · on Drive' : ''}`,
+      }${d.id.startsWith('srv') ? 'From Drive' : 'Added by you'}${
+        d.serverFileId && !d.id.startsWith('srv') ? ' · on Drive' : ''
+      }`,
     })),
   };
 }
@@ -480,6 +486,8 @@ function LiveCaptchaProvider({ children }: { children: React.ReactNode }) {
 
 function LiveNotifyProvider({ children }: { children: React.ReactNode }) {
   const s = useSettings();
+  const prebidOnIds = usePrebidOn();
+  const prebidOffIds = usePrebidOff();
   const value = useMemo<NotifyCtx>(
     () => ({
       settings: {
@@ -487,6 +495,8 @@ function LiveNotifyProvider({ children }: { children: React.ReactNode }) {
         tenderAlerts: s.notifyTenderAlertsOn,
         reminderDays: s.reminderDays,
         projectAlerts: s.notifyProjectAlertsOn,
+        prebidLeads: s.prebidLeads,
+        prebidAutoBookmarked: s.prebidAutoBookmarked,
       },
       set: patch => {
         // New projects is an in-app alert on this phone only: nothing to send.
@@ -496,9 +506,15 @@ function LiveNotifyProvider({ children }: { children: React.ReactNode }) {
         const pushed =
           patch.orgAlerts !== undefined ||
           patch.tenderAlerts !== undefined ||
-          patch.reminderDays !== undefined;
+          patch.reminderDays !== undefined ||
+          patch.prebidLeads !== undefined ||
+          patch.prebidAutoBookmarked !== undefined;
         if (!pushed) return;
         setSettings({
+          ...(patch.prebidLeads && { prebidLeads: patch.prebidLeads }),
+          ...(patch.prebidAutoBookmarked !== undefined && {
+            prebidAutoBookmarked: patch.prebidAutoBookmarked,
+          }),
           ...(patch.orgAlerts !== undefined && {
             notifyOrgAlertsOn: patch.orgAlerts,
           }),
@@ -511,17 +527,33 @@ function LiveNotifyProvider({ children }: { children: React.ReactNode }) {
         schedulePush();
       },
       toggleDay: (day, on) => {
-        const days = on
-          ? [...new Set([...s.reminderDays, day])].sort((a, b) => a - b)
-          : s.reminderDays.filter(d => d !== day);
         setSettings({
-          reminderDays: days,
+          reminderDays: toggleIn(s.reminderDays, day, on),
           notificationPrefsUpdatedAt: Date.now(),
         });
         schedulePush();
       },
+      togglePrebidLead: (minutes, on) => {
+        setSettings({
+          prebidLeads: toggleIn(s.prebidLeads, minutes, on, true),
+          notificationPrefsUpdatedAt: Date.now(),
+        });
+        schedulePush();
+      },
+      prebidOn: (id, bookmarked) =>
+        prebidReminderOn(
+          id,
+          bookmarked,
+          s.prebidAutoBookmarked,
+          prebidOnIds,
+          prebidOffIds,
+        ),
+      setPrebid: (id, enabled) => {
+        setPrebidReminder(id, enabled);
+        schedulePush();
+      },
     }),
-    [s],
+    [s, prebidOnIds, prebidOffIds],
   );
   return (
     <NotifyContext.Provider value={value}>{children}</NotifyContext.Provider>

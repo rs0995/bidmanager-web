@@ -23,12 +23,13 @@ it('counts the filters that are set; a value range counts once', () => {
   expect(sheetFilterCount(NO_SHEET_FILTERS)).toBe(0);
   expect(
     sheetFilterCount({
+      department: 'PWD',
       category: 'Works',
       location: 'Pune',
       minCr: '5',
       maxCr: '20',
     }),
-  ).toBe(3);
+  ).toBe(4);
   expect(sheetFilterCount({ ...NO_SHEET_FILTERS, maxCr: 'abc' })).toBe(0);
 });
 
@@ -45,6 +46,18 @@ it('matches category and location as text', () => {
   // Live pages are already filtered by the server on these.
   expect(
     passesSheetFilters(t, { ...NO_SHEET_FILTERS, location: 'Nagpur' }, true),
+  ).toBe(true);
+});
+
+it('filters the saved list by department (the whole organisation name)', () => {
+  const dept = (department: string) =>
+    passesSheetFilters(t, { ...NO_SHEET_FILTERS, department });
+  expect(dept(t.org)).toBe(true);
+  expect(dept('Some Other Department')).toBe(false);
+  expect(dept('')).toBe(true);
+  // Live pages: the server already narrowed them to the department.
+  expect(
+    passesSheetFilters(t, { ...NO_SHEET_FILTERS, department: 'Other' }, true),
   ).toBe(true);
 });
 

@@ -137,7 +137,9 @@ describe('bid agent from the tab bar', () => {
     await press(last(r, 'Bid Agent settings and training'));
     expect(screenText(r)).toContain('Standing instructions');
     await press(byText(r, 'Learned'));
-    expect(screenText(r)).toContain('GMRC tenders: the qualification criteria are in Section III.');
+    expect(screenText(r)).toContain(
+      'GMRC tenders: the qualification criteria are in Section III.',
+    );
     await press(pressable(r, 'Forget'));
     expect(screenText(r)).not.toContain('GMRC tenders: the qualification');
     await press(byText(r, 'Docs'));
@@ -241,6 +243,43 @@ describe('bidwise flows', () => {
     await press(pressable(r, 'Filters, 1 on'));
     await press(byText(r, 'Clear', 'button'));
     expect(pressable(r, 'Filters')).toBeTruthy();
+  });
+
+  it('switches a pre-bid reminder on next to an upcoming pre-bid meeting', async () => {
+    // The demo meeting (26-Aug-2024 11:00) is still ahead on this "today".
+    const now = jest
+      .spyOn(Date, 'now')
+      .mockReturnValue(new Date(2024, 7, 1).getTime());
+    try {
+      const r = await mount();
+      await press(tab(r, 'Tenders'));
+      await press(byText(r, 'Tenders', 'tab'));
+      await press(pressable(r, 'Portal: MahaTenders'));
+      await press(pressable(r, 'eProcure'));
+      await press(
+        pressable(
+          r,
+          'HVAC & DG AMC, CGO complex, Central Public Works Department',
+        ),
+      );
+      expect(screenText(r)).toContain('Remind me');
+      const sw = () =>
+        r.root.findAll(
+          n =>
+            n.props.accessibilityLabel ===
+              'Remind me before the pre-bid meeting' &&
+            typeof n.props.onValueChange === 'function',
+        )[0];
+      expect(sw().props.value).toBe(false);
+      await ReactTestRenderer.act(async () => sw().props.onValueChange(true));
+      expect(sw().props.value).toBe(true);
+      // The portal choice is remembered: leave the Tenders tab on MahaTenders.
+      await press(pressable(r, 'Back'));
+      await press(pressable(r, 'Portal: eProcure'));
+      await press(pressable(r, 'MahaTenders'));
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it('starts a project from the first Ready for Bid item, then attaches and toggles', async () => {
@@ -396,9 +435,9 @@ describe('bidwise flows', () => {
         Array.isArray(n.props.data) &&
         n.props.ListHeaderComponent !== undefined,
     );
-    const order = (
-      byEmd[byEmd.length - 1].props.data as { emd: string }[]
-    ).map(x => x.emd);
+    const order = (byEmd[byEmd.length - 1].props.data as { emd: string }[]).map(
+      x => x.emd,
+    );
     expect(order).toEqual(['₹16,20,000', '₹9,35,000']);
     // Search narrows the list.
     const search = r.root.findAll(
@@ -738,7 +777,7 @@ describe('bidwise flows', () => {
       'Export tenders (CSV)',
       'Captcha',
       'App lock',
-      'Push notifications',
+      'Push notifications & Alerts',
       'Clear local cache',
       'Change password',
       'Theme',
@@ -806,7 +845,7 @@ describe('bidwise flows', () => {
   it('shows push notification settings with closing reminders', async () => {
     const r = await mount();
     await press(tab(r, 'More'));
-    await press(pressable(r, 'Push notifications'));
+    await press(pressable(r, 'Push notifications & Alerts'));
     let out = screenText(r);
     [
       'Notifications: Not set up',
@@ -826,6 +865,23 @@ describe('bidwise flows', () => {
     );
     await press(last(r, 'Remind 2 days before'));
     expect(screenText(r)).toContain('1, 2 and 3 days before');
+  });
+
+  it('sets pre-bid reminder times and auto-on for bookmarked tenders', async () => {
+    const r = await mount();
+    await press(tab(r, 'More'));
+    await press(pressable(r, 'Push notifications & Alerts'));
+    let out = screenText(r);
+    [
+      'Pre-bid reminders',
+      '1 day and 2 h before',
+      'Bookmarked tenders automatically',
+    ].forEach(x => expect(out).toContain(x));
+    await press(byText(r, 'Pre-bid reminders'));
+    out = screenText(r);
+    ['4 h before', '1 h before'].forEach(x => expect(out).toContain(x));
+    await press(last(r, 'Remind 1 h before'));
+    expect(screenText(r)).toContain('1 day, 2 h and 1 h before');
   });
 
   it('shows the profile card first on More', async () => {

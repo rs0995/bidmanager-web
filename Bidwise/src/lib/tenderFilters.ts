@@ -179,8 +179,13 @@ export function groupByOrg(
 export const CATEGORIES = ['Works', 'Services', 'Goods'] as const;
 export type Category = (typeof CATEGORIES)[number];
 
-/** The Tenders tab's Filter sheet: category and location pick-lists, tender value range. */
+/**
+ * The Tenders tab's Filter sheet: department, category and location pick-lists, tender
+ * value range.
+ */
 export type SheetFilters = {
+  /** '' = any; an organisation (department) of the chosen portal. */
+  department: string;
   /** '' = any. Text match, as the server's `category` / `location` filters. */
   category: '' | Category;
   /** '' = any; one of the locations in the data. */
@@ -191,6 +196,7 @@ export type SheetFilters = {
 };
 
 export const NO_SHEET_FILTERS: SheetFilters = {
+  department: '',
   category: '',
   location: '',
   minCr: '',
@@ -206,6 +212,7 @@ export function parseLimit(text: string): number | null {
 /** How many filters are set, for the Filter button's badge (the value range counts once). */
 export function sheetFilterCount(f: SheetFilters): number {
   return [
+    f.department,
     f.category,
     f.location.trim(),
     parseLimit(f.minCr) !== null || parseLimit(f.maxCr) !== null,
@@ -217,7 +224,8 @@ const matches = (field: string, needle: string) =>
 
 /**
  * Whether a tender passes the sheet's filters. `serverSide` skips the ones the server
- * already applied to a live page of results (category, location, value range).
+ * already applied to a live page of results (department, category, location, value
+ * range).
  */
 export function passesSheetFilters(
   t: Tender,
@@ -225,6 +233,7 @@ export function passesSheetFilters(
   serverSide = false,
 ): boolean {
   if (serverSide) return true;
+  if (f.department && t.org !== f.department) return false;
   if (!matches(t.category, f.category) || !matches(t.location, f.location))
     return false;
   const min = parseLimit(f.minCr);

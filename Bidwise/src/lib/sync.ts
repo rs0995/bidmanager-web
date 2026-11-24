@@ -16,10 +16,14 @@ import {
   getBookmarkedOrgs,
   getBookmarks,
   getOrgIdByName,
+  getPrebidOff,
+  getPrebidOn,
   getSettings,
   setBookmarkedOrgs,
   setBookmarks,
+  setPrebidLists,
   setSettings,
+  tenderKey,
 } from './store';
 
 // /client/sync is one whole-user JSON blob shared with BM Pro and the desktop Client UI.
@@ -53,6 +57,8 @@ export function buildPushBody(): {
   const last = getLastBlob();
   const localBm = getBookmarks();
   const localOrgs = getBookmarkedOrgs();
+  const prebidOn = getPrebidOn();
+  const prebidOff = getPrebidOff();
   const orgIdByName = getOrgIdByName();
   const { projects, checklist } = forSync();
   const localProjIds = new Set(ids(projects));
@@ -67,6 +73,8 @@ export function buildPushBody(): {
       .filter(id => Number.isFinite(id)),
     projects,
     checklist,
+    prebidReminderIds: [...prebidOn],
+    prebidReminderOffIds: [...prebidOff],
   };
   // Notification preferences (read by the server's push pass) are sent only once the
   // user has set them here, or one is on. A fresh install sends nothing, so its "off"
@@ -82,6 +90,8 @@ export function buildPushBody(): {
       notifyOrgAlertsOn: Boolean(settings.notifyOrgAlertsOn),
       notifyTenderAlertsOn: Boolean(settings.notifyTenderAlertsOn),
       reminderDays: settings.reminderDays,
+      prebidLeads: settings.prebidLeads,
+      prebidAutoBookmarked: Boolean(settings.prebidAutoBookmarked),
       updatedAt: stamp,
     };
   }
@@ -96,6 +106,12 @@ export function buildPushBody(): {
       ),
       projects: ids(last.projects).filter(id => !localProjIds.has(id)),
       checklist: ids(last.checklist).filter(id => !localChkIds.has(id)),
+      prebidReminderIds: (last.prebidReminderIds ?? [])
+        .map(tenderKey)
+        .filter(id => id && !prebidOn.has(id)),
+      prebidReminderOffIds: (last.prebidReminderOffIds ?? [])
+        .map(tenderKey)
+        .filter(id => id && !prebidOff.has(id)),
     },
     base_updated_at: getBase(),
   };
@@ -135,6 +151,11 @@ export function applyServerNotificationPrefs(
     notifyOrgAlertsOn: Boolean(prefs.notifyOrgAlertsOn),
     notifyTenderAlertsOn: Boolean(prefs.notifyTenderAlertsOn),
     reminderDays: Array.isArray(prefs.reminderDays) ? prefs.reminderDays : [],
+    // Older apps (BM Pro) don't send these: keep this phone's choice then.
+    ...(Array.isArray(prefs.prebidLeads) && { prebidLeads: prefs.prebidLeads }),
+    ...(typeof prefs.prebidAutoBookmarked === 'boolean' && {
+      prebidAutoBookmarked: prefs.prebidAutoBookmarked,
+    }),
     notificationPrefsUpdatedAt: remote,
   });
 }
@@ -145,6 +166,7 @@ export async function pull(): Promise<boolean> {
   const blob = res.data ?? {};
   setBookmarks((blob.bookmarks ?? []).map(Number));
   setBookmarkedOrgs(blob.bookmarkedOrgs ?? []);
+  setPrebidLists(blob.prebidReminderIds ?? [], blob.prebidReminderOffIds ?? []);
   mergeFromServer(blob.projects ?? [], blob.checklist ?? []);
   // Projects someone else added: an alert in the Alerts tab (if that's on).
   if (Array.isArray(blob.projects)) checkNewProjects(blob.projects);

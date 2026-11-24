@@ -23,6 +23,8 @@ export type Tender = {
   closeIn: string;
   state: Urgency;
   prebid: string;
+  /** The pre-bid meeting's time (ms) when it has one; null for no time of day. */
+  prebidAt?: number | null;
   docs: TenderDoc[];
   // Live-only extras (absent in the sample data).
   /** The portal's own tender reference, shown on cards. Defaults to `id`. */

@@ -11,6 +11,7 @@ import { Check, ChevronDown, ChevronUp } from 'lucide-react-native';
 import { fonts, useTheme } from '../../theme';
 import { GlassBlur } from './GlassBlur';
 import { useSurface } from './Controls';
+import { useCycledHint } from './useCycledHint';
 
 export type DropdownOption = {
   value: string;
@@ -29,11 +30,14 @@ type Props = {
   anyLabel?: string;
   /** A search box above the list, for long lists. */
   searchable?: boolean;
+  /** Examples the empty search box cycles through ("e.g. …"). */
+  hints?: string[];
   open: boolean;
   onToggle: () => void;
 };
 
 const LIST_HEIGHT = 190;
+const NO_HINTS: string[] = [];
 
 /**
  * A field that opens its choices in a list right under it (picking one closes it). The
@@ -46,12 +50,14 @@ export function Dropdown({
   onChange,
   anyLabel = 'Any',
   searchable,
+  hints = NO_HINTS,
   open,
   onToggle,
 }: Props) {
   const t = useTheme();
   const surface = useSurface();
   const [query, setQuery] = useState('');
+  const { hint } = useCycledHint(hints, !open || Boolean(query));
   const needle = query.trim().toLowerCase();
   const shown = needle
     ? options.filter(o => o.label.toLowerCase().includes(needle))
@@ -118,7 +124,9 @@ export function Dropdown({
             <TextInput
               value={query}
               onChangeText={setQuery}
-              placeholder={`Search ${label.toLowerCase()}`}
+              placeholder={
+                hint ? `Search, e.g. ${hint}` : `Search ${label.toLowerCase()}`
+              }
               placeholderTextColor={t.colors.muted}
               accessibilityLabel={`Search ${label.toLowerCase()}`}
               autoCorrect={false}
