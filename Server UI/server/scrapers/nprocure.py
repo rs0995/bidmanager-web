@@ -602,7 +602,7 @@ def fetch_organisations(website_id):
         ensure_tables()
         conn = _connect()
         try:
-            for entry in clients:
+            for site_order, entry in enumerate(clients, start=1):
                 conn.execute(
                     "DELETE FROM nprocure_clients WHERE website_id=? AND org_name=?", (site["id"], entry["name"])
                 )
@@ -616,15 +616,15 @@ def fetch_organisations(website_id):
                 ).fetchone()
                 if existing:
                     conn.execute(
-                        "UPDATE organizations SET tender_count=?, tenders_url=?, is_available=1, last_seen_at=? "
-                        "WHERE id=?",
-                        (entry["count"], site["base_url"], now, existing[0]),
+                        "UPDATE organizations SET tender_count=?, tenders_url=?, is_available=1, last_seen_at=?, "
+                        "site_order=? WHERE id=?",
+                        (entry["count"], site["base_url"], now, site_order, existing[0]),
                     )
                 else:
                     conn.execute(
                         "INSERT INTO organizations (website_id, name, tender_count, tenders_url, is_available, "
-                        "last_seen_at) VALUES (?, ?, ?, ?, 1, ?)",
-                        (site["id"], entry["name"], entry["count"], site["base_url"], now),
+                        "last_seen_at, site_order) VALUES (?, ?, ?, ?, 1, ?, ?)",
+                        (site["id"], entry["name"], entry["count"], site["base_url"], now, site_order),
                     )
             names = [entry["name"] for entry in clients]
             placeholders = ",".join("?" for _ in names)

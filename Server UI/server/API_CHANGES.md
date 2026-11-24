@@ -328,3 +328,13 @@ No route or response shape changes. What changes is when a download job fails:
 - **Scope:** the sort and the range cover every tender that matches the other filters (search, portal, organisation, archived, category, location, section permissions), not just one page. Other sorts and their filters behave as before.
 - **How it runs:** the server sorts and filters in a temporary in-memory database built for each request. The main database is only read, never changed.
 - Values are stored as text such as "34,57,94,756". Units "Cr" and "Lakh" are understood when present.
+
+---
+
+## 8. Organisations in portal order (READY since 2026-11-24)
+
+`GET /client/organizations`:
+- **New field:** each item has **`site_order`** (int or `null`): the organisation's position in the portal's own organisation list. On NIC portals it's the S.No column of the organisation page; on nProcure, the 1-based place in the client list.
+- **New order:** items come back in portal order: by `website_id`, then `site_order`. Organisations without a `site_order` follow, A–Z by name. Before, the list was A–Z by name across all portals. Paging and `total` are unchanged.
+- **When it fills in:** `site_order` is stored on each portal's next organisation-list fetch (the daily list update), and is renumbered on every fetch. Until then it is `null`, and those organisations keep the A–Z order.
+- Bidwise, BM Pro and Client UI can show organisations in the portal's order. Bidwise already reads `site_order` (sorted: available first, then by portal, then `site_order`). The operator `/v1` organisation list is unchanged.

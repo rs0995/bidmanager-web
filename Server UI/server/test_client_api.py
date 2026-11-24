@@ -180,6 +180,7 @@ class ClientApiTests(unittest.TestCase):
         )
         conn.execute("ALTER TABLE tenders ADD COLUMN last_update_checked_at REAL")
         conn.execute("ALTER TABLE tenders ADD COLUMN last_status_checked_at REAL")
+        conn.execute("ALTER TABLE organizations ADD COLUMN site_order INTEGER")
         # The scraper keeps normalized_tender_id = canonical tender id; mirror it
         # here for the fixture rows and any a test inserts later.
         conn.execute("ALTER TABLE tenders ADD COLUMN normalized_tender_id TEXT")
@@ -541,6 +542,27 @@ class ClientApiTests(unittest.TestCase):
         self.assertIn("scrape_enabled", first)
         self.assertIn("website_name", first)
 
+    def test_organizations_come_back_in_portal_order(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("INSERT INTO websites VALUES (2, 'Other Portal', 'https://other.test')")
+        conn.executemany(
+            "INSERT INTO organizations (id,website_id,name,site_order) VALUES (?,?,?,?)",
+            [(3, 1, "Zeta Board", 1), (4, 1, "Alpha Board", 3), (5, 2, "Beta Council", 1)],
+        )
+        conn.execute("UPDATE organizations SET site_order=2 WHERE id=2")  # Water Authority
+        conn.commit()
+        conn.close()
+        payload = self.client.get("/client/organizations", headers=self.headers).json()
+        # Portal 1 in S.No order, unnumbered Road Authority last; then portal 2.
+        self.assertEqual(
+            [(i["name"], i["site_order"]) for i in payload["items"]],
+            [("Zeta Board", 1), ("Water Authority", 2), ("Alpha Board", 3),
+             ("Road Authority", None), ("Beta Council", 1)],
+        )
+        self.assertEqual(payload["total"], 5)
+        page2 = self.client.get("/client/organizations?page=2&page_size=2", headers=self.headers).json()
+        self.assertEqual([i["name"] for i in page2["items"]], ["Alpha Board", "Road Authority"])
+
     def test_organizations_archived_filter_lists_only_orgs_with_archived_tenders(self):
         response = self.client.get("/client/organizations?archived=true", headers=self.headers)
         self.assertEqual(response.status_code, 200)
@@ -564,7 +586,7 @@ class ClientApiTests(unittest.TestCase):
             "VALUES (61,1,'Road Authority','T-610','Old road job',1)"
         )
         conn.execute(
-            "INSERT INTO organizations VALUES (3,1,'Empty Board','https://example.test/org/3',12,1,0,0,0,NULL,1,NULL)"
+            "INSERT INTO organizations VALUES (3,1,'Empty Board','https://example.test/org/3',12,1,0,0,0,NULL,1,NULL,NULL)"
         )
         conn.commit()
         conn.close()
@@ -731,7 +753,7 @@ class ClientApiTests(unittest.TestCase):
             "VALUES (50,99,'Ghost Org','T-GHOST','Ghost tender',0)"
         )
         conn.execute(
-            "INSERT INTO organizations VALUES (50,99,'Ghost Org','https://ghost.test',1,1,0,0,0,NULL,1,NULL)"
+            "INSERT INTO organizations VALUES (50,99,'Ghost Org','https://ghost.test',1,1,0,0,0,NULL,1,NULL,NULL)"
         )
         conn.commit()
         conn.close()

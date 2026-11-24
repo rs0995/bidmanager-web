@@ -1181,6 +1181,10 @@ def _init_db_schema(conn):
         # as available until the next org-list scrape says otherwise.
         ("is_available", "INTEGER DEFAULT 1"),
         ("last_seen_at", "REAL"),
+        # The org's position in the portal's own organisation list (NIC: the
+        # S.No column; nProcure: 1-based place in the client list), so apps
+        # can list orgs in portal order. NULL until the next org-list fetch.
+        ("site_order", "INTEGER"),
     ]
     for col, ddl in org_migrations:
         try:
@@ -2669,6 +2673,7 @@ class ScraperBackend:
             for row in rows:
                 cols = row.find_all('td')
                 if len(cols) > 2 and cols[0].text.strip().isdigit():
+                    site_order = int(cols[0].text.strip())
                     org_name = cols[1].text.strip()
                     tender_count = cols[2].text.strip()
                     link = cols[2].find('a')['href'] if cols[2].find('a') else ""
@@ -2682,14 +2687,15 @@ class ScraperBackend:
 
                     if exists:
                         c.execute(
-                            "UPDATE organizations SET tender_count=?, tenders_url=?, is_available=1, last_seen_at=? WHERE id=?",
-                            (tender_count, full_link, now, exists[0]),
+                            "UPDATE organizations SET tender_count=?, tenders_url=?, is_available=1, last_seen_at=?, "
+                            "site_order=? WHERE id=?",
+                            (tender_count, full_link, now, site_order, exists[0]),
                         )
                     else:
                         c.execute(
-                            "INSERT INTO organizations (website_id, name, tender_count, tenders_url, is_available, last_seen_at) "
-                            "VALUES (?, ?, ?, ?, 1, ?)",
-                            (website_id, org_name, tender_count, full_link, now),
+                            "INSERT INTO organizations (website_id, name, tender_count, tenders_url, is_available, "
+                            "last_seen_at, site_order) VALUES (?, ?, ?, ?, 1, ?, ?)",
+                            (website_id, org_name, tender_count, full_link, now, site_order),
                         )
                     count += 1
 

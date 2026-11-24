@@ -321,6 +321,17 @@ class NprocureScrapeTests(unittest.TestCase):
         self.assertEqual(self.portal.count("list"), 0)
         self.assertEqual(self._rows("SELECT COUNT(*) FROM tenders")[0][0], 0)
 
+    def test_fetch_organisations_stores_the_dropdown_position(self):
+        self.assertTrue(core.ScraperBackend.fetch_organisations_logic(self.website_id))
+        home = self.portal(None, "GET", nprocure.DEFAULT_BASE_URL + "/").text
+        expected = {c["name"]: i for i, c in enumerate(nprocure.parse_client_dropdown(home), start=1)}
+        stored = dict(self._rows(
+            "SELECT name, site_order FROM organizations WHERE website_id=? AND is_available=1",
+            (self.website_id,),
+        ))
+        self.assertEqual(stored, expected)
+        self.assertEqual(sorted(stored.values()), list(range(1, len(expected) + 1)))
+
     def test_fetch_organisations_stores_client_ids(self):
         core.ScraperBackend.fetch_organisations_logic(self.website_id)
         ids = dict(self._rows("SELECT org_name, client_id FROM nprocure_clients WHERE website_id=?", (self.website_id,)))
@@ -424,6 +435,33 @@ class NicDispatchUnchangedTests(unittest.TestCase):
             self.assertFalse(core.ScraperBackend.fetch_organisations_logic(nic_id))
             self.assertFalse(core.ScraperBackend.download_tenders_logic(nic_id))
         self.assertEqual(deps.call_count, 3)
+
+    def test_nic_org_list_stores_the_portal_serial_number(self):
+        nic_id = core.sqlite3.connect(core.DB_FILE).execute(
+            "SELECT id FROM websites WHERE name='MahaTenders'"
+        ).fetchone()[0]
+        conn = core.sqlite3.connect(core.DB_FILE)
+        conn.execute(
+            "INSERT INTO organizations (website_id, name, tender_count, site_order) VALUES (?, 'Old Board', 3, 9)",
+            (nic_id,),
+        )
+        conn.commit()
+        conn.close()
+        page = (
+            "<table><tr><td>S.No</td><td>Organisation Name</td><td>Tender Count</td></tr>"
+            "<tr><td>1</td><td>Zilla Parishad</td><td><a href='/z'>12</a></td></tr>"
+            "<tr><td>2</td><td>Old Board</td><td><a href='/o'>4</a></td></tr>"
+            "<tr><td>3</td><td>Agri Dept</td><td><a href='/a'>7</a></td></tr></table>"
+        )
+        if not core.ensure_scraper_dependencies():
+            self.skipTest("scraper dependencies (bs4) not installed")
+        with mock.patch.object(core.ScraperBackend, "safe_request", return_value=FakeResponse(page)):
+            self.assertTrue(core.ScraperBackend.fetch_organisations_logic(nic_id))
+        rows = dict(core.sqlite3.connect(core.DB_FILE).execute(
+            "SELECT name, site_order FROM organizations WHERE website_id=?", (nic_id,)
+        ).fetchall())
+        # New rows get their S.No; an existing row (was 9) is renumbered.
+        self.assertEqual(rows, {"Zilla Parishad": 1, "Old Board": 2, "Agri Dept": 3})
 
 
 class EnqueueGuardTests(unittest.TestCase):

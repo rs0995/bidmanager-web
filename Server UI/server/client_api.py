@@ -1757,6 +1757,9 @@ def _public_organization(
         # row present to grey it out / sink it to the bottom of a bookmarked
         # list rather than have it silently vanish.
         "is_available": bool(data.get("is_available", 1)),
+        # Position in the portal's own organisation list; None until the next
+        # org-list fetch numbers it.
+        "site_order": None if data.get("site_order") is None else int(data["site_order"]),
     }
 
 
@@ -1862,14 +1865,16 @@ def client_organizations(
         "COALESCE(o.name,'') AS name,COALESCE(o.tenders_url,'') AS tenders_url,"
         "COALESCE(o.scrape_enabled,0) AS scrape_enabled,"
         "COALESCE(o.last_scraped_at,0) AS last_scraped_at,"
-        "COALESCE(o.is_available,1) AS is_available "
+        "COALESCE(o.is_available,1) AS is_available,o.site_order AS site_order "
         "FROM organizations o LEFT JOIN websites w ON w.id=o.website_id"
     )
     offset = (page - 1) * page_size
     with _get_db() as conn:
         total = int(conn.execute(f"SELECT COUNT(*) FROM organizations o{where_sql}", params).fetchone()[0])
+        # Portal order (site_order); orgs not yet numbered follow, A-Z.
         rows = conn.execute(
-            f"{select_sql}{where_sql} ORDER BY o.name ASC,o.id ASC LIMIT ? OFFSET ?",
+            f"{select_sql}{where_sql} ORDER BY o.website_id ASC,(o.site_order IS NULL) ASC,"
+            f"o.site_order ASC,o.name ASC,o.id ASC LIMIT ? OFFSET ?",
             [*params, page_size, offset],
         ).fetchall()
         covered_org_ids, full_websites = _org_scrape_coverage(conn, [dict(r)["website_id"] for r in rows])

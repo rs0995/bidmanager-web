@@ -30,7 +30,7 @@ class OrgAccessTests(unittest.TestCase):
             "VALUES (3,1,'Bridge Board','T-300','Flyover','Open',0)"
         )
         conn.execute(
-            "INSERT INTO organizations VALUES (3,1,'Bridge Board','https://example.test/org/3',1,1,0,0,0,NULL,1,NULL)"
+            "INSERT INTO organizations VALUES (3,1,'Bridge Board','https://example.test/org/3',1,1,0,0,0,NULL,1,NULL,NULL)"
         )
         conn.commit()
         conn.close()

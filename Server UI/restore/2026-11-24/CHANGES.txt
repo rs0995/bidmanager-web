@@ -9,3 +9,6 @@
 ----
 2026-11-24 10:02  server/client_api.py, server/test_client_api.py, server/API_CHANGES.md (OCI Server Manager session, on the Mac mini)
   Tender list: sort_by=tender_value now numeric, new sort_by=emd, new min_value_cr/max_value_cr range. Runs in a per-request in-memory SQLite temp DB built from the filtered rows; the main DB is only read. NA/N/A sort after 0 both ways and count as 0 for the range. API_CHANGES section 7 + Bidwise to-do. Backups: restore/2026-11-24/server/. Tests 341/341. NOT deployed.
+----
+2026-11-24 10:56  server/app_core.py, server/scrapers/nprocure.py, server/client_api.py, tests (test_client_api.py, test_nprocure.py, test_orgs.py), server/API_CHANGES.md (OCI Server Manager session, on the Mac mini; asked by the Bidwise app session)
+  organizations.site_order (new column, migration with the other org columns): NIC stores the org page S.No, nProcure the 1-based client-list position, on every org-list fetch. GET /client/organizations returns site_order and orders by website, site_order (NULLs last), name. API_CHANGES section 8. Backups: restore/2026-11-24/server/ (test_nprocure.py backup taken from git HEAD after the first edit). Tests 344/344. NOT deployed.
