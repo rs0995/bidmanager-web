@@ -4,9 +4,15 @@ frontend/dist/
 frontend/tsconfig.tsbuildinfo
 dist/
 dist-electron/
+dist-electron-admin/
+dist-electron-cloud/
+Client UI/Archived Installers/
+Server UI/build/
+Server UI/installer/
 dist_new/
 build/
 build_backend/
+build_backend_admin/
 build_backend_debug/
 dist_debug/
 __pycache__/
@@ -34,3 +40,31 @@ backend/Checklist_Templates/
 Python app/tender_manager.db
 Python app/app_paths.json
 Python app/user_settings.json
+
+# --- Added 2026-10-25: keep secrets, databases and generated files out of git ---
+# Keys and signing material (App Store Connect, APNs push, Android debug keystores)
+*.p8
+*.keystore
+**/signing/
+Server UI/Push APNs/
+# Databases and installers
+*.db
+*.exe
+# Dependencies and build output in every app folder
+**/node_modules/
+**/dist/
+**/Pods/
+**/ios/build/
+**/android/build/
+**/android/app/build/
+**/android/.gradle/
+**/vendor/bundle/
+**/.bundle/
+# Machine-local files
+.xcode.env.local
+.DS_Store
+._*
+.watchman-cookie-*
+xcuserdata/
+.mac-sync-backup/
+Server UI/server/sim-screenshot.png

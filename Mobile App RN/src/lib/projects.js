@@ -1,0 +1,291 @@
+import { useSyncExternalStore } from "react";
+import { File, Directory, Paths } from "expo-file-system";
+import { getRaw, setRaw } from "./kv.js";
+import { schedulePush } from "./pushQueue.js";
+import { addAlert } from "./alerts.js";
+
+// Local-first projects + checklist. Field names are made to match the
+// desktop Client UI rows EXACTLY, because both apps read/write the same
+// /client/sync projects/checklist blob fields.
+//   Project:        { id, title, client_name, source_tender_id,
+//                      source_tender_db_id, project_value, emd, deadline,
+//                      prebid, status, description }
+//   Checklist item: { id, project_id, sr_no, req_file_name, description,
+//                      subfolder, status: "Pending" | "Completed",
+//                      attachment }
+//
+// File attachments are NOT fully persisted: only {name, size, type, uri}
+// metadata is stored, and the live picked-asset reference is kept in an
+// in-memory Map keyed by checklist item id, so a preview only reliably
+// works for files attached this session (same limitation as the web app,
+// which could not persist a File object across reloads either).
+const PROJECTS_KEY = "bm.projects";
+const CHECKLIST_KEY = "bm.checklist";
+const DEFAULT_FOLDERS = ["Ready Docs", "Tender Docs", "Working Docs"];
+
+const fileObjects = new Map();
+
+const listeners = new Set();
+function emit() {
+  listeners.forEach((fn) => fn());
+}
+
+function readJSON(key, fallback) {
+  try {
+    const raw = getRaw(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function writeJSON(key, value) {
+  setRaw(key, JSON.stringify(value));
+}
+
+let projectsCache = readJSON(PROJECTS_KEY, []);
+let checklistCache = readJSON(CHECKLIST_KEY, []);
+let nextProjectId = 1 + projectsCache.reduce((m, p) => Math.max(m, p.id), 0);
+let nextItemId = 1 + checklistCache.reduce((m, c) => Math.max(m, c.id), 0);
+let checklistViewCache = new Map();
+
+export function rehydrateProjects() {
+  projectsCache = readJSON(PROJECTS_KEY, []);
+  checklistCache = readJSON(CHECKLIST_KEY, []);
+  nextProjectId = 1 + projectsCache.reduce((m, p) => Math.max(m, p.id), 0);
+  nextItemId = 1 + checklistCache.reduce((m, c) => Math.max(m, c.id), 0);
+  checklistViewCache = new Map();
+  emit();
+}
+
+function persist(pushToServer = true) {
+  writeJSON(PROJECTS_KEY, projectsCache);
+  writeJSON(CHECKLIST_KEY, checklistCache);
+  checklistViewCache = new Map();
+  emit();
+  if (pushToServer) schedulePush();
+}
+
+export function getProjects() {
+  return projectsCache;
+}
+
+export function getChecklist(projectId) {
+  const key = Number(projectId);
+  if (!checklistViewCache.has(key)) {
+    const rows = checklistCache.filter((row) => row.project_id === key);
+    rows.sort((a, b) => (a.sr_no || 0) - (b.sr_no || 0));
+    checklistViewCache.set(key, rows);
+  }
+  return checklistViewCache.get(key);
+}
+export function getProject(id) {
+  return projectsCache.find((row) => row.id === Number(id)) || null;
+}
+
+export function createProjectFromTender(tender) {
+  const project = {
+    id: nextProjectId++,
+    title: tender.title || tender.tender_id || "Untitled project",
+    client_name: tender.organization || tender.website_name || "",
+    source_tender_id: tender.tender_id || "",
+    source_tender_db_id: tender.id ?? null,
+    project_value: tender.tender_value || 0,
+    emd: tender.emd || 0,
+    deadline: tender.closing_date || null,
+    prebid: tender.pre_bid_meeting_date || null,
+    status: "Active",
+    description: tender.work_description || "",
+    // What was copied from the tender: a field still equal to this follows
+    // the tender; one that differs was edited by hand and is kept.
+    tender_snapshot: {
+      closing_date: tender.closing_date || null,
+      pre_bid_meeting_date: tender.pre_bid_meeting_date || null,
+      tender_value: tender.tender_value || 0,
+    },
+  };
+  projectsCache = [...projectsCache, project];
+  persist();
+  return project;
+}
+
+export function updateProject(id, patch) {
+  projectsCache = projectsCache.map((row) => (row.id === Number(id) ? { ...row, ...patch } : row));
+  persist();
+}
+
+export function archiveProject(id) {
+  updateProject(id, { status: "Archived" });
+}
+
+// sync.js reports ids that were in the last server blob and are no longer
+// local as `removed`, so dropping the rows here is all the server needs.
+export function deleteProject(id) {
+  const projectId = Number(id);
+  checklistCache.filter((row) => row.project_id === projectId).forEach((row) => {
+    fileObjects.delete(row.id);
+    deleteAttachmentCopy(row.id);
+  });
+  checklistCache = checklistCache.filter((row) => row.project_id !== projectId);
+  projectsCache = projectsCache.filter((row) => row.id !== projectId);
+  persist();
+}
+
+// checklist_folders is written by the desktop client (its Manage Folders), so
+// folders created there show here even before they hold any item.
+export function folderNames(projectId) {
+  const used = getChecklist(projectId).map((row) => row.subfolder);
+  const project = getProject(projectId);
+  const synced = Array.isArray(project?.checklist_folders) ? project.checklist_folders.filter(Boolean) : [];
+  return [...new Set([...DEFAULT_FOLDERS, ...synced, ...used])];
+}
+
+export function addChecklistItem(projectId, { req_file_name, subfolder, description }) {
+  const siblings = getChecklist(projectId);
+  const item = {
+    id: nextItemId++,
+    project_id: Number(projectId),
+    sr_no: siblings.length + 1,
+    req_file_name,
+    subfolder: subfolder || DEFAULT_FOLDERS[0],
+    description: description || "",
+    status: "Pending",
+    attachment: null,
+  };
+  checklistCache = [...checklistCache, item];
+  persist();
+  return item;
+}
+
+export function setChecklistItemStatus(itemId, status) {
+  let justCompleted = false;
+  checklistCache = checklistCache.map((row) => {
+    if (row.id !== Number(itemId)) return row;
+    justCompleted = status === "Completed" && row.status !== "Completed";
+    return { ...row, status };
+  });
+  persist();
+  if (justCompleted) maybeNotifyProjectComplete(itemId);
+}
+
+function maybeNotifyProjectComplete(itemId) {
+  const item = checklistCache.find((row) => row.id === Number(itemId));
+  if (!item) return;
+  const siblings = getChecklist(item.project_id);
+  if (siblings.length > 0 && siblings.every((row) => row.status === "Completed")) {
+    const project = getProject(item.project_id);
+    addAlert({ kind: "success", message: `"${project?.title || "Project"}" checklist reached 100%.` });
+  }
+}
+
+// Attached files are copied into the app's permanent documents folder (the
+// picker's copy lives in a cache iOS may clear), so they still open after a
+// restart. The stored uri is only meaningful on this phone; device: "phone"
+// tells other clients not to try to open it.
+export const ATTACHMENTS_DIR_NAME = "attachments";
+
+function attachmentDir(itemId) {
+  return new Directory(Paths.document, ATTACHMENTS_DIR_NAME, String(itemId));
+}
+
+function deleteAttachmentCopy(itemId) {
+  try {
+    const dir = attachmentDir(itemId);
+    if (dir.exists) dir.delete();
+  } catch {
+    // already gone
+  }
+}
+
+function saveAttachmentCopy(itemId, asset) {
+  try {
+    deleteAttachmentCopy(itemId);
+    const dir = attachmentDir(itemId);
+    dir.create({ intermediates: true, idempotent: true });
+    const dest = new File(dir, asset.name || `attachment-${itemId}`);
+    new File(asset.uri).copy(dest);
+    return dest.uri;
+  } catch {
+    return asset.uri;
+  }
+}
+
+// asset: a document-picker result shaped { name, size, mimeType, uri }.
+export function attachFile(itemId, asset) {
+  const uri = saveAttachmentCopy(itemId, asset);
+  const saved = { ...asset, uri };
+  fileObjects.set(Number(itemId), saved);
+  checklistCache = checklistCache.map((row) => (
+    row.id === Number(itemId)
+      ? { ...row, attachment: { name: asset.name, size: asset.size, type: asset.mimeType, uri, device: "phone" }, status: "Completed" }
+      : row
+  ));
+  persist();
+  maybeNotifyProjectComplete(itemId);
+}
+
+export function removeAttachment(itemId) {
+  fileObjects.delete(Number(itemId));
+  deleteAttachmentCopy(itemId);
+  checklistCache = checklistCache.map((row) => (
+    row.id === Number(itemId) ? { ...row, attachment: null, status: "Pending" } : row
+  ));
+  persist();
+}
+
+// The file to preview, if it exists on this phone (attached this session, or
+// saved here by an earlier one); null when it was attached on another device.
+export function getAttachedFile(itemId) {
+  const live = fileObjects.get(Number(itemId));
+  if (live) return live;
+  const row = checklistCache.find((r) => r.id === Number(itemId));
+  const a = row?.attachment;
+  if (!a || a.device !== "phone" || !a.uri) return null;
+  try {
+    if (!new File(a.uri).exists) return null;
+  } catch {
+    return null;
+  }
+  return { name: a.name, size: a.size, mimeType: a.type, uri: a.uri };
+}
+
+export function deleteChecklistItem(itemId) {
+  fileObjects.delete(Number(itemId));
+  deleteAttachmentCopy(itemId);
+  checklistCache = checklistCache.filter((row) => row.id !== Number(itemId));
+  persist();
+}
+
+export function mergeFromServer(serverProjects, serverChecklist) {
+  if (Array.isArray(serverProjects)) {
+    projectsCache = serverProjects.map((row) => ({ ...row }));
+    nextProjectId = 1 + projectsCache.reduce((m, p) => Math.max(m, Number(p.id) || 0), 0);
+  }
+  if (Array.isArray(serverChecklist)) {
+    const localById = new Map(checklistCache.map((row) => [row.id, row]));
+    checklistCache = serverChecklist.map((row) => {
+      const local = localById.get(row.id);
+      return { ...row, attachment: local?.attachment ?? row.attachment ?? null };
+    });
+    nextItemId = 1 + checklistCache.reduce((m, c) => Math.max(m, Number(c.id) || 0), 0);
+  }
+  persist(false);
+}
+
+export function forSync() {
+  return { projects: projectsCache, checklist: checklistCache };
+}
+
+function subscribe(fn) {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+}
+
+export function useProjects() {
+  return useSyncExternalStore(subscribe, getProjects, getProjects);
+}
+export function useChecklist(projectId) {
+  return useSyncExternalStore(subscribe, () => getChecklist(projectId), () => getChecklist(projectId));
+}
+export function useProject(id) {
+  return useSyncExternalStore(subscribe, () => getProject(id), () => getProject(id));
+}

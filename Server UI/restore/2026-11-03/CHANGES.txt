@@ -1,0 +1,6 @@
+----
+2026-11-03 (OCI Server Manager) - Request: org new-tender push shows the count once more than 1 tender is grouped (was more than 3).
+Backed up: server/api_server.py, server/test_push_notification_pass.py
+- api_server.py: _NAMED_NEW_TENDERS 3 -> 1; _org_push_text names a single tender, else "N new tenders added under ORG".
+- test_push_notification_pass.py: 2-tender group now expects the count text.
+2026-11-03 - Status: tests 324 passed. Deployed 2026-11-05 from the PC (full rebuild, /health OK).

@@ -1,0 +1,29 @@
+Change log — 2026-10-21
+Files in this folder are the ORIGINAL (pre-change) copies, same paths relative to "Server UI/". Restore by copying back.
+
+Request: "Ensure on the server, if a project is added twice, it still adds only once"
+ 1. Client sync: projects that share a source tender collapse into one (earliest id kept; field
+    values from the most recently changed copy, blanks filled from the others; checklist rows
+    re-pointed to the kept project). Applied on every push (stored) and pull (returned).
+
+Files backed up (pre-change) and intended change:
+ - server/client_api.py : new _dedupe_projects(), called from _with_current_row_ids().
+ - server/test_project_dedupe.py  : NEW test (production case 15/17, newest values win, no-tender projects untouched, checklist moved, push-merge end to end).
+
+2026-10-21 23:09:53 (another session) Request: Bidwise new-tender alerts/pushes grouped per organisation;
+badge counts alerts, not tenders. Pre-change copies saved as server/<file>.230953 (these already contain
+the changes above and everything from 2026-10-19).
+ - server/app_core.py : client_push_tokens.pending_orgs TEXT DEFAULT '{}' (org -> tenders of an org push
+   not yet read on that device); idempotent ALTER.
+ - server/apns_push.py : send(collapse_id=...) adds the apns-collapse-id header, so iOS replaces the
+   earlier notification for the same organisation instead of stacking another.
+ - server/api_server.py : org pushes to Bidwise tokens merge into pending_orgs; body names up to 3
+   tenders, otherwise "N new tenders added under ORG"; same collapse id per org; badge not bumped while
+   that org's push is still unread. BM Pro tokens unchanged.
+ - server/client_api.py : PUT /client/badge accepts optional unread_orgs; prunes pending_orgs to them
+   (count 0 clears all). BM Pro sends only {count}: unchanged.
+ - server/test_push_notification_pass.py, test_apns_push.py, test_client_api.py : tests.
+Status: code + tests done 2026-10-21; full suite 258/258 passed (includes the project de-dupe change above).
+Deployed 2026-10-22 from the PC (deploy-backend.sh). Before deploying, the VM's files matched the .230953
+copies exactly (the other session's changes were already live). Live check: new code in the container,
+client_push_tokens.pending_orgs present, /health OK.

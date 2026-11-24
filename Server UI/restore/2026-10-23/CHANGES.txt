@@ -1,0 +1,43 @@
+Change log — 2026-10-23
+Files in this folder are the ORIGINAL (pre-change) copies, same paths relative to "Server UI/". Restore by copying back
+(and delete the new files server/org_access.py and server/test_orgs.py).
+
+Request: accounts as individual or organisation. An org has an admin (first account), members join by request
+(admin/operator approves), each member gets per-section access (active tenders, archived, bookmarks, projects;
+captcha always on), org data is shared, admin/operator can de-link (retain = keep bookmarks only, or wipe).
+Existing users are individuals with every section on; old apps keep working unchanged. Server API only this round.
+
+Files backed up (pre-change) and change:
+ - server/app_core.py : imports org_access; _init_db_schema calls org_access.create_schema (tables client_orgs,
+   client_org_members, client_org_join_requests, client_org_sync; column client_users.permissions_json, NULL = all
+   sections on); Postgres REAL->DOUBLE repair list extended with the new tables' timestamps.
+ - server/db_compat.py : client_orgs, client_org_join_requests added to ID_TABLES (RETURNING id on Postgres).
+ - server/client_api.py :
+     register accepts optional account_type/org_name (organisation signup creates the org, user = admin);
+     register/login responses gain `account`; new GET /client/me.
+     /client/sync GET = effective blob (org pool's shared keys + own personal keys, hidden sections left out);
+     PUT routes shared keys to client_org_sync, personal keys to the user's row, ignores hidden sections, and
+     ignores a push whose base_updated_at is older than the user's _reset_at (stale device after join/de-link).
+     Tender list/search/resolve/stats/organizations filtered by _tender_scope / _organization_scope (no filter when
+     active+archived are both on); tender detail/documents/download routes 404 outside scope; org request-tenders
+     needs the active section. /client/changes and _bookmark_union read org bookmarks.
+     New /client/org* routes: create org, join request (+ mine / cancel), and admin-only: org detail, rename,
+     join-code regenerate, list/approve/reject requests, member permissions, role, delink {retain}.
+ - server/api_server.py : push pass and closing reminders use org_access.effective_blob; /admin/users(+/{id}) gain
+   account_type/org/permissions (member detail shows the org pool); new PUT /admin/users/{id}/permissions and
+   /admin/orgs* (list, create for existing user, detail, rename, dissolve ?retain=, regenerate code, add member,
+   approve/reject request, member permissions/role, delink).
+ - server/test_client_api.py : backed up for safety; NOT modified (existing tests untouched).
+New files: server/org_access.py (all org/permission logic), server/test_orgs.py (25 tests).
+Status: code + tests done (test_orgs 25/25; full suite 278 passed, 1 known-flaky job_runtime test passes alone). Deployed 2026-10-23 from the PC (full rebuild), health OK; /client/me and /admin/orgs answer 401 without credentials.
+
+----
+Request: incorporate the organisation / per-section access server changes into the Server UI (Users tab only).
+Files backed up (pre-change) and intended change:
+ - BidManagerControl.jsx : api helpers for /admin/orgs* and PUT /admin/users/{id}/permissions; SectionToggles
+   component; Users tab gains an Organisations card (create, rename, join code, dissolve keep/wipe, join requests,
+   members: role / sections / remove keep/wipe, add member), an Account column + individual/organisation filters,
+   and an Access block (section toggles) in each user's expanded row.
+ - CHANGELOG_PENDING.txt : release note appended.
+
+Status (Server UI): done 2026-10-23. vite build OK; server/test_orgs.py 25/25. Not yet clicked through against the live server.

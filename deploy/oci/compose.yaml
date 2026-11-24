@@ -1,0 +1,117 @@
+# BidManager backend on one OCI Ampere A1 VM.
+#
+# Database:  self-hosted Postgres, running as the `postgres` container below on the
+#            same VM as the backend (no external DB, no egress between app and DB).
+#            Reachable only over the internal Docker network — not published to the
+#            host, so it is not accessible outside the VM.
+# Storage:   Google Drive (unchanged) — a service-account JSON key is mounted at
+#            /run/secrets/drive-sa.json because a VM has no Google ADC. Share the
+#            Drive root folder with that service account (already done for Cloud Run).
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ../../Server UI/server
+    restart: unless-stopped
+    shm_size: 1gb
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      BIDMANAGER_ENV: production
+      BIDMANAGER_PROCESS_ROLE: all
+      BIDMANAGER_HEADLESS: "true"
+      BIDMANAGER_BROWSER: chromium
+      # System Chromium + version-matched chromedriver from the image (see Dockerfile).
+      BIDMANAGER_CHROME_BINARY: /usr/bin/chromium
+      BIDMANAGER_CHROMEDRIVER: /usr/bin/chromedriver
+      BIDMANAGER_WORKER_THREADS: "2"
+      BIDMANAGER_RUNTIME_DIR: /var/lib/bidmanager
+      BIDMANAGER_PUBLIC_URL: https://${BIDMANAGER_DOMAIN}
+      BIDMANAGER_CORS_ORIGINS: ${BIDMANAGER_CORS_ORIGINS:-bidmanager://app}
+      # Self-hosted Postgres — the `postgres` service above, same Docker network.
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      # Google Drive — same folder as Cloud Run; auth via the mounted SA key file.
+      GOOGLE_DRIVE_FOLDER_ID: ${GOOGLE_DRIVE_FOLDER_ID:?set GOOGLE_DRIVE_FOLDER_ID in .env}
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/drive-sa.json
+      # Carry these three over verbatim from GCP Secret Manager so already-issued
+      # admin keys and signed download URLs keep working.
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?set ADMIN_API_KEY in .env}
+      BIDMANAGER_CLIENT_API_KEY: ${BIDMANAGER_CLIENT_API_KEY:?set BIDMANAGER_CLIENT_API_KEY in .env}
+      BIDMANAGER_DOWNLOAD_TOKEN_SECRET: ${BIDMANAGER_DOWNLOAD_TOKEN_SECRET:?set BIDMANAGER_DOWNLOAD_TOKEN_SECRET in .env}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      BIDMANAGER_PROXY_URLS: ${BIDMANAGER_PROXY_URLS:-}
+      OCI_REGION: ${OCI_REGION:-}
+      OCI_INSTANCE_ID: ${OCI_INSTANCE_ID:-}
+      # Direct APNs push (apns_push.py) -- not Expo's relay, not FCM. Key file is
+      # mounted read-only; team/topic are fixed, key id/environment come from .env.
+      APNS_KEY_PATH: /run/secrets/apns-auth-key.p8
+      APNS_KEY_ID: ${APNS_KEY_ID:?set APNS_KEY_ID in .env}
+      APNS_TEAM_ID: ${APNS_TEAM_ID:?set APNS_TEAM_ID in .env}
+      APNS_TOPIC: ${APNS_TOPIC:?set APNS_TOPIC in .env}
+      APNS_ENVIRONMENT: ${APNS_ENVIRONMENT:-production}
+    volumes:
+      - ./drive-sa.json:/run/secrets/drive-sa.json:ro
+      - ./secrets/AuthKey_T5JSK43654.p8:/run/secrets/apns-auth-key.p8:ro
+      # Scratch only (downloads in flight); durable copies live in Google Drive.
+      - bidmanager-data:/var/lib/bidmanager
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      BIDMANAGER_DOMAIN: ${BIDMANAGER_DOMAIN:?set BIDMANAGER_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+  # TEMPORARY anti-idle-reclamation shim -- NOT a real workload.
+  # Oracle reclaims an Always-Free A1 VM whose CPU/network/memory all stay under 20%
+  # utilization (95th percentile) for 7 days straight. This container exists only to
+  # hold memory above that line while real usage is low. Remove this whole service
+  # (and `docker compose up -d` to apply) once any of the following makes it
+  # unnecessary: the app's own real memory usage naturally stays >20% (e.g. more
+  # concurrent scrape workers/Chromium sessions), the VM is upgraded off Always-Free,
+  # or Oracle's reclamation policy/this account's exemption status changes.
+  # oom_score_adj=1000 + bounded restarts: if the VM genuinely needs the RAM (backend/
+  # postgres under real pressure), the kernel OOM-kills THIS container first, and after
+  # a few kills Docker stops respawning it -- so it gets out of the way on its own
+  # instead of starving the real workload, without waiting for a human to notice.
+  keepalive:
+    image: python:3.12-alpine
+    restart: on-failure:5
+    mem_limit: 4200m
+    oom_score_adj: 1000
+    command: ["python3", "-c", "import os,time;SIZE=3500*1024*1024;CHUNK=16*1024*1024;b=bytearray(SIZE);mv=memoryview(b);[mv.__setitem__(slice(i,min(i+CHUNK,SIZE)), os.urandom(min(CHUNK,SIZE-i))) for i in range(0,SIZE,CHUNK)];time.sleep(10**9)"]
+
+volumes:
+  bidmanager-data:
+  pgdata:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,41 @@
+----
+01:15 2026-11-05 (Bid Agent session) - Request: Bid Agent tab in the console (API key / model, learned employers, form library).
+Backed up: BidManagerControl.jsx
+- BidManagerControl.jsx: new BidAgentPanel + NAV entry 'BID' (calls /admin/bid-agent/*; shows 'not installed' when the server has no Bid Agent yet).
+- Server part is bid_agent_server/ (not applied to server/ by this session).
+----
+01:47 Bid Agent installed (bid_agent_server/install.py)
+  - server/bid_agent/ (new package: Bid Agent pipeline + /client bid-pack and /admin/bid-agent routes)
+  - server/api_server.py: mount bid_agent routers before the SPA catch-all
+  - server/requirements.txt: anthropic>=2.5.0, pdfplumber>=0.11.0, pypdf>=5.0.0, python-docx>=1.1.0, openpyxl>=3.1.0
+----
+01:48 2026-11-05 (Bid Agent session) - Request: apply the Bid Agent to the server.
+Backed up: server/api_server.py, server/requirements.txt, server/API_CHANGES.md
+- server/API_CHANGES.md: new section 5 (bid packs, READY) + to-do items per app in section 4.
+- bid_agent_server/install.py now keeps api_server.py's UTF-8 byte-order mark.
+----
+02:36 Bid Agent installed (bid_agent_server/install.py)
+  - server/bid_agent/ (new package: Bid Agent pipeline + /client bid-pack and /admin/bid-agent routes)
+  - server/requirements.txt: xlrd>=2.0.1, striprtf>=0.0.26
+  - correction: the entry above is an UPDATE of server/bid_agent/, not a new package: tender ZIPs (also ZIPs inside ZIPs) are unpacked with size/depth limits; damaged or password-protected ZIPs, .rar/.7z and unreadable files are listed in the bid pack with the reason; .xls (xlrd) and .rtf (striprtf) are converted, .doc/.odt/.ods via LibreOffice only if it is installed.
+  - server/bid_agent/: chat agent (bid_agent/chat.py, workspace.py): routes /client/tenders/{id}/bid-agent/chat, /files, /prep-files; saves into project-files/P - <tender>/<owner>/<project>/ (Docs for Preparation subfolder) with 'Bid Agent index.json' and table bid_agent_files; adds Ready Docs checklist rows to the sync data and attaches its files.
+  - server/Dockerfile (backed up): LibreOffice headless Writer + Calc and fonts, for old .doc/.odt/.ods and PDF output.
+----
+03:03 2026-11-05 (Bid Agent session) - API_CHANGES.md section 5 rewritten for the chat agent (chat / files / prep-files routes, Drive layout, index file); section 4 to-do lines updated.
+----
+04:31 2026-11-05 (Bid Agent session) - Request: agent missed the qualification criteria of 2026_MMRDA_1345405_1 (only JV rules), even with pages given.
+- server/bid_agent/: 'Eligibility Criteria' (Indian NIT heading) now counts as qualification criteria; criteria pages are also found by content (turnover / similar work / bid capacity / crore amounts) when they beat the classified section; numbered-paragraph criteria are read; scanned pages are sent to Claude as page images; chat tools list_tender_documents / read_tender_pages / extract_criteria_from_pages use the pages the user names and keep the result; analyses from the old pipeline are redone (pipeline_version 2).
+----
+2026-11-05 (OCI Server Manager) - Status: feat/bid-agent fast-forwarded into feat/mobile-app (83d2bb8) and pushed. Tests 324 passed (bid_agent 4 passed, 2 skipped). Deployed from the PC (full rebuild, new packages installed), health OK, Bid Agent routes live (401 unauthenticated).
+----
+2026-11-05 (OCI Server Manager) - Status: feat/bid-agent (chat agent, Drive ZIPs, LibreOffice) fast-forwarded into feat/mobile-app (545625f) and pushed. Server tests 324 passed. Deployed from the PC (full rebuild), health OK; LibreOffice 7.4.7.2, striprtf/xlrd present; chat/files/admin routes live (401 unauthenticated).
+----
+2026-11-05 (OCI Server Manager) - Status: feat/bid-agent (0183890: NIT criteria, user-named pages, floating/own-screen chat) in feat/mobile-app and pushed. Server tests 324 passed. Deployed from the PC (full rebuild), health OK, Bid Agent routes live.
+----
+09:48 2026-11-05 (Bid Agent session) - Request: agent slow and long-winded; open and train it outside projects.
+- server/bid_agent/: chat runs on a fast chat model (setting bid_agent_chat_model, default claude-sonnet-5-5, effort low), streams the reply (GET chat 'partial'), answers from the tender's key pages (Files API, cached), short replies by default. Training: tables bid_agent_instructions / bid_agent_learnings, chat tool 'remember', reference documents (project-files/Bid Agent Library/<owner>/), checklist starts from the owner's matching template.
+- New routes: /client/bid-agent/recent, /instructions, /learnings[/id], /references[/id]; /admin/bid-agent/instructions, /learnings, /tenders/{id}/chat; /admin/bid-agent/config gains chat_model.
+----
+10:09 2026-11-05 (Bid Agent session) - BidManagerControl.jsx (backed up): Bid Agent tab gains the chat model field, Training panel (global instructions, learned notes of every owner) and 'Try the agent' (chat on a tender by row id, read only). server/API_CHANGES.md section 5: fast/streamed chat ('partial'), open anywhere, training routes.
+----
+2026-11-05 (OCI Server Manager) - Status: pulled server changes up to f51bb37 (Bid Agent streamed chat, training, recent/console chat routes). Server tests 324 passed. Deployed from the PC (full rebuild), health OK, Bid Agent routes live.

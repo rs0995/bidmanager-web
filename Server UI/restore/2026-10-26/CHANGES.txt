@@ -1,0 +1,72 @@
+Change log — 2026-10-26
+Files in this folder are the ORIGINAL (pre-change) copies, same paths relative to "Server UI/". Restore by copying back
+(and delete the new files listed below).
+
+Request: use the BM Server icon/logo (from Server Mobile App/assets/icon/) for the Server desktop app.
+Files backed up (pre-change) and change:
+ - electron/package.json : build.icon = assets/icon.png (installer + exe icon); assets/icon.png added to "files".
+ - electron/main.cjs     : BrowserWindow icon (window + taskbar).
+ - index.html            : favicon -> src/assets/bm-server-icon.svg.
+ - BidManagerControl.jsx : logo next to "BidManager CONTROL" in the masthead.
+ - CHANGELOG_PENDING.txt : note appended.
+New files: electron/assets/icon.png (copy of icon-1024.png), src/assets/bm-server-icon.svg (copy of icon.svg).
+
+Status: done 2026-10-26. vite build OK (icon bundled). Installer not built (user runs build_admin_electron_setup.bat).
+
+----------------------------------------------------------------------------------------------------------------
+2026-10-26 (later) — Request: a new corrigendum for tender 2026_MMRDA_1341650_1 ("CSD", CSD_Contractor.pdf) was
+missed: the detail page's Latest Corrigendum List only shows the newest corrigenda, so "CORRIGENDUM 1" -> "CSD"
+kept the row count at 1; new_portal_files_available compared counts only, skipped the update download (which reads
+the Corrigendum History popup), and no alert went out.
+Backups: server/app_core.py and server/api_server.py copied before this change (client_api.py backup above is the
+start-of-day copy).
+ - server/app_core.py : tenders.corrigendum_latest + last_dl_corrigendum_latest (guarded ALTERs);
+   extract_latest_corrigenda(soup) ("title | type; ..."); _store_corrigendum_latest (records history field
+   "corrigendum_latest" only after a known previous value -- first read is a baseline). Called from the NIC scrape
+   (optional 17th upsert tuple item; content hash unaffected), refresh_tender_details and refresh_tender_counts
+   (which now also records prebid/corrigendum count changes). Download completion stores last_dl_corrigendum_latest.
+   new_portal_files_available: a changed list = new files; a NULL baseline is set to today's list.
+ - server/client_api.py : _ALERTABLE_CHANGED_FIELDS += corrigendum_latest.
+ - server/api_server.py : push text treats corrigendum_latest as "has a new pre-bid or corrigendum".
+New file: server/test_corrigendum_change.py (6 tests).
+For the MMRDA tender itself: run a FULL download once (always reads the history popup).
+Status: corrigendum fix -- test_corrigendum_change 6/6, full suite 315 passed. Deployed 2026-10-26 from the PC (full rebuild), health OK.
+
+----------------------------------------------------------------------------------------------------------------
+2026-10-26 (later) — Request: tenders added to projects are always bookmarked and can't be un-bookmarked (the apps
+warn). Backups: the start-of-day copies above (client_api.py, org_access.py, API_CHANGES.md).
+ - server/org_access.py : project_tender_ids / with_project_bookmarks (bookmarkTenderIds gains every project's
+   canonical source_tender_id; skips old row-id-only blobs). Applied in effective_blob (pull, changes feed, push pass,
+   tender scope) before hidden sections are stripped.
+ - server/client_api.py : _merge_sync_blob re-adds project tenders after the merge (a removal of one is undone,
+   stamped like a bookmark add); _bookmark_union applies it so the 24h bookmark jobs include project tenders at once.
+ - server/API_CHANGES.md : section 1 note + to-dos for Client UI, Bidwise, BM Pro (local bookmark on project create;
+   block un-bookmark with a warning).
+New file: server/test_project_bookmarks.py (6 tests).
+ - server/test_orgs.py : individual-sync test now expects the project tender (T-100) bookmarked too.
+Status: full suite 319 passed + test_orgs expectation updated (46/46 org/bookmark/file tests pass); the timing-flaky changes-feed test passes alone 3/3. Deployed 2026-10-26 from the PC (full rebuild), health OK.
+
+----------------------------------------------------------------------------------------------------------------
+(Re-added 2026-10-27: this entry was written at ~01:40 on 2026-10-26 and was lost when the file was recreated for the
+icon change at 14:29.)
+2026-10-26 — Request: store uploaded checklist files on Drive in readable folders, grouped by tender:
+project-files/P - <tender id>/<Owner (org N | user N)>/<Project title (project id)>/<file>; projects without a
+tender under project-files/P - No tender/ (beside the tender folders). Every user id / org has its own folder
+(org members share the org's). Same-name files in a project become "name (2).ext". Archiving moves nothing.
+(The project-files feature itself, 2026-10-25, was deployed together with this.)
+Files backed up (pre-change) and change:
+ - server/project_files.py : tender_folder / owner_folder / project_folder / _folder_name (strips / \ : * ? " < > |
+   and control chars, max 80), find_project, name_candidates, name_taken; scope_slug removed (unused).
+ - server/org_access.py : client_project_files gains stored_name + folder_path (CREATE + guarded ALTERs); new unique
+   index (scope, project_id, stored_name) WHERE trashed_at IS NULL, created after the ALTERs (_POST_COLUMN_SCHEMA).
+ - server/client_api.py : upload picks folder_path + a free stored_name (retries the next on a race), streams to
+   project-files/.uploading/<id>/<stored_name>, then Drive persist(local, folder_path, "project_file", "project-files/")
+   or, for local storage, moves it into project-files/<folder_path>/. _slug removed (unused).
+ - server/test_project_files.py : +4 tests (layout and (2) naming, per-user folders under one tender folder, org
+   folder + P - No tender + name cleaning, Drive upload arguments).
+ - server/API_CHANGES.md : section 3 storage note.
+Status: test_project_files 15/15; full suite 308 passed + 1 known timing-flaky changes-feed test (passes alone).
+Deployed 2026-10-26 from the PC (full rebuild) together with the 2026-10-25 project-files feature; health OK;
+/client/project-files answers 401 without a token, download 404/401 for a bad id/token. API_CHANGES.md section 3
+marked LIVE. (Found 2026-10-27: this layout passed the whole folder path as the Drive file label -> HTTP 500 on
+real uploads; fixed in restore/2026-10-27.)

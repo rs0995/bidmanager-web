@@ -1,0 +1,27 @@
+Change log — 2026-10-19
+Files in this folder are the ORIGINAL (pre-change) copies, same paths relative to "Server UI/". Restore by copying back.
+Note: server/apns_push.py is untracked in git, so this copy is its only pre-change version.
+
+Request: push notifications for the Bidwise iOS app (bundle com.raku.s0995.bidwise) alongside BM Pro
+(com.raku.s0995.bidmanager-mobile). Each device token now remembers which app (and APNs environment)
+it belongs to, and every push goes out with that app's topic.
+
+Files backed up (pre-change) and intended change:
+ - server/app_core.py : client_push_tokens gets columns `app` (default 'bmpro') and `apns_env`
+   (default 'production'); idempotent ALTERs like the existing badge_count one.
+ - server/client_api.py : POST /client/push-token accepts optional `app` ('bmpro'|'bidwise') and
+   `environment` ('production'|'sandbox'); BM Pro sends neither, so its rows keep the defaults.
+ - server/apns_push.py : topic per app (APNS_TOPIC for BM Pro, APNS_TOPIC_BIDWISE or
+   com.raku.s0995.bidwise for Bidwise); send() takes app/environment and picks topic + host per token.
+ - server/api_server.py : every push send (download complete, captcha, tender/org/closing pass) reads
+   the token's app/apns_env and passes them to apns_push.send.
+ - server/test_apns_push.py, server/test_push_notification_pass.py, server/test_client_api.py : tests.
+
+Status: code + tests done 2026-10-19; full suite 243/243 passed (incl. new tests: Bidwise topic, topic override,
+BM Pro default unchanged, per-token sandbox host, per-device app/env in sends, registration app/env + 400 on unknown app).
+Deployed 2026-10-19 from the PC (deploy-backend.sh) together with the 15:59 client_api.py change
+(organization tender_count from the DB); combined suite 244/244 passed before deploy. Live check: new code in
+the container, client_push_tokens.app/apns_env columns present, /health 200.
+2026-10-19 15:59:48 client_api.py: /client/organizations tender_count = real DB count (active or archived), not the scraped portal figure
+2026-10-19 17:33:03 app_core.py: upsert_tender_row URL/title fallbacks no longer match a row holding a different tender id (different tenders were merging and overwriting each other)
+2026-10-19 18:18:47 Tender ID as the only tender identity: upsert/dedupe match by tender id only; sync blob stores bookmarkTenderIds; /client/tenders/resolve

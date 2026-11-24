@@ -1,0 +1,20 @@
+<!-- Copy of assets/icon.svg (the master). Keep the two in step when editing. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#273352"/>
+      <stop offset="1" stop-color="#0f1422"/>
+    </linearGradient>
+    <linearGradient id="bar" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#3b6ce7"/>
+      <stop offset="1" stop-color="#8db0ff"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="228" fill="url(#tile)"/>
+  <rect x="196" y="576" width="156" height="236" rx="42" fill="#5f719a"/>
+  <rect x="382" y="452" width="156" height="360" rx="42" fill="#8ca7d8"/>
+  <rect x="568" y="304" width="156" height="508" rx="42" fill="url(#bar)"/>
+  <circle cx="716" cy="292" r="168" fill="#131a2b"/>
+  <circle cx="716" cy="292" r="146" fill="#10b981"/>
+  <path d="M644 294 L697 348 L792 240" fill="none" stroke="#ffffff" stroke-width="66" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

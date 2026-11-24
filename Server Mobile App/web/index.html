@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>BM Server — browser preview</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #cfd6dd;
+      }
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      #root {
+        display: flex;
+        position: relative;
+        width: 430px;
+        height: 932px;
+        flex: none;
+        border-radius: 56px;
+        overflow: hidden;
+        background: #e9edf1;
+        box-shadow: 0 0 0 11px #17151c, 0 0 0 13px #3a3742,
+          0 30px 80px -20px rgba(30, 20, 60, 0.5);
+        transform-origin: center center;
+      }
+      /* Preview only: no square browser focus ring around rounded pressables. */
+      #root [tabindex]:focus,
+      #root [tabindex]:focus-visible {
+        outline: none;
+      }
+      @media (max-width: 440px) {
+        html,
+        body {
+          background: #e9edf1;
+        }
+        #root {
+          width: 100vw;
+          height: 100vh;
+          max-height: none;
+          border-radius: 0;
+          box-shadow: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,89 @@
+import { useMemo, useState } from "react";
+import { View, FlatList, Pressable } from "react-native";
+import { Bookmark, Search, Building2 } from "lucide-react-native";
+import { OrganizationCard } from "./OrganizationCard";
+import { SkeletonList } from "@/components/feedback/Skeleton";
+import { EmptyState } from "@/components/feedback/EmptyState";
+import { ErrorState } from "@/components/feedback/ErrorState";
+import { Input } from "@/components/common/Field";
+import { useOrgBookmarkToggle } from "@/hooks/useBookmarks";
+import { useThemeColors } from "@/constants/colors";
+
+type OrganizationListProps = {
+  query: any;
+  bookmarkedOnly: boolean;
+  onToggleBookmarked: (value: boolean) => void;
+  archived?: boolean;
+};
+
+export function OrganizationList({ query, bookmarkedOnly, onToggleBookmarked, archived = false }: OrganizationListProps) {
+  const { data, isLoading, isError, error, refetch } = query;
+  const { isOrgBookmarked } = useOrgBookmarkToggle();
+  const [search, setSearch] = useState("");
+  const colors = useThemeColors();
+
+  const items = useMemo(() => {
+    let all = data || [];
+    if (bookmarkedOnly) {
+      all = all.filter((org: any) => isOrgBookmarked(org.name));
+    } else {
+      all = all.filter((org: any) => org.is_available !== false);
+    }
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      all = all.filter((org: any) => org.name.toLowerCase().includes(q));
+    }
+    if (bookmarkedOnly) {
+      all = [...all].sort((a: any, b: any) => (a.is_available === false ? 1 : 0) - (b.is_available === false ? 1 : 0));
+    }
+    return all;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, bookmarkedOnly, search]);
+
+  const header = (
+    <View className="px-4 pt-3 pb-2 bg-bg">
+      <View className="flex-row items-center gap-2">
+        <Pressable
+          onPress={() => onToggleBookmarked(!bookmarkedOnly)}
+          className="w-[41px] h-[41px] items-center justify-center rounded-[10px] border"
+          style={bookmarkedOnly ? { borderColor: colors.accent, backgroundColor: colors.accentBg } : { borderColor: colors.border, backgroundColor: colors.surface1 }}
+          accessibilityLabel="Bookmarked only"
+        >
+          <Bookmark size={16} color={bookmarkedOnly ? colors.accent : colors.textMuted} fill={bookmarkedOnly ? colors.accent : "none"} />
+        </Pressable>
+        <View className="relative flex-1 justify-center">
+          <Search size={15} color={colors.textMuted} style={{ position: "absolute", left: 12, zIndex: 1 }} />
+          <Input
+            style={{ paddingLeft: 34 }}
+            placeholder="Search organisations"
+            value={search}
+            onChangeText={setSearch}
+          />
+        </View>
+      </View>
+    </View>
+  );
+
+  return (
+    <View className="flex-1">
+      {header}
+      {isLoading && <SkeletonList />}
+      {isError && <ErrorState message={error?.message} onRetry={refetch} />}
+      {!isLoading && !isError && items.length === 0 && (
+        <EmptyState
+          icon={Building2}
+          title={search ? "No organisations match your search" : bookmarkedOnly ? "No bookmarked organisations" : "No organizations found"}
+          body={search ? "Try a different search." : bookmarkedOnly ? "Bookmark an organisation to see it here." : "Try a different portal scope."}
+        />
+      )}
+      {!isLoading && !isError && items.length > 0 && (
+        <FlatList
+          data={items}
+          keyExtractor={(item: any) => String(item.id)}
+          renderItem={({ item }) => <OrganizationCard org={item} archived={archived} />}
+          contentContainerClassName="gap-2 px-4 pb-4"
+        />
+      )}
+    </View>
+  );
+}

@@ -1,0 +1,51 @@
+import { Pressable, View, Text } from "react-native";
+import { router } from "expo-router";
+import { Star } from "lucide-react-native";
+import { StatusPill } from "./StatusPill";
+import { fmtINR, timeRemaining, urgency } from "@/lib/format";
+import { useBookmarkToggle } from "@/hooks/useBookmarks";
+import { useThemeColors, urgencyColor, hexToRgba } from "@/constants/colors";
+
+export function TenderCard({ tender }: { tender: any }) {
+  const { isBookmarked, toggle } = useBookmarkToggle();
+  const { totalDays, label, expired } = timeRemaining(tender.closing_date);
+  const u = urgency(totalDays);
+  const bookmarked = isBookmarked(tender);
+  const colors = useThemeColors();
+  const color = urgencyColor(u.key, colors);
+
+  return (
+    <Pressable
+      className="bg-surface-0 border border-border rounded-[14px] flex flex-col gap-1.5 p-3.5"
+      onPress={() => router.push(`/tenders/${tender.id}` as any)}
+    >
+      <View className="flex-row items-center justify-between gap-2">
+        <Text className="text-[12px] font-bold text-accent" style={{ fontFamily: "IBMPlexMono_600SemiBold" }}>{tender.tender_id}</Text>
+        <View className="flex-row items-center gap-2">
+          {(expired || tender.is_archived) && tender.status ? (
+            <StatusPill status={tender.status} />
+          ) : (
+            <View
+              className="px-2 py-0.5 rounded-full"
+              style={{ backgroundColor: expired ? colors.surface2 : hexToRgba(color, 0.16) }}
+            >
+              <Text className="font-mono text-xs font-semibold" style={{ color: expired ? colors.textMuted : color }}>
+                {expired ? "Closed" : label}
+              </Text>
+            </View>
+          )}
+          <Pressable onPress={() => toggle(tender)} accessibilityLabel="Toggle bookmark" className="p-0.5">
+            <Star size={19} fill={bookmarked ? colors.warn : "none"} color={bookmarked ? colors.warn : colors.textMuted} />
+          </Pressable>
+        </View>
+      </View>
+      <Text className="text-base font-semibold text-text" numberOfLines={2}>{tender.title}</Text>
+      <Text className="text-sm">
+        <Text className="text-text font-semibold">{fmtINR(tender.tender_value)}</Text>
+      </Text>
+      {tender.organization && (
+        <Text className="text-[14px] text-text-muted" numberOfLines={1}>{tender.organization}</Text>
+      )}
+    </Pressable>
+  );
+}

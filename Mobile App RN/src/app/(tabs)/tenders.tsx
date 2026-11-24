@@ -1,0 +1,168 @@
+import { useState, useMemo, useCallback } from "react";
+import { View } from "react-native";
+import { useLocalSearchParams, router } from "expo-router";
+import { ScreenHeader } from "@/components/shell/ScreenHeader";
+import { SyncPausedBanner } from "@/components/feedback/SyncPausedBanner";
+import { SiteScope } from "@/components/tender/SiteScope";
+import { SegmentedControl } from "@/components/common/SegmentedControl";
+import { TenderFilterBar } from "@/components/tender/TenderFilterBar";
+import { TenderFilterSheet } from "@/components/tender/TenderFilterSheet";
+import { TenderList } from "@/components/tender/TenderList";
+import { OrganizationList } from "@/components/tender/OrganizationList";
+import { useTenders } from "@/hooks/useTenders";
+import { useOrganizations } from "@/hooks/useOrganizations";
+import { useBookmarkToggle, useBookmarkedTenders } from "@/hooks/useBookmarks";
+import { timeRemaining } from "@/lib/format";
+import { customFilterPass } from "@/components/tender/CustomFilterMenu";
+import { getRaw, setRaw } from "@/lib/kv";
+
+function toStr(v: string | string[] | undefined): string {
+  return Array.isArray(v) ? v[0] || "" : v || "";
+}
+
+export default function TendersScreen() {
+  const params = useLocalSearchParams<Record<string, string | string[]>>();
+  const [sheetOpen, setSheetOpen] = useState(false);
+  const [rows, setRows] = useState<any[]>([]);
+  const { isBookmarked } = useBookmarkToggle();
+
+  const filters = useMemo(() => {
+    const out: Record<string, string> = {};
+    Object.entries(params).forEach(([k, v]) => { out[k] = toStr(v); });
+    return out;
+  }, [params]);
+
+  const view = filters.view
+    ? (filters.view === "orgs" ? "orgs" : "tenders")
+    : (getRaw("bm.tendersLastView") === "orgs" ? "orgs" : "tenders");
+  const websiteId = filters.website_id || getRaw("bm.tendersLastWebsiteId") || "";
+  const customFilters = filters.custom ? filters.custom.split(",").filter(Boolean) : [];
+  const bookmarkedOnly = filters.bookmarked_only === "1";
+  const closingSoon = filters.closing5 === "1";
+  const orgBookmarkedOnly = filters.org_bookmarked === "1";
+
+  const apiFilters = useMemo(() => {
+    const { view: _v, custom: _c, bookmarked_only: _b, closing5: _c5, org_bookmarked: _o, ...rest } = filters;
+    if (rest.archived === undefined || rest.archived === "") rest.archived = "false";
+    rest.website_id = websiteId;
+    return rest;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters, websiteId]);
+
+  const tendersQuery = useTenders(apiFilters);
+  // Bookmarked-only reads the saved bookmarks directly (one fetch per id) rather
+  // than filtering whichever 25-per-page tenders happen to be loaded, so every
+  // bookmark shows immediately no matter where it sorts in the full list.
+  const bookmarked = useBookmarkedTenders();
+  const bookmarkedKey = bookmarked.tenders.map((t: any) => `${t.id}:${t.status}:${t.closing_date}:${t.is_archived}`).join("|");
+  const bookmarkQuery = useMemo(() => ({
+    data: { pages: [{ items: bookmarked.tenders }] },
+    isLoading: bookmarked.isLoading,
+    isError: false,
+    error: null,
+    fetchNextPage: () => {},
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    refetch: () => {},
+  }), // eslint-disable-next-line react-hooks/exhaustive-deps
+  [bookmarkedKey, bookmarked.isLoading]);
+  const listQuery = bookmarkedOnly ? bookmarkQuery : tendersQuery;
+  const bookmarkSort = useCallback((a: any, b: any) => {
+    const at = timeRemaining(a.closing_date).date?.getTime() ?? Infinity;
+    const bt = timeRemaining(b.closing_date).date?.getTime() ?? Infinity;
+    return at - bt;
+  }, []);
+  // Deliberately NOT apiFilters.q here -- that is the Tenders sub-tabs own
+  // search text, and switching sub-tabs never clears it. Sending it through
+  // filtered the org list server-side by that leftover tender search, which
+  // looked like the org list had gone empty.
+  const orgsQuery = useOrganizations({ website_id: apiFilters.website_id });
+
+  // router.setParams() merges/patches the given keys into the current route
+  // params rather than replacing the whole set — omitting a key (the old
+  // `delete next[key]` approach) leaves its previous value in place instead
+  // of clearing it, so toggling a filter off silently did nothing. Passing
+  // an explicit "" keeps the key present with a value setParams actually
+  // applies, and every reader here already treats "" as falsy/unset.
+  const onChange = useCallback((patch: Record<string, string>) => {
+    const next: Record<string, string> = { ...filters };
+    Object.entries(patch).forEach(([key, value]) => {
+      next[key] = value || "";
+    });
+    router.setParams(next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters]);
+
+  const filterFn = useCallback((t: any) => {
+    if (bookmarkedOnly) {
+      if (!isBookmarked(t)) return false;
+      // The bookmark list is not server-filtered, so apply the tab's scope here.
+      if (apiFilters.archived === "true" ? !t.is_archived : Boolean(t.is_archived)) return false;
+      if (apiFilters.website_id && String(t.website_id) !== String(apiFilters.website_id)) return false;
+      const needle = String(apiFilters.q || "").trim().toLowerCase();
+      if (needle && !`${t.title} ${t.tender_id} ${t.organization}`.toLowerCase().includes(needle)) return false;
+    }
+    if (closingSoon) {
+      const { totalDays, expired } = timeRemaining(t.closing_date);
+      if (expired || totalDays == null || totalDays > 5) return false;
+    }
+    for (const key of customFilters) if (!customFilterPass(t, key)) return false;
+    return true;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookmarkedOnly, closingSoon, customFilters.join(","), apiFilters.archived, apiFilters.website_id, apiFilters.q]);
+
+  return (
+    <View className="flex-1 bg-bg">
+      <ScreenHeader title="Tenders" />
+      <View className="px-4 pt-3"><SyncPausedBanner /></View>
+      <SiteScope
+        websiteId={apiFilters.website_id}
+        onChange={(id) => {
+          setRaw("bm.tendersLastWebsiteId", id);
+          onChange({ website_id: id });
+        }}
+      />
+      <View className="px-4 pb-1">
+        <SegmentedControl
+          value={view}
+          onChange={(v) => {
+            setRaw("bm.tendersLastView", v);
+            onChange({ view: v === "tenders" ? "" : v });
+          }}
+          options={[{ value: "orgs", label: "Organisations" }, { value: "tenders", label: "Tenders" }]}
+        />
+      </View>
+      {view === "tenders" && (
+        <View className="flex-1">
+          <TenderFilterBar
+            q={filters.q}
+            onSearch={(q) => onChange({ q })}
+            bookmarkedOnly={bookmarkedOnly}
+            onToggleBookmarked={(v) => onChange({ bookmarked_only: v ? "1" : "" })}
+            closingSoon={closingSoon}
+            onToggleClosingSoon={(v) => onChange({ closing5: v ? "1" : "" })}
+            customFilters={customFilters}
+            onAddCustom={(key) => onChange({ custom: [...customFilters, key].join(",") })}
+            onRemoveCustom={(key) => onChange({ custom: customFilters.filter((k) => k !== key).join(",") })}
+            rows={rows}
+            onOpenAdvanced={() => setSheetOpen(true)}
+          />
+          <TenderList
+            query={listQuery}
+            filterFn={filterFn}
+            sortFn={bookmarkedOnly ? bookmarkSort : undefined}
+            onRowsChange={setRows}
+          />
+          <TenderFilterSheet open={sheetOpen} onClose={() => setSheetOpen(false)} filters={filters} onApply={onChange} />
+        </View>
+      )}
+      {view === "orgs" && (
+        <OrganizationList
+          query={orgsQuery}
+          bookmarkedOnly={orgBookmarkedOnly}
+          onToggleBookmarked={(v) => onChange({ org_bookmarked: v ? "1" : "" })}
+        />
+      )}
+    </View>
+  );
+}

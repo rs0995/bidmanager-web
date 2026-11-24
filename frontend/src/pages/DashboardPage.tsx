@@ -27,7 +27,7 @@ export default function DashboardPage() {
       <EmptyState
         icon={Activity}
         title="Could not load dashboard"
-        description="Could not reach backend API. In Electron dev, restart with npm run dev:electron."
+        description="Could not reach backend API. Restart BidManager or check Backend Configuration."
       />
     );
   }

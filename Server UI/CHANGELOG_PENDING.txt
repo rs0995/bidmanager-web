@@ -1,0 +1,19 @@
+----
+02:36 Bid Agent: bid packs per tender (section map, qualification criteria vs company profile, Word/Excel bid forms). Routes /client/tenders/{id}/bid-pack*, /client/company-profile, /admin/bid-agent/*. Needs an Anthropic API key in the console.
+  (correction: the line above repeats the first Bid Agent note. This update: the Bid Agent reads tender ZIPs from Drive, including ZIPs inside ZIPs, converts old .xls/.rtf files, and lists any file it can't read with the reason.)
+----
+03:03 Bid Agent is now a chat on each tender/project (Bidwise above Ready for Bid, Client UI above the Ready Docs checklist): show/save the prequal (Excel/Word/PDF), extract all or specific tender forms, prepare the Ready Docs checklist with the forms attached. Files are saved to the tender folder on Drive (Docs for Preparation) with a 'Bid Agent index.json' key; phone prep docs are uploaded there too. Server image adds LibreOffice.
+----
+09:48 Bid Agent replies faster and shorter (streamed, fast chat model, grounded on the tender pages). It can be taught: standing instructions, 'remember …' corrections, reference documents, checklist templates; console can chat with any tender.
+----
+10:09 Console Bid Agent tab: set the chat model, write global instructions, see what users taught the agent, and try the agent on any tender.
+Desktop app icon (exe, desktop shortcut, taskbar, installer) restored to the previous default icon; the flat BM Server tile from 1.0.17 is no longer used there.
+Bid Agent: AI provider and model are now dropdowns (models listed live from the provider when the server supports it, built-in Claude list otherwise); Save / Remove key line up with the inputs. Gemini / ChatGPT become selectable once the server adds them.
+----
+10:06 Bid Agent can run on Claude, Gemini or ChatGPT: pick the provider and models in the console (Bid Agent tab); each provider keeps its own key; models are listed live from the provider.
+----
+2026-11-24 12:25  Downloads no longer save the portal page as a document when the CAPTCHA is not solved; such jobs now fail with the reason, and every saved ZIP/PDF is checked before it is stored.
+----
+2026-11-24 10:02  Tender lists sort by value and EMD across all tenders on the server (not just the loaded page), with tenders without a value last; the server can also filter by a value range.
+----
+2026-11-24 10:56  Organisations are listed in the same order as on the portal (filled in on each portal's next organisation-list update).

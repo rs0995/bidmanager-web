@@ -1,0 +1,6600 @@
+import React, { useState, useEffect, useMemo, useCallback, useRef, Fragment } from 'react';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import {
+  LayoutDashboard, Globe, FolderOpen, FileText, Server, Settings,
+  Bell, Sun, Moon, PanelLeftClose, PanelLeft, X, AlertTriangle,
+  Activity, Calendar, Edit3, Save,
+  Search, Plus, Eye, EyeOff, Copy, ExternalLink, Trash2,
+  CheckSquare, Square, ChevronRight, ChevronLeft, LayoutGrid, List, Clock,
+  Building2, IndianRupee, CalendarClock, ArchiveRestore, SlidersHorizontal,
+  Bookmark, Columns3, FileDown, Star, RefreshCw,
+  ChevronDown, Folder, ArrowUp, Wifi, WifiOff, CheckCircle2,
+  Paperclip, FolderCog, Link2, BookOpen, Pencil,
+  Palette, RotateCcw, Home, Download, Upload, Rows3, Type, Info, Filter,
+  LogOut, LogIn, UserPlus, KeyRound, ArrowLeft, ShieldQuestion,
+  Users, Shield, UserMinus, Check, Ban, Briefcase, Sparkles,
+} from 'lucide-react';
+import { api, canonTenderId, tenderKey, PROJECT_BOOKMARK_LOCKED } from './lib/api';
+import { cn, formatINR, formatCrores, timeRemaining } from './lib/utils';
+import { useAppStore } from './lib/store';
+import {
+  Badge, TimeBadge, StatusBadge, EmptyState, Spinner, NotificationIcon,
+} from './components/ui/shared';
+import AgentChatPanel from './components/AgentChatPanel';
+import CompanyProfilePage from './components/CompanyProfilePage';
+import BidAgentPage from './components/BidAgentPage';
+
+/* ════════════════════════════════════════════════════════════════════════════
+   BID MANAGER — CLIENT APP (draft)
+   ────────────────────────────────────────────────────────────────────────────
+   This is the client-facing counterpart to the operator/scraper app. It reuses
+   the same lib/api, lib/store, lib/utils and shared UI components — nothing
+   here changes those files. What's removed, relative to the full app:
+
+     • No scraping controls: no "fetch tenders" / job queue / live scraper log
+       console / website & organization management. (The Captcha page here is
+       not the operator solver: it only shows CAPTCHAs raised by this user's
+       own requests, and the operator console can answer the same one.)
+     • Tenders page is now a read-only browse-and-bookmark list over tenders
+       that already exist in the shared database (Organizations + Logs tabs
+       from the operator app are gone).
+     • Projects: dropped tender-autofill-from-scrape ("Fetch" button); manual
+       entry / editing only.
+     • Project Workspace: dropped "Fetch tender info" (scraper + CAPTCHA
+       assisted sync). Manual entry + local file attachment only.
+     • Settings: dropped CAPTCHA AI provider config, Backend/Cloud Run
+       connection config, and Auto-Archive scheduling — all operator-only.
+     • Server Control → renamed "Files": dropped bulk "delete files older
+       than N days" maintenance action; kept simple browse + folder delete.
+     • App shell: dropped the background auto-archive polling loop that used
+       to call the scraper endpoints on a timer.
+
+   Anything marked  // WIRE:  is a spot the person asked to leave for wiring
+   once the client-facing API surface is finalized. Everything else already
+   calls the same `api` used by the operator app.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+// Page keys: 'dashboard' | 'tenders' | 'projects' | 'templates' | 'archived_projects' | 'files' | 'settings'
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   CLIENT-SIDE PREFERENCES
+   — purely local (localStorage), never sent to the backend. Separate from the
+     `settings` object returned by api.getSettings/updateSettings, which is
+     server-relevant config. These control appearance/UI behavior only and are
+     safe to add without touching lib/api.js, lib/store.js, or the backend.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const CLIENT_PREFS_KEY = 'bm-client-prefs';
+const CLIENT_PREFS_EVENT = 'bm-client-prefs-updated';
+const ACCENT_PRESETS = [
+  { name: 'Blue', hex: '#5b8af5' },
+  { name: 'Violet', hex: '#8b5cf6' },
+  { name: 'Emerald', hex: '#10b981' },
+  { name: 'Amber', hex: '#f59e0b' },
+  { name: 'Rose', hex: '#ef4444' },
+  { name: 'Teal', hex: '#14b8a6' },
+  { name: 'Pink', hex: '#ec4899' },
+];
+const STARTUP_PAGE_OPTIONS = [
+  { value: 'resume', label: 'Resume last visited' },
+  { value: 'dashboard', label: 'Dashboard' },
+  { value: 'tenders', label: 'Online Tenders' },
+  { value: 'projects', label: 'Projects' },
+  { value: 'templates', label: 'Templates' },
+  { value: 'files', label: 'Files' },
+];
+const DEFAULT_CLIENT_PREFS = {
+  accent: '',              // '' = follow theme default
+  density: 'comfortable',  // 'comfortable' | 'compact'
+  uiScale: 'md',           // 'sm' | 'md' | 'lg'
+  startupPage: 'resume',
+};
+
+function readClientPrefs() {
+  try {
+    const raw = localStorage.getItem(CLIENT_PREFS_KEY);
+    return raw ? { ...DEFAULT_CLIENT_PREFS, ...JSON.parse(raw) } : { ...DEFAULT_CLIENT_PREFS };
+  } catch {
+    return { ...DEFAULT_CLIENT_PREFS };
+  }
+}
+function hexToRgb(hex) {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex || '');
+  return m ? { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) } : null;
+}
+function shadeHex(hex, amt) {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return hex;
+  const clamp = (v) => Math.max(0, Math.min(255, v));
+  return `#${[rgb.r, rgb.g, rgb.b].map((v) => clamp(v + amt).toString(16).padStart(2, '0')).join('')}`;
+}
+function applyClientPrefs(prefs) {
+  const root = document.documentElement;
+  const rgb = hexToRgb(prefs.accent);
+  if (rgb) {
+    root.style.setProperty('--accent', prefs.accent);
+    root.style.setProperty('--accent-hover', shadeHex(prefs.accent, 28));
+    root.style.setProperty('--accent-bg', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.12)`);
+    root.style.setProperty('--row-selected-bg', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.08)`);
+  } else {
+    ['--accent', '--accent-hover', '--accent-bg', '--row-selected-bg'].forEach((v) => root.style.removeProperty(v));
+  }
+  root.dataset.density = prefs.density === 'compact' ? 'compact' : 'comfortable';
+  if (prefs.uiScale === 'sm') root.style.fontSize = '14px';
+  else if (prefs.uiScale === 'lg') root.style.fontSize = '18px';
+  else root.style.removeProperty('font-size');
+}
+function writeClientPrefs(prefs) {
+  localStorage.setItem(CLIENT_PREFS_KEY, JSON.stringify(prefs));
+  applyClientPrefs(prefs);
+  window.dispatchEvent(new CustomEvent(CLIENT_PREFS_EVENT, { detail: prefs }));
+}
+// Apply immediately on module load so there's no flash of un-styled defaults.
+applyClientPrefs(readClientPrefs());
+
+function useClientPrefs() {
+  const [prefs, setPrefs] = useState(readClientPrefs);
+  useEffect(() => {
+    const onUpdate = (e) => setPrefs(e.detail || readClientPrefs());
+    window.addEventListener(CLIENT_PREFS_EVENT, onUpdate);
+    return () => window.removeEventListener(CLIENT_PREFS_EVENT, onUpdate);
+  }, []);
+  const update = useCallback((patch) => {
+    setPrefs((prev) => {
+      const next = { ...prev, ...patch };
+      writeClientPrefs(next);
+      return next;
+    });
+  }, []);
+  const reset = useCallback(() => {
+    writeClientPrefs(DEFAULT_CLIENT_PREFS);
+    setPrefs(DEFAULT_CLIENT_PREFS);
+  }, []);
+  return [prefs, update, reset];
+}
+
+// ── Small reusable settings-UI primitives ───────────────────────────────────
+function Toggle({ checked, onChange, disabled }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      className={cn('toggle-switch', checked && 'toggle-switch-on')}
+    >
+      <span className="toggle-thumb" />
+    </button>
+  );
+}
+
+function SegmentedControl({ options, value, onChange, disabled }) {
+  return (
+    <div className="segmented">
+      {options.map((opt) => (
+        <button
+          key={opt.value}
+          type="button"
+          disabled={disabled}
+          onClick={() => onChange(opt.value)}
+          className={cn('segmented-item', value === opt.value && 'segmented-item-active')}
+        >
+          {opt.icon ? <opt.icon size={13} /> : null}{opt.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function SettingRow({ title, hint, children }) {
+  return (
+    <div className="flex items-center justify-between gap-4">
+      <div className="min-w-0">
+        <p className="text-sm text-[var(--text)]">{title}</p>
+        {hint && <p className="text-xs text-[var(--text-muted)]">{hint}</p>}
+      </div>
+      <div className="shrink-0">{children}</div>
+    </div>
+  );
+}
+
+// ── Error boundary ───────────────────────────────────────────────────────────
+class RenderErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, message: '' };
+  }
+  static getDerivedStateFromError(error) {
+    const message = error instanceof Error ? error.message : String(error || 'Unknown error');
+    return { hasError: true, message };
+  }
+  componentDidCatch(error) {
+    // eslint-disable-next-line no-console
+    console.error('RenderErrorBoundary caught error:', error);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex h-full items-center justify-center p-6">
+          <div className="card max-w-xl p-5">
+            <h2 className="text-base font-semibold text-[var(--text)]">UI error detected</h2>
+            <p className="mt-2 text-sm text-[var(--text-muted)]">
+              The page crashed while rendering. Please restart once; if it repeats, share this message.
+            </p>
+            <pre className="mt-3 overflow-auto rounded-md border border-[var(--border)] bg-[var(--surface-1)] p-3 text-xs text-rose-400">
+              {this.state.message || 'Unknown renderer error'}
+            </pre>
+            <div className="mt-4 flex items-center gap-2">
+              <button className="btn-primary text-xs" onClick={() => window.location.reload()}>Reload App</button>
+              <button className="btn-ghost text-xs" onClick={() => this.setState({ hasError: false, message: '' })}>Try Continue</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// ── Tender detail drawer ───────────────────────────────────────────────────
+// Any screen opens it with openTenderDetailDrawer(tender); App owns the state.
+// The drawer is identified by the tender id — the row id rides along only as
+// a hint (see api.resolveTenderRowId).
+function openTenderDetailDrawer(tender) {
+  window.dispatchEvent(new CustomEvent('bm-open-tender-detail', { detail: { tenderId: tenderKey(tender), id: Number(tender?.id) || null } }));
+}
+
+// Same client-side cooldowns as the mobile app, so neither app hammers the
+// portal: update checks at most hourly, status fetches every 6 hours.
+const TENDER_CHECK_COOLDOWN_MS = { update: 60 * 60 * 1000, status: 6 * 60 * 60 * 1000 };
+const TENDER_CHECK_TIMES_KEY = 'bm-tender-check-times';
+const PENDING_TENDER_CHECKS_KEY = 'bm-pending-tender-checks';
+
+function readJsonStorage(key, fallback) {
+  try { return JSON.parse(localStorage.getItem(key) || '') ?? fallback; } catch { return fallback; }
+}
+// Cooldowns and pending checks are keyed by the canonical tender id (row id
+// only for a tender without one) so they survive a server DB restore.
+const tenderCheckKey = (tender) => tenderKey(tender) || `#${Number(tender?.id)}`;
+function lastTenderCheckAt(kind, checkKey) {
+  return Number(readJsonStorage(TENDER_CHECK_TIMES_KEY, {})[`${kind}:${checkKey}`]) || 0;
+}
+function recordTenderCheck(kind, checkKey) {
+  const times = readJsonStorage(TENDER_CHECK_TIMES_KEY, {});
+  times[`${kind}:${checkKey}`] = Date.now();
+  localStorage.setItem(TENDER_CHECK_TIMES_KEY, JSON.stringify(times));
+}
+function setPendingTenderCheck(checkKey, entry) {
+  const pending = readJsonStorage(PENDING_TENDER_CHECKS_KEY, {});
+  if (entry) pending[checkKey] = entry; else delete pending[checkKey];
+  localStorage.setItem(PENDING_TENDER_CHECKS_KEY, JSON.stringify(pending));
+}
+
+// Runs one check job to the end and refreshes the tender's documents.
+// Returns { ok, newDocuments, error }.
+async function runTenderCheck(kind, tender) {
+  const tenderId = Number(tender.id);
+  const before = await api.listTenderDocuments(tenderId, { page_size: 100 }).catch(() => null);
+  const knownIds = new Set((before?.items || []).map((d) => d.id));
+  const start = kind === 'status' ? api.fetchTenderStatus : api.requestTenderUpdateJob;
+  const { job_id: jobId } = await start(tenderId);
+  setPendingTenderCheck(tenderCheckKey(tender), { kind, jobId, knownIds: [...knownIds], tender: { id: tenderId, tender_id: tender.tender_id, title: tender.title } });
+  return finishTenderCheck(kind, tender, jobId, knownIds);
+}
+
+async function finishTenderCheck(kind, tender, jobId, knownIds, pendingKey = tenderCheckKey(tender)) {
+  try {
+    // A check resumed after a restart re-resolves the row id by tender_id.
+    const tenderId = await api.resolveTenderRowId(tender);
+    if (!tenderId) return { ok: false, error: 'This tender is no longer on the server.' };
+    const { status, error } = await api.waitForTenderJob(tenderId, jobId);
+    if (status !== 'completed') return { ok: false, error: error || 'The check failed.' };
+    recordTenderCheck(kind, tenderCheckKey(tender));
+    const after = await api.syncTenderDocuments(tender).catch(() => null);
+    const items = after?.items || (await api.listTenderDocuments(tenderId, { page_size: 100 }).catch(() => null))?.items || [];
+    return { ok: true, newDocuments: items.filter((d) => !knownIds.has(d.id)).length };
+  } finally {
+    setPendingTenderCheck(pendingKey, null);
+  }
+}
+
+// A check started before a restart finishes quietly in the background.
+// The entry's own storage key is cleared (an older entry may be row-id keyed).
+function resumePendingTenderChecks() {
+  const pending = readJsonStorage(PENDING_TENDER_CHECKS_KEY, {});
+  for (const [pendingKey, entry] of Object.entries(pending)) {
+    if (!entry?.jobId || !entry?.tender) continue;
+    finishTenderCheck(entry.kind, entry.tender, entry.jobId, new Set(entry.knownIds || []), pendingKey).catch(() => {});
+  }
+}
+
+// `tenderRef` is { tenderId (canonical portal id), id (row-id hint) }. The
+// row id the /client/tenders/{id} calls need is resolved from the tender id.
+function TenderDetailDrawer({ tenderRef, onClose }) {
+  const qc = useQueryClient();
+  const pushToast = useAppStore((s) => s.pushToast);
+  const ref = { tender_id: tenderRef.tenderId, id: tenderRef.id };
+  const { data: tenderId, isLoading: resolving } = useQuery({
+    queryKey: ['tender-detail-row', tenderRef.tenderId, tenderRef.id],
+    queryFn: () => api.resolveTenderRowId(ref),
+  });
+  const { data: tender, isLoading: loadingTender, error } = useQuery({
+    queryKey: ['tender-detail', tenderId],
+    queryFn: () => api.getTenderDetail(tenderId),
+    enabled: Boolean(tenderId),
+  });
+  const isLoading = resolving || loadingTender;
+  const notFound = !resolving && !tenderId;
+  const { data: docsPage } = useQuery({
+    queryKey: ['tender-detail-docs', tenderId],
+    queryFn: () => api.listTenderDocuments(tenderId, { page_size: 100 }),
+    enabled: Boolean(tenderId),
+  });
+  const { data: localTender } = useQuery({
+    queryKey: ['tender-detail-local', tenderRef.tenderId, tenderRef.id],
+    queryFn: () => api.getLocalTender(ref),
+  });
+  const [checking, setChecking] = useState(false);
+  const docs = docsPage?.items || [];
+  const archived = Boolean(tender?.is_archived);
+  const kind = archived ? 'status' : 'update';
+
+  const refresh = () => {
+    qc.invalidateQueries({ queryKey: ['tender-detail', tenderId] });
+    qc.invalidateQueries({ queryKey: ['tender-detail-docs', tenderId] });
+    qc.invalidateQueries({ queryKey: ['tender-detail-local'] });
+    qc.invalidateQueries({ queryKey: ['client-documents'] });
+  };
+
+  const handleCheck = async () => {
+    if (!tender || checking) return;
+    const last = lastTenderCheckAt(kind, tenderCheckKey(tender));
+    if (last && Date.now() - last < TENDER_CHECK_COOLDOWN_MS[kind]) {
+      pushToast({ type: 'info', message: `Already checked ${new Date(last).toLocaleString('en-IN')}. Try again later.` });
+      return;
+    }
+    setChecking(true);
+    pushToast({ type: 'info', message: archived ? 'Fetching the tender status from the portal…' : 'Checking the portal for new corrigendum or pre-bid files…' });
+    try {
+      const result = await runTenderCheck(kind, tender);
+      refresh();
+      if (!result.ok) pushToast({ type: 'error', message: result.error });
+      else if (archived) pushToast({ type: 'success', message: 'Status updated.' });
+      else if (result.newDocuments > 0) pushToast({ type: 'success', message: `${result.newDocuments} new document(s) found.` });
+      else pushToast({ type: 'info', message: 'No updates available.' });
+    } catch (err) {
+      pushToast({ type: 'error', message: err?.message || String(err) });
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  // Mirrors the row star: a project's tender can't be un-bookmarked.
+  const { data: drawerProjects } = useQuery({ queryKey: ['projects', '', ''], queryFn: () => api.listProjects() });
+  const bookmarkLockedByProject = Boolean(
+    localTender?.is_bookmarked
+    && (drawerProjects || []).some((p) => canonTenderId(p.source_tender_id) === tenderKey(localTender)),
+  );
+
+  const toggleBookmark = useMutation({
+    mutationFn: async () => {
+      if (!localTender) throw new Error('Sync tenders first to bookmark this one.');
+      if (!localTender.is_bookmarked && (await api.countBookmarkedTenders()) >= 30) {
+        throw new Error('You can bookmark at most 30 tenders. Remove one before adding another.');
+      }
+      return api.patchTender(localTender.id, { is_bookmarked: !localTender.is_bookmarked });
+    },
+    onSuccess: () => qc.invalidateQueries(),
+    onError: (err) => pushToast({ type: 'error', message: err?.message || String(err) }),
+  });
+
+  const addToProject = useMutation({
+    mutationFn: () => api.createProject({
+      title: tender.title || '',
+      client_name: tender.organization || '',
+      source_tender_id: tender.tender_id || '',
+      project_value: tender.tender_value || '',
+      prebid: tender.pre_bid_meeting_date || '',
+      deadline: tender.closing_date || '',
+      tender_snapshot: { closing_date: tender.closing_date || '', pre_bid_meeting_date: tender.pre_bid_meeting_date || '', tender_value: tender.tender_value || '' },
+      description: tender.work_description || tender.title || '',
+      status: 'Active',
+    }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['projects'] });
+      qc.invalidateQueries({ queryKey: ['dashboard'] });
+      pushToast({ type: 'success', message: 'Added to Projects.' });
+    },
+    onError: (err) => pushToast({ type: 'error', message: err?.message || String(err) }),
+  });
+
+  const downloadAll = useMutation({
+    mutationFn: async () => {
+      if (!docs.length) {
+        await api.requestTenderDownload(tender);
+        return { requested: true };
+      }
+      let ok = 0;
+      let failed = 0;
+      for (const d of docs.filter((x) => x.downloadable !== false)) {
+        try {
+          await api.downloadDocument({ id: d.id, tender_db_id: tender.id, tender_id: tender.tender_id, tender_title: tender.title, file_name: d.name });
+          ok += 1;
+        } catch {
+          failed += 1;
+        }
+      }
+      return { ok, failed };
+    },
+    onSuccess: (r) => {
+      refresh();
+      if (r.requested) pushToast({ type: 'info', message: 'Documents requested. They will appear in Downloads when ready.' });
+      else pushToast({ type: r.failed ? 'error' : 'success', message: `Downloaded ${r.ok} file(s)${r.failed ? `, ${r.failed} failed` : ''}.` });
+    },
+    onError: (err) => pushToast({ type: 'error', message: err?.message || String(err) }),
+  });
+
+  const downloadOne = useMutation({
+    mutationFn: (d) => api.downloadDocument({ id: d.id, tender_db_id: tender.id, tender_id: tender.tender_id, tender_title: tender.title, file_name: d.name }),
+    onSuccess: refresh,
+    onError: (err) => pushToast({ type: 'error', message: err?.message || String(err) }),
+  });
+
+  const fields = tender ? [
+    ['Tender value', formatINR(tender.tender_value)],
+    ['EMD', formatINR(tender.emd)],
+    ['Category', tender.category],
+    ['Location', tender.location],
+    ['Published', tender.published_date],
+    ['Bid opening', tender.opening_date],
+    ['Closing', tender.closing_date],
+    ['Pre-bid meeting', tender.pre_bid_meeting_date],
+    ['Status', tender.status || (archived ? 'Closed' : 'Active')],
+    ['Portal', tender.website_name],
+  ] : [];
+
+  return (
+    <>
+      <div className="fixed inset-0 z-40 bg-black/35" onClick={onClose} />
+      <aside className="fixed inset-y-0 right-0 z-50 flex w-[560px] max-w-[92vw] flex-col border-l border-[var(--border)] bg-[var(--bg)] shadow-2xl">
+        <div className="flex h-11 shrink-0 items-center justify-between border-b border-[var(--border)] bg-[var(--surface-0)] px-3">
+          <h3 className="text-sm font-semibold text-[var(--text)]">Tender Details</h3>
+          <div className="flex items-center gap-2">
+            {tender && (
+              <button onClick={handleCheck} disabled={checking} className="btn-ghost gap-1 text-xs" title={archived ? 'Read the tender stage and result files from the portal' : 'Look for new corrigendum or pre-bid files'}>
+                {checking ? <Spinner size={12} /> : <RefreshCw size={12} />}
+                {archived ? 'Fetch status' : 'Check for updates'}
+              </button>
+            )}
+            <button onClick={onClose} className="rounded p-1 text-[var(--text-muted)] hover:bg-[var(--surface-1)] hover:text-[var(--text)]"><X size={16} /></button>
+          </div>
+        </div>
+        <div className="flex-1 overflow-y-auto p-4">
+          {isLoading && <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>}
+          {error && <p className="text-sm text-[var(--danger)]">{error.message || String(error)}</p>}
+          {notFound && <p className="text-sm text-[var(--text-muted)]">This tender is no longer on the server.</p>}
+          {tender && (
+            <div className="flex flex-col gap-4">
+              <div>
+                <p className="font-mono text-xs text-[var(--accent)]">{tender.tender_id || '—'}</p>
+                <h2 className="mt-1 text-base font-semibold leading-snug text-[var(--text)]">{tender.title || '—'}</h2>
+                <p className="mt-1 text-xs text-[var(--text-muted)]">{tender.organization || '—'}</p>
+              </div>
+              <div className="grid grid-cols-2 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface-0)]">
+                {fields.map(([label, value], i) => (
+                  <div key={label} className={cn('px-3 py-2.5', i % 2 === 0 && 'border-r border-[var(--border)]', i < fields.length - 2 && 'border-b border-[var(--border)]')}>
+                    <p className="text-xs text-[var(--text-muted)]">{label}</p>
+                    <p className="mt-0.5 text-sm text-[var(--text)]">{value || '—'}</p>
+                  </div>
+                ))}
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => toggleBookmark.mutate()}
+                  disabled={toggleBookmark.isPending || bookmarkLockedByProject}
+                  title={bookmarkLockedByProject ? PROJECT_BOOKMARK_LOCKED : undefined}
+                  className="btn-ghost gap-1 text-xs"
+                >
+                  <Star size={12} fill={localTender?.is_bookmarked ? 'currentColor' : 'none'} />
+                  {localTender?.is_bookmarked ? 'Bookmarked' : 'Bookmark'}
+                </button>
+                <button onClick={() => addToProject.mutate()} disabled={addToProject.isPending} className="btn-ghost gap-1 text-xs"><Plus size={12} />Add to Project</button>
+                {tender.tender_url && (
+                  <button onClick={() => api.openTenderUrl({ ...tender, org_chain: tender.organization })} className="btn-ghost gap-1 text-xs"><ExternalLink size={12} />Open on portal</button>
+                )}
+                <button onClick={() => downloadAll.mutate()} disabled={downloadAll.isPending} className="btn-primary gap-1 text-xs">
+                  {downloadAll.isPending ? <Spinner size={12} /> : <Download size={12} />}
+                  {docs.length ? 'Download all' : 'Request download'}
+                </button>
+              </div>
+              <div>
+                <p className="mb-2 text-sm font-semibold text-[var(--text)]">Documents ({docs.length})</p>
+                {docs.length === 0 ? (
+                  <p className="text-xs text-[var(--text-muted)]">No documents downloaded yet for this tender.</p>
+                ) : (
+                  <div className="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface-0)]">
+                    {docs.map((d, i) => (
+                      <div key={d.id} className={cn('flex items-center gap-3 px-3 py-2', i < docs.length - 1 && 'border-b border-[var(--border)]')}>
+                        <FileText size={14} className="shrink-0 text-[var(--text-muted)]" />
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm text-[var(--text)]">{d.name}</p>
+                          <p className="text-xs text-[var(--text-muted)]">{[d.file_type, d.downloaded_at && String(d.downloaded_at).slice(0, 10)].filter(Boolean).join(' · ')}</p>
+                        </div>
+                        <button onClick={() => downloadOne.mutate(d)} disabled={d.downloadable === false || downloadOne.isPending} className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]" title="Download">
+                          <Download size={14} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      </aside>
+    </>
+  );
+}
+
+// ── Captcha page ───────────────────────────────────────────────────────────
+function CaptchaPage() {
+  const qc = useQueryClient();
+  const pushToast = useAppStore((s) => s.pushToast);
+  const { data: pending, isLoading, refetch } = useQuery({
+    queryKey: ['captcha-pending'],
+    queryFn: () => api.getPendingCaptcha(),
+    refetchInterval: 15000,
+  });
+  const [text, setText] = useState('');
+  const submit = useMutation({
+    mutationFn: () => api.answerCaptcha(pending.request_id, text.trim()),
+    onSuccess: () => { setText(''); pushToast({ type: 'success', message: 'Submitted. The job will continue shortly.' }); },
+    onError: (err) => pushToast({ type: 'error', message: `${err?.message || String(err)} It may have been answered already.` }),
+    onSettled: () => qc.invalidateQueries({ queryKey: ['captcha-pending'] }),
+  });
+
+  return (
+    <div className="h-full overflow-y-auto p-6">
+      <div className="mx-auto max-w-lg">
+        <h1 className="text-lg font-semibold text-[var(--text)]">Captcha</h1>
+        <p className="mt-1 text-sm text-[var(--text-muted)]">
+          When a portal asks for a CAPTCHA during one of your requests and it can't be solved automatically, it appears here.
+        </p>
+        <div className="card mt-4 p-4">
+          {isLoading ? (
+            <div className="flex justify-center py-10"><Spinner size={20} className="text-[var(--accent)]" /></div>
+          ) : !pending ? (
+            <div className="flex flex-col items-center gap-2 py-8 text-center">
+              <ShieldQuestion size={28} className="text-[var(--text-muted)]" />
+              <p className="text-sm text-[var(--text-muted)]">No CAPTCHA needs solving right now.</p>
+              <button onClick={() => refetch()} className="btn-ghost gap-1 text-xs"><RefreshCw size={12} />Check again</button>
+            </div>
+          ) : (
+            <form
+              className="flex flex-col gap-3"
+              onSubmit={(event) => { event.preventDefault(); if (text.trim()) submit.mutate(); }}
+            >
+              <img
+                src={`data:image/png;base64,${pending.image_base64}`}
+                alt="CAPTCHA"
+                className="mx-auto max-h-32 rounded border border-[var(--border)] bg-white object-contain"
+              />
+              <input
+                className="input"
+                value={text}
+                onChange={(event) => setText(event.target.value)}
+                placeholder="Enter the text shown above"
+                autoFocus
+                autoComplete="off"
+              />
+              <button type="submit" disabled={!text.trim() || submit.isPending} className="btn-primary justify-center">
+                {submit.isPending ? 'Submitting…' : 'Submit'}
+              </button>
+            </form>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Portal Search page ────────────────────────────────────────────────────
+// Search a tender ID directly on a NIC portal's Tender Status page — the
+// portal_search section (Server UI/server/API_CHANGES.md §2). Off by
+// default; only reachable when the sidebar/page-gate already let the user
+// in, so no permission check needed here.
+function portalSearchResultLabel(entry) {
+  if (!entry) return '';
+  if (entry.status === 'pending') return 'Searching…';
+  if (entry.status === 'not_found') return 'Not found on the portal';
+  if (entry.status === 'failed') return entry.error || 'Search failed';
+  if (entry.status === 'found') {
+    if (!entry.created) return 'Updated';
+    return entry.is_archived ? 'Added to archive' : 'Added to current';
+  }
+  return entry.status || '';
+}
+function PortalSearchResultBadge({ entry }) {
+  if (!entry) return null;
+  if (entry.status === 'pending') return <Badge variant="info"><Spinner size={10} />Searching…</Badge>;
+  if (entry.status === 'not_found') return <Badge variant="muted">Not found</Badge>;
+  if (entry.status === 'failed') return <Badge variant="danger">Failed</Badge>;
+  if (entry.status === 'found') return <Badge variant="success">{portalSearchResultLabel(entry)}</Badge>;
+  return <Badge variant="muted">{entry.status}</Badge>;
+}
+
+function PortalSearchPage({ onOpenTender }) {
+  const qc = useQueryClient();
+  const [websiteId, setWebsiteId] = useState('');
+  const [tenderId, setTenderId] = useState('');
+  const [activeSearchId, setActiveSearchId] = useState(null);
+  const [formError, setFormError] = useState('');
+
+  const { data: portalsResult, isLoading: portalsLoading } = useQuery({ queryKey: ['portal-search-portals'], queryFn: () => api.getPortalSearchPortals() });
+  const portals = portalsResult?.items || [];
+  useEffect(() => {
+    if (!websiteId && portals.length) setWebsiteId(String(portals[0].id));
+  }, [portals, websiteId]);
+
+  const { data: historyResult, isLoading: historyLoading } = useQuery({ queryKey: ['portal-search-history'], queryFn: () => api.getPortalSearchHistory(50) });
+  const history = historyResult?.items || [];
+
+  // Background completions (e.g. the app was restarted mid-search) notify
+  // here via the same cross-module bus api.js uses for tender changes.
+  useEffect(() => api.onPortalSearchChanged(() => qc.invalidateQueries({ queryKey: ['portal-search-history'] })), [qc]);
+
+  const { data: activeSearchResult } = useQuery({
+    queryKey: ['portal-search', activeSearchId],
+    queryFn: () => api.getPortalSearch(activeSearchId),
+    enabled: activeSearchId != null,
+    refetchInterval: (query) => (query.state.data?.search?.status === 'pending' ? 3000 : false),
+  });
+  const activeSearch = activeSearchResult?.search;
+  const isPending = activeSearch?.status === 'pending';
+  useEffect(() => {
+    if (activeSearch && activeSearch.status !== 'pending') qc.invalidateQueries({ queryKey: ['portal-search-history'] });
+  }, [activeSearch?.status, qc]);
+
+  // While our own search is pending, surface the same captcha signal the
+  // Captcha tab/header badge already poll — no new server concept, just a
+  // local hint so the user knows to go solve it.
+  const { data: pendingCaptcha } = useQuery({
+    queryKey: ['captcha-pending'],
+    queryFn: () => api.getPendingCaptcha(),
+    enabled: isPending,
+    refetchInterval: isPending ? 5000 : false,
+  });
+
+  const searchMut = useMutation({
+    mutationFn: () => api.requestPortalSearch(Number(websiteId), tenderId.trim()),
+    onSuccess: (result) => {
+      setFormError('');
+      setActiveSearchId(result?.search?.id ?? null);
+      qc.invalidateQueries({ queryKey: ['portal-search-history'] });
+    },
+    onError: (err) => setFormError(err instanceof Error ? err.message : String(err)),
+  });
+  const deleteMut = useMutation({
+    mutationFn: (id) => api.deletePortalSearchHistoryItem(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['portal-search-history'] }),
+  });
+  const clearMut = useMutation({
+    mutationFn: () => api.clearPortalSearchHistory(),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['portal-search-history'] }),
+  });
+
+  const handleSubmit = (event) => {
+    event.preventDefault();
+    if (!websiteId || !tenderId.trim()) { setFormError('Pick a portal and enter a tender ID.'); return; }
+    searchMut.mutate();
+  };
+
+  if (!portalsLoading && portalsResult && !portalsResult.allowed) {
+    return (
+      <div className="h-full overflow-y-auto p-6">
+        <EmptyState icon={Search} title="Portal Search" description="Your account doesn't have access to this section." />
+      </div>
+    );
+  }
+
+  return (
+    <div className="h-full overflow-y-auto p-6">
+      <div className="mx-auto max-w-2xl">
+        <h1 className="text-lg font-semibold text-[var(--text)]">Portal Search</h1>
+        <p className="mt-1 text-sm text-[var(--text-muted)]">Search a tender ID directly on a NIC portal. A tender already in the system is updated for everyone; a new one is added.</p>
+
+        <form onSubmit={handleSubmit} className="card mt-4 flex flex-wrap items-end gap-2 p-4">
+          <div className="min-w-[160px]">
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Portal</label>
+            <select value={websiteId} onChange={(e) => setWebsiteId(e.target.value)} className="input-field h-9 w-full text-sm">
+              {portals.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </div>
+          <div className="min-w-[200px] flex-1">
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Tender ID</label>
+            <input value={tenderId} onChange={(e) => setTenderId(e.target.value)} className="input-field h-9 w-full text-sm" placeholder="e.g. 2026_XYZ_123456_1" />
+          </div>
+          <button type="submit" disabled={searchMut.isPending || isPending} className="btn-primary h-9 gap-1.5 text-sm">
+            {searchMut.isPending || isPending ? <Spinner size={14} /> : <Search size={14} />}
+            {isPending ? 'Searching…' : 'Search'}
+          </button>
+        </form>
+        {formError && <p className="mt-2 text-xs text-rose-400">{formError}</p>}
+        {isPending && pendingCaptcha && (
+          <p className="mt-2 text-xs text-amber-400">A CAPTCHA needs solving to continue this search — go to the Captcha tab.</p>
+        )}
+        {activeSearch && activeSearch.status !== 'pending' && (
+          <div className="card mt-3 flex items-center justify-between p-3">
+            <div>
+              <p className="text-sm text-[var(--text)]">{activeSearch.tender_id} <span className="text-[var(--text-muted)]">on {activeSearch.website_name}</span></p>
+              <p className="text-xs text-[var(--text-muted)]">{portalSearchResultLabel(activeSearch)}{activeSearch.stage ? ` — ${activeSearch.stage}` : ''}</p>
+            </div>
+            {activeSearch.tender_db_id && (
+              <button onClick={() => onOpenTender?.(activeSearch.tender_db_id)} className="btn-secondary text-xs gap-1.5">
+                <ExternalLink size={13} />Open Tender
+              </button>
+            )}
+          </div>
+        )}
+
+        <div className="mt-6 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-[var(--text)]">History</h2>
+          {history.length > 0 && (
+            <button onClick={() => clearMut.mutate()} disabled={clearMut.isPending} className="btn-ghost text-xs gap-1.5">
+              <Trash2 size={12} />Clear
+            </button>
+          )}
+        </div>
+        {historyLoading && <div className="flex justify-center py-10"><Spinner size={20} className="text-[var(--accent)]" /></div>}
+        {!historyLoading && history.length === 0 && (
+          <EmptyState icon={Search} title="No searches yet" description="Search a tender ID on a portal to see it here." />
+        )}
+        {!historyLoading && history.length > 0 && (
+          <div className="mt-2 space-y-2">
+            {history.map((entry) => (
+              <div
+                key={entry.id}
+                onClick={() => entry.tender_db_id && onOpenTender?.(entry.tender_db_id)}
+                className={cn('card flex items-center justify-between gap-3 p-3', entry.tender_db_id && 'cursor-pointer hover:bg-[var(--surface-1)]')}
+              >
+                <div className="min-w-0">
+                  <p className="truncate text-sm text-[var(--text)]">{entry.tender_id} <span className="text-[var(--text-muted)]">on {entry.website_name}</span></p>
+                  <p className="text-xs text-[var(--text-muted)]">{new Date(entry.created_at * 1000).toLocaleString()}{entry.stage ? ` — ${entry.stage}` : ''}</p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <PortalSearchResultBadge entry={entry} />
+                  <button
+                    onClick={(event) => { event.stopPropagation(); deleteMut.mutate(entry.id); }}
+                    disabled={deleteMut.isPending}
+                    className="rounded p-1 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]"
+                    title="Remove"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Sidebar ────────────────────────────────────────────────────────────────
+// Which sidebar tabs a set of org-account permissions (active/archived/
+// bookmarks/projects — see Server UI/server/org_access.py) hides. An
+// unrestricted (individual, or org admin) account has every permission
+// true, so this is a no-op for the common case. "Online Tenders" only
+// hides outright when BOTH active and archived are off — otherwise the
+// page itself narrows to whichever sub-tab is still permitted (same
+// server-side scope rule _tender_scope uses: no filter when both are on).
+function sidebarKeyGatedOff(key, permissions) {
+  // portal_search defaults OFF (unlike the other four, which default on) —
+  // while permissions haven't loaded yet, keep it hidden rather than
+  // flashing a tab most accounts don't actually have.
+  if (key === 'portal_search') return permissions?.portal_search !== true;
+  if (!permissions) return false;
+  if (key === 'tenders') return permissions.active === false && permissions.archived === false;
+  // The `active` section covers "active tenders AND the organisations list"
+  // (API_CHANGES.md §1), so Organizations follows it alone — it used to need
+  // archived and bookmarks to be off as well, which left the tab visible to a
+  // member who'd had only active revoked.
+  if (key === 'organizations') return permissions.active === false;
+  if (key === 'bookmarks') return permissions.bookmarks === false;
+  if (key === 'projects' || key === 'archived_projects' || key === 'templates' || key === 'company' || key === 'bid_agent') return permissions.projects === false;
+  return false;
+}
+
+// A dashboard card jumps to a specific destination, sometimes a specific
+// sub-tab, so it needs its own permission rather than the page's rule: the
+// Online Tenders page stays visible while either sub-tab is permitted, but the
+// "Archived" card is only reachable with `archived`.
+const DASHBOARD_TARGET_SECTION = {
+  'tenders-active': 'active',
+  'tenders-closing-7d': 'active',
+  'tenders-archived': 'archived',
+  projects: 'projects',
+  bookmarks: 'bookmarks',
+};
+function dashboardTargetGatedOff(target, permissions) {
+  const section = DASHBOARD_TARGET_SECTION[target];
+  if (!section) return false;
+  return permissions?.[section] === false;
+}
+
+function Sidebar({ active, onNavigate, collapsed, onToggle, badges = {}, permissions }) {
+  const mainItems = [
+    { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
+    { key: 'tenders', label: 'Online Tenders', icon: Globe },
+    { key: 'organizations', label: 'Organizations', icon: Building2 },
+    { key: 'bookmarks', label: 'Bookmarks', icon: Star },
+    { key: 'projects', label: 'Projects', icon: FolderOpen },
+    { key: 'bid_agent', label: 'Bid Agent', icon: Sparkles },
+    { key: 'templates', label: 'Templates', icon: FileText },
+    { key: 'company', label: 'Company Profile', icon: Briefcase },
+    { key: 'portal_search', label: 'Portal Search', icon: Search },
+  ].filter((item) => !sidebarKeyGatedOff(item.key, permissions));
+  const bottomItems = [
+    { key: 'archived_projects', label: 'Archived Projects', icon: FolderOpen },
+    { key: 'captcha', label: 'Captcha', icon: ShieldQuestion },
+    { key: 'files', label: 'Files', icon: Server },
+    { key: 'settings', label: 'Settings', icon: Settings },
+  ].filter((item) => !sidebarKeyGatedOff(item.key, permissions));
+
+  const NavButton = ({ item }) => (
+    <button
+      onClick={() => onNavigate(item.key)}
+      className={cn(
+        'flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-all w-full text-left',
+        active === item.key
+          ? 'bg-[var(--accent-bg)] text-[var(--accent)] font-medium'
+          : 'text-[var(--text-muted)] hover:bg-[var(--surface-1)] hover:text-[var(--text)]'
+      )}
+      title={collapsed ? item.label : undefined}
+    >
+      <span className="relative shrink-0">
+        <item.icon size={18} />
+        {badges[item.key] && (
+          <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-[var(--danger)]" />
+        )}
+      </span>
+      {!collapsed && <span className="truncate">{item.label}</span>}
+    </button>
+  );
+
+  return (
+    <div className={cn(
+      'flex flex-col h-full border-r border-[var(--border)] bg-[var(--surface-0)] transition-all duration-200 shrink-0',
+      collapsed ? 'w-[56px]' : 'w-[210px]'
+    )}>
+      <div className="flex items-center gap-2 px-3 h-11 border-b border-[var(--border)] shrink-0">
+        {!collapsed && (
+          <span className="text-sm font-bold tracking-tight text-[var(--accent)] truncate">BID MANAGER</span>
+        )}
+        <button onClick={onToggle} className={cn('p-1 rounded hover:bg-[var(--surface-1)] text-[var(--text-muted)]', collapsed && 'mx-auto')}>
+          {collapsed ? <PanelLeft size={16} /> : <PanelLeftClose size={16} />}
+        </button>
+      </div>
+
+      <div className="flex-1 flex flex-col py-2 px-1.5 gap-0.5 overflow-hidden">
+        {mainItems.map(item => <NavButton key={item.key} item={item} />)}
+      </div>
+
+      <div className="px-1.5 pb-2 flex flex-col gap-0.5">
+        {bottomItems.map(item => <NavButton key={item.key} item={item} />)}
+      </div>
+    </div>
+  );
+}
+
+// "2h ago" for a notification's epoch stamp. Returns '' for notifications
+// saved before `at` existed, so the caller can fall back to their `time`.
+function relativeTime(at) {
+  const ms = Number(at);
+  if (!Number.isFinite(ms) || ms <= 0) return '';
+  const seconds = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (seconds < 60) return 'just now';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  return new Date(ms).toLocaleDateString();
+}
+
+// ── Notification Panel ────────────────────────────────────────────────────
+function NotificationPanel({ open, onClose, onOpenTender, onOpenOrg, onOpenProject }) {
+  const { notifications, markRead, markAllRead, dismissNotification, clearNotifications } = useAppStore();
+  if (!open) return null;
+  return (
+    <>
+      <div className="fixed inset-0 z-40" onClick={onClose} />
+      <div className="absolute top-10 right-2 w-80 z-50 card shadow-xl border border-[var(--border)] overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border)]">
+          <span className="text-sm font-semibold text-[var(--text)]">Notifications</span>
+          <div className="flex items-center gap-2">
+            {notifications.length > 0 && (
+              <>
+                <button onClick={markAllRead} className="text-xs text-[var(--accent)] hover:underline">Mark all read</button>
+                <button onClick={clearNotifications} className="text-xs text-[var(--text-muted)] hover:text-[var(--text)] hover:underline">Clear all</button>
+              </>
+            )}
+            <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text)]"><X size={14} /></button>
+          </div>
+        </div>
+        <div className="max-h-80 overflow-auto">
+          {notifications.length === 0 && (
+            <EmptyState icon={Bell} title="No notifications" description="Changes to your tenders and projects will appear here." />
+          )}
+          {notifications.map(n => {
+            // tenderId is the canonical tender id; a numeric one (saved before
+            // that) or tenderDbId is only a row-id hint.
+            const tenderRef = typeof n.tenderId === 'string' && n.tenderId
+              ? { tender_id: n.tenderId, id: n.tenderDbId }
+              : { tender_id: '', id: n.tenderDbId ?? n.tenderId };
+            const opensTender = Boolean(tenderRef.tender_id || Number(tenderRef.id) > 0);
+            const opensProject = Number(n.projectId) > 0;
+            const navigable = opensTender || opensProject || Boolean(n.orgName);
+            return (
+            <div
+              key={n.id}
+              onClick={() => {
+                markRead(n.id);
+                if (opensProject) { onClose(); onOpenProject?.(Number(n.projectId)); }
+                else if (opensTender) { onClose(); onOpenTender?.(tenderRef); }
+                else if (n.orgName) { onClose(); onOpenOrg?.(n.orgName); }
+              }}
+              className={cn(
+                'group/notif flex items-start gap-3 px-4 py-3 border-b border-[var(--border)] last:border-0 transition-colors',
+                // Only a row that actually goes somewhere should look clickable.
+                navigable ? 'cursor-pointer hover:bg-[var(--surface-1)]' : 'cursor-default',
+                !n.read && 'bg-[var(--accent-bg)]/20'
+              )}
+            >
+              <NotificationIcon type={n.type} />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm text-[var(--text)]">{n.message}</p>
+                <p className="text-xs text-[var(--text-muted)] mt-0.5">{relativeTime(n.at) || n.time}</p>
+              </div>
+              {!n.read && <div className="w-2 h-2 rounded-full bg-[var(--accent)] mt-1.5 shrink-0" />}
+              {navigable && <ChevronRight size={14} className="text-[var(--text-muted)] shrink-0 mt-0.5" />}
+              <button
+                onClick={(event) => { event.stopPropagation(); dismissNotification(n.id); }}
+                title="Dismiss"
+                className="shrink-0 rounded p-0.5 text-[var(--text-muted)] opacity-0 transition-opacity hover:text-[var(--text)] group-hover/notif:opacity-100"
+              >
+                <X size={12} />
+              </button>
+            </div>
+            );
+          })}
+        </div>
+      </div>
+    </>
+  );
+}
+
+// Small floating auto-dismissing cards — direct feedback for a user-
+// initiated action (e.g. the "Request tenders" cooldown message), distinct
+// from the notifications bell above (passive background events the user
+// opens a dropdown to see). Mounted once near the root; state lives in the
+// zustand store so non-React code (api.js) can push one too.
+function ToastHost() {
+  const { toasts, dismissToast } = useAppStore();
+  if (!toasts.length) return null;
+  return (
+    <div className="fixed bottom-4 right-4 z-[80] flex flex-col gap-2 w-80">
+      {toasts.map((t) => (
+        <div key={t.id} className="card shadow-xl border border-[var(--border)] flex items-start gap-3 px-4 py-3">
+          <NotificationIcon type={t.type} />
+          <p className="flex-1 min-w-0 text-sm text-[var(--text)]">{t.message}</p>
+          <button onClick={() => dismissToast(t.id)} className="text-[var(--text-muted)] hover:text-[var(--text)] shrink-0">
+            <X size={14} />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   DASHBOARD
+   ═══════════════════════════════════════════════════════════════════════════ */
+function DashboardPage({ onNavigate, onOpenProjectWorkspace, onOpenWebsiteOrganizations }) {
+  const qc = useQueryClient();
+  const { data: stats, isLoading } = useQuery({
+    queryKey: ['dashboard'],
+    queryFn: api.dashboardStats,
+    refetchInterval: 60000,
+  });
+  const syncNow = useMutation({
+    mutationFn: () => api.syncFromServer(),
+    onSuccess: () => qc.invalidateQueries(),
+    onError: (err) => alert(`Sync failed: ${err?.message || String(err)}`),
+  });
+  const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
+  const { data: activeProjects } = useQuery({ queryKey: ['projects', 'Active', ''], queryFn: () => api.listProjects('', 'Active') });
+  // Same source the sidebar gates on, so the dashboard can't offer a route
+  // into a section this account has had switched off.
+  const permissions = settings?.permissions;
+  const orgsGatedOff = sidebarKeyGatedOff('organizations', permissions);
+  // api.dashboardStats has already narrowed every number to what this account
+  // can reach and reports here which sections applied.
+  const sections = stats?.sections || {};
+  const scope = stats?.tender_scope || {};
+  // A scoped tender card counts bookmarked / in-project tenders, so it should
+  // open wherever those live rather than the tender list it can't reach.
+  const scopedTarget = sections.bookmarks !== false ? 'bookmarks' : (sections.projects !== false ? 'projects' : '');
+  const scopedNote = scope.via === 'both' ? 'in your bookmarks & projects'
+    : scope.via === 'bookmarks' ? 'in your bookmarks'
+      : scope.via === 'projects' ? 'in your projects' : '';
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <Spinner size={32} className="text-[var(--accent)]" />
+      </div>
+    );
+  }
+
+  if (!stats) {
+    return (
+      <EmptyState
+        icon={Activity}
+        title="Could not load dashboard"
+        description="Could not reach the API. Check your connection or contact your administrator."
+      />
+    );
+  }
+
+  const statCards = [
+    { label: 'Active Tenders', value: stats.active_tenders, icon: Globe, color: 'text-sky-400', bg: 'bg-sky-500/10', target: 'tenders-active' },
+    { label: 'Active Projects', value: stats.active_projects, icon: FolderOpen, color: 'text-emerald-400', bg: 'bg-emerald-500/10', target: 'projects' },
+    { label: 'Bookmarked', value: stats.bookmarked_tenders, icon: Bookmark, color: 'text-amber-400', bg: 'bg-amber-500/10', target: 'bookmarks' },
+    { label: 'Closing < 7 Days', value: stats.closing_soon, icon: Clock, color: 'text-rose-400', bg: 'bg-rose-500/10', target: 'tenders-closing-7d' },
+    { label: 'Archived', value: stats.archived_tenders, icon: AlertTriangle, color: 'text-rose-400', bg: 'bg-rose-500/10', target: 'tenders-archived' },
+    // Pipeline Value is the same shape as these — one number — and used to sit
+    // alone in a third of the row below, leaving a hole beside it whenever
+    // Website Coverage was hidden. It belongs up here.
+    { label: 'Pipeline Value', value: formatCrores(stats.total_pipeline_value), icon: IndianRupee, color: 'text-[var(--accent)]', bg: 'bg-[var(--accent-bg)]', target: 'projects' },
+  ]
+    // Bookmarked and Active Projects have nothing left to say once their own
+    // section is off, so they go. The tender cards stay: their numbers are
+    // already narrowed to what this account can reach (api.dashboardStats),
+    // and they re-point at wherever those tenders actually live.
+    .filter((card) => !(card.target === 'bookmarks' && sections.bookmarks === false))
+    .filter((card) => !(card.target === 'projects' && sections.projects === false))
+    .map((card) => (dashboardTargetGatedOff(card.target, permissions)
+      ? { ...card, target: scopedTarget, note: scopedNote }
+      : card));
+
+  // ── "Needs attention" (item 5) ────────────────────────────────────────────
+  const daysUntil = (dateStr) => {
+    const target = parseDeadlineText(dateStr);
+    if (!target) return null;
+    return Math.floor((target.getTime() - Date.now()) / 86400000);
+  };
+  const projectTenderIds = new Set((activeProjects || []).map((p) => canonTenderId(p.source_tender_id)).filter(Boolean));
+  // These rows link into Bookmarks, so they're pointless (and unreachable)
+  // without that section.
+  const urgentUnclaimedBookmarks = (permissions?.bookmarks === false ? [] : (stats.bookmarked_items || [])).filter((t) => {
+    const days = daysUntil(t.closing_date);
+    return days !== null && days >= 0 && days <= 2 && !projectTenderIds.has(tenderKey(t));
+  });
+  const syncAgeDays = settings?.last_sync_at ? (Date.now() - new Date(settings.last_sync_at).getTime()) / 86400000 : null;
+  const staleSync = syncAgeDays === null || syncAgeDays > 1;
+  const attentionRows = [
+    ...urgentUnclaimedBookmarks.slice(0, 4).map((t) => ({
+      key: `bm-${t.id}`,
+      icon: AlertTriangle,
+      color: 'text-rose-400',
+      text: `Bookmarked tender "${t.title || t.tender_id}" closes in ${Math.max(0, daysUntil(t.closing_date))}d and has no project yet`,
+      cta: 'Review',
+      onClick: () => onNavigate?.('bookmarks'),
+    })),
+    ...(staleSync ? [{
+      key: 'stale-sync',
+      icon: WifiOff,
+      color: 'text-[var(--text-muted)]',
+      text: settings?.last_sync_at ? `Tender data last synced ${formatAgo(settings.last_sync_at)}` : 'Tender data has not been synced yet',
+      cta: 'Sync now',
+      onClick: () => syncNow.mutate(),
+    }] : []),
+  ].slice(0, 5);
+
+  // ── Upcoming deadlines grouped by urgency (item 7) ────────────────────────
+  const urgencyBand = (days) => (days <= 3 ? { label: 'Critical', color: 'var(--danger)' } : days <= 7 ? { label: 'Soon', color: '#f59e0b' } : { label: 'Comfortable', color: 'var(--text-muted)' });
+  const bandedDeadlines = ['Critical', 'Soon', 'Comfortable'].map((band) => ({
+    band,
+    color: band === 'Critical' ? 'var(--danger)' : band === 'Soon' ? '#f59e0b' : 'var(--text-muted)',
+    rows: stats.upcoming_deadlines.slice(0, 6).filter((d) => {
+      const days = daysUntil(d.closing_date);
+      return days !== null && urgencyBand(Math.max(0, days)).label === band;
+    }),
+  })).filter((g) => g.rows.length > 0);
+
+  return (
+    <div className="p-6 space-y-6 overflow-auto h-full">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-[var(--text)]">Dashboard</h1>
+          <p className="text-sm text-[var(--text-muted)] mt-0.5">Overview of your tender pipeline</p>
+        </div>
+        <button type="button" onClick={() => syncNow.mutate()} disabled={syncNow.isPending} className="btn-secondary flex items-center gap-2 text-sm">
+          {syncNow.isPending ? <Spinner size={14} /> : <RefreshCw size={14} />} Sync Now
+        </button>
+      </div>
+
+      {attentionRows.length > 0 && (
+        <div className="card p-4 border-amber-500/30">
+          <div className="flex items-center gap-2 mb-3">
+            <AlertTriangle size={16} className="text-amber-400" />
+            <h3 className="text-sm font-semibold text-[var(--text)]">Needs attention</h3>
+          </div>
+          <div className="space-y-2">
+            {attentionRows.map((row) => (
+              <div key={row.key} className="flex items-center gap-3 rounded-lg bg-[var(--surface-1)] px-3 py-2.5">
+                <row.icon size={15} className={cn('shrink-0', row.color)} />
+                <span className="flex-1 text-sm text-[var(--text)]">{row.text}</span>
+                <button type="button" onClick={row.onClick} className="btn-secondary text-xs shrink-0">{row.cta}</button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Was a fixed 5-column grid, which left an empty cell whenever a card
+          was filtered out by permissions. Flex-wrap lets however many remain
+          share the width evenly. */}
+      <div className="flex flex-wrap gap-4 items-stretch">
+        {statCards.map((s, i) => (
+          <button
+            key={i}
+            type="button"
+            onClick={() => s.target && onNavigate?.(s.target)}
+            disabled={!s.target}
+            title={s.note ? `Counting only the tenders ${s.note}` : undefined}
+            className={cn(
+              // min-w keeps a card readable; flex-1 shares out the rest.
+              'card p-4 flex flex-1 min-w-[190px] items-center gap-4 text-left transition-colors',
+              s.target ? 'hover:bg-[var(--surface-1)]' : 'cursor-default',
+            )}
+          >
+            <div className={cn('w-11 h-11 rounded-xl flex items-center justify-center shrink-0', s.bg)}>
+              <s.icon size={20} className={s.color} />
+            </div>
+            <div className="min-w-0">
+              <p className="text-2xl font-bold text-[var(--text)]">{s.value}</p>
+              <p className="text-xs text-[var(--text-muted)]">{s.label}</p>
+              {/* Says out loud that this is a narrowed count, so the figure
+                  can't be mistaken for the whole pool. */}
+              {s.note && <p className="text-[10px] text-[var(--text-muted)]/70 truncate">{s.note}</p>}
+            </div>
+          </button>
+        ))}
+      </div>
+
+      {/* Flex-wrap, not a fixed column count: whatever cards survive the
+          permission filters grow to fill the row, so hiding one never leaves a
+          gap where its column used to be. */}
+      <div className="flex flex-wrap gap-4 items-stretch">
+          {/* Website Coverage summarises the whole tender pool, so it belongs
+              to `active`. */}
+          {sections.active !== false && (
+          <div className="card p-4 flex-1 min-w-[280px]">
+            <div className="flex items-center gap-2 mb-3">
+              <Activity size={15} className="text-[var(--accent)]" />
+              <h3 className="text-sm font-semibold text-[var(--text)]">Website Coverage</h3>
+            </div>
+            {(stats.websites || []).length === 0 ? (
+              <p className="rounded-lg bg-[var(--surface-1)] px-3 py-4 text-center text-xs text-[var(--text-muted)]">
+                No website data yet. Sync to load tender data.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {stats.websites.map((website) => (
+                  <button
+                    type="button"
+                    key={website.id}
+                    onClick={() => onOpenWebsiteOrganizations?.(website.name)}
+                    // These open the Organizations page; without that section
+                    // the counts still inform, but the tile mustn't navigate.
+                    disabled={orgsGatedOff}
+                    className={cn(
+                      'w-full rounded-lg bg-[var(--surface-1)] px-3 py-2 text-left transition-colors',
+                      orgsGatedOff ? 'cursor-default' : 'hover:bg-[var(--surface-2)]',
+                    )}
+                  >
+                    <p className="text-sm font-semibold text-[var(--text)] truncate">{website.name}</p>
+                    <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-[var(--text-muted)]">
+                      <span className="inline-flex items-center gap-1"><Building2 size={11} />{website.orgs || 0} orgs</span>
+                      <span className="inline-flex items-center gap-1"><FileText size={11} />{website.active_tenders || 0} active</span>
+                      <span className="inline-flex items-center gap-1"><CheckSquare size={11} />{website.selected_orgs || 0} selected</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          )}
+
+        {/* Deadlines come from bookmarks, else projects (api.dashboardStats),
+            so with neither there is nothing to show. Twice the basis of the
+            coverage card beside it, and full width when that one is hidden. */}
+        {(sections.bookmarks !== false || sections.projects !== false) && (
+        <div className="card p-5 flex-[2] min-w-[420px]">
+          <div className="flex items-center gap-2 mb-3">
+            <Calendar size={16} className="text-[var(--accent)]" />
+            <h3 className="text-sm font-semibold text-[var(--text)]">Upcoming Deadlines</h3>
+          </div>
+          <div>
+            {bandedDeadlines.length === 0 && (
+              <p className="text-sm text-[var(--text-muted)] py-4 text-center">No upcoming deadlines</p>
+            )}
+            {bandedDeadlines.map((group) => (
+              <div key={group.band} className="mb-3 last:mb-0">
+                <p className="text-[11px] font-bold uppercase tracking-wider mb-1.5" style={{ color: group.color }}>{group.band}</p>
+                <div className="space-y-1">
+                  {group.rows.map((d, i) => (
+                    <div key={i} className="flex items-center gap-3 py-1.5">
+                      <div className="w-[3px] self-stretch rounded-full shrink-0" style={{ background: group.color }} />
+                      <div className="flex-1 min-w-0 mr-2">
+                        <p className="text-xs font-mono text-[var(--accent)]">{d.tender_id}</p>
+                        <p className="text-sm text-[var(--text)] truncate">{d.title}</p>
+                      </div>
+                      <TimeBadge dateStr={d.closing_date} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        )}
+      </div>
+
+      <div className="flex flex-wrap gap-4 items-stretch">
+        {sections.bookmarks !== false && (
+        <div className="card p-5 flex-1 min-w-[340px]">
+          <div className="flex items-center justify-between gap-3 mb-3">
+            <div className="flex items-center gap-2">
+              <Bookmark size={16} className="text-amber-400" />
+              <h3 className="text-sm font-semibold text-[var(--text)]">Bookmarked Tenders</h3>
+            </div>
+            <Badge variant="warning">{stats.bookmarked_tenders || 0}</Badge>
+          </div>
+          <div className="space-y-1">
+            {(stats.bookmarked_items || []).length === 0 && (
+              <p className="py-6 text-center text-sm text-[var(--text-muted)]">No bookmarked tenders</p>
+            )}
+            {(stats.bookmarked_items || []).map((tender, i) => (
+              <button
+                type="button"
+                key={tender.id}
+                onClick={() => onNavigate?.('bookmarks')}
+                className="flex w-full items-center gap-3 border-b border-[var(--border)] py-2.5 last:border-0 text-left transition-colors hover:bg-[var(--surface-1)] rounded-md px-1.5 -mx-1.5"
+              >
+                <span className="w-5 shrink-0 text-xs text-[var(--text-muted)] text-center">{i + 1}</span>
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-mono text-[var(--accent)]">{tender.tender_id || 'No tender ID'}</p>
+                  <p className="truncate text-sm text-[var(--text)]">{tender.title || 'Untitled tender'}</p>
+                </div>
+                <TimeBadge dateStr={tender.closing_date} />
+              </button>
+            ))}
+          </div>
+        </div>
+        )}
+
+        {sections.projects !== false && (
+        <div className="card p-5 flex-1 min-w-[340px]">
+          <div className="flex items-center justify-between gap-3 mb-3">
+            <div className="flex items-center gap-2">
+              <FolderCog size={16} className="text-emerald-400" />
+              <h3 className="text-sm font-semibold text-[var(--text)]">Bids Under Preparation</h3>
+            </div>
+            <Badge variant="success">{stats.active_projects || 0}</Badge>
+          </div>
+          <div className="space-y-1">
+            {(stats.bids_under_preparation || []).length === 0 && (
+              <p className="py-6 text-center text-sm text-[var(--text-muted)]">No bids under preparation</p>
+            )}
+            {(stats.bids_under_preparation || []).map((project, i) => (
+              <button
+                type="button"
+                key={project.id}
+                onClick={() => onOpenProjectWorkspace?.(project.id)}
+                className="flex w-full items-center gap-3 border-b border-[var(--border)] py-2.5 last:border-0 text-left transition-colors hover:bg-[var(--surface-1)] rounded-md px-1.5 -mx-1.5"
+              >
+                <span className="w-5 shrink-0 text-xs text-[var(--text-muted)] text-center">{i + 1}</span>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-medium text-[var(--text)]">{project.title || 'Untitled project'}</p>
+                  <p className="truncate text-xs text-[var(--text-muted)]">{project.client_name || project.source_tender_id || 'Local project'}</p>
+                </div>
+                <TimeBadge dateStr={project.deadline} />
+              </button>
+            ))}
+          </div>
+        </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Downloads Panel ────────────────────────────────────────────────────────
+// Shows only documents the user actually acted on (requested/downloading/
+// downloaded/failed) — not the much larger pool of merely-known, never-
+// touched rows that `documents` also carries.
+const DOWNLOAD_STATUS_META = {
+  requested: { icon: Spinner, label: 'Requested…', color: 'text-sky-400' },
+  downloading: { icon: Spinner, label: 'Downloading…', color: 'text-sky-400' },
+  downloaded: { icon: CheckCircle2, label: 'Ready', color: 'text-emerald-400' },
+  failed: { icon: AlertTriangle, label: 'Failed', color: 'text-rose-400' },
+};
+
+function DownloadsPanel({ open, onClose, onOpenTender }) {
+  const qc = useQueryClient();
+  const { data: documents } = useQuery({ queryKey: ['client-documents'], queryFn: api.listAllDocuments, enabled: open });
+  const rows = useMemo(() => {
+    const list = (documents || []).filter((d) => d.client_status && d.client_status !== 'synced');
+    return [...list].sort((a, b) => String(b.downloaded_at || b.requested_at || b.updated_at || '').localeCompare(String(a.downloaded_at || a.requested_at || a.updated_at || '')));
+  }, [documents]);
+  const retry = useMutation({
+    // A negative id is the "request" placeholder row (documents didn't exist
+    // server-side yet — re-run the scrape job). A positive id is a real,
+    // already-known document that just failed to fetch — re-fetch that exact
+    // file instead of re-queuing a scrape job for a tender that's already
+    // been scraped.
+    mutationFn: (d) => (d.id < 0
+      ? api.requestTenderDownload({ id: d.tender_db_id, tender_id: d.tender_id, title: d.tender_title })
+      : api.downloadDocument({ id: d.id, tender_db_id: d.tender_db_id, tender_id: d.tender_id, tender_title: d.tender_title, file_name: d.file_name })),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['client-documents'] }),
+  });
+  const openFolder = useMutation({
+    mutationFn: async (d) => {
+      const folder = await api.getTenderDownloadFolder(d.tender_id);
+      const bridge = window.bidmanagerDesktop;
+      if (!bridge?.openPath) throw new Error('Open Folder is available in the desktop app.');
+      const result = await bridge.openPath(folder);
+      if (!result?.ok) throw new Error(result?.message || 'Could not open the folder.');
+    },
+    onError: (err) => alert(err instanceof Error ? err.message : String(err)),
+  });
+  if (!open) return null;
+  return (
+    <>
+      <div className="fixed inset-0 z-40" onClick={onClose} />
+      <div className="absolute top-10 right-12 w-80 z-50 card shadow-xl border border-[var(--border)] overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border)]">
+          <span className="text-sm font-semibold text-[var(--text)]">Downloads</span>
+          <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text)]"><X size={14} /></button>
+        </div>
+        <div className="max-h-80 overflow-auto">
+          {rows.length === 0 && (
+            <p className="text-sm text-[var(--text-muted)] text-center py-8">No downloads yet</p>
+          )}
+          {rows.map((d) => {
+            const meta = DOWNLOAD_STATUS_META[d.client_status] || DOWNLOAD_STATUS_META.requested;
+            const Icon = meta.icon;
+            const retrying = retry.isPending && retry.variables?.id === d.id;
+            const openingFolder = openFolder.isPending && openFolder.variables?.id === d.id;
+            return (
+              <div
+                key={d.id}
+                onClick={() => (d.tender_id || d.tender_db_id) && onOpenTender?.({ tender_id: d.tender_id, id: d.tender_db_id })}
+                className={cn('flex items-start gap-3 px-4 py-3 border-b border-[var(--border)] last:border-0 transition-colors', (d.tender_id || d.tender_db_id) && 'cursor-pointer hover:bg-[var(--surface-1)]')}
+              >
+                <Icon size={16} className={cn('mt-0.5 shrink-0', meta.color)} />
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm text-[var(--text)] truncate">{d.tender_title || d.tender_id || 'Untitled tender'}</p>
+                  <p className="text-xs text-[var(--text-muted)] mt-0.5 truncate">{d.file_name || 'All documents'}</p>
+                  {d.client_status === 'failed' && d.error && <p className="text-xs text-rose-400 mt-0.5 truncate">{d.error}</p>}
+                </div>
+                {d.client_status === 'failed' ? (
+                  <button
+                    onClick={(event) => { event.stopPropagation(); retry.mutate(d); }}
+                    disabled={retrying}
+                    className="text-xs shrink-0 text-[var(--accent)] hover:underline disabled:opacity-50"
+                  >
+                    {retrying ? 'Retrying…' : 'Retry'}
+                  </button>
+                ) : d.client_status === 'downloaded' ? (
+                  <button
+                    title="Open Folder"
+                    disabled={!d.tender_id || openingFolder}
+                    onClick={(event) => { event.stopPropagation(); openFolder.mutate(d); }}
+                    className="shrink-0 rounded p-1 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)] disabled:opacity-40"
+                  >
+                    {openingFolder ? <Spinner size={14} /> : <FolderOpen size={14} />}
+                  </button>
+                ) : (
+                  <span className={cn('text-xs shrink-0', meta.color)}>{meta.label}</span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   TENDERS  (browse + bookmark only — no scraping, no org/website management,
+   no job queue, no CAPTCHA, no live log console)
+   ═══════════════════════════════════════════════════════════════════════════ */
+const TENDER_COLUMNS = [
+  { key: '_sr', label: 'Sr. No.', width: 60, fixed: true },
+  { key: 'is_bookmarked', label: 'Bookmark', width: 90, fixed: true },
+  { key: 'tender_id', label: 'Tender ID / Work Desc', width: 320 },
+  { key: 'title', label: 'Title', width: 300 },
+  { key: 'tender_value', label: 'Value', width: 130 },
+  { key: 'emd', label: 'EMD', width: 120 },
+  { key: 'org_chain', label: 'Org Chain', width: 200 },
+  { key: 'published_date', label: 'Published', width: 150 },
+  { key: 'closing_date', label: 'Closing Date', width: 170 },
+  { key: 'pre_bid_meeting_date', label: 'Pre-Bid', width: 150 },
+  { key: '_prebid_corrigendum', label: 'Prebid/Corrigendum', width: 150 },
+  { key: 'location', label: 'Location', width: 180 },
+  { key: 'tender_category', label: 'Category', width: 130 },
+  { key: 'status', label: 'Status', width: 140 },
+  { key: '_download', label: 'Download', width: 170, fixed: true },
+  { key: '_time', label: 'Time Left', width: 110 },
+  { key: '_actions', label: 'Actions', width: 100, fixed: true },
+];
+
+const TENDER_NON_SORTABLE = new Set(['_sr', 'is_bookmarked', '_prebid_corrigendum', '_download', '_time', '_actions']);
+
+const TENDER_TABLE_WIDTH = TENDER_COLUMNS.reduce((total, column) => total + column.width, 0);
+
+// Shared between OrganizationsPage and Bookmarks' Organizations sub-tab (see
+// useOrganizationColumns/OrganizationTable below).
+const ORG_COLUMNS = [
+  { key: '_sr', label: 'Sr. No.', width: 64 },
+  { key: '_bookmark', label: 'Bookmark', width: 90 },
+  { key: 'name', label: 'Organization', width: 320 },
+  { key: 'website_name', label: 'Website', width: 200 },
+  { key: 'tender_count', label: 'Tenders', width: 110 },
+];
+const ORG_NON_SORTABLE_COLS = new Set(['_sr', '_bookmark']);
+
+// Permanent (localStorage): remembers the last website and, per website, the
+// last Organization/Location/Category picked — but NOT whether a filter is
+// currently active. See TENDERS_ACTIVE_FILTER_KEY for that.
+const TENDERS_FILTER_STATE_KEY = 'bm-client:tenders:filters:v1';
+// Session-only (sessionStorage, cleared on app restart): the org/location/
+// category filter actually applied to the view right now.
+const TENDERS_ACTIVE_FILTER_KEY = 'bm-client:tenders:active-filter';
+// Session-only: whether the user has "woken up" filtering this session
+// (via the Filters button, a manual dropdown pick, or an org/dashboard
+// navigation that applies a filter directly) — gates whether switching
+// websites auto-recalls that website's remembered selection.
+const TENDERS_FILTERS_ACTIVATED_KEY = 'bm-client:tenders:filters-activated';
+// One-shot flag: OrganizationsPage sets this immediately before navigating
+// here so "view this org's tenders" always opens on Active, then TendersPage
+// reads and clears it on mount.
+const TENDERS_FORCE_TAB_KEY = 'bm-client:tenders:force-tab';
+// One-shot flag: the "Closing < 7 Days" dashboard stat card sets this
+// immediately before navigating here so Tenders opens with that filter
+// already applied; TendersPage reads and clears it on mount.
+const TENDERS_FORCE_CLOSING_KEY = 'bm-client:tenders:force-closing-soon';
+// One-shot flag: the Downloads panel sets this immediately before navigating
+// here so the clicked tender's row is selected/highlighted once tenders
+// load; TendersPage reads and clears it on mount. Tolerates the tender no
+// longer being present (e.g. archived/removed) — simply selects nothing.
+const TENDERS_FORCE_SELECT_KEY = 'bm-client:tenders:force-select';
+// Not one-shot: set by openOrgTenders and cleared by any other navigation
+// (see App()'s `navigate` helper) — drives whether TendersPage shows a
+// "Back to Organizations" button.
+const TENDERS_CAME_FROM_ORG_KEY = 'bm-client:tenders:came-from-org';
+// Persists the Organizations search box across navigating away and back
+// (e.g. via the Tenders "Back to Organizations" button) — not one-shot,
+// only changes when the user edits the search box.
+const ORGANIZATIONS_SEARCH_KEY = 'bm-client:organizations:search';
+// One-shot flag: a Dashboard Website Coverage card sets this immediately
+// before navigating here so that website is preselected/filtered.
+const ORGANIZATIONS_FORCE_WEBSITE_KEY = 'bm-client:organizations:force-website';
+// Session-only: which Bookmarks sub-tab (Organisations/Tenders) was last
+// open — remembered for in-session navigation, but resets to Organisations
+// on a fresh app launch since sessionStorage doesn't survive that.
+const BOOKMARKS_LAST_TAB_KEY = 'bm-client:bookmarks:last-tab';
+// Permanent memory — the last selected website (portal) and sort column/
+// direction on the Organizations tab, until manually changed.
+const ORGANIZATIONS_STATE_KEY = 'bm-client:organizations:state:v1';
+
+function loadOrganizationsState() {
+  try {
+    const raw = localStorage.getItem(ORGANIZATIONS_STATE_KEY);
+    if (!raw) return { website: '', sortCol: 'tender_count', sortDir: 'desc' };
+    const parsed = JSON.parse(raw);
+    return {
+      website: String(parsed?.website || ''),
+      sortCol: String(parsed?.sortCol || 'tender_count'),
+      sortDir: parsed?.sortDir === 'asc' ? 'asc' : 'desc',
+    };
+  } catch {
+    return { website: '', sortCol: 'tender_count', sortDir: 'desc' };
+  }
+}
+
+// Permanent memory only — last website + each website's remembered
+// Organization/Location/Category selection. Never includes whether a
+// filter is actually active right now (see loadActiveTenderFilterState).
+function loadTenderFilterState() {
+  try {
+    const raw = localStorage.getItem(TENDERS_FILTER_STATE_KEY);
+    if (!raw) return { website: '', savedByWebsite: {} };
+    const parsed = JSON.parse(raw);
+    const savedByWebsite = (parsed?.savedByWebsite && typeof parsed.savedByWebsite === 'object') ? parsed.savedByWebsite : {};
+    return { website: String(parsed?.website || ''), savedByWebsite };
+  } catch {
+    return { website: '', savedByWebsite: {} };
+  }
+}
+
+// Session-only — the org/location/category filter actually applied right
+// now. Empty on a fresh app launch (sessionStorage doesn't survive a
+// restart); persists across in-session navigation so a filter stays
+// applied until explicitly cleared.
+function loadActiveTenderFilterState() {
+  try {
+    const raw = sessionStorage.getItem(TENDERS_ACTIVE_FILTER_KEY);
+    if (!raw) return { org: '', location: '', category: '' };
+    const parsed = JSON.parse(raw);
+    return {
+      org: String(parsed?.org || ''),
+      location: String(parsed?.location || ''),
+      category: String(parsed?.category || ''),
+    };
+  } catch {
+    return { org: '', location: '', category: '' };
+  }
+}
+
+function smartCmp(a, b) {
+  const na = parseFloat(String(a).replace(/[₹,\s]/g, ''));
+  const nb = parseFloat(String(b).replace(/[₹,\s]/g, ''));
+  if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+  const months = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+  const parseDate = (value) => {
+    const text = String(value || '');
+    const named = text.match(/(\d{1,2})-([A-Za-z]{3})-(\d{4})/);
+    if (named && months[named[2].toLowerCase()]) return Number(named[3]) * 10000 + months[named[2].toLowerCase()] * 100 + Number(named[1]);
+    const numeric = text.match(/(\d{1,2})-(\d{1,2})-(\d{4})/);
+    if (numeric) return Number(numeric[3]) * 10000 + Number(numeric[2]) * 100 + Number(numeric[1]);
+    return null;
+  };
+  const da = parseDate(a);
+  const db = parseDate(b);
+  if (da !== null && db !== null) return da - db;
+  return String(a).localeCompare(String(b), undefined, { sensitivity: 'base' });
+}
+
+function exportCSV(headers, rows, keys, filename) {
+  const esc = (v) => `"${String(v).replace(/"/g, '""')}"`;
+  const lines = [headers.map(esc).join(','), ...rows.map((r) => keys.map((k) => esc(String(r[k] ?? ''))).join(','))];
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ── Shared tender column customization (Tenders + Bookmarks pages) ─────────
+// Per-account column show/hide/order/width — persisted in tendersTable/
+// tendersView (Client UI/src/lib/store.ts) and synced across devices via
+// pushUserData/pullUserData (Client UI/src/lib/api.js), same as bookmarks.
+function useTenderColumns(tab) {
+  const { tendersTable, tendersView, setTendersHiddenColumns, setTendersColumnOrder, setTenderColumnWidth } = useAppStore();
+  // Active tenders are active by definition, so the Status column only earns
+  // its place once tenders can carry other statuses — i.e. once archived.
+  const baseTenderColumns = useMemo(
+    () => TENDER_COLUMNS.filter((column) => tab === 'active' ? column.key !== 'status' : true),
+    [tab]
+  );
+  const tenderColOrder = useMemo(
+    () => (tendersTable.columnOrder?.length ? tendersTable.columnOrder : baseTenderColumns.map((c) => c.key)),
+    [tendersTable.columnOrder, baseTenderColumns]
+  );
+  const tenderHidden = useMemo(() => new Set(tendersTable.hiddenColumns || []), [tendersTable.hiddenColumns]);
+  const orderedTenderColumns = useMemo(() => {
+    const byKey = new Map(baseTenderColumns.map((c) => [c.key, c]));
+    const ordered = tenderColOrder.map((k) => byKey.get(k)).filter(Boolean);
+    const missing = baseTenderColumns.filter((c) => !ordered.includes(c));
+    return [...ordered, ...missing];
+  }, [tenderColOrder, baseTenderColumns]);
+  const visibleTenderColumns = useMemo(
+    () => orderedTenderColumns.filter((c) => c.fixed || !tenderHidden.has(c.key)),
+    [orderedTenderColumns, tenderHidden]
+  );
+  const getTenderColWidth = (c) => {
+    const v = tendersView.tenderColumnWidths?.[c.key];
+    return Number.isFinite(v) && v > 0 ? v : c.width;
+  };
+  const tenderTableWidth = useMemo(
+    () => visibleTenderColumns.reduce((total, column) => total + getTenderColWidth(column), 0),
+    [visibleTenderColumns, tendersView.tenderColumnWidths]
+  );
+  const toggleTenderCol = (key) => {
+    const next = new Set(tenderHidden);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    setTendersHiddenColumns(Array.from(next));
+  };
+  const moveTenderCol = (from, to) => {
+    if (from === to) return;
+    const next = [...tenderColOrder];
+    const [item] = next.splice(from, 1);
+    next.splice(to, 0, item);
+    setTendersColumnOrder(next);
+  };
+  // Drag handles in the Columns menu only show/reorder movable columns, but
+  // the persisted order array holds every column (fixed included) — translate
+  // a drag between two movable-list positions into the two real indices.
+  const reorderMovableColumn = (fromMovableIdx, toMovableIdx) => {
+    const movable = orderedTenderColumns.filter((c) => !c.fixed);
+    const fromKey = movable[fromMovableIdx]?.key;
+    const toKey = movable[toMovableIdx]?.key;
+    if (!fromKey || !toKey) return;
+    const from = tenderColOrder.indexOf(fromKey);
+    const to = tenderColOrder.indexOf(toKey);
+    if (from >= 0 && to >= 0) moveTenderCol(from, to);
+  };
+  const startTenderColResize = (col, startX) => {
+    const min = col.key === '_sr' ? 48 : 90;
+    const startWidth = getTenderColWidth(col);
+    const onMove = (e) => setTenderColumnWidth(col.key, Math.max(min, startWidth + (e.clientX - startX)));
+    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+  return {
+    orderedTenderColumns, tenderHidden, visibleTenderColumns,
+    getTenderColWidth, tenderTableWidth, toggleTenderCol, reorderMovableColumn, startTenderColResize,
+  };
+}
+
+function TenderColumnsMenuButton({ orderedTenderColumns, tenderHidden, toggleTenderCol, reorderMovableColumn }) {
+  const [open, setOpen] = useState(false);
+  const [dragIdx, setDragIdx] = useState(null);
+  const movable = orderedTenderColumns.filter((c) => !c.fixed);
+  return (
+    <div className="relative">
+      <button onClick={() => setOpen((v) => !v)} className="btn-ghost gap-1.5 text-xs"><SlidersHorizontal size={13} />Columns</button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div className="card absolute right-0 top-9 z-50 max-h-80 w-60 overflow-auto border border-[var(--border)] p-2 shadow-xl">
+            <p className="mb-2 border-b border-[var(--border)] px-2 pb-1.5 text-[10px] font-medium uppercase tracking-wider text-[var(--text-muted)]">Drag to reorder · toggle visibility</p>
+            {movable.map((c, i) => (
+              <div
+                key={c.key}
+                draggable
+                onDragStart={() => setDragIdx(i)}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={() => { if (dragIdx !== null) reorderMovableColumn(dragIdx, i); setDragIdx(null); }}
+                className={cn('flex cursor-grab items-center gap-2 rounded px-2 py-1.5 hover:bg-[var(--surface-1)]', dragIdx === i && 'opacity-50')}
+              >
+                <span className="select-none text-xs text-[var(--text-muted)]">⠿</span>
+                <input type="checkbox" checked={!tenderHidden.has(c.key)} onChange={() => toggleTenderCol(c.key)} className="accent-[var(--accent)]" />
+                <span className="flex-1 text-xs">{c.label || c.key}</span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// Shared <table> used everywhere a tender list is shown (Tenders, Bookmarks) —
+// same columns, same sort/resize behavior, same row rendering.
+function TenderTable({ columns, getColWidth, tableWidth, sortCol, sortDir, onToggleSort, onStartResize, rows, isLoading, emptyState, renderCell, selectedId, onSelectRow }) {
+  if (isLoading) return <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>;
+  if (!rows.length) return emptyState;
+  return (
+    <table className="data-table" style={{ tableLayout: 'fixed', width: tableWidth, minWidth: tableWidth }}>
+      <thead>
+        <tr>
+          {columns.map((c) => (
+            <th
+              key={c.key}
+              style={{ width: getColWidth(c), textAlign: (c.key === 'is_bookmarked' || c.key === '_sr' || c.key === '_download') ? 'center' : 'left' }}
+              className={cn('relative', !TENDER_NON_SORTABLE.has(c.key) && 'cursor-pointer')}
+              onClick={() => !TENDER_NON_SORTABLE.has(c.key) && onToggleSort(c.key)}
+            >
+              {c.label}{sortCol === c.key && <span className="ml-1">{sortDir === 'asc' ? '▲' : '▼'}</span>}
+              <div
+                className="absolute right-0 top-0 h-full w-2 cursor-col-resize hover:bg-[var(--accent)]/20"
+                onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); onStartResize(c, e.clientX); }}
+              />
+            </th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((t, i) => (
+          <tr
+            key={t.id}
+            onClick={() => onSelectRow?.(t)}
+            onDoubleClick={() => openTenderDetailDrawer(t)}
+            className={cn('cursor-pointer', selectedId === t.id && 'row-selected')}
+          >
+            {columns.map((column) => (
+              <td key={column.key} className={column.key === 'is_bookmarked' || column.key === '_sr' || column.key === '_download' ? 'text-center' : ''}>
+                {renderCell(t, column, i)}
+              </td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+// Shared resize/width logic for the Organizations table — used by both
+// OrganizationsPage and Bookmarks' Organizations sub-tab so column widths
+// stay in sync between them (same persisted store slice).
+function useOrganizationColumns() {
+  const { organizationsTable, setOrganizationsColumnWidth } = useAppStore();
+  const getOrgColWidth = (c) => { const v = organizationsTable.columnWidths?.[c.key]; return Number.isFinite(v) && v > 0 ? v : c.width; };
+  const startOrgColResize = (col, startX) => {
+    const min = col.key === '_sr' ? 48 : 70;
+    const sw = getOrgColWidth(col);
+    const onMove = (e) => setOrganizationsColumnWidth(col.key, Math.max(min, sw + (e.clientX - startX)));
+    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp);
+  };
+  return { getOrgColWidth, startOrgColResize };
+}
+
+// Shared organizations table — used by both OrganizationsPage and Bookmarks'
+// Organizations sub-tab so a bookmarked organization looks and behaves
+// identically wherever it's shown (mirrors TenderTable's role above).
+function OrganizationTable({ rows, isLoading, emptyState, sortCol, sortDir, onToggleSort, getColWidth, onStartResize, bookmarkedOrgsSet, onToggleBookmark, onRowClick }) {
+  if (isLoading) return <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>;
+  if (!rows.length) return emptyState;
+  return (
+    <table className="data-table" style={{ tableLayout: 'fixed', width: '100%' }}>
+      <thead>
+        <tr>
+          {ORG_COLUMNS.map((c) => (
+            <th
+              key={c.key}
+              style={{ width: getColWidth(c), textAlign: c.key === 'tender_count' || c.key === '_bookmark' || c.key === '_sr' ? 'center' : 'left' }}
+              className={cn('relative', !ORG_NON_SORTABLE_COLS.has(c.key) && 'cursor-pointer')}
+              onClick={() => !ORG_NON_SORTABLE_COLS.has(c.key) && onToggleSort(c.key)}
+            >
+              {c.label}{sortCol === c.key && <span className="ml-1">{sortDir === 'asc' ? '▲' : '▼'}</span>}
+              <div
+                className="absolute right-0 top-0 h-full w-2 cursor-col-resize hover:bg-[var(--accent)]/20"
+                onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); onStartResize(c, e.clientX); }}
+              />
+            </th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((org, i) => {
+          // OrganizationsPage already filters these out — this only ever
+          // matters for BookmarksPage, which keeps a bookmarked-but-gone org
+          // visible (so the bookmark isn't silently lost) but inert.
+          const unavailable = org.is_available === false;
+          return (
+          <tr
+            key={org.id}
+            className={cn(unavailable ? 'cursor-default opacity-50' : 'cursor-pointer')}
+            onClick={() => !unavailable && onRowClick?.(org)}
+            title={unavailable ? 'No longer available on the source website' : undefined}
+          >
+            <td className="text-center text-xs text-[var(--text-muted)]">{i + 1}</td>
+            <td className="text-center">
+              <button
+                onClick={(event) => { event.stopPropagation(); onToggleBookmark?.(org); }}
+                className={cn('inline-flex h-7 w-7 items-center justify-center rounded transition-colors', bookmarkedOrgsSet.has(org.name) ? 'text-amber-400' : 'text-[var(--text-muted)] hover:text-amber-400')}
+                title={bookmarkedOrgsSet.has(org.name) ? 'Remove bookmark' : 'Bookmark organization'}
+              >
+                <Bookmark size={16} fill={bookmarkedOrgsSet.has(org.name) ? 'currentColor' : 'none'} />
+              </button>
+            </td>
+            <td className="text-sm">
+              <div>{org.name}{unavailable && <span className="ml-1.5 text-xs text-[var(--text-muted)]">(unavailable)</span>}</div>
+              {org.last_scraped_at > 0 && (
+                <div className="text-xs text-[var(--text-muted)] mt-0.5">Last updated {api.formatISTTimestamp(org.last_scraped_at)}</div>
+              )}
+            </td>
+            <td className="text-xs text-[var(--text-muted)]">{org.website_name || '—'}</td>
+            <td className="text-center text-xs">{org.tender_count}</td>
+          </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
+// Shared tender-row actions (bookmark toggle, download/request pill, add-to-
+// project, open-tender link) and the cell renderer that wires them into
+// TenderTable — used by both Tenders and Bookmarks so a bookmarked tender
+// behaves identically wherever it's shown.
+function useTenderRowActions() {
+  const qc = useQueryClient();
+  const pushToast = useAppStore((s) => s.pushToast);
+  const { data: allDocuments } = useQuery({ queryKey: ['client-documents'], queryFn: api.listAllDocuments });
+  // Both sets hold canonical tender ids — documents belong to a tender by
+  // tender_id, not by the (restore-unstable) row id.
+  const pendingRequestIds = useMemo(
+    () => new Set((allDocuments || []).filter((row) => row.client_status === 'requested').map((row) => canonTenderId(row.tender_id)).filter(Boolean)),
+    [allDocuments]
+  );
+  // The durable, sync-safe record of what's actually been downloaded — read
+  // from the local `documents` ledger (never touched by syncFromServer's
+  // wholesale tender-array replacement) instead of the tender row's own
+  // `client_downloaded` flag, which gets silently dropped on every sync.
+  const downloadedTenderIds = useMemo(
+    () => new Set((allDocuments || []).filter((row) => row.client_status === 'downloaded').map((row) => canonTenderId(row.tender_id)).filter(Boolean)),
+    [allDocuments]
+  );
+
+  // Any project — not just active ones — locks its tender's bookmark, which is
+  // the same rule the server enforces on push and pull (API_CHANGES.md §1).
+  const { data: allProjectsForBookmarks } = useQuery({ queryKey: ['projects', '', ''], queryFn: () => api.listProjects() });
+  const projectTenderIds = useMemo(
+    () => new Set((allProjectsForBookmarks || []).map((p) => canonTenderId(p.source_tender_id)).filter(Boolean)),
+    [allProjectsForBookmarks],
+  );
+
+  const toggleBookmark = useMutation({
+    mutationFn: async (t) => {
+      if (!t.is_bookmarked) {
+        const count = await api.countBookmarkedTenders();
+        if (count >= 30) throw new Error('You can bookmark at most 30 tenders. Remove one before adding another.');
+      }
+      return api.patchTender(t.id, { is_bookmarked: !t.is_bookmarked });
+    },
+    onSuccess: () => qc.invalidateQueries(),
+    onError: (err) => pushToast({ type: 'error', message: err instanceof Error ? err.message : String(err) }),
+  });
+
+  // Fetches every document available for a tender and saves them all in one
+  // click. Each file goes through api.downloadDocument (signed URL -> Electron
+  // IPC write to <parent_dir>/Tender_Downloads/<tender_id>/<name>) sequentially
+  // — a loop of synthetic <a> clicks only ever lands the first file because
+  // Chromium/Electron throttles rapid programmatic downloads.
+  const downloadTenderDocuments = useMutation({
+    mutationFn: async (t) => {
+      const docsPage = await api.listTenderDocuments(t.id, { page_size: 100 });
+      const items = (docsPage?.items || []).filter((d) => d.downloadable !== false);
+      if (!items.length) return { tenderId: t.id, count: 0, failed: 0, failures: [] };
+      let ok = 0;
+      const failures = [];
+      for (const it of items) {
+        try {
+          await api.downloadDocument({
+            id: it.id,
+            tender_db_id: t.id,
+            tender_id: t.tender_id,
+            tender_title: t.title,
+            file_name: it.name,
+          });
+          ok += 1;
+        } catch (err) {
+          failures.push({ name: it.name || `#${it.id}`, message: err?.message || String(err) });
+        }
+      }
+      await api.patchTender(t.id, { client_downloaded: ok > 0, has_documents: true, document_count: items.length });
+      return { tenderId: t.id, count: ok, failed: failures.length, failures };
+    },
+    onSuccess: (result) => {
+      qc.invalidateQueries();
+      if (!result.count && !result.failed) {
+        alert('No documents are available yet for this tender.');
+      } else if (result.failed) {
+        const reasons = [...new Set(result.failures.map((f) => f.message))].join('; ');
+        alert(`Downloaded ${result.count} file(s). ${result.failed} failed: ${reasons}`);
+      }
+    },
+    onError: (err) => alert(`Download failed: ${err?.message || String(err)}`),
+  });
+
+  // "Request" — queues the real server-side scrape/download job for a tender
+  // that has no documents yet (see Server UI/server/client_api.py
+  // request-download, which enqueues the same download_single_tender job the
+  // admin console uses). api.requestTenderDownload persists the pending state
+  // in the `documents` store and polls in the background (api.js), so it
+  // survives a reload/restart — see api.resumePendingDownloadJobs.
+  const requestTenderJob = useMutation({
+    mutationFn: (t) => api.requestTenderDownload(t),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['client-documents'] }),
+    onError: (err) => alert(`Request failed: ${err?.message || String(err)}`),
+  });
+
+  // Converts a tender into a project — a normal client action, not scraping.
+  const addToProject = useMutation({
+    mutationFn: (t) => api.createProject({
+      title: t.title || '',
+      client_name: t.org_chain || '',
+      source_tender_id: t.tender_id || '',
+      project_value: t.tender_value || '',
+      prebid: t.pre_bid_meeting_date || '',
+      deadline: t.closing_date || '',
+      tender_snapshot: { closing_date: t.closing_date || '', pre_bid_meeting_date: t.pre_bid_meeting_date || '', tender_value: t.tender_value || '' },
+      description: t.work_description || t.title || '',
+      status: 'Active',
+    }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['projects'] }); qc.invalidateQueries({ queryKey: ['dashboard'] }); },
+    onError: (err) => {
+      const message = err?.message || String(err);
+      alert(message === 'Tender already added to Projects.' ? message : `Could not create project: ${message}`);
+    },
+  });
+
+  // Opens the folder a tender's documents were downloaded into — same
+  // mechanism as the Downloads panel's own Open Folder button.
+  const openTenderFolder = useMutation({
+    mutationFn: async (t) => {
+      const folder = await api.getTenderDownloadFolder(t.tender_id);
+      const bridge = window.bidmanagerDesktop;
+      if (!bridge?.openPath) throw new Error('Open Folder is available in the desktop app.');
+      const result = await bridge.openPath(folder);
+      if (!result?.ok) throw new Error(result?.message || 'Could not open the folder.');
+    },
+    onError: (err) => alert(err instanceof Error ? err.message : String(err)),
+  });
+
+  const renderTenderCell = (tender, column, index) => {
+    if (column.key === '_sr') return <span className="text-xs text-[var(--text-muted)]">{index + 1}</span>;
+    if (column.key === '_time') return <TimeBadge dateStr={tender.closing_date} />;
+    if (column.key === '_download') {
+      const hasDocs = tender.has_documents || Number(tender.document_count) > 0;
+      const isDownloaded = downloadedTenderIds.has(tenderKey(tender));
+      const busy = downloadTenderDocuments.isPending && downloadTenderDocuments.variables?.id === tender.id;
+      const requesting = pendingRequestIds.has(tenderKey(tender))
+        || (requestTenderJob.isPending && requestTenderJob.variables?.id === tender.id);
+      if (isDownloaded) {
+        return (
+          <button
+            onClick={(event) => {
+              event.stopPropagation();
+              const proceed = window.confirm('Tender Already Downloaded. Want to download again and overwrite? Additional files will be untouched.');
+              if (proceed) downloadTenderDocuments.mutate(tender);
+            }}
+            disabled={busy}
+            className="inline-flex items-center gap-1 whitespace-nowrap rounded-full border-0 bg-emerald-500/15 px-2.5 py-0.5 text-xs font-medium text-emerald-400 transition-colors hover:bg-emerald-500/25 disabled:opacity-50"
+          >
+            {busy ? <Spinner size={11} /> : <Download size={11} />}
+            {busy ? 'Working…' : 'Downloaded'}
+          </button>
+        );
+      }
+      const pillStyles = hasDocs
+        ? 'bg-sky-500/15 text-sky-400 hover:bg-sky-500/25'
+        : 'bg-[var(--surface-2)] text-[var(--text-muted)] hover:bg-[var(--surface-3)]';
+      return (
+        <button
+          onClick={(event) => {
+            event.stopPropagation();
+            if (hasDocs) downloadTenderDocuments.mutate(tender);
+            else requestTenderJob.mutate(tender);
+          }}
+          disabled={busy || requesting}
+          className={cn('inline-flex items-center gap-1 whitespace-nowrap rounded-full border-0 px-2.5 py-0.5 text-xs font-medium transition-colors disabled:opacity-50', pillStyles)}
+        >
+          <Download size={11} />
+          {busy ? 'Working…' : requesting ? 'Requested…' : hasDocs ? 'Download' : 'Request'}
+        </button>
+      );
+    }
+    if (column.key === 'is_bookmarked') {
+      // A project's tender stays bookmarked, so show the star as locked rather
+      // than letting the click fail — the server would re-add it anyway.
+      const lockedByProject = projectTenderIds.has(tenderKey(tender));
+      return (
+        <button
+          onClick={(event) => { event.stopPropagation(); if (!lockedByProject) toggleBookmark.mutate(tender); }}
+          disabled={lockedByProject}
+          className={cn(
+            'inline-flex h-7 w-7 items-center justify-center rounded transition-colors',
+            tender.is_bookmarked ? 'text-amber-400' : 'text-[var(--text-muted)] hover:text-amber-400',
+            lockedByProject && 'cursor-default opacity-70',
+          )}
+          title={lockedByProject ? PROJECT_BOOKMARK_LOCKED : (tender.is_bookmarked ? 'Remove bookmark' : 'Bookmark tender')}
+        >
+          <Star size={18} fill={tender.is_bookmarked ? 'currentColor' : 'none'} />
+        </button>
+      );
+    }
+    if (column.key === '_actions') {
+      const isDownloaded = downloadedTenderIds.has(tenderKey(tender));
+      return (
+        <div className="flex items-center gap-1" onClick={(event) => event.stopPropagation()}>
+          <button onClick={() => openTenderDetailDrawer(tender)} className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]" title="Details">
+            <Info size={14} />
+          </button>
+          <button onClick={() => addToProject.mutate(tender)} disabled={addToProject.isPending} className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]" title="Add to Project">
+            <Plus size={14} />
+          </button>
+          {isDownloaded && (
+            <button
+              onClick={() => openTenderFolder.mutate(tender)}
+              disabled={openTenderFolder.isPending && openTenderFolder.variables?.id === tender.id}
+              className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]"
+              title="Open Folder"
+            >
+              <FolderOpen size={14} />
+            </button>
+          )}
+          {tender.tender_url && (
+            <button
+              type="button"
+              onClick={() => api.openTenderUrl(tender)}
+              className="rounded p-1.5 text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]"
+              title="Open Tender"
+            >
+              <ExternalLink size={14} />
+            </button>
+          )}
+        </div>
+      );
+    }
+    if (column.key === 'status') return <StatusBadge status={tender.status} />;
+    if (column.key === 'tender_value' || column.key === 'emd') return <span className="whitespace-nowrap font-mono text-xs">{formatINR(tender[column.key])}</span>;
+    if (column.key === 'tender_id') {
+      return (
+        <div>
+          <p className="font-mono text-xs text-[var(--accent)]">{tender.tender_id || '—'}</p>
+          <p className="mt-0.5 overflow-hidden text-xs text-[var(--text-muted)]" style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>{tender.work_description || '—'}</p>
+        </div>
+      );
+    }
+    if (column.key === 'title') {
+      return <p className="overflow-hidden text-sm text-[var(--text)]" style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>{tender.title || '—'}</p>;
+    }
+    if (column.key === '_prebid_corrigendum') {
+      const total = (Number(tender.prebid_count) || 0) + (Number(tender.corrigendum_count) || 0);
+      return <span className="text-xs">{total || '—'}</span>;
+    }
+    return <span className="text-xs">{String(tender[column.key] ?? '') || '—'}</span>;
+  };
+
+  return { renderTenderCell, addToProject };
+}
+
+function TendersPage({ onBackToOrganizations }) {
+  const qc = useQueryClient();
+  const { data: authSettings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
+  const tenderTabPermissions = authSettings?.permissions;
+  // A row on Organizations (OrganizationsPage) writes this before navigating
+  // here, so "view this org's tenders" always lands on Active regardless of
+  // whatever tab was last open.
+  const [tab, setTab] = useState(() => {
+    const forced = sessionStorage.getItem(TENDERS_FORCE_TAB_KEY);
+    if (forced) sessionStorage.removeItem(TENDERS_FORCE_TAB_KEY);
+    return forced === 'archived' ? 'archived' : 'active';
+  });
+  // If this account only has one of active/archived, land (and stay) on the
+  // permitted one rather than showing an always-empty tab.
+  useEffect(() => {
+    if (!tenderTabPermissions) return;
+    if (tab === 'active' && tenderTabPermissions.active === false && tenderTabPermissions.archived !== false) setTab('archived');
+    else if (tab === 'archived' && tenderTabPermissions.archived === false && tenderTabPermissions.active !== false) setTab('active');
+  }, [tab, tenderTabPermissions]);
+  // Not one-shot here — App()'s `navigate` helper clears this on any other
+  // navigation, so it stays accurate without TendersPage clearing it itself.
+  const [cameFromOrg] = useState(() => sessionStorage.getItem(TENDERS_CAME_FROM_ORG_KEY) === '1');
+  const [closingSoonOnly, setClosingSoonOnly] = useState(() => {
+    const forced = sessionStorage.getItem(TENDERS_FORCE_CLOSING_KEY);
+    if (forced) sessionStorage.removeItem(TENDERS_FORCE_CLOSING_KEY);
+    return forced === '1';
+  });
+  const [search, setSearch] = useState('');
+  const [showBookmarkedOnly, setShowBookmarkedOnly] = useState(false);
+  const [sortCol, setSortCol] = useState('closing_date');
+  const [sortDir, setSortDir] = useState('asc');
+  const [selectedId, setSelectedId] = useState(null);
+  // One-shot: the Downloads panel sets this before navigating here so the
+  // clicked tender gets selected/highlighted once its data has loaded.
+  // Holds { tender_id, id } — matched by tender id (row id only without one).
+  const [pendingSelectId, setPendingSelectId] = useState(() => {
+    const forced = sessionStorage.getItem(TENDERS_FORCE_SELECT_KEY);
+    if (forced) sessionStorage.removeItem(TENDERS_FORCE_SELECT_KEY);
+    try {
+      const ref = JSON.parse(forced || 'null');
+      return ref && (tenderKey(ref) || Number(ref.id) > 0) ? ref : null;
+    } catch {
+      return null;
+    }
+  });
+  const [showFilters, setShowFilters] = useState(false);
+  // `website`/`savedByWebsite` are permanent (localStorage); `org`/`location`/
+  // `category` are the session-only active filter (sessionStorage) — see the
+  // two constants/helpers above. `filtersActivated` tracks whether the user
+  // has "woken up" filtering this session (gates the Filters button/website
+  // switch behavior below).
+  const [filters, setFilters] = useState(() => ({ ...loadTenderFilterState(), ...loadActiveTenderFilterState() }));
+  const [filtersActivated, setFiltersActivated] = useState(() => sessionStorage.getItem(TENDERS_FILTERS_ACTIVATED_KEY) === '1');
+  // Remembers each tab's scroll offset separately so switching Active <->
+  // Archived restores where you were instead of both sharing one clamped
+  // scrollTop on the same (never-unmounted) scroll container.
+  const scrollRef = useRef(null);
+  const scrollPositions = useRef({ active: { top: 0, left: 0 }, archived: { top: 0, left: 0 } });
+  const columns = useTenderColumns(tab);
+  const { renderTenderCell } = useTenderRowActions();
+
+  // Website + the permanent per-website memory persist forever.
+  useEffect(() => {
+    try { localStorage.setItem(TENDERS_FILTER_STATE_KEY, JSON.stringify({ website: filters.website, savedByWebsite: filters.savedByWebsite || {} })); } catch { /* ignore storage failures */ }
+  }, [filters.website, filters.savedByWebsite]);
+
+  // The actually-applied filter is session-only — it stays applied across
+  // in-session navigation (a sync, switching pages, etc. never drops it) but
+  // resets on a fresh app launch since sessionStorage doesn't survive that.
+  useEffect(() => {
+    try { sessionStorage.setItem(TENDERS_ACTIVE_FILTER_KEY, JSON.stringify({ org: filters.org, location: filters.location, category: filters.category })); } catch { /* ignore storage failures */ }
+  }, [filters.org, filters.location, filters.category]);
+
+  useEffect(() => {
+    try { sessionStorage.setItem(TENDERS_FILTERS_ACTIVATED_KEY, filtersActivated ? '1' : '0'); } catch { /* ignore storage failures */ }
+  }, [filtersActivated]);
+
+  // Updates one Organization/Location/Category field, mirrors the result
+  // into that website's permanent remembered selection, and marks filtering
+  // as activated this session (so a manual pick behaves like pressing
+  // Filters — no need to press it twice).
+  const updateFilterField = (key, value) => {
+    setFilters((f) => {
+      const next = { ...f, [key]: value };
+      next.savedByWebsite = { ...(f.savedByWebsite || {}), [f.website]: { org: next.org, location: next.location, category: next.category } };
+      return next;
+    });
+    setFiltersActivated(true);
+  };
+
+  // Clears the active Organization/Location/Category filter AND that
+  // website's remembered selection (used by the Filters-button auto-clear
+  // and the panel's own "Clear" button).
+  const clearOrgLocationCategory = () => {
+    setFilters((f) => ({ ...f, org: '', location: '', category: '', savedByWebsite: { ...(f.savedByWebsite || {}), [f.website]: { org: '', location: '', category: '' } } }));
+  };
+
+  // Switching website: while filtering is "activated" this session, recall
+  // that website's own remembered selection; otherwise just switch and
+  // leave the filter clear (matches a website picked before ever opening
+  // Filters this session).
+  const changeWebsite = (newWebsite) => {
+    setFilters((f) => {
+      if (!filtersActivated) return { ...f, website: newWebsite };
+      const saved = f.savedByWebsite?.[newWebsite] || { org: '', location: '', category: '' };
+      return { ...f, website: newWebsite, org: saved.org || '', location: saved.location || '', category: saved.category || '' };
+    });
+  };
+
+  // WIRE: list of tenders visible to the client. Assumes the same
+  // api.listTenders(websiteId, opts) shape as the operator app, called
+  // across all configured sources rather than filtered by a single website.
+  const { data: tenders, isLoading } = useQuery({
+    queryKey: ['client-tenders', tab],
+    queryFn: () => api.listTenders(null, { archived: tab === 'archived' }),
+  });
+
+  useEffect(() => {
+    if (!pendingSelectId || !tenders) return;
+    const key = tenderKey(pendingSelectId);
+    const match = tenders.find((t) => (key ? tenderKey(t) === key : t.id === Number(pendingSelectId.id)));
+    if (match) setSelectedId(match.id);
+    setPendingSelectId(null);
+  }, [pendingSelectId, tenders]);
+
+  // Restore this tab's remembered scroll offset once its rows are actually
+  // in the DOM (accurate scrollHeight/scrollWidth to clamp against) — not
+  // before, or it'd restore against the previous tab's still-rendered rows.
+  useEffect(() => {
+    if (isLoading || !scrollRef.current) return;
+    const pos = scrollPositions.current[tab] || { top: 0, left: 0 };
+    scrollRef.current.scrollTop = pos.top;
+    scrollRef.current.scrollLeft = pos.left;
+  }, [tab, isLoading]);
+
+  // "Request tenders" — a one-time manual scrape for the org this view is
+  // currently filtered to, when it isn't already covered by a saved custom
+  // job. `organizations` is the full server-side org list (not derived from
+  // loaded tenders), so this also works for an org with zero tenders.
+  const { data: organizations } = useQuery({ queryKey: ['organizations'], queryFn: api.listOrganizations });
+  const activeOrg = useMemo(
+    () => (filters.org ? (organizations || []).find((o) => o.name === filters.org && (!filters.website || o.website_name === filters.website)) : null),
+    [organizations, filters.org, filters.website]
+  );
+  const { data: pendingOrgRequestIds } = useQuery({
+    queryKey: ['pending-org-requests'],
+    queryFn: api.getPendingOrgRequestIds,
+    enabled: Boolean(activeOrg),
+    refetchInterval: 5000,
+  });
+  const isRequestingOrgTenders = Boolean(activeOrg) && (pendingOrgRequestIds || []).includes(activeOrg.id);
+  const requestOrgTenders = useMutation({
+    mutationFn: () => api.requestOrgTenders(activeOrg),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['pending-org-requests'] }),
+    onError: (err) => alert(`Could not request tenders: ${err?.message || String(err)}`),
+  });
+  // Shown for every org now — a saved job covering it no longer hides the
+  // button. requestOrgTenders itself decides whether to actually fire based
+  // on org.last_scraped_at (a 24h cooldown), never touching the network when
+  // it's still within the window (see api.getScrapeCooldownMessage).
+  const canRequestOrgTenders = Boolean(activeOrg);
+
+  // Same pull as Settings' "Sync Tenders" button (api.js:syncFromServer) —
+  // just reachable without leaving the Online Tenders tab.
+  const refreshTenders = useMutation({
+    mutationFn: () => api.syncFromServer(),
+    onSuccess: () => qc.invalidateQueries(),
+    onError: (err) => alert(`Refresh failed: ${err?.message || String(err)}`),
+  });
+
+  // Organization/Location/Category options only reflect the currently
+  // selected website's tenders, not every website's.
+  const websiteTenders = useMemo(
+    () => (tenders || []).filter((t) => !filters.website || t.website_name === filters.website),
+    [tenders, filters.website]
+  );
+  const uniqueOrgs = useMemo(
+    () => [...new Set(websiteTenders.map((t) => t.org_chain).filter(Boolean))].sort(),
+    [websiteTenders]
+  );
+  const uniqueLocations = useMemo(
+    () => [...new Set(websiteTenders.map((t) => t.location).filter(Boolean))].sort(),
+    [websiteTenders]
+  );
+  const uniqueCategories = useMemo(
+    () => [...new Set(websiteTenders.map((t) => t.tender_category).filter(Boolean))].sort(),
+    [websiteTenders]
+  );
+  const { data: portalList } = useQuery({ queryKey: ['websites'], queryFn: api.listWebsites });
+  const uniqueWebsites = useMemo(() => {
+    const fromServer = (portalList || []).map((w) => w.name).filter(Boolean);
+    if (fromServer.length) return [...new Set(fromServer)].sort();
+    return [...new Set((tenders || []).map((t) => t.website_name).filter(Boolean))].sort();
+  }, [portalList, tenders]);
+
+  // Exactly one website must always be selected — pick the first one the
+  // moment there's a real list and the current selection is empty/stale.
+  useEffect(() => {
+    if (uniqueWebsites.length === 0) return;
+    if (!filters.website || !uniqueWebsites.includes(filters.website)) {
+      changeWebsite(uniqueWebsites[0]);
+    }
+  }, [uniqueWebsites, filters.website]);
+
+  const filtered = useMemo(() => {
+    let list = tenders || [];
+    if (showBookmarkedOnly) list = list.filter((t) => t.is_bookmarked);
+    if (filters.org) list = list.filter((t) => t.org_chain === filters.org);
+    if (filters.location) list = list.filter((t) => t.location === filters.location);
+    if (filters.category) list = list.filter((t) => t.tender_category === filters.category);
+    if (filters.website) list = list.filter((t) => t.website_name === filters.website);
+    if (closingSoonOnly) list = list.filter((t) => { const r = timeRemaining(t.closing_date); return !r.expired && r.totalDays >= 0 && r.totalDays <= 7; });
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter((t) => Object.values(t).some((v) => String(v ?? '').toLowerCase().includes(q)));
+    }
+    return [...list].sort((a, b) => {
+      const c = smartCmp(a[sortCol] ?? '', b[sortCol] ?? '');
+      return sortDir === 'asc' ? c : -c;
+    });
+  }, [tenders, showBookmarkedOnly, filters, closingSoonOnly, search, sortCol, sortDir]);
+
+  const toggleSort = (key) => {
+    if (sortCol === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else { setSortCol(key); setSortDir('asc'); }
+  };
+
+  const exportCurrent = () => {
+    const exportColumns = columns.visibleTenderColumns.filter((column) => !TENDER_NON_SORTABLE.has(column.key));
+    exportCSV(
+      exportColumns.map((column) => column.label),
+      filtered,
+      exportColumns.map((column) => column.key),
+      `tenders_${tab}_${new Date().toISOString().slice(0, 10)}.csv`
+    );
+  };
+
+  return (
+    <div className="flex h-full flex-col">
+      {/* Header */}
+      <div className="space-y-2 border-b border-[var(--border)] bg-[var(--surface-0)] px-6 py-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            {cameFromOrg && (
+              <button onClick={onBackToOrganizations} className="btn-ghost gap-1.5 text-xs shrink-0">
+                <ArrowLeft size={13} />Back to Organizations
+              </button>
+            )}
+            <h1 className="text-lg font-bold text-[var(--text)]">Online Tenders</h1>
+            <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-xs font-medium text-[var(--text-muted)]">{filtered.length}</span>
+          </div>
+          <button onClick={() => refreshTenders.mutate()} disabled={refreshTenders.isPending} className="btn-secondary flex items-center gap-2 text-sm">
+            {refreshTenders.isPending ? <Spinner size={14} /> : <RefreshCw size={14} />} Sync Now
+          </button>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="relative min-w-[180px] max-w-sm flex-1">
+            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search..." className="input-field h-8 w-full text-sm" />
+            {search && <button onClick={() => setSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><X size={14} /></button>}
+          </div>
+          <select
+            value={filters.website}
+            onChange={(e) => changeWebsite(e.target.value)}
+            className="input-field h-8 w-auto max-w-[180px] text-xs"
+          >
+            {uniqueWebsites.map((w) => <option key={w} value={w}>{w}</option>)}
+          </select>
+          <button
+            onClick={() => setShowBookmarkedOnly((v) => !v)}
+            className={cn('btn-ghost gap-1.5 text-xs', showBookmarkedOnly && 'bg-[var(--accent-bg)] text-[var(--accent)]')}
+          >
+            <Star size={13} />Bookmarked
+          </button>
+          <button
+            onClick={() => setClosingSoonOnly((v) => !v)}
+            className={cn('btn-ghost gap-1.5 text-xs', closingSoonOnly && 'bg-[var(--accent-bg)] text-[var(--accent)]')}
+          >
+            <Clock size={13} />Closing ≤7d
+          </button>
+          <button
+            onClick={() => {
+              if (filters.org || filters.location || filters.category) {
+                clearOrgLocationCategory();
+                setShowFilters(false);
+                return;
+              }
+              if (!filtersActivated) {
+                setFiltersActivated(true);
+                const saved = filters.savedByWebsite?.[filters.website] || { org: '', location: '', category: '' };
+                setFilters((f) => ({ ...f, org: saved.org || '', location: saved.location || '', category: saved.category || '' }));
+                setShowFilters(true);
+                return;
+              }
+              setShowFilters((v) => !v);
+            }}
+            className={cn('btn-ghost gap-1.5 text-xs', (showFilters || filters.org || filters.location || filters.category) && 'bg-[var(--accent-bg)] text-[var(--accent)]')}
+            title="Organization / Location / Category filters"
+          >
+            <Filter size={13} />Filters
+          </button>
+          <div className="flex-1" />
+          <TenderColumnsMenuButton
+            orderedTenderColumns={columns.orderedTenderColumns}
+            tenderHidden={columns.tenderHidden}
+            toggleTenderCol={columns.toggleTenderCol}
+            reorderMovableColumn={columns.reorderMovableColumn}
+          />
+          <button onClick={exportCurrent} className="btn-ghost gap-1.5 text-xs"><FileDown size={13} />Export CSV</button>
+        </div>
+        {showFilters && (
+          <div className="grid grid-cols-2 gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3 lg:grid-cols-4">
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Organization</label>
+              <select value={filters.org} onChange={(e) => updateFilterField('org', e.target.value)} className="input-field h-8 w-full text-xs">
+                <option value="">All</option>
+                {uniqueOrgs.map((o) => <option key={o} value={o}>{o}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Location</label>
+              <select value={filters.location} onChange={(e) => updateFilterField('location', e.target.value)} className="input-field h-8 w-full text-xs">
+                <option value="">All</option>
+                {uniqueLocations.map((l) => <option key={l} value={l}>{l}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Category</label>
+              <select value={filters.category} onChange={(e) => updateFilterField('category', e.target.value)} className="input-field h-8 w-full text-xs">
+                <option value="">All</option>
+                {uniqueCategories.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <div className="flex items-end"><button onClick={clearOrgLocationCategory} className="btn-ghost text-xs">Clear</button></div>
+          </div>
+        )}
+        <div className="-mx-6 -mb-3 mt-1 flex border-t border-[var(--border)] px-6">
+          {[{ key: 'active', label: 'Active Tenders' }, { key: 'archived', label: 'Archived' }]
+            .filter((t) => tenderTabPermissions?.[t.key] !== false)
+            .map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              className={cn('border-b-2 px-4 py-2.5 text-sm font-medium transition-colors', tab === t.key ? 'border-[var(--accent)] text-[var(--accent)]' : 'border-transparent text-[var(--text-muted)] hover:text-[var(--text)]')}
+            >
+              {t.label}
+            </button>
+          ))}
+          {canRequestOrgTenders && (
+            <button
+              onClick={() => requestOrgTenders.mutate()}
+              disabled={isRequestingOrgTenders || requestOrgTenders.isPending}
+              className="btn-ghost my-1 ml-auto gap-1.5 text-xs"
+              title="Send a one-time scrape request for this organization"
+            >
+              {isRequestingOrgTenders || requestOrgTenders.isPending ? <Spinner size={13} /> : <RefreshCw size={13} />}
+              {isRequestingOrgTenders || requestOrgTenders.isPending ? 'Requesting…' : 'Request tenders'}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Table */}
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-auto"
+        onScroll={(e) => { scrollPositions.current[tab] = { top: e.currentTarget.scrollTop, left: e.currentTarget.scrollLeft }; }}
+      >
+        <TenderTable
+          columns={columns.visibleTenderColumns}
+          getColWidth={columns.getTenderColWidth}
+          tableWidth={columns.tenderTableWidth}
+          sortCol={sortCol}
+          sortDir={sortDir}
+          onToggleSort={toggleSort}
+          onStartResize={columns.startTenderColResize}
+          rows={filtered}
+          isLoading={isLoading}
+          emptyState={
+            <EmptyState
+              icon={Globe}
+              title="No tenders"
+              description={search ? `No tenders match "${search}"` : 'No tenders to show yet.'}
+              action={tab === 'active' && !search && canRequestOrgTenders && (
+                <button
+                  onClick={() => requestOrgTenders.mutate()}
+                  disabled={isRequestingOrgTenders || requestOrgTenders.isPending}
+                  className="btn-secondary text-xs"
+                >
+                  {isRequestingOrgTenders || requestOrgTenders.isPending ? 'Requesting…' : 'Request now'}
+                </button>
+              )}
+            />
+          }
+          renderCell={renderTenderCell}
+          selectedId={selectedId}
+          onSelectRow={(t) => setSelectedId(t.id === selectedId ? null : t.id)}
+        />
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ORGANIZATIONS  — browse every organization synced from the server (not just
+   bookmarked ones), bookmark from here, and jump to that org's Active tenders.
+   ═══════════════════════════════════════════════════════════════════════════ */
+function OrganizationsPage({ onOpenOrgTenders }) {
+  const qc = useQueryClient();
+  const { getOrgColWidth, startOrgColResize } = useOrganizationColumns();
+  // Persisted across navigating away and back (e.g. via Tenders' "Back to
+  // Organizations" button) — only changes when the user edits the box.
+  const [search, setSearch] = useState(() => { try { return sessionStorage.getItem(ORGANIZATIONS_SEARCH_KEY) || ''; } catch { return ''; } });
+  // One-shot: a Website Coverage card on the Dashboard sets this immediately
+  // before navigating here so that website is preselected/filtered.
+  // Otherwise falls back to the last website/sort the user picked here,
+  // which survives an app restart (see ORGANIZATIONS_STATE_KEY) — until
+  // manually changed.
+  const [website, setWebsite] = useState(() => {
+    try {
+      const forced = sessionStorage.getItem(ORGANIZATIONS_FORCE_WEBSITE_KEY);
+      if (forced !== null) { sessionStorage.removeItem(ORGANIZATIONS_FORCE_WEBSITE_KEY); return forced; }
+    } catch { /* ignore storage failures */ }
+    return loadOrganizationsState().website;
+  });
+  const [sortCol, setSortCol] = useState(() => loadOrganizationsState().sortCol);
+  const [sortDir, setSortDir] = useState(() => loadOrganizationsState().sortDir);
+
+  useEffect(() => {
+    try { sessionStorage.setItem(ORGANIZATIONS_SEARCH_KEY, search); } catch { /* ignore storage failures */ }
+  }, [search]);
+
+  useEffect(() => {
+    try { localStorage.setItem(ORGANIZATIONS_STATE_KEY, JSON.stringify({ website, sortCol, sortDir })); } catch { /* ignore storage failures */ }
+  }, [website, sortCol, sortDir]);
+
+  const { data: organizations, isLoading } = useQuery({ queryKey: ['organizations'], queryFn: api.listOrganizations });
+  const { data: bookmarkedOrgs } = useQuery({ queryKey: ['bookmarked-orgs'], queryFn: api.listBookmarkedOrgs });
+  const bookmarkedOrgsSet = useMemo(() => new Set(bookmarkedOrgs || []), [bookmarkedOrgs]);
+  const toggleOrgBookmark = useMutation({
+    mutationFn: (org) => api.toggleOrgBookmark(org),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['bookmarked-orgs'] }),
+  });
+
+  const { data: portalList } = useQuery({ queryKey: ['websites'], queryFn: api.listWebsites });
+  const uniqueWebsites = useMemo(() => {
+    const fromServer = (portalList || []).map((w) => w.name).filter(Boolean);
+    if (fromServer.length) return [...new Set(fromServer)].sort();
+    return [...new Set((organizations || []).map((o) => o.website_name).filter(Boolean))].sort();
+  }, [portalList, organizations]);
+
+  // Exactly one website must always be selected — pick the first one the
+  // moment there's a real list and the current selection is empty/stale.
+  useEffect(() => {
+    if (uniqueWebsites.length === 0) return;
+    if (!website || !uniqueWebsites.includes(website)) setWebsite(uniqueWebsites[0]);
+  }, [uniqueWebsites, website]);
+
+  const filtered = useMemo(() => {
+    // Orgs no longer found on the site's own listing are hidden here
+    // entirely — they still show up (greyed out) in Bookmarks if bookmarked.
+    let list = (organizations || []).filter((o) => o.is_available !== false);
+    if (website) list = list.filter((o) => o.website_name === website);
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter((o) => o.name.toLowerCase().includes(q) || (o.website_name || '').toLowerCase().includes(q));
+    }
+    return [...list].sort((a, b) => {
+      const c = smartCmp(a[sortCol] ?? '', b[sortCol] ?? '');
+      return sortDir === 'asc' ? c : -c;
+    });
+  }, [organizations, website, search, sortCol, sortDir]);
+
+  const toggleSort = (key) => {
+    if (sortCol === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else { setSortCol(key); setSortDir(key === 'tender_count' ? 'desc' : 'asc'); }
+  };
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="space-y-2 border-b border-[var(--border)] bg-[var(--surface-0)] px-6 py-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <h1 className="text-lg font-bold text-[var(--text)]">Organizations</h1>
+            <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-xs font-medium text-[var(--text-muted)]">{filtered.length}</span>
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="relative min-w-[180px] max-w-sm flex-1">
+            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search organizations..." className="input-field h-8 w-full text-sm" />
+            {search && <button onClick={() => setSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><X size={14} /></button>}
+          </div>
+          <select
+            value={website}
+            onChange={(e) => setWebsite(e.target.value)}
+            className="input-field h-8 w-auto max-w-[180px] text-xs"
+          >
+            {uniqueWebsites.map((w) => <option key={w} value={w}>{w}</option>)}
+          </select>
+        </div>
+      </div>
+      <div className="flex-1 overflow-auto">
+        <OrganizationTable
+          rows={filtered}
+          isLoading={isLoading}
+          emptyState={<EmptyState icon={Building2} title="No organizations" description={search ? `No organizations match "${search}"` : 'Sync from the server to load organizations.'} />}
+          sortCol={sortCol}
+          sortDir={sortDir}
+          onToggleSort={toggleSort}
+          getColWidth={getOrgColWidth}
+          onStartResize={startOrgColResize}
+          bookmarkedOrgsSet={bookmarkedOrgsSet}
+          onToggleBookmark={(org) => toggleOrgBookmark.mutate(org.name)}
+          onRowClick={(org) => onOpenOrgTenders?.(org.name, org.website_name)}
+        />
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   BOOKMARKS  — saved tenders only (organization bookmarking lives on the
+   Organizations page). Renders through the same TenderTable/column system as
+   Online Tenders so a bookmarked tender looks and behaves identically there.
+   ═══════════════════════════════════════════════════════════════════════════ */
+function BookmarksPage({ onOpenOrgTenders }) {
+  const qc = useQueryClient();
+  // This page's Organizations sub-tab renders the same org list as the
+  // Organizations page, so it has to honour the same permission — otherwise
+  // hiding that page just moves the back door here.
+  const { data: bookmarkSettings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
+  const orgsGatedOff = sidebarKeyGatedOff('organizations', bookmarkSettings?.permissions);
+  const [tab, setTab] = useState(() => {
+    try { return sessionStorage.getItem(BOOKMARKS_LAST_TAB_KEY) || 'organizations'; } catch { return 'organizations'; }
+  });
+  useEffect(() => {
+    try { sessionStorage.setItem(BOOKMARKS_LAST_TAB_KEY, tab); } catch { /* ignore storage failures */ }
+  }, [tab]);
+  // A remembered 'organizations' tab would otherwise reopen the hidden list.
+  useEffect(() => {
+    if (orgsGatedOff && tab === 'organizations') setTab('tenders');
+  }, [orgsGatedOff, tab]);
+
+  // ── Tenders sub-tab ────────────────────────────────────────────────────
+  const [sortCol, setSortCol] = useState('closing_date');
+  const [sortDir, setSortDir] = useState('asc');
+  const [selectedId, setSelectedId] = useState(null);
+  const [showFilters, setShowFilters] = useState(false);
+  const [filters, setFilters] = useState({ org: '', location: '', category: '' });
+  const [search, setSearch] = useState('');
+  const columns = useTenderColumns('bookmarks');
+  const { renderTenderCell } = useTenderRowActions();
+
+  // Needs both active and archived tenders in one list — listTenders only
+  // applies the `archived` filter when that key is present in params.
+  const { data: tenders, isLoading } = useQuery({
+    queryKey: ['client-tenders-bookmarked'],
+    queryFn: () => api.listTenders(null),
+    enabled: tab === 'tenders',
+  });
+
+  const allBookmarkedRows = useMemo(() => (tenders || []).filter((t) => t.is_bookmarked), [tenders]);
+  const uniqueOrgs = useMemo(() => [...new Set(allBookmarkedRows.map((t) => t.org_chain).filter(Boolean))].sort(), [allBookmarkedRows]);
+  const uniqueLocations = useMemo(() => [...new Set(allBookmarkedRows.map((t) => t.location).filter(Boolean))].sort(), [allBookmarkedRows]);
+  const uniqueCategories = useMemo(() => [...new Set(allBookmarkedRows.map((t) => t.tender_category).filter(Boolean))].sort(), [allBookmarkedRows]);
+
+  const bookmarkedRows = useMemo(() => {
+    let list = allBookmarkedRows;
+    if (filters.org) list = list.filter((t) => t.org_chain === filters.org);
+    if (filters.location) list = list.filter((t) => t.location === filters.location);
+    if (filters.category) list = list.filter((t) => t.tender_category === filters.category);
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter((t) => [t.tender_id, t.title, t.org_chain, t.location, t.tender_category].some((v) => String(v ?? '').toLowerCase().includes(q)));
+    }
+    return [...list].sort((a, b) => {
+      const c = smartCmp(a[sortCol] ?? '', b[sortCol] ?? '');
+      return sortDir === 'asc' ? c : -c;
+    });
+  }, [allBookmarkedRows, filters, search, sortCol, sortDir]);
+
+  const toggleSort = (key) => {
+    if (sortCol === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else { setSortCol(key); setSortDir('asc'); }
+  };
+
+  const exportBookmarkedTenders = () => {
+    const exportColumns = columns.visibleTenderColumns.filter((column) => !TENDER_NON_SORTABLE.has(column.key));
+    exportCSV(
+      exportColumns.map((column) => column.label),
+      bookmarkedRows,
+      exportColumns.map((column) => column.key),
+      `bookmarked_tenders_${new Date().toISOString().slice(0, 10)}.csv`
+    );
+  };
+
+  // ── Organizations sub-tab ──────────────────────────────────────────────
+  const [orgSortCol, setOrgSortCol] = useState('tender_count');
+  const [orgSortDir, setOrgSortDir] = useState('desc');
+  const [orgSearch, setOrgSearch] = useState('');
+  const { getOrgColWidth, startOrgColResize } = useOrganizationColumns();
+  const { data: organizations, isLoading: orgsLoading } = useQuery({ queryKey: ['organizations'], queryFn: api.listOrganizations, enabled: tab === 'organizations' });
+  const { data: bookmarkedOrgs } = useQuery({ queryKey: ['bookmarked-orgs'], queryFn: api.listBookmarkedOrgs, enabled: tab === 'organizations' });
+  const bookmarkedOrgsSet = useMemo(() => new Set(bookmarkedOrgs || []), [bookmarkedOrgs]);
+  const toggleOrgBookmark = useMutation({
+    mutationFn: (org) => api.toggleOrgBookmark(org),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['bookmarked-orgs'] }),
+  });
+  const bookmarkedOrgRows = useMemo(() => {
+    let list = (organizations || []).filter((o) => bookmarkedOrgsSet.has(o.name));
+    if (orgSearch.trim()) {
+      const q = orgSearch.toLowerCase();
+      list = list.filter((o) => o.name.toLowerCase().includes(q) || (o.website_name || '').toLowerCase().includes(q));
+    }
+    // Availability is the primary sort — a bookmarked org no longer on its
+    // site always sinks to the bottom — with the user's chosen column/
+    // direction as the tiebreak inside each group, so switching sort still
+    // fully re-orders "available" and "unavailable" independently.
+    return [...list].sort((a, b) => {
+      const au = a.is_available === false ? 1 : 0;
+      const bu = b.is_available === false ? 1 : 0;
+      if (au !== bu) return au - bu;
+      const c = smartCmp(a[orgSortCol] ?? '', b[orgSortCol] ?? '');
+      return orgSortDir === 'asc' ? c : -c;
+    });
+  }, [organizations, bookmarkedOrgsSet, orgSearch, orgSortCol, orgSortDir]);
+  const toggleOrgSort = (key) => {
+    if (orgSortCol === key) setOrgSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else { setOrgSortCol(key); setOrgSortDir(key === 'tender_count' ? 'desc' : 'asc'); }
+  };
+
+  const count = tab === 'organizations' ? bookmarkedOrgRows.length : bookmarkedRows.length;
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="border-b border-[var(--border)] bg-[var(--surface-0)] px-6 py-3">
+        <div className="flex items-center gap-2.5">
+          <h1 className="text-lg font-bold text-[var(--text)]">Bookmarks</h1>
+          <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-xs font-medium text-[var(--text-muted)]">{count}</span>
+        </div>
+        {tab === 'organizations' && (
+          <div className="mt-2 flex flex-wrap items-center gap-3">
+            <div className="relative min-w-[180px] max-w-sm flex-1">
+              <input value={orgSearch} onChange={(e) => setOrgSearch(e.target.value)} placeholder="Search organizations..." className="input-field h-8 w-full text-sm" />
+              {orgSearch && <button onClick={() => setOrgSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><X size={14} /></button>}
+            </div>
+          </div>
+        )}
+        {tab === 'tenders' && (
+          <div className="mt-2 flex flex-wrap items-center gap-3">
+            <div className="relative min-w-[180px] max-w-sm flex-1">
+              <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search..." className="input-field h-8 w-full text-sm" />
+              {search && <button onClick={() => setSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><X size={14} /></button>}
+            </div>
+            <button
+              onClick={() => setShowFilters((v) => !v)}
+              className={cn('btn-ghost gap-1.5 text-xs', (showFilters || filters.org || filters.location || filters.category) && 'bg-[var(--accent-bg)] text-[var(--accent)]')}
+              title="Organization / Location / Category filters"
+            >
+              <Filter size={13} />Filters
+            </button>
+            <div className="flex-1" />
+            <TenderColumnsMenuButton
+              orderedTenderColumns={columns.orderedTenderColumns}
+              tenderHidden={columns.tenderHidden}
+              toggleTenderCol={columns.toggleTenderCol}
+              reorderMovableColumn={columns.reorderMovableColumn}
+            />
+            <button onClick={exportBookmarkedTenders} className="btn-ghost gap-1.5 text-xs"><FileDown size={13} />Export CSV</button>
+          </div>
+        )}
+        {tab === 'tenders' && showFilters && (
+          <div className="mt-2 grid grid-cols-2 gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3 lg:grid-cols-4">
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Organization</label>
+              <select value={filters.org} onChange={(e) => setFilters((f) => ({ ...f, org: e.target.value }))} className="input-field h-8 w-full text-xs">
+                <option value="">All</option>
+                {uniqueOrgs.map((o) => <option key={o} value={o}>{o}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Location</label>
+              <select value={filters.location} onChange={(e) => setFilters((f) => ({ ...f, location: e.target.value }))} className="input-field h-8 w-full text-xs">
+                <option value="">All</option>
+                {uniqueLocations.map((l) => <option key={l} value={l}>{l}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Category</label>
+              <select value={filters.category} onChange={(e) => setFilters((f) => ({ ...f, category: e.target.value }))} className="input-field h-8 w-full text-xs">
+                <option value="">All</option>
+                {uniqueCategories.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <div className="flex items-end"><button onClick={() => setFilters({ org: '', location: '', category: '' })} className="btn-ghost text-xs">Clear</button></div>
+          </div>
+        )}
+        <div className="-mx-6 -mb-3 mt-2 flex border-t border-[var(--border)] px-6">
+          {[{ key: 'organizations', label: 'Organizations' }, { key: 'tenders', label: 'Tenders' }]
+            .filter((t) => t.key !== 'organizations' || !orgsGatedOff)
+            .map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              className={cn('border-b-2 px-4 py-2.5 text-sm font-medium transition-colors', tab === t.key ? 'border-[var(--accent)] text-[var(--accent)]' : 'border-transparent text-[var(--text-muted)] hover:text-[var(--text)]')}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="flex-1 overflow-auto">
+        {tab === 'organizations' && !orgsGatedOff ? (
+          <OrganizationTable
+            rows={bookmarkedOrgRows}
+            isLoading={orgsLoading}
+            emptyState={<EmptyState icon={Bookmark} title="No bookmarked organizations" description="Star an organization in Organizations to see it here." />}
+            sortCol={orgSortCol}
+            sortDir={orgSortDir}
+            onToggleSort={toggleOrgSort}
+            getColWidth={getOrgColWidth}
+            onStartResize={startOrgColResize}
+            bookmarkedOrgsSet={bookmarkedOrgsSet}
+            onToggleBookmark={(org) => toggleOrgBookmark.mutate(org.name)}
+            onRowClick={(org) => onOpenOrgTenders?.(org.name, org.website_name)}
+          />
+        ) : (
+          <TenderTable
+            columns={columns.visibleTenderColumns}
+            getColWidth={columns.getTenderColWidth}
+            tableWidth={columns.tenderTableWidth}
+            sortCol={sortCol}
+            sortDir={sortDir}
+            onToggleSort={toggleSort}
+            onStartResize={columns.startTenderColResize}
+            rows={bookmarkedRows}
+            isLoading={isLoading}
+            emptyState={<EmptyState icon={Star} title="No bookmarked tenders" description="Star a tender in Online Tenders to see it here." />}
+            renderCell={renderTenderCell}
+            selectedId={selectedId}
+            onSelectRow={(t) => setSelectedId(t.id === selectedId ? null : t.id)}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   PROJECTS  (list / cards, create, edit, checklist, archive)
+   — dropped: "Fetch" tender-autofill button that matched against scraped
+     tender data. Manual entry / editing only.
+   ═══════════════════════════════════════════════════════════════════════════ */
+function sanitizeFolderLeaf(value, fallback = 'Project') {
+  const txt = String(value || '')
+    .replace(/[<>:"/\\|?*\x00-\x1F]+/g, '_')
+    .replace(/\s+/g, ' ').trim().replace(/[. ]+$/g, '');
+  return txt || fallback;
+}
+
+const PROJECT_COLUMNS = [
+  { key: '_sr', label: '#', width: 56, fixed: true },
+  { key: 'source_tender_id', label: 'Tender ID', width: 160 },
+  { key: 'title', label: 'Name of Work', width: 320 },
+  { key: 'client_name', label: 'Client', width: 220 },
+  { key: 'project_value', label: 'Value', width: 140 },
+  { key: 'prebid', label: 'Prebid', width: 170 },
+  { key: 'deadline', label: 'Deadline', width: 170 },
+  { key: '_time_left', label: 'Time Left', width: 120 },
+  { key: 'status', label: 'Status', width: 110 },
+];
+
+function StatsBar({ projects }) {
+  const total = projects.length;
+  const active = projects.filter(p => p.status === 'Active').length;
+  const totalValue = projects.reduce((sum, p) => {
+    const n = parseFloat(String(p.project_value || '').replace(/[₹,\s]/g, ''));
+    return sum + (isNaN(n) ? 0 : n);
+  }, 0);
+  const fmt = (n) => n >= 1e7 ? `₹${(n / 1e7).toFixed(1)} Cr` : n >= 1e5 ? `₹${(n / 1e5).toFixed(1)} L` : `₹${n.toLocaleString('en-IN')}`;
+
+  return (
+    <div className="flex items-center gap-5 px-6 py-2 border-b border-[var(--border)] bg-[var(--surface-0)]">
+      <div className="flex items-center gap-1.5">
+        <span className="text-xs text-[var(--text-muted)]">Total</span>
+        <span className="text-sm font-semibold text-[var(--text)]">{total}</span>
+      </div>
+      <div className="h-3 w-px bg-[var(--border)]" />
+      <div className="flex items-center gap-1.5">
+        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+        <span className="text-xs text-[var(--text-muted)]">Active</span>
+        <span className="text-sm font-semibold text-emerald-500">{active}</span>
+      </div>
+      {totalValue > 0 && <>
+        <div className="h-3 w-px bg-[var(--border)]" />
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs text-[var(--text-muted)]">Portfolio</span>
+          <span className="text-sm font-semibold font-mono text-[var(--text)]">{fmt(totalValue)}</span>
+        </div>
+      </>}
+    </div>
+  );
+}
+
+function Ring({ done, total, size = 34 }) {
+  const pct = total ? done / total : 0;
+  const r = (size - 6) / 2;
+  const c = 2 * Math.PI * r;
+  const col = pct === 1 ? '#10b981' : pct >= 0.6 ? 'var(--accent)' : '#f59e0b';
+  return (
+    <svg width={size} height={size} className="shrink-0">
+      <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="var(--surface-2)" strokeWidth={4} />
+      {total > 0 && (
+        <circle
+          cx={size / 2} cy={size / 2} r={r} fill="none" stroke={col} strokeWidth={4} strokeLinecap="round"
+          strokeDasharray={c} strokeDashoffset={c * (1 - pct)} transform={`rotate(-90 ${size / 2} ${size / 2})`}
+        />
+      )}
+      <text x="50%" y="50%" dominantBaseline="central" textAnchor="middle" fontSize={9} fontWeight={700} fill="var(--text)">{done}/{total}</text>
+    </svg>
+  );
+}
+
+function ProjectCard({ project, isSelected, isFocused, onClick, onDoubleClick }) {
+  const { data: checklist } = useQuery({ queryKey: ['project-checklist-ring', project.id], queryFn: () => api.listChecklist(project.id) });
+  const done = (checklist || []).filter((i) => i.status === 'Completed').length;
+  const total = (checklist || []).length;
+  return (
+    <div
+      onClick={onClick} onDoubleClick={onDoubleClick}
+      className={cn(
+        'group relative flex flex-col gap-3 rounded-xl border p-4 cursor-pointer transition-all duration-150',
+        'bg-[var(--surface-0)] hover:bg-[var(--surface-1)]',
+        isSelected ? 'border-[var(--accent)] ring-2 ring-[var(--accent)]/20 bg-[var(--accent-bg)]'
+          : 'border-[var(--border)] hover:border-[var(--accent)]/40',
+        isFocused && !isSelected && 'ring-1 ring-[var(--accent)]/30'
+      )}
+    >
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex items-start gap-2.5 flex-1 min-w-0">
+          <Ring done={done} total={total} />
+          <div className="flex-1 min-w-0">
+            <p className="text-[10px] font-mono text-[var(--accent)] mb-1 truncate">{project.source_tender_id || '—'}</p>
+            <p className="text-sm font-semibold text-[var(--text)] line-clamp-2 leading-snug">{project.title || 'Untitled'}</p>
+          </div>
+        </div>
+        <Badge variant={project.status === 'Active' ? 'success' : 'muted'} className="shrink-0 text-[10px]">
+          {project.status || 'Active'}
+        </Badge>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <div className="flex items-center gap-1.5 text-xs text-[var(--text-muted)]">
+          <Building2 size={11} className="shrink-0 text-[var(--accent)]/60" />
+          <span className="truncate">{project.client_name || '—'}</span>
+        </div>
+        <div className="flex items-center gap-1.5 text-xs text-[var(--text-muted)]">
+          <IndianRupee size={11} className="shrink-0 text-emerald-500/70" />
+          <span className="truncate font-mono">{formatINR(project.project_value) || '—'}</span>
+        </div>
+        <div className="flex items-center gap-1.5 text-xs text-[var(--text-muted)]">
+          <CalendarClock size={11} className="shrink-0 text-amber-500/70" />
+          <span className="truncate">{project.prebid || '—'}</span>
+        </div>
+        <div className="flex items-center gap-1.5 text-xs">
+          <Clock size={11} className="shrink-0 text-rose-400/70" />
+          <TimeBadge dateStr={project.deadline} />
+        </div>
+      </div>
+      <div className={cn('absolute right-3 bottom-3 opacity-0 group-hover:opacity-100 transition-opacity', isSelected && 'opacity-60')}>
+        <ExternalLink size={12} className="text-[var(--accent)]" />
+      </div>
+    </div>
+  );
+}
+
+function ProjectsPage({ onOpenProjectWorkspace, archived = false }) {
+  const qc = useQueryClient();
+  const projectStatus = archived ? 'Archived' : 'Active';
+  const { projectsTable, setProjectsHiddenColumns, setProjectsColumnOrder, setProjectsColumnWidth } = useAppStore();
+
+  const [search, setSearch] = useState('');
+  const [viewMode, setViewMode] = useState('table');
+  const [selId, setSelId] = useState(null);
+  const [selectedProjectIds, setSelectedProjectIds] = useState([]);
+  const [projectFocusId, setProjectFocusId] = useState(null);
+  const [lastProjectClickedId, setLastProjectClickedId] = useState(null);
+  const [showForm, setShowForm] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
+  const [editMode, setEditMode] = useState(false);
+  const [formEditable, setFormEditable] = useState(true);
+  const [showColsMenu, setShowColsMenu] = useState(false);
+  const [dragIdx, setDragIdx] = useState(null);
+  const [form, setForm] = useState({ title: '', client_name: '', source_tender_id: '', project_value: '', prebid: '', deadline: '', description: '', status: projectStatus });
+  const [newChecklistItem, setNewChecklistItem] = useState({ req_file_name: '', description: '', subfolder: 'Main' });
+  const [confirmDelIds, setConfirmDelIds] = useState([]);
+
+  const desktop = window.bidmanagerDesktop;
+
+  const { data: projects, isLoading } = useQuery({ queryKey: ['projects', projectStatus, search], queryFn: () => api.listProjects(search, projectStatus) });
+  const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
+  const projectsEntryMode = String(settings?.projects_entry_mode || 'inline').toLowerCase() === 'popup' ? 'popup' : 'inline';
+  const selectedProject = useMemo(() => (projects || []).find((p) => p.id === selId) || null, [projects, selId]);
+  const { data: checklist, isLoading: checklistLoading } = useQuery({ queryKey: ['project-checklist', selId], queryFn: () => api.listChecklist(selId), enabled: !!selId && showDetails });
+
+  const createProject = useMutation({
+    mutationFn: (d) => api.createProject(d),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['projects'] }); qc.invalidateQueries({ queryKey: ['dashboard'] }); resetForm(); },
+    onError: (err) => alert(err instanceof Error ? err.message : String(err)),
+  });
+  const updateProject = useMutation({ mutationFn: ({ id, data }) => api.updateProject(id, data), onSuccess: () => { qc.invalidateQueries({ queryKey: ['projects'] }); resetForm(); } });
+  const deleteProject = useMutation({
+    mutationFn: async (ids) => {
+      const uniqueIds = Array.from(new Set(ids.map(Number).filter(x => Number.isFinite(x) && x > 0)));
+      if (!uniqueIds.length) return { ok: true };
+      if (archived) await Promise.all(uniqueIds.map(id => api.deleteProject(id)));
+      else await Promise.all(uniqueIds.map(id => api.archiveProject(id)));
+      return { ok: true };
+    },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['projects'], refetchType: 'all' }); qc.invalidateQueries({ queryKey: ['dashboard'], refetchType: 'all' }); setSelId(null); setSelectedProjectIds([]); setProjectFocusId(null); setLastProjectClickedId(null); setConfirmDelIds([]); },
+    onError: (err) => alert(`${archived ? 'Delete' : 'Archive'} failed: ${err?.message || String(err)}`),
+  });
+  const restoreProjects = useMutation({
+    mutationFn: () => api.restoreProjectsFromFolders(),
+    onSuccess: (res) => { qc.invalidateQueries({ queryKey: ['projects'], refetchType: 'all' }); qc.invalidateQueries({ queryKey: ['dashboard'], refetchType: 'all' }); alert(`Restore complete\nScanned: ${res.scanned_folders}\nCreated: ${res.created_projects}\nUpdated: ${res.updated_projects}\nChecklist restored: ${res.restored_checklist_items}`); },
+    onError: (err) => alert(`Restore failed: ${err?.message || String(err)}`),
+  });
+  const createChecklistItem = useMutation({ mutationFn: (p) => api.createChecklistItem(p.projectId, { req_file_name: p.req_file_name, description: p.description, subfolder: p.subfolder, status: 'Pending' }), onSuccess: () => { qc.invalidateQueries({ queryKey: ['project-checklist', selId] }); setNewChecklistItem({ req_file_name: '', description: '', subfolder: 'Main' }); } });
+  const updateChecklistItem = useMutation({ mutationFn: ({ itemId, data }) => api.updateChecklistItem(itemId, data), onSuccess: () => qc.invalidateQueries({ queryKey: ['project-checklist', selId] }) });
+  const deleteChecklistItem = useMutation({ mutationFn: (itemId) => api.deleteChecklistItem(itemId), onSuccess: () => qc.invalidateQueries({ queryKey: ['project-checklist', selId] }) });
+
+  const resetForm = () => { setForm({ title: '', client_name: '', source_tender_id: '', project_value: '', prebid: '', deadline: '', description: '', status: projectStatus }); setShowForm(false); setEditMode(false); setFormEditable(true); };
+  const loadIntoForm = (p) => { setForm({ title: p.title || '', client_name: p.client_name || '', source_tender_id: p.source_tender_id || '', project_value: p.project_value || '', prebid: p.prebid || '', deadline: p.deadline || '', description: p.description || '', status: p.status || 'Active' }); setSelId(p.id); setSelectedProjectIds([p.id]); setProjectFocusId(p.id); setLastProjectClickedId(p.id); setEditMode(true); setFormEditable(false); setShowForm(true); };
+  const handleSubmit = () => { if (!form.title.trim()) return; if (editMode && selId) updateProject.mutate({ id: selId, data: form }); else createProject.mutate(form); };
+  const uf = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  const canEditForm = !editMode || formEditable;
+  const copyText = async (v) => { try { await navigator.clipboard.writeText(String(v || '')); } catch { /* silent */ } };
+
+  const openSelectedProjectFolder = async () => {
+    if (!desktop?.openPath) { alert('Open Folder is available in the desktop app.'); return; }
+    let rootFolder = '';
+    try { const root = await api.getProjectsRootFolder(archived); rootFolder = String(root?.root_folder || '').trim(); } catch { /* compat */ }
+    const rootCandidates = archived ? [rootFolder, 'backend/Archived Projects', 'Archived Projects'].filter(Boolean) : [rootFolder, 'backend/My_Tender_Projects', 'My_Tender_Projects'].filter(Boolean);
+    if (archived) { try { const ar = await api.getProjectsRootFolder(false); const arp = String(ar?.root_folder || '').trim(); if (arp) { const p = arp.replace(/\\/g, '/').replace(/\/+$/, '').split('/').slice(0, -1).join('/'); if (p) rootCandidates.push(`${p}/Archived Projects`); } } catch { /* ignore */ } }
+    const pc = []; let sti = ''; let st = '';
+    if (selId) {
+      let lp = null;
+      try { await api.ensureProjectFolder(selId); } catch { /* continue */ }
+      try { lp = await api.getProject(selId); } catch { lp = null; }
+      const cp = lp || selectedProject;
+      const df = String(cp?.folder_path || '').trim(); if (df) pc.push(df);
+      sti = String(cp?.source_tender_id || '').trim(); st = String(cp?.title || '').trim();
+      for (const root of rootCandidates) { if (sti) pc.push(`${root}/${sanitizeFolderLeaf(sti, 'Project')}`); if (st) pc.push(`${root}/${sanitizeFolderLeaf(st, 'Project')}`); }
+    }
+    if (selId && desktop?.ensureProjectFolders) {
+      const br = rootCandidates[0] || (archived ? 'backend/Archived Projects' : 'backend/My_Tender_Projects');
+      const leaf = sanitizeFolderLeaf(sti || st || `Project_${selId}`, `Project_${selId}`);
+      try { const mk = await desktop.ensureProjectFolders(`${br}${br.endsWith('\\') || br.endsWith('/') ? '' : '/'}${leaf}`); if (mk?.ok && mk.path) { pc.unshift(String(mk.path).trim()); try { await api.updateProject(selId, { folder_path: String(mk.path).trim() }); } catch { /* ignore */ } } } catch { /* ignore */ }
+    }
+    const ordered = Array.from(new Set((selId ? pc : rootCandidates).map(x => String(x || '').trim()).filter(Boolean)));
+    if (!ordered.length) { alert('Projects root folder is not available.'); return; }
+    let msg = '';
+    for (const c of ordered) { const r = await desktop.openPath(c); if (r?.ok) return; msg = String(r?.message || ''); }
+    alert(msg ? `Open folder failed: ${msg}` : 'Open folder failed.');
+  };
+
+  const openProjectWorkspace = async (project) => {
+    const pid = Number(project.id);
+    if (!Number.isFinite(pid) || pid <= 0) return;
+    if (onOpenProjectWorkspace) { onOpenProjectWorkspace(pid); return; }
+    window.open(`${window.location.origin}${window.location.pathname}?projectId=${pid}`, '_blank', 'noopener,noreferrer');
+  };
+
+  const filtered = useMemo(() => {
+    if (!search.trim()) return projects || [];
+    const q = search.toLowerCase();
+    return (projects || []).filter(p => (p.title || '').toLowerCase().includes(q) || (p.client_name || '').toLowerCase().includes(q) || (p.source_tender_id || '').toLowerCase().includes(q) || (p.description || '').toLowerCase().includes(q));
+  }, [projects, search]);
+
+  useEffect(() => {
+    const vis = new Set(filtered.map(p => p.id));
+    const ns = selectedProjectIds.filter(id => vis.has(id));
+    if (ns.length !== selectedProjectIds.length) setSelectedProjectIds(ns);
+    if (selId !== null && !vis.has(selId)) setSelId(ns[0] ?? null);
+    if (projectFocusId !== null && !vis.has(projectFocusId)) setProjectFocusId(ns[0] ?? null);
+  }, [filtered, selectedProjectIds, selId, projectFocusId]);
+
+  const applyRange = (project, additive) => {
+    if (!lastProjectClickedId) return false;
+    const ai = filtered.findIndex(x => x.id === lastProjectClickedId);
+    const ci = filtered.findIndex(x => x.id === project.id);
+    if (ai < 0 || ci < 0) return false;
+    const rangeIds = filtered.slice(Math.min(ai, ci), Math.max(ai, ci) + 1).map(x => x.id);
+    setSelectedProjectIds(additive ? Array.from(new Set([...selectedProjectIds, ...rangeIds])) : rangeIds);
+    setSelId(project.id); setProjectFocusId(project.id);
+    return true;
+  };
+
+  const handleProjectRowClick = (project, evt) => {
+    setConfirmDelIds([]);
+    const ctrl = evt.ctrlKey || evt.metaKey;
+    if (evt.shiftKey && applyRange(project, ctrl)) { setLastProjectClickedId(project.id); return; }
+    if (ctrl) { const e = selectedProjectIds.includes(project.id); setSelectedProjectIds(e ? selectedProjectIds.filter(id => id !== project.id) : [...selectedProjectIds, project.id]); setSelId(project.id); setProjectFocusId(project.id); setLastProjectClickedId(project.id); return; }
+    if (selectedProjectIds.length === 1 && selectedProjectIds[0] === project.id) { setSelectedProjectIds([]); setSelId(null); setProjectFocusId(project.id); setLastProjectClickedId(project.id); return; }
+    setSelectedProjectIds([project.id]); setSelId(project.id); setProjectFocusId(project.id); setLastProjectClickedId(project.id);
+  };
+
+  const onProjectsKeyDown = (evt) => {
+    if (filtered.length === 0) return;
+    const ci = projectFocusId ? filtered.findIndex(p => p.id === projectFocusId) : -1;
+    if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(evt.key)) {
+      evt.preventDefault();
+      const ctrlLike = evt.ctrlKey || evt.metaKey;
+      let ni = ci < 0 ? 0 : ci;
+      if (evt.key === 'ArrowDown') ni = ctrlLike ? filtered.length - 1 : Math.min(filtered.length - 1, ni + 1);
+      if (evt.key === 'ArrowUp') ni = ctrlLike ? 0 : Math.max(0, ni - 1);
+      if (evt.key === 'Home') ni = 0;
+      if (evt.key === 'End') ni = filtered.length - 1;
+      const np = filtered[ni];
+      if (!np) return;
+      if (ctrlLike && evt.shiftKey && (evt.key === 'ArrowDown' || evt.key === 'ArrowUp')) {
+        const anchor = (lastProjectClickedId && filtered.find(p => p.id === lastProjectClickedId)) || (projectFocusId && filtered.find(p => p.id === projectFocusId)) || np;
+        const ai = filtered.findIndex(x => x.id === anchor.id);
+        if (ai >= 0) {
+          const goingDown = evt.key === 'ArrowDown';
+          const start = goingDown ? ai : 0;
+          const end = goingDown ? filtered.length - 1 : ai;
+          const rangeIds = filtered.slice(start, end + 1).map(x => x.id);
+          setSelectedProjectIds(rangeIds);
+          setSelId(anchor.id);
+          setLastProjectClickedId(anchor.id);
+          setProjectFocusId(goingDown ? filtered[filtered.length - 1].id : filtered[0].id);
+        }
+        return;
+      }
+      setProjectFocusId(np.id);
+      return;
+    }
+    if (evt.code !== 'Space' && evt.key !== ' ') return;
+    evt.preventDefault();
+    const fp = (projectFocusId && filtered.find(p => p.id === projectFocusId)) || filtered[0];
+    if (!fp) return;
+    const ctrl = evt.ctrlKey || evt.metaKey;
+    if (evt.shiftKey && applyRange(fp, ctrl)) { setLastProjectClickedId(fp.id); return; }
+    setSelectedProjectIds(ctrl ? (selectedProjectIds.includes(fp.id) ? selectedProjectIds.filter(id => id !== fp.id) : [...selectedProjectIds, fp.id]) : [fp.id]);
+    setSelId(fp.id); setProjectFocusId(fp.id); setLastProjectClickedId(fp.id);
+  };
+
+  const projectColOrder = useMemo(() => projectsTable.columnOrder?.length ? projectsTable.columnOrder : PROJECT_COLUMNS.map(c => c.key), [projectsTable.columnOrder]);
+  const projectHidden = useMemo(() => new Set(projectsTable.hiddenColumns || []), [projectsTable.hiddenColumns]);
+  const orderedProjectCols = useMemo(() => { const byKey = new Map(PROJECT_COLUMNS.map(c => [c.key, c])); return projectColOrder.map(k => byKey.get(k)).filter(Boolean); }, [projectColOrder]);
+  const visibleProjectCols = orderedProjectCols.filter(c => c.fixed || !projectHidden.has(c.key));
+  const getProjectColWidth = (c) => { const v = projectsTable.columnWidths?.[c.key]; return Number.isFinite(v) && v > 0 ? v : c.width; };
+  const toggleProjectCol = (key) => { const n = new Set(projectHidden); if (n.has(key)) n.delete(key); else n.add(key); setProjectsHiddenColumns(Array.from(n)); };
+  const moveProjectCol = (from, to) => { if (from === to) return; const n = [...projectColOrder]; const [item] = n.splice(from, 1); n.splice(to, 0, item); setProjectsColumnOrder(n); };
+  const startProjectColResize = (col, startX) => {
+    const min = col.key === '_sr' ? 48 : 90; const sw = getProjectColWidth(col);
+    const onMove = (e) => setProjectsColumnWidth(col.key, Math.max(min, sw + (e.clientX - startX)));
+    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp);
+  };
+
+  useEffect(() => { const iv = setInterval(() => qc.invalidateQueries({ queryKey: ['projects'] }), 60_000); return () => clearInterval(iv); }, [qc]);
+
+  const CopyBtn = ({ val }) => (
+    <button onClick={() => copyText(val)} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)] transition-colors"><Copy size={12} /></button>
+  );
+
+  const projectForm = (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <div className="h-7 w-7 flex items-center justify-center rounded-lg bg-[var(--accent)]/10">
+            {editMode ? <Edit3 size={13} className="text-[var(--accent)]" /> : <Plus size={13} className="text-[var(--accent)]" />}
+          </div>
+          <h3 className="text-sm font-semibold text-[var(--text)]">{editMode ? 'Tender Details' : 'New Project'}</h3>
+        </div>
+        <div className="flex items-center gap-2">
+          {editMode && <button onClick={() => setFormEditable(v => !v)} className={cn('btn-ghost gap-1.5 text-xs', formEditable && 'bg-[var(--accent-bg)] text-[var(--accent)]')}><Edit3 size={12} />{formEditable ? 'Editing' : 'Edit'}</button>}
+          <button onClick={resetForm} className="text-[var(--text-muted)] hover:text-[var(--text)] transition-colors"><X size={16} /></button>
+        </div>
+      </div>
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-4">
+        <div>
+          <label className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">Tender ID</label>
+          <div className="relative"><input value={form.source_tender_id} readOnly={!canEditForm} onChange={e => uf('source_tender_id', e.target.value)} placeholder="2025/PWD/MH/12345" className="input-field h-9 w-full pr-8 text-sm" /><CopyBtn val={form.source_tender_id} /></div>
+        </div>
+        <div>
+          <label className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">Client</label>
+          <div className="relative"><input value={form.client_name} readOnly={!canEditForm} onChange={e => uf('client_name', e.target.value)} className="input-field h-9 w-full pr-8 text-sm" /><CopyBtn val={form.client_name} /></div>
+        </div>
+        <div>
+          <label className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">Value</label>
+          <div className="relative"><input value={form.project_value} readOnly={!canEditForm} onChange={e => uf('project_value', e.target.value)} className="input-field h-9 w-full pr-8 text-sm" /><CopyBtn val={form.project_value} /></div>
+        </div>
+        <div>
+          <label className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">Status</label>
+          <select value={form.status} disabled={!canEditForm} onChange={e => uf('status', e.target.value)} className="input-field h-9 w-full text-sm"><option>Active</option><option>Archived</option></select>
+        </div>
+      </div>
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+        <div>
+          <label className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">Prebid Date</label>
+          <div className="relative"><input value={form.prebid} readOnly={!canEditForm} onChange={e => uf('prebid', e.target.value)} placeholder="15-Apr-2026 03:00 PM" className="input-field h-9 w-full pr-8 text-sm" /><CopyBtn val={form.prebid} /></div>
+        </div>
+        <div>
+          <label className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">Deadline</label>
+          <div className="relative"><input value={form.deadline} readOnly={!canEditForm} onChange={e => uf('deadline', e.target.value)} placeholder="28-Apr-2026 05:00 PM" className="input-field h-9 w-full pr-8 text-sm" /><CopyBtn val={form.deadline} /></div>
+        </div>
+      </div>
+      <div>
+        <label className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">Title / Name of Work</label>
+        <div className="relative"><input value={form.title} readOnly={!canEditForm} onChange={e => uf('title', e.target.value)} className="input-field h-9 w-full pr-8 text-sm" /><CopyBtn val={form.title} /></div>
+      </div>
+      <div>
+        <label className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">Description</label>
+        <div className="relative">
+          <textarea value={form.description} readOnly={!canEditForm} onChange={e => uf('description', e.target.value)} rows={2} className="input-field w-full py-2 pr-8 text-sm resize-none" style={{ minHeight: 60 }} />
+          <button onClick={() => copyText(form.description)} className="absolute right-2 top-3 text-[var(--text-muted)] hover:text-[var(--text)] transition-colors"><Copy size={12} /></button>
+        </div>
+      </div>
+      <div className="flex items-center justify-end gap-2 pt-1 border-t border-[var(--border)]">
+        <button onClick={resetForm} className="btn-ghost text-sm">Cancel</button>
+        <button onClick={handleSubmit} disabled={!form.title.trim() || (editMode && !canEditForm)} className="btn-primary gap-1.5 text-sm">
+          <Save size={13} />{editMode ? 'Update' : 'Create Project'}
+        </button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="border-b border-[var(--border)] bg-[var(--surface-0)] px-6 py-4">
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2.5">
+            <h1 className="text-base font-bold text-[var(--text)]">{archived ? 'Archived Projects' : 'Projects'}</h1>
+            {!isLoading && <span className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-xs font-medium text-[var(--text-muted)]">{filtered.length}</span>}
+          </div>
+          <div className="flex items-center gap-2">
+            <button onClick={openSelectedProjectFolder} className="btn-ghost gap-1.5 text-xs"><FolderOpen size={13} />Open Folder</button>
+            {!archived && <button onClick={() => restoreProjects.mutate()} disabled={restoreProjects.isPending} className="btn-ghost gap-1.5 text-xs"><ArchiveRestore size={13} />{restoreProjects.isPending ? 'Restoring…' : 'Restore Folders'}</button>}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="relative flex-1 min-w-[180px] max-w-xs">
+            <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)]" />
+            <input value={search} onChange={e => setSearch(e.target.value)} placeholder={archived ? 'Search archived…' : 'Search projects…'} className="input-field h-9 w-full text-sm" style={{ paddingLeft: '2.25rem' }} />
+            {search && <button onClick={() => setSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><X size={13} /></button>}
+          </div>
+          <div className="h-5 w-px bg-[var(--border)]" />
+          <div className="flex items-center rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-0.5 gap-0.5">
+            {['table', 'cards'].map(mode => (
+              <button key={mode} onClick={() => setViewMode(mode)} className={cn('flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs transition-all', viewMode === mode ? 'bg-[var(--surface-0)] text-[var(--text)] shadow-sm' : 'text-[var(--text-muted)] hover:text-[var(--text)]')}>
+                {mode === 'table' ? <><List size={13} />Table</> : <><LayoutGrid size={13} />Cards</>}
+              </button>
+            ))}
+          </div>
+          {viewMode === 'table' && (
+            <div className="relative">
+              <button onClick={() => setShowColsMenu(v => !v)} className="btn-ghost gap-1.5 text-xs"><SlidersHorizontal size={13} />Columns</button>
+              {showColsMenu && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setShowColsMenu(false)} />
+                  <div className="card absolute left-0 top-9 z-50 max-h-80 w-60 overflow-auto border border-[var(--border)] p-2 shadow-xl">
+                    <p className="mb-2 border-b border-[var(--border)] px-2 pb-1.5 text-[10px] font-medium uppercase tracking-wider text-[var(--text-muted)]">Drag to reorder · toggle visibility</p>
+                    {orderedProjectCols.filter(c => !c.fixed).map((c, i) => (
+                      <div key={c.key} draggable onDragStart={() => setDragIdx(i)} onDragOver={e => e.preventDefault()}
+                        onDrop={() => { if (dragIdx !== null) { const nf = orderedProjectCols.filter(x => !x.fixed); const fk = nf[dragIdx]?.key; const tk = nf[i]?.key; if (fk && tk) { const fi = projectColOrder.indexOf(fk); const ti = projectColOrder.indexOf(tk); if (fi >= 0 && ti >= 0) moveProjectCol(fi, ti); } } setDragIdx(null); }}
+                        className={cn('flex cursor-grab items-center gap-2 rounded px-2 py-1.5 hover:bg-[var(--surface-1)]', dragIdx === i && 'opacity-50')}>
+                        <span className="select-none text-xs text-[var(--text-muted)]">⠿</span>
+                        <input type="checkbox" checked={!projectHidden.has(c.key)} onChange={() => toggleProjectCol(c.key)} className="accent-[var(--accent)]" />
+                        <span className="flex-1 text-xs">{c.label || c.key}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+          <div className="flex-1" />
+          <div className="flex items-center gap-1.5">
+            <button disabled={!selId} onClick={() => setShowDetails(v => !v)} className={cn('btn-ghost gap-1.5 text-xs', showDetails && selId && 'bg-[var(--accent-bg)] text-[var(--accent)]')}>
+              {showDetails ? <EyeOff size={13} /> : <Eye size={13} />}Details
+            </button>
+            <button disabled={!selId} onClick={() => { const p = filtered.find(x => x.id === selId); if (p) openProjectWorkspace(p); }} className="btn-ghost gap-1.5 text-xs">
+              <ExternalLink size={13} />Open
+            </button>
+            {!archived && <button disabled={!selId} onClick={() => { const p = filtered.find(x => x.id === selId); if (p) loadIntoForm(p); }} className="btn-secondary gap-1.5 text-xs"><Edit3 size={13} />Edit</button>}
+            {!archived && <button onClick={() => { resetForm(); setShowForm(v => !v); }} className="btn-primary gap-1.5 text-sm"><Plus size={14} />New Project</button>}
+            <button disabled={selectedProjectIds.length === 0} onClick={() => { const targets = selectedProjectIds.length ? selectedProjectIds : (selId ? [selId] : []); setConfirmDelIds(Array.from(new Set(targets))); }} className="btn-danger gap-1.5 text-xs">
+              <Trash2 size={13} />{archived ? 'Delete' : 'Archive'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {!isLoading && filtered.length > 0 && <StatsBar projects={filtered} />}
+
+      {!archived && showForm && projectsEntryMode === 'inline' && (
+        <div className="border-b border-[var(--border)] bg-[var(--surface-1)] px-6 py-5">{projectForm}</div>
+      )}
+
+      {confirmDelIds.length > 0 && (
+        <div className="flex items-center justify-between border-b border-rose-500/20 bg-rose-500/8 px-6 py-3">
+          <div className="flex items-center gap-2">
+            <Trash2 size={14} className="text-rose-400" />
+            <p className="text-sm text-rose-400">{archived ? `Permanently delete ${confirmDelIds.length} project(s)?` : `Archive ${confirmDelIds.length} project(s)?`}</p>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={() => setConfirmDelIds([])} className="btn-ghost text-xs">Cancel</button>
+            <button onClick={() => deleteProject.mutate(confirmDelIds)} className="btn-danger gap-1 text-xs"><Trash2 size={11} />{archived ? 'Delete permanently' : 'Archive'}</button>
+          </div>
+        </div>
+      )}
+
+      {showDetails && selId && selectedProject && (
+        <div className="border-b border-[var(--border)] bg-[var(--surface-1)] px-6 py-4 space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <ChevronRight size={14} className="text-[var(--text-muted)]" />
+              <h3 className="text-sm font-semibold text-[var(--text)] truncate max-w-[500px]">{selectedProject.title}</h3>
+              <Badge variant={selectedProject.status === 'Active' ? 'success' : 'muted'}>{selectedProject.status || 'Active'}</Badge>
+            </div>
+            <button onClick={() => setShowDetails(false)} className="text-[var(--text-muted)] hover:text-[var(--text)] transition-colors"><X size={14} /></button>
+          </div>
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            {[{ label: 'Tender ID', value: selectedProject.source_tender_id, mono: true }, { label: 'Client', value: selectedProject.client_name }, { label: 'Value', value: formatINR(selectedProject.project_value) }, { label: 'Deadline', value: selectedProject.deadline }].map(({ label, value, mono }) => (
+              <div key={label} className="rounded-lg bg-[var(--surface-0)] border border-[var(--border)] px-3 py-2.5">
+                <p className="text-[10px] font-medium uppercase tracking-wider text-[var(--text-muted)] mb-1">{label}</p>
+                <p className={cn('text-sm text-[var(--text)] truncate', mono && 'font-mono')}>{value || '—'}</p>
+              </div>
+            ))}
+          </div>
+          <div className="space-y-2 border-t border-[var(--border)] pt-3">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)]">Checklist</h4>
+              {checklist && <span className="text-xs text-[var(--text-muted)]">{checklist.filter(i => i.status === 'Completed').length}/{checklist.length} done</span>}
+            </div>
+            <div className="grid grid-cols-1 gap-2 lg:grid-cols-4">
+              <input value={newChecklistItem.req_file_name} onChange={e => setNewChecklistItem(v => ({ ...v, req_file_name: e.target.value }))} placeholder="Required file" className="input-field h-8 text-xs" />
+              <input value={newChecklistItem.description} onChange={e => setNewChecklistItem(v => ({ ...v, description: e.target.value }))} placeholder="Description" className="input-field h-8 text-xs" />
+              <input value={newChecklistItem.subfolder} onChange={e => setNewChecklistItem(v => ({ ...v, subfolder: e.target.value }))} placeholder="Subfolder" className="input-field h-8 text-xs" />
+              <button disabled={!newChecklistItem.req_file_name.trim()} onClick={() => createChecklistItem.mutate({ projectId: selId, req_file_name: newChecklistItem.req_file_name.trim(), description: newChecklistItem.description.trim(), subfolder: newChecklistItem.subfolder.trim() || 'Main' })} className="btn-primary gap-1 text-xs"><Plus size={12} />Add Item</button>
+            </div>
+            {checklistLoading ? <div className="flex justify-center py-4"><Spinner size={16} className="text-[var(--accent)]" /></div> : (
+              <table className="data-table">
+                <thead><tr><th className="w-10">#</th><th>Required File</th><th>Description</th><th>Subfolder</th><th className="w-20 text-center">Done</th><th className="w-16 text-center">Del</th></tr></thead>
+                <tbody>
+                  {(checklist || []).map(item => (
+                    <tr key={item.id} className={item.status === 'Completed' ? 'opacity-60' : ''}>
+                      <td className="text-[var(--text-muted)]">{item.sr_no}</td>
+                      <td className={cn('text-sm', item.status === 'Completed' && 'line-through text-[var(--text-muted)]')}>{item.req_file_name || '-'}</td>
+                      <td className="text-xs">{item.description || '-'}</td>
+                      <td className="text-xs">{item.subfolder || 'Main'}</td>
+                      <td className="text-center"><button onClick={() => updateChecklistItem.mutate({ itemId: item.id, data: { status: item.status === 'Completed' ? 'Pending' : 'Completed' } })} className={cn('inline-flex h-5 w-5 items-center justify-center rounded border transition-colors', item.status === 'Completed' ? 'border-[var(--accent)] bg-[var(--accent)] text-white' : 'border-[var(--border)] hover:border-[var(--accent)]')}>{item.status === 'Completed' ? <CheckSquare size={11} /> : <Square size={11} />}</button></td>
+                      <td className="text-center"><button onClick={() => deleteChecklistItem.mutate(item.id)} className="text-rose-400 hover:text-rose-500 transition-colors"><Trash2 size={12} /></button></td>
+                    </tr>
+                  ))}
+                  {(checklist || []).length === 0 && <tr><td colSpan={6}><EmptyState icon={Plus} title="No checklist items" description="Add first item above" /></td></tr>}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="flex-1 overflow-auto" tabIndex={0} onKeyDown={onProjectsKeyDown}>
+        {isLoading ? (
+          <div className="flex flex-col items-center justify-center py-24 gap-3">
+            <Spinner size={24} className="text-[var(--accent)]" />
+            <p className="text-sm text-[var(--text-muted)]">Loading projects…</p>
+          </div>
+        ) : viewMode === 'cards' ? (
+          <div className="p-6">
+            {filtered.length === 0 ? (
+              <EmptyState icon={FolderOpen} title={search ? 'No matches found' : 'No projects yet'} description={search ? `No projects match "${search}"` : "Click '+ New Project' to get started"}
+                action={!archived && !search ? <button onClick={() => { resetForm(); setShowForm(true); }} className="btn-primary gap-1.5 text-sm"><Plus size={14} />New Project</button> : undefined} />
+            ) : (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                {filtered.map(p => (
+                  <ProjectCard key={p.id} project={p} isSelected={selectedProjectIds.includes(p.id)} isFocused={projectFocusId === p.id}
+                    onClick={e => handleProjectRowClick(p, e)} onDoubleClick={() => openProjectWorkspace(p)} />
+                ))}
+              </div>
+            )}
+          </div>
+        ) : (
+          <table className="data-table" style={{ tableLayout: 'fixed', width: '100%' }}>
+            <thead>
+              <tr>
+                {visibleProjectCols.map(c => (
+                  <th key={c.key} style={{ width: getProjectColWidth(c) }} className="relative">
+                    <div className="flex items-center">{c.label}</div>
+                    <div className="absolute right-0 top-0 h-full w-2 cursor-col-resize hover:bg-[var(--accent)]/20" onMouseDown={e => { e.preventDefault(); e.stopPropagation(); startProjectColResize(c, e.clientX); }} />
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((p, i) => (
+                <tr key={p.id} onClick={e => handleProjectRowClick(p, e)} onDoubleClick={() => openProjectWorkspace(p)}
+                  className={cn('cursor-pointer', selectedProjectIds.includes(p.id) && 'row-selected', projectFocusId === p.id && 'ring-1 ring-[var(--accent)]/40')}>
+                  {visibleProjectCols.map(c => {
+                    if (c.key === '_sr') return <td key={c.key} className="text-[var(--text-muted)] text-center">{i + 1}</td>;
+                    if (c.key === 'source_tender_id') return <td key={c.key} className="font-mono text-xs text-[var(--accent)]">{p.source_tender_id || '—'}</td>;
+                    // One line only: a project made from a tender gets its
+                    // description seeded from that tender, so the two lines
+                    // were near-duplicates. The description moves to the
+                    // cell's tooltip, falling back to the title so a
+                    // truncated name still reveals in full on hover.
+                    if (c.key === 'title') return <td key={c.key} title={p.description || p.title || ''}><p className="text-[13px] leading-snug font-medium text-[var(--text)] line-clamp-2">{p.title}</p></td>;
+                    if (c.key === 'client_name') return <td key={c.key} className="text-sm text-[var(--text-muted)] truncate">{p.client_name || '—'}</td>;
+                    if (c.key === 'project_value') return <td key={c.key} className="font-mono text-sm">{formatINR(p.project_value)}</td>;
+                    if (c.key === '_time_left') return <td key={c.key}><TimeBadge dateStr={p.deadline} /></td>;
+                    if (c.key === 'status') return <td key={c.key}><Badge variant={p.status === 'Active' ? 'success' : 'muted'}>{p.status}</Badge></td>;
+                    return <td key={c.key} className="text-sm">{String(p[c.key] || '—')}</td>;
+                  })}
+                </tr>
+              ))}
+              {filtered.length === 0 && (
+                <tr><td colSpan={visibleProjectCols.length}>
+                  <EmptyState icon={FolderOpen} title={search ? 'No matches found' : 'No projects yet'} description={search ? `No projects match "${search}"` : "Click '+ New Project' to get started"}
+                    action={!archived && !search ? <button onClick={() => { resetForm(); setShowForm(true); }} className="btn-primary gap-1.5 text-sm"><Plus size={14} />New Project</button> : undefined} />
+                </td></tr>
+              )}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {!archived && showForm && projectsEntryMode === 'popup' && (
+        <>
+          <div className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm" onClick={resetForm} />
+          <div className="fixed inset-0 z-50 flex items-start justify-center overflow-auto px-4 py-8">
+            <div className="card w-full max-w-5xl border border-[var(--border)] bg-[var(--surface-0)] p-6 shadow-2xl">{projectForm}</div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   PROJECT WORKSPACE
+   — dropped: "Fetch tender info" (scraper + CAPTCHA sync) and "Check for
+     Corrigendum" (scraper re-sync + CAPTCHA fallback). Tender ID / title /
+     value / dates are edited manually here instead. Everything else —
+     checklist by folder, local file attach/rename/delete, preview panel,
+     manage-folders, save/apply template — is unchanged.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const FOLDER_ORDER = ['Ready Docs', 'Tender Docs', 'Working Docs'];
+
+function widenDateTimeGap(value) {
+  const txt = String(value || '').trim();
+  if (!txt) return '';
+  return txt.replace(/(\d{2}-[A-Za-z]{3}-\d{4})\s+(\d{1,2}:\d{2}\s*(?:AM|PM))/i, '$1   $2');
+}
+
+function normalizeValue2dp(value) {
+  const txt = String(value || '').trim();
+  if (!txt) return '';
+  const stripped = txt.replace(/[₹,\s]/g, '').replace(/Rs\.?/i, '').replace(/INR/i, '').trim();
+  if (!/^\d+(?:\.\d+)?$/.test(stripped)) return txt;
+  const n = Number(stripped);
+  if (!Number.isFinite(n)) return txt;
+  return n.toFixed(2);
+}
+
+function addIndianCommas(value) {
+  const txt = String(value || '').trim();
+  if (!txt) return '';
+  const stripped = txt.replace(/[₹,\s]/g, '').replace(/Rs\.?/i, '').replace(/INR/i, '').trim();
+  if (!/^\d+(?:\.\d+)?$/.test(stripped)) return txt;
+  const [intPart, decPart] = stripped.split('.');
+  let grouped = intPart;
+  if (intPart.length > 3) {
+    let tail = intPart.slice(-3);
+    let head = intPart.slice(0, -3);
+    while (head.length > 2) { tail = `${head.slice(-2)},${tail}`; head = head.slice(0, -2); }
+    grouped = `${head},${tail}`.replace(/^,/, '');
+  }
+  return decPart !== undefined ? `${grouped}.${decPart}` : grouped;
+}
+
+const WORKSPACE_VIEW_KEY = (projectId) => `bm-workspace-view-${projectId}`;
+
+function fileNameOnly(path) {
+  const txt = String(path || '');
+  if (!txt) return '';
+  const parts = txt.replace(/\\/g, '/').split('/');
+  return parts[parts.length - 1] || txt;
+}
+
+function sanitizeFileName(name) {
+  return String(name || '').replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').replace(/\s+/g, ' ').trim();
+}
+
+// Chromium blocks file:// subresources from the renderer, so in the desktop
+// app local previews go through the bmfile:// scheme registered in
+// electron/main.cjs. The plain file:// form is kept for the browser build,
+// which has no local attachments anyway.
+function toFileUrl(localPath) {
+  const forward = String(localPath || '').replace(/\\/g, '/');
+  // Per segment, because encodeURI leaves '#' and '?' alone: a file called
+  // "Annexure #2.pdf" would be truncated at the '#' and the preview would
+  // silently 404. encodeURIComponent escapes them, and splitting on '/'
+  // keeps the separators intact.
+  const encoded = forward.split('/').map(encodeURIComponent).join('/');
+  if (window.bidmanagerDesktop) return `bmfile://local/${encoded}`;
+  return `file:///${encoded}`;
+}
+
+function parseDeadlineText(input) {
+  const txt = String(input || '').trim();
+  if (!txt) return null;
+  const native = new Date(txt);
+  if (!Number.isNaN(native.getTime())) return native;
+  const m = txt.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})(?:\s+(\d{1,2}):(\d{2})\s*([AP]M))?$/i);
+  if (!m) return null;
+  const monMap = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+  const month = monMap[m[2].toLowerCase()];
+  if (month === undefined) return null;
+  let hour = Number(m[4] || '0');
+  const ampm = String(m[6] || '').toUpperCase();
+  if (ampm === 'PM' && hour < 12) hour += 12;
+  if (ampm === 'AM' && hour === 12) hour = 0;
+  const dt = new Date(Number(m[3]), month, Number(m[1]), hour, Number(m[5] || '0'), 0, 0);
+  return Number.isNaN(dt.getTime()) ? null : dt;
+}
+
+function getTimeRemaining(deadline) {
+  const target = parseDeadlineText(deadline);
+  if (!target) return { label: '—', urgent: false, expired: false };
+  const diff = target.getTime() - Date.now();
+  if (diff <= 0) return { label: 'Expired', urgent: false, expired: true };
+  const days = Math.floor(diff / 86400000);
+  const hours = Math.floor((diff % 86400000) / 3600000);
+  const mins = Math.floor((diff % 3600000) / 60000);
+  const urgent = days < 3;
+  if (days > 0) return { label: `${days}d ${hours}h ${mins}m`, urgent, expired: false };
+  if (hours > 0) return { label: `${hours}h ${mins}m`, urgent: true, expired: false };
+  return { label: `${mins}m`, urgent: true, expired: false };
+}
+
+function WorkspaceCopyBtn({ val, className }) {
+  const [copied, setCopied] = useState(false);
+  const handle = async () => {
+    try { await navigator.clipboard.writeText(String(val || '')); setCopied(true); setTimeout(() => setCopied(false), 1200); } catch { /* silent */ }
+  };
+  return (
+    <button onClick={handle} title="Copy" className={cn('absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors', className)}>
+      {copied ? <CheckCircle2 size={12} className="text-emerald-500" /> : <Copy size={12} />}
+    </button>
+  );
+}
+
+function InfoField({ label, children }) {
+  return (
+    <div>
+      <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-[var(--text-muted)]">{label}</label>
+      {children}
+    </div>
+  );
+}
+
+function ToolBtn({ icon: Icon, label, onClick, disabled, danger, active, spinning }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={cn(
+        'inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors whitespace-nowrap',
+        'hover:bg-[var(--surface-2)] disabled:pointer-events-none disabled:opacity-40',
+        danger ? 'text-rose-400 hover:bg-rose-500/10' : active ? 'text-[var(--accent)] bg-[var(--accent-bg)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'
+      )}
+    >
+      <Icon size={12} className={cn('shrink-0', spinning && 'animate-spin')} />{label}
+    </button>
+  );
+}
+
+function ProjectWorkspacePage({ projectId, embedded = false }) {
+  const qc = useQueryClient();
+  const [docName, setDocName] = useState('');
+  const [desc, setDesc] = useState('');
+  const [folder, setFolder] = useState('Ready Docs');
+  const [selectedId, setSelectedId] = useState(null);
+  const [infoEditable, setInfoEditable] = useState(false);
+  const [infoForm, setInfoForm] = useState({ source_tender_id: '', title: '', client_name: '', project_value: '', prebid: '', deadline: '' });
+  const [previewWidth, setPreviewWidth] = useState(330);
+  const [previewCollapsed, setPreviewCollapsed] = useState(false);
+  const [managedFolders, setManagedFolders] = useState([]);
+  const [manageFoldersOpen, setManageFoldersOpen] = useState(false);
+  const [newFolderName, setNewFolderName] = useState('');
+  const [renameFrom, setRenameFrom] = useState('');
+  const [renameTo, setRenameTo] = useState('');
+  const [moveFrom, setMoveFrom] = useState('');
+  const [moveTo, setMoveTo] = useState('');
+  const [deleteFolderName, setDeleteFolderName] = useState('');
+  const [textPreview, setTextPreview] = useState('');
+  const [textPreviewError, setTextPreviewError] = useState('');
+  // Why the image/PDF preview couldn't be fetched, '' when it's fine.
+  const [previewLoadError, setPreviewLoadError] = useState('');
+  const [saveTemplateOpen, setSaveTemplateOpen] = useState(false);
+  const [saveTemplateForm, setSaveTemplateForm] = useState({ template_no: '', organization: '', template_name: '', description: '', notes: '' });
+  const [savingTemplate, setSavingTemplate] = useState(false);
+  const [applyTemplateOpen, setApplyTemplateOpen] = useState(false);
+  const [templateSearch, setTemplateSearch] = useState('');
+  // The project header fields as they were when loaded (already normalized —
+  // see infoFromProject below), so "has the user actually changed anything?"
+  // is a straight comparison and the Save button can stay hidden until then.
+  const [pristineInfo, setPristineInfo] = useState(null);
+  // Attach File spans a native dialog + a disk copy + two writes; without this
+  // the button looks inert and can be double-clicked into a duplicate row.
+  const [attaching, setAttaching] = useState(false);
+  // Re-renders the deadline countdown so it actually ticks down while the
+  // workspace sits open.
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  // Checklist row id whose shared file is downloading right now, so only that
+  // row's button spins.
+  const [downloadingFileId, setDownloadingFileId] = useState(null);
+  // Rows this session already tried to share, so a row whose upload keeps
+  // failing (no network, file too large) isn't retried on every render.
+  const attemptedShareRef = useRef(new Set());
+  // Tender Documents modal: the linked tender's server-side files.
+  const [tenderDocsOpen, setTenderDocsOpen] = useState(false);
+  // Document id being downloaded by hand, or 'all' during Download all.
+  const [tenderDocBusy, setTenderDocBusy] = useState(null);
+  // server document id -> true when that file is already in Tender Docs.
+  const [tenderDocPresence, setTenderDocPresence] = useState({});
+  // Name of the file whose target already exists, '' when the prompt is shut.
+  const [nameClash, setNameClash] = useState('');
+  const nameClashResolve = useRef(null);
+  // row id -> why its file couldn't be shared. Drives the warning triangle in
+  // the Attachment cell; a failure was otherwise only an 8-second toast.
+  const [shareErrors, setShareErrors] = useState({});
+  // Row whose upload is being retried by hand right now.
+  const [retryingShareId, setRetryingShareId] = useState(null);
+  // Row whose ready checkbox is mid-write, so it can't be double-toggled.
+  const [togglingStatusId, setTogglingStatusId] = useState(null);
+  // row id -> true when that row's linked_file_path was confirmed on disk.
+  // Checked with the desktop bridge because a path synced from nowhere, a
+  // moved folder or a file deleted outside the app all look identical in the
+  // row itself.
+  const [localFilePresence, setLocalFilePresence] = useState({});
+
+  const desktop = window.bidmanagerDesktop;
+  const pushToast = useAppStore((s) => s.pushToast);
+
+  const { data: project, isLoading: projectLoading } = useQuery({ queryKey: ['project', projectId], queryFn: () => api.getProject(projectId) });
+  const { data: checklist, isLoading: checklistLoading, isFetching: checklistFetching } = useQuery({ queryKey: ['project-checklist', projectId], queryFn: () => api.listChecklist(projectId) });
+  const { data: allTemplates } = useQuery({ queryKey: ['templates'], queryFn: () => api.listTemplates(), enabled: applyTemplateOpen });
+
+  // ── The linked tender's documents ──────────────────────────────────────
+  // The server keeps one global set of scraped files per tender, so files
+  // fetched by any other user or platform are already downloadable here —
+  // the Projects side just never asked for them before.
+  const sourceTenderId = String(project?.source_tender_id || '').trim();
+  const { data: tenderRowId } = useQuery({
+    // source_tender_id is the portal id; the documents routes need the
+    // server row id, which can be renumbered by a restore.
+    queryKey: ['project-tender-row', sourceTenderId],
+    queryFn: () => api.resolveTenderRowId({ tender_id: sourceTenderId }),
+    enabled: Boolean(sourceTenderId),
+  });
+  const { data: tenderDocsPage, isFetching: tenderDocsFetching } = useQuery({
+    queryKey: ['project-tender-docs', tenderRowId],
+    queryFn: () => api.listTenderDocuments(tenderRowId, { page_size: 100 }),
+    enabled: Boolean(tenderRowId),
+  });
+  const tenderDocs = tenderDocsPage?.items || [];
+
+  const toastError = (label) => (error) => pushToast({ type: 'error', message: `${label}: ${error instanceof Error ? error.message : String(error)}` });
+
+  // Back to "adding a new item": no row selected, all three inputs blank.
+  // Every exit from an edit goes through this so the three never disagree.
+  const clearItemForm = useCallback(() => {
+    setSelectedId(null);
+    setDocName('');
+    setDesc('');
+    setFolder('Ready Docs');
+  }, []);
+
+  const createItem = useMutation({
+    mutationFn: () => api.createChecklistItem(projectId, { req_file_name: docName.trim(), description: desc.trim(), subfolder: folder, status: 'Pending' }),
+    onSuccess: () => { setDocName(''); setDesc(''); setFolder('Ready Docs'); qc.invalidateQueries({ queryKey: ['project-checklist', projectId] }); },
+    onError: toastError('Could not add the item'),
+  });
+  const updateItem = useMutation({
+    mutationFn: (itemId) => api.updateChecklistItem(itemId, { req_file_name: docName.trim(), description: desc.trim(), subfolder: folder }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['project-checklist', projectId] }),
+    onError: toastError('Could not update the item'),
+  });
+  const deleteItem = useMutation({
+    mutationFn: (itemId) => api.deleteChecklistItem(itemId),
+    onSuccess: () => { clearItemForm(); qc.invalidateQueries({ queryKey: ['project-checklist', projectId] }); },
+    onError: toastError('Could not delete the item'),
+  });
+  const updateProjectInfo = useMutation({
+    mutationFn: () => api.updateProject(projectId, { source_tender_id: infoForm.source_tender_id, title: infoForm.title, client_name: infoForm.client_name, project_value: infoForm.project_value, prebid: infoForm.prebid, deadline: infoForm.deadline }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['project', projectId] });
+      qc.invalidateQueries({ queryKey: ['projects'] });
+      // The saved values are the new baseline, so Save hides again until the
+      // next real edit (the project query refetch would do this too, but not
+      // until it lands).
+      setPristineInfo(infoForm);
+      setInfoEditable(false);
+    },
+    onError: toastError('Could not save project details'),
+  });
+
+  const selectedItem = useMemo(() => (checklist || []).find(x => x.id === selectedId) || null, [checklist, selectedId]);
+
+  // Selecting a row loads it into the toolbar inputs for editing; losing the
+  // selection empties them again, so the next Add Item starts blank instead of
+  // silently reusing the last row's text.
+  useEffect(() => {
+    if (!selectedItem) { setDocName(''); setDesc(''); setFolder('Ready Docs'); return; }
+    setDocName(selectedItem.req_file_name || '');
+    setDesc(selectedItem.description || '');
+    setFolder(selectedItem.subfolder || 'Ready Docs');
+  }, [selectedItem?.id]);
+
+  // The form shows normalized values (2dp amounts, widened date/time gaps),
+  // so the pristine baseline has to be the normalized object too — comparing
+  // against the raw project row would read "dirty" the instant it loads.
+  const infoFromProject = (row) => ({
+    source_tender_id: String(row.source_tender_id || ''),
+    title: String(row.title || ''),
+    client_name: String(row.client_name || ''),
+    project_value: normalizeValue2dp(String(row.project_value || '')),
+    prebid: widenDateTimeGap(String(row.prebid || '')),
+    deadline: String(row.deadline || ''),
+  });
+  useEffect(() => {
+    if (!project || infoEditable) return;
+    const next = infoFromProject(project);
+    setInfoForm(next);
+    setPristineInfo(next);
+    // Every field the form shows is a dependency — leaving title/client_name/
+    // source_tender_id out meant a change made on another device never
+    // refreshed the form, and would now also leave the baseline stale.
+  }, [project?.id, project?.deadline, project?.prebid, project?.project_value, project?.title, project?.client_name, project?.source_tender_id]);
+
+  const isInfoDirty = useMemo(() => {
+    if (!pristineInfo) return false;
+    return Object.keys(infoForm).some((key) => String(infoForm[key] ?? '') !== String(pristineInfo[key] ?? ''));
+  }, [infoForm, pristineInfo]);
+
+  // Cancel throws the edits away rather than leaving them on screen in a
+  // read-only grid, where they'd look saved.
+  const cancelInfoEdit = useCallback(() => {
+    if (pristineInfo) setInfoForm(pristineInfo);
+    setInfoEditable(false);
+  }, [pristineInfo]);
+
+  // One tick a minute is enough for an "19h 49m" style countdown.
+  useEffect(() => {
+    const timer = setInterval(() => setNowTick(Date.now()), 60000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const folderOptions = useMemo(() => {
+    const names = new Set(FOLDER_ORDER);
+    for (const f of managedFolders) { const c = String(f || '').trim(); if (c) names.add(c); }
+    for (const row of checklist || []) { const c = String(row.subfolder || '').trim(); if (c) names.add(c); }
+    const picked = String(folder || '').trim(); if (picked) names.add(picked);
+    return Array.from(names);
+  }, [managedFolders, checklist, folder]);
+
+  const grouped = useMemo(() => {
+    const source = checklist || [];
+    const map = new Map();
+    for (const key of folderOptions) map.set(key, []);
+    for (const row of source) { const key = (row.subfolder || 'Ready Docs').trim() || 'Ready Docs'; if (!map.has(key)) map.set(key, []); map.get(key).push(row); }
+    const ordered = [...FOLDER_ORDER.filter(k => map.has(k)), ...[...map.keys()].filter(k => !FOLDER_ORDER.includes(k)).sort()];
+    return ordered.map(name => ({ name, rows: map.get(name) || [] }));
+  }, [checklist, folderOptions]);
+
+  const totalItems = (checklist || []).length;
+  const completedItems = (checklist || []).filter(x => x.status === 'Completed').length;
+  const progressPct = totalItems > 0 ? Math.round((completedItems / totalItems) * 100) : 0;
+
+  const projectFolderPath = useMemo(() => {
+    const direct = String(project?.folder_path || '').trim();
+    if (direct) return direct;
+    const knownFolders = new Set([...FOLDER_ORDER, ...managedFolders, ...(checklist || []).map(x => String(x.subfolder || '').trim())].map(x => String(x || '').trim().toLowerCase()).filter(Boolean));
+    for (const row of checklist || []) {
+      const linked = String(row.linked_file_path || '').trim();
+      if (!linked) continue;
+      const normalized = linked.replace(/\\/g, '/');
+      const lower = normalized.toLowerCase();
+      for (const sub of knownFolders) {
+        const idx = lower.indexOf(`/${sub}/`);
+        if (idx > 0) return normalized.slice(0, idx).replace(/\/+$/, '');
+      }
+      const slash = normalized.lastIndexOf('/');
+      if (slash > 0) {
+        const parent = normalized.slice(0, slash).replace(/\/+$/, '');
+        const parts = parent.split('/');
+        const last = (parts[parts.length - 1] || '').trim().toLowerCase();
+        if (knownFolders.has(last)) { const root = parts.slice(0, -1).join('/').replace(/\/+$/, ''); if (root) return root; }
+        return parent;
+      }
+    }
+    return '';
+  }, [project?.folder_path, managedFolders, checklist]);
+
+  const openPath = async (path) => { if (!path.trim() || !desktop?.openPath) return; await desktop.openPath(path); };
+
+  const resolveExistingProjectFolder = async () => {
+    let lp = null;
+    try { await api.ensureProjectFolder(projectId); } catch { /* older backend */ }
+    try { lp = await api.getProject(projectId); } catch { lp = null; }
+    let rootFolder = '';
+    try { const r = await api.getProjectsRootFolder(); rootFolder = String(r?.root_folder || '').trim(); } catch { /* compat */ }
+    const rootCandidates = [rootFolder, 'backend/My_Tender_Projects', 'My_Tender_Projects'].filter(Boolean);
+    const sti = String(lp?.source_tender_id || infoForm.source_tender_id || '').trim();
+    const ttl = String(lp?.title || infoForm.title || '').trim();
+    const candidates = Array.from(new Set([String(projectFolderPath || '').trim(), String(lp?.folder_path || '').trim(), ...rootCandidates.flatMap(root => [sti ? `${root}/${sanitizeFolderLeaf(sti, 'Project')}` : '', ttl ? `${root}/${sanitizeFolderLeaf(ttl, 'Project')}` : ''])].map(x => String(x || '').trim()).filter(Boolean)));
+    if (!desktop?.pathExists) return candidates[0] || '';
+    for (const c of candidates) { const chk = await desktop.pathExists(c); if (chk?.ok && chk.exists && chk.isDir) return String(chk.resolved || c).trim(); }
+    if (desktop?.ensureProjectFolders) {
+      const br = rootFolder || 'backend/My_Tender_Projects';
+      const leaf = sanitizeFolderLeaf(sti || ttl || `Project_${projectId}`, `Project_${projectId}`);
+      const mk = await desktop.ensureProjectFolders(`${br}${br.endsWith('\\') || br.endsWith('/') ? '' : '/'}${leaf}`);
+      if (mk?.ok && mk.path) { const created = String(mk.path).trim(); try { await api.updateProject(projectId, { folder_path: created }); } catch { /* ignore */ } return created; }
+    }
+    return '';
+  };
+
+  const openProjectFolder = async () => {
+    if (!desktop?.openPath) { pushToast({ type: 'error', message: 'Open Folder is available in the desktop app.' }); return; }
+    const existing = await resolveExistingProjectFolder();
+    const candidates = Array.from(new Set([existing].map(x => String(x || '').trim()).filter(Boolean)));
+    if (!candidates.length) { pushToast({ type: 'error', message: 'Project folder is not available.' }); return; }
+    let msg = '';
+    for (const c of candidates) { const res = await desktop.openPath(c); if (res?.ok) return; msg = String(res?.message || ''); }
+    pushToast({ type: 'error', message: msg ? `Open folder failed: ${msg}` : 'Project folder is not available.' });
+  };
+
+  const uf = (k, v) => setInfoForm(prev => ({ ...prev, [k]: v }));
+
+  const handleSaveTemplate = async () => {
+    if (!saveTemplateForm.template_name.trim() || !saveTemplateForm.organization.trim()) return;
+    setSavingTemplate(true);
+    try {
+      await api.saveProjectAsTemplate(projectId, { template_no: saveTemplateForm.template_no ? Number(saveTemplateForm.template_no) : undefined, organization: saveTemplateForm.organization, template_name: saveTemplateForm.template_name, description: saveTemplateForm.description || undefined, notes: saveTemplateForm.notes || undefined });
+      setSaveTemplateOpen(false);
+      setSaveTemplateForm({ template_no: '', organization: '', template_name: '', description: '', notes: '' });
+      qc.invalidateQueries({ queryKey: ['templates'] });
+      pushToast({ type: 'success', message: 'Template saved.' });
+    } catch (err) {
+      pushToast({ type: 'error', message: `Save template failed: ${err instanceof Error ? err.message : String(err)}` });
+    } finally { setSavingTemplate(false); }
+  };
+
+  const handleApplyTemplate = async (templateId) => {
+    try {
+      const result = await api.applyTemplateToProject(projectId, templateId);
+      setApplyTemplateOpen(false);
+      qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+      pushToast({ type: 'success', message: `Template applied — ${result.added} item(s) added.` });
+    } catch (err) { pushToast({ type: 'error', message: `Apply template failed: ${err instanceof Error ? err.message : String(err)}` }); }
+  };
+
+  // Where a row's file lives on disk: the project folder, or its subfolder.
+  // Shared by attachFile and downloadRowFile so a downloaded file lands
+  // exactly where an attached one would.
+  const folderForSubfolder = (baseFolder, subfolder) => {
+    const clean = String(subfolder || 'Ready Docs').trim() || 'Ready Docs';
+    if (clean === 'Main') return baseFolder;
+    return `${baseFolder}${baseFolder.endsWith('\\') || baseFolder.endsWith('/') ? '' : '\\'}${clean}`;
+  };
+
+  const joinWorkspacePath = (dir, name) => (
+    `${dir}${dir.endsWith('\\') || dir.endsWith('/') ? '' : '\\'}${name}`
+  );
+
+  // "report.pdf" -> "report (2).pdf", stepping until the name is free. Mirrors
+  // how the server stores same-named files in one project
+  // (project_files.name_candidates).
+  const uniqueFileName = async (targetDir, name) => {
+    const dot = name.lastIndexOf('.');
+    const stem = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : '';
+    for (let n = 2; n < 100; n += 1) {
+      const candidate = `${stem} (${n})${ext}`;
+      const check = await desktop.pathExists(joinWorkspacePath(targetDir, candidate));
+      if (!check?.ok || !check.exists) return candidate;
+    }
+    return `${stem} (${Date.now()})${ext}`;
+  };
+
+  // Resolves to 'overwrite' | 'keep-both' | 'cancel' once the user picks. The
+  // promise's resolver is parked in a ref so the modal's buttons can settle it.
+  const askNameClash = (name) => new Promise((resolve) => {
+    nameClashResolve.current = resolve;
+    setNameClash(name);
+  });
+  const settleNameClash = (choice) => {
+    setNameClash('');
+    const resolve = nameClashResolve.current;
+    nameClashResolve.current = null;
+    if (resolve) resolve(choice);
+  };
+
+  const attachFile = async () => {
+    // The button is disabled without the desktop bridge, so this only guards
+    // against a stale render.
+    if (!desktop?.pickPath || !desktop?.copyFileToFolder || attaching) return;
+    setAttaching(true);
+    try {
+      const baseFolder = await resolveExistingProjectFolder();
+      if (!baseFolder) { pushToast({ type: 'error', message: 'Project folder is not available.' }); return; }
+      const pick = await desktop.pickPath({ file: true, title: 'Select attachment file' });
+      if (!pick?.ok || !pick.path) return;
+      const subfolder = selectedItem?.subfolder || folder || 'Ready Docs';
+      const cleanSubfolder = String(subfolder || 'Ready Docs').trim();
+      const targetDir = folderForSubfolder(baseFolder, cleanSubfolder);
+      // Keep the file's own name. It used to be renamed to the row's
+      // req_file_name, which lost the original and could produce odd results
+      // like "Bid Form.pdf.jpg" when the row name carried its own extension.
+      const pickedName = fileNameOnly(pick.path || '');
+      let desiredName = sanitizeFileName(pickedName);
+      const existing = desktop.pathExists ? await desktop.pathExists(joinWorkspacePath(targetDir, desiredName)) : null;
+      if (existing?.ok && existing.exists) {
+        // Original names collide far more readily than row names did, and
+        // copyFileToFolder overwrites without asking — so ask.
+        const choice = await askNameClash(desiredName);
+        if (choice === 'cancel') return;
+        if (choice === 'keep-both') desiredName = await uniqueFileName(targetDir, desiredName);
+      }
+      const copied = await desktop.copyFileToFolder({ sourcePath: pick.path, targetDir, targetName: desiredName || undefined });
+      if (!copied?.ok || !copied.path) { pushToast({ type: 'error', message: `Attach failed: ${copied?.message || 'Unknown error'}` }); return; }
+      let rowId = selectedItem?.id;
+      if (selectedItem) {
+        await api.updateChecklistItem(selectedItem.id, { linked_file_path: copied.path, status: 'Completed', subfolder: cleanSubfolder });
+      } else {
+        const created = await api.createChecklistItem(projectId, { req_file_name: (docName || desiredName).trim(), description: desc.trim(), subfolder: cleanSubfolder, linked_file_path: copied.path, status: 'Completed' });
+        rowId = created.id;
+        setSelectedId(created.id);
+      }
+      qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+      // The local copy is done and the row is correct. Sharing it is a second,
+      // independent step: if it fails the file is still attached here, so the
+      // error is reported but nothing is rolled back.
+      await uploadRowFile(rowId, copied.path, targetDir);
+    } catch (err) {
+      pushToast({ type: 'error', message: `Attach failed: ${err instanceof Error ? err.message : String(err)}` });
+    } finally { setAttaching(false); }
+  };
+
+  // Caches the server's view of a row's file locally so the UI reflects it at
+  // once. `server_file` is server-owned; this is a copy, never a claim.
+  // `invalidate: false` is for the catch-up pass: refetching after every row
+  // would restart the effect mid-run and emit one summary toast per file.
+  const markRowServerFile = async (rowId, serverFile, { invalidate = true } = {}) => {
+    await api.updateChecklistItem(rowId, { server_file: serverFile || null });
+    if (invalidate) qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+  };
+
+  // Pushes a row's local file to the server so every platform on this account
+  // can open it (API_CHANGES.md §3). One file per row, first upload wins.
+  // `quiet` suppresses the per-row toasts for the catch-up pass, which would
+  // otherwise fire one per row; it reports a single summary instead. Returns
+  // 'shared' | 'adopted' | 'failed' so the caller can count.
+  const uploadRowFile = async (rowId, localPath, targetDir, { quiet = false } = {}) => {
+    if (!rowId || !localPath) return 'failed';
+    const toast = (payload) => { if (!quiet) pushToast(payload); };
+    // The catch-up pass marks a row attempted before trying it, so a failure
+    // that is really "not yet" — offline, the project hasn't synced, another
+    // device mid-upload — must clear that mark or the row sits unshared until
+    // the app restarts.
+    const retryLater = (id) => attemptedShareRef.current.delete(id);
+    // Remembered so the row can show a warning triangle long after the toast
+    // has gone, and so the quiet catch-up pass doesn't swallow failures.
+    const noteFailure = (message) => setShareErrors((prev) => ({ ...prev, [rowId]: message }));
+    const clearFailure = () => setShareErrors((prev) => {
+      if (!(rowId in prev)) return prev;
+      const next = { ...prev };
+      delete next[rowId];
+      return next;
+    });
+    const upload = async () => api.uploadProjectFile({
+      checklistItemId: rowId,
+      projectId,
+      filePath: localPath,
+      device: 'desktop',
+    });
+    try {
+      // The server can only attach to a row it already has, so flush the
+      // debounced /client/sync push that createChecklistItem just armed.
+      try { await api.flushPendingSyncPush(); } catch { /* reported below if it matters */ }
+      let result;
+      try {
+        result = await upload();
+      } catch (err) {
+        // Belt and braces: the row still wasn't there, so push and retry once.
+        if (err?.status === 404 && err?.detail?.reason === 'row_not_found') {
+          const pushed = await api.pushUserData();
+          // A push before the first successful pull is a silent no-op
+          // (has_synced_once is false), so the retry would 404 again and the
+          // row would never be shared. Pull first — that sets the flag — then
+          // push for real.
+          if (pushed?.skipped) {
+            await api.pullUserData();
+            await api.pushUserData();
+          }
+          result = await upload();
+        } else throw err;
+      }
+      // Record the server's file on the row now. Without this the row can't
+      // show that it is shared until the next /client/sync pull — up to a
+      // whole sync interval later — so a successful upload and a failed one
+      // look identical. Writing it locally is only a cache: the next push
+      // echoes it back and the server replaces it with its own copy
+      // (client_api.py _keep_server_file), so this can't fake or clobber it.
+      // Caching it must not be able to turn a successful upload into a
+      // reported failure: the bytes are already on the server by this point,
+      // so a local write error is worth a line in the console and nothing
+      // more. (Without its own catch, an IndexedDB failure here fell into the
+      // catch below and told the user sharing had failed — which then made
+      // the catch-up pass re-upload and take the 409 "adopt" path.)
+      if (result?.file) {
+        try {
+          await markRowServerFile(rowId, result.file, { invalidate: !quiet });
+        } catch (cacheError) {
+          console.warn('Shared the file but could not cache server_file locally:', cacheError);
+        }
+      }
+      clearFailure();
+      toast({ type: 'success', message: `Attached ${fileNameOnly(localPath)} and shared with your other devices.` });
+      return 'shared';
+    } catch (err) {
+      const reason = err?.detail?.reason;
+      const localName = fileNameOnly(localPath);
+      if (err?.status === 409 && reason === 'file_exists') {
+        // Another platform got there first. Server-side that file is now the
+        // row's one and only file, so adopt it rather than leaving the two
+        // platforms showing different documents.
+        const winner = err.detail?.file;
+        const replaced = winner ? await adoptServerFile(rowId, winner, targetDir) : false;
+        // The copy made moments ago is now superseded and nothing points at
+        // it, so don't leave it behind as a duplicate in the project folder.
+        if (replaced && desktop?.deleteFile && fileNameOnly(localPath).toLowerCase() !== String(winner.name || '').toLowerCase()) {
+          try { await desktop.deleteFile(localPath); } catch { /* leaving it is harmless */ }
+        }
+        toast({
+          type: 'info',
+          message: replaced
+            ? `Another device attached a file to this row first — using that one (${winner.name}) instead of ${localName}.`
+            : 'Another device attached a file to this row first. Use Download File to get it.',
+        });
+        if (replaced) clearFailure(); else noteFailure('Another device attached a file to this row first. Use Download File to get it.');
+        return replaced ? 'adopted' : 'failed';
+      }
+      if (err?.status === 409 && reason === 'upload_in_progress') {
+        toast({ type: 'info', message: `Attached ${localName}. Another device is uploading a file for this row — try sharing again in a few seconds.` });
+        noteFailure('Another device is uploading a file for this row. Try again in a few seconds.');
+        retryLater(rowId);
+      } else if (err?.status === 413) {
+        // Genuinely permanent: retrying the same oversized file is pointless.
+        toast({ type: 'error', message: `Attached ${localName} on this device only: ${err.message || 'the file is too large to share.'}` });
+        noteFailure(err.message || 'The file is too large to share.');
+      } else if (err?.status === 404 && reason === 'row_not_found') {
+        toast({ type: 'info', message: `Attached ${localName}. It will be shared once the project has synced.` });
+        noteFailure('This item isn\'t on the server yet — it will share once the project syncs.');
+        retryLater(rowId);
+      } else {
+        const detail = err instanceof Error ? err.message : String(err);
+        toast({ type: 'error', message: `Attached ${localName} on this device only — could not share it: ${detail}` });
+        noteFailure(`${err?.status ? `HTTP ${err.status}${reason ? ` ${reason}` : ''} — ` : ''}${detail}`);
+        retryLater(rowId);
+      }
+      return 'failed';
+    }
+  };
+
+  // Downloads a server file over its signed URL and points the row at it,
+  // replacing whatever was there. Returns true when the file is on disk.
+  const adoptServerFile = async (rowId, serverFile, targetDir) => {
+    if (!desktop?.downloadFile || !serverFile?.id || !targetDir) return false;
+    try {
+      const { url } = await api.requestProjectFileDownload(serverFile.id);
+      if (!url) return false;
+      const name = sanitizeFileName(String(serverFile.name || 'file')) || 'file';
+      const destinationPath = `${targetDir}${targetDir.endsWith('\\') || targetDir.endsWith('/') ? '' : '\\'}${name}`;
+      const result = await desktop.downloadFile({ url, destinationPath });
+      if (!result?.ok || !result.path) return false;
+      // Stamp server_file too: on the 409 "first upload wins" path this row
+      // may not carry it yet, and without it the row would keep offering a
+      // Download for the file it just downloaded.
+      await api.updateChecklistItem(rowId, { linked_file_path: result.path, status: 'Completed', server_file: serverFile });
+      qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+      return true;
+    } catch { return false; }
+  };
+
+  // The Download action for a row whose file was uploaded from another
+  // platform. Takes the row so the table's per-row button and the toolbar
+  // button for the selected row share one implementation.
+  const downloadRowFile = async (item) => {
+    const serverFile = item?.server_file;
+    if (!item || !serverFile || downloadingFileId) return;
+    if (!desktop?.downloadFile) { pushToast({ type: 'error', message: 'Downloading files is available in the desktop app.' }); return; }
+    setDownloadingFileId(item.id);
+    try {
+      const baseFolder = await resolveExistingProjectFolder();
+      if (!baseFolder) { pushToast({ type: 'error', message: 'Project folder is not available.' }); return; }
+      const targetDir = folderForSubfolder(baseFolder, item.subfolder);
+      const ok = await adoptServerFile(item.id, serverFile, targetDir);
+      pushToast(ok
+        ? { type: 'success', message: `Downloaded ${serverFile.name}` }
+        : { type: 'error', message: `Could not download ${serverFile.name}.` });
+    } catch (err) {
+      pushToast({ type: 'error', message: `Download failed: ${err instanceof Error ? err.message : String(err)}` });
+    } finally { setDownloadingFileId(null); }
+  };
+
+  // Where this project keeps the tender's own documents.
+  const tenderDocsDir = async () => {
+    const baseFolder = await resolveExistingProjectFolder();
+    return baseFolder ? folderForSubfolder(baseFolder, 'Tender Docs') : '';
+  };
+
+  // Which of the tender's documents are already sitting in Tender Docs, so a
+  // row can offer Open instead of Download. Read from disk rather than the
+  // shared `documents` ledger, which belongs to the Tenders page.
+  const refreshTenderDocPresence = async (docs) => {
+    if (!desktop?.pathExists || !docs?.length) return;
+    const dir = await tenderDocsDir();
+    if (!dir) return;
+    const found = {};
+    for (const doc of docs) {
+        const check = await desktop.pathExists(joinWorkspacePath(dir, sanitizeFileName(String(doc.name || ''))));
+      found[doc.id] = Boolean(check?.ok && check.exists && !check.isDir);
+    }
+    setTenderDocPresence(prev => ({ ...prev, ...found }));
+  };
+
+  // Pull one of the tender's documents into the project's Tender Docs folder.
+  // Overwrites in place on a repeat: it is the same server file, not a
+  // different document the user picked, so there is nothing to disambiguate.
+  const downloadTenderDoc = async (doc, { quiet = false } = {}) => {
+    const dir = await tenderDocsDir();
+    if (!dir) { pushToast({ type: 'error', message: 'Project folder is not available.' }); return false; }
+    try {
+      await api.downloadTenderDocumentTo({
+        tenderDbId: tenderRowId,
+        documentId: doc.id,
+        fileName: sanitizeFileName(String(doc.name || 'file')),
+        targetDir: dir,
+      });
+      setTenderDocPresence(prev => ({ ...prev, [doc.id]: true }));
+      if (!quiet) pushToast({ type: 'success', message: `Downloaded ${doc.name}` });
+      return true;
+    } catch (err) {
+      if (!quiet) pushToast({ type: 'error', message: `Could not download ${doc.name}: ${err instanceof Error ? err.message : String(err)}` });
+      return false;
+    }
+  };
+
+  const downloadAllTenderDocs = async () => {
+    const pending = tenderDocs.filter(d => d.downloadable !== false);
+    if (!pending.length || tenderDocBusy) return;
+    setTenderDocBusy('all');
+    let ok = 0;
+    let failed = 0;
+    try {
+      // Sequential on purpose — Chromium throttles rapid programmatic
+      // downloads, the same reason the Tenders page's bulk loop is serial.
+      for (const doc of pending) {
+        // eslint-disable-next-line no-await-in-loop
+        if (await downloadTenderDoc(doc, { quiet: true })) ok += 1; else failed += 1;
+      }
+      pushToast({
+        type: failed ? 'error' : 'success',
+        message: `Downloaded ${ok} of ${pending.length} tender document(s)${failed ? `, ${failed} failed` : ''}.`,
+      });
+    } finally { setTenderDocBusy(null); }
+  };
+
+  // Nothing scraped yet: ask the server to go and fetch them. Only offered
+  // when the list is genuinely empty — re-running a scrape for a tender whose
+  // files are already stored runs a real browser session and can raise a
+  // captcha for no gain.
+  const requestTenderDocs = async () => {
+    if (tenderDocBusy) return;
+    setTenderDocBusy('request');
+    try {
+      await api.requestTenderDownload({ id: tenderRowId, tender_id: sourceTenderId, title: project?.title || '' });
+      pushToast({ type: 'info', message: 'Requested. The documents will appear here once the server has fetched them.' });
+    } catch (err) {
+      pushToast({ type: 'error', message: `Could not request the documents: ${err instanceof Error ? err.message : String(err)}` });
+    } finally { setTenderDocBusy(null); }
+  };
+
+  // Tick/untick a row's "ready" checkbox. Status is the only field touched, so
+  // this never disturbs the attachment or the toolbar inputs.
+  const toggleItemStatus = async (item) => {
+    if (!item || togglingStatusId) return;
+    setTogglingStatusId(item.id);
+    try {
+      await api.updateChecklistItem(item.id, { status: item.status === 'Completed' ? 'Pending' : 'Completed' });
+      qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+    } catch (err) {
+      pushToast({ type: 'error', message: `Could not update the status: ${err instanceof Error ? err.message : String(err)}` });
+    } finally { setTogglingStatusId(null); }
+  };
+
+  // Re-upload on demand after a failed share, from the row's warning triangle.
+  const retryRowShare = async (item) => {
+    const localPath = String(item?.linked_file_path || '').trim();
+    if (!item || !localPath || retryingShareId) return;
+    setRetryingShareId(item.id);
+    try {
+      const baseFolder = await resolveExistingProjectFolder();
+      if (!baseFolder) { pushToast({ type: 'error', message: 'Project folder is not available.' }); return; }
+      // Lets the automatic catch-up pass consider it again too.
+      attemptedShareRef.current.delete(item.id);
+      await uploadRowFile(item.id, localPath, folderForSubfolder(baseFolder, item.subfolder));
+    } finally { setRetryingShareId(null); }
+  };
+
+  // The row failed to share and still has only a local copy. Mid-upload rows
+  // have no recorded failure, so no warning flashes during a normal attach.
+  const rowShareFailed = (item) => Boolean(
+    shareErrors[item?.id] && String(item?.linked_file_path || '').trim() && !item?.server_file,
+  );
+
+  // Does this row's shared file differ from what's on this disk? Same test as
+  // serverFileNeedsDownload, per row, for the table's Download button.
+  const rowNeedsDownload = (item) => {
+    const serverFile = item?.server_file;
+    if (!serverFile) return false;
+    const localPath = String(item.linked_file_path || '').trim();
+    if (!localPath) return true;
+    if (localFilePresence[item.id] === false) return true;
+    return fileNameOnly(localPath).toLowerCase() !== String(serverFile.name || '').toLowerCase();
+  };
+
+  const attachmentPath = String(selectedItem?.linked_file_path || '').trim();
+  const attachmentName = fileNameOnly(attachmentPath);
+  // The server's copy of the selected row's file, if any. The server owns this
+  // field — see api.js uploadProjectFile.
+  const selectedServerFile = selectedItem?.server_file || null;
+  // "The shared file isn't the one on this disk": either nothing is attached
+  // here, or what is attached has a different name. A content comparison isn't
+  // possible (the renderer can't read the bytes), and §3 suggests the name.
+  const serverFileNeedsDownload = Boolean(
+    selectedServerFile && (
+      !attachmentPath
+      || localFilePresence[selectedItem?.id] === false
+      || fileNameOnly(attachmentPath).toLowerCase() !== String(selectedServerFile.name || '').toLowerCase()
+    )
+  );
+  // The row claims a path but the disk check says it isn't there.
+  const fileMissingOnDisk = Boolean(attachmentPath && localFilePresence[selectedItem?.id] === false);
+  // Safe to point an <img>/<iframe> at it: a local path, confirmed present
+  // (undefined means the check hasn't run yet, which is fine), and not
+  // superseded by a different file on the server.
+  const canPreviewLocal = Boolean(attachmentPath && !fileMissingOnDisk && !serverFileNeedsDownload);
+
+  // Every refetch hands back a fresh array, so key the disk check on the
+  // id:path pairs themselves — otherwise it re-runs a full sweep of IPC calls
+  // on each poll even when nothing about the paths changed.
+  const attachmentPathSignature = useMemo(
+    () => (checklist || []).map(row => `${row.id}:${String(row.linked_file_path || '').trim()}`).filter(entry => !entry.endsWith(':')).join('|'),
+    [checklist],
+  );
+
+  // Confirm on disk the paths the rows claim, so a row can't offer "Open File"
+  // for a file that isn't there, and does offer Download when the shared copy
+  // is the only one left (folder moved, file deleted outside the app).
+  useEffect(() => {
+    if (!desktop?.pathExists || !attachmentPathSignature) return undefined;
+    let cancelled = false;
+    (async () => {
+      const found = {};
+      for (const entry of attachmentPathSignature.split('|')) {
+        const split = entry.indexOf(':');
+        const id = Number(entry.slice(0, split));
+        const check = await desktop.pathExists(entry.slice(split + 1));
+        if (cancelled) return;
+        found[id] = Boolean(check?.ok && check.exists && !check.isDir);
+      }
+      if (!cancelled) setLocalFilePresence(prev => ({ ...prev, ...found }));
+    })();
+    return () => { cancelled = true; };
+  }, [attachmentPathSignature]);
+
+  // Share anything still local-only: a row whose file is on this disk but has
+  // no server_file, because its upload failed earlier or it was attached
+  // before files were shared at all. Runs once the on-disk check has settled,
+  // one row at a time so a folder of attachments can't saturate the uplink.
+  useEffect(() => {
+    if (!desktop?.uploadFile || !checklist?.length) return undefined;
+    const pending = checklist.filter(row => (
+      !row.server_file
+      && String(row.linked_file_path || '').trim()
+      && localFilePresence[row.id] === true
+      && !attemptedShareRef.current.has(row.id)
+    ));
+    if (!pending.length) return undefined;
+    let cancelled = false;
+    (async () => {
+      const baseFolder = await resolveExistingProjectFolder();
+      if (cancelled || !baseFolder) return;
+      let shared = 0;
+      for (const row of pending) {
+        if (cancelled) return;
+        // Mark before attempting, so a row that keeps failing is tried once
+        // per session rather than on every checklist refetch.
+        attemptedShareRef.current.add(row.id);
+        const outcome = await uploadRowFile(
+          row.id,
+          String(row.linked_file_path).trim(),
+          folderForSubfolder(baseFolder, row.subfolder),
+          { quiet: true },
+        );
+        if (outcome === 'shared' || outcome === 'adopted') shared += 1;
+      }
+      if (cancelled) return;
+      if (shared > 0) {
+        // One refetch for the whole pass, so every row's marker appears at once.
+        qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+        pushToast({ type: 'success', message: `Shared ${shared} already-attached file(s) with your other devices.` });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [checklist, localFilePresence, projectId]);
+
+  const isImage = /\.(png|jpg|jpeg|gif|bmp|webp|svg)$/i.test(attachmentName);
+  const isPdf = /\.pdf$/i.test(attachmentName);
+  const isTextLike = /\.(txt|log|csv|json|md|xml|html|css|js|ts|tsx|py)$/i.test(attachmentName);
+  const ext = (attachmentName.match(/\.([^.]+)$/)?.[1] || '').toLowerCase();
+
+  useEffect(() => {
+    let cancelled = false;
+    setTextPreview(''); setTextPreviewError('');
+    if (!attachmentPath || !isTextLike) return;
+    fetch(toFileUrl(attachmentPath)).then(r => r.text()).then(txt => { if (cancelled) return; setTextPreview(txt.slice(0, 4000)); }).catch(() => { if (cancelled) return; setTextPreviewError('Text preview is not available here. Use Open File.'); });
+    return () => { cancelled = true; };
+  }, [attachmentPath, isTextLike]);
+
+  // An <img>/<iframe> that can't load its source just draws an empty box —
+  // no error, nothing to act on. Ask for the bytes first and keep the reason
+  // if they don't come, so the pane can explain itself instead of going blank.
+  useEffect(() => {
+    let cancelled = false;
+    setPreviewLoadError('');
+    if (!canPreviewLocal || !(isImage || isPdf)) return undefined;
+    fetch(toFileUrl(attachmentPath))
+      .then((res) => { if (!cancelled && !res.ok) setPreviewLoadError(`The file could not be read (HTTP ${res.status}).`); })
+      .catch((err) => {
+        if (cancelled) return;
+        // The desktop bridge is present but the bmfile:// scheme isn't
+        // answering — which is what a hot-reloaded renderer on an
+        // already-running Electron looks like, since electron/main.cjs only
+        // registers that scheme at startup.
+        setPreviewLoadError(desktop
+          ? 'Preview could not load. If the app was updated while running, restart it.'
+          : `Preview is not available here: ${err?.message || err}`);
+      });
+    return () => { cancelled = true; };
+  }, [attachmentPath, canPreviewLocal, isImage, isPdf]);
+
+  const startPreviewResize = (startX) => {
+    const startW = previewWidth;
+    const onMove = (evt) => { const next = Math.max(240, Math.min(680, startW - (evt.clientX - startX))); setPreviewWidth(next); if (previewCollapsed) setPreviewCollapsed(false); };
+    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp);
+  };
+
+  const renameAttachedFile = async () => {
+    if (!selectedItem || !attachmentPath || !desktop?.renamePath) return;
+    const asked = window.prompt('New file name', String(attachmentName || '').trim());
+    const nextName = String(asked || '').trim();
+    if (!nextName) return;
+    const dir = attachmentPath.replace(/[\\\/][^\\\/]+$/, '');
+    const newPath = `${dir}${dir.endsWith('\\') || dir.endsWith('/') ? '' : '\\'}${nextName}`;
+    const result = await desktop.renamePath({ oldPath: attachmentPath, newPath });
+    if (!result?.ok || !result.path) { pushToast({ type: 'error', message: `Rename file failed: ${result?.message || 'Unknown error'}` }); return; }
+    await api.updateChecklistItem(selectedItem.id, { linked_file_path: result.path });
+    qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+  };
+
+  const deleteAttachedFile = async () => {
+    if (!selectedItem || (!attachmentPath && !selectedServerFile)) return;
+    const label = attachmentName || selectedServerFile?.name || 'this file';
+    if (!window.confirm(selectedServerFile
+      ? `Delete attached file?\n${label}\n\nThis removes it from the server too, for every device on this account.`
+      : `Delete attached file?\n${label}`)) return;
+    // Server first: if that fails the row keeps a shared file, and clearing
+    // the local copy would leave this device unable to see or remove it.
+    if (selectedServerFile?.id) {
+      try {
+        await api.deleteProjectFile(selectedServerFile.id);
+      } catch (err) {
+        pushToast({ type: 'error', message: `Could not remove the shared file: ${err instanceof Error ? err.message : String(err)}` });
+        return;
+      }
+    }
+    if (attachmentPath && desktop?.deleteFile && localFilePresence[selectedItem.id] !== false) {
+      const result = await desktop.deleteFile(attachmentPath);
+      // The server copy is already gone, so a missing local file is no longer
+      // a reason to stop — just clear the row.
+      if (!result?.ok) pushToast({ type: 'info', message: `Removed from the server. The local file could not be deleted: ${result?.message || 'unknown error'}` });
+    }
+    // Clear the cached server_file as well, or the row would still advertise a
+    // shared file (and offer to download it) until the next pull.
+    await api.updateChecklistItem(selectedItem.id, { linked_file_path: '', status: 'Pending', server_file: null });
+    attemptedShareRef.current.delete(selectedItem.id);
+    qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+  };
+
+  const deleteSelectedItem = async () => {
+    if (!selectedItem) return;
+    const label = String(selectedItem.req_file_name || selectedItem.description || `#${selectedItem.id}`);
+    if (!window.confirm(`Delete item?\n${label}`)) return;
+    await deleteItem.mutateAsync(selectedItem.id);
+  };
+
+  // Extra folders are saved on the project row (checklist_folders) as well as
+  // locally, so they sync to other devices -- the phone shows them even
+  // before they hold any item.
+  const saveFolders = (next) => {
+    const clean = [...new Set(next.map((x) => String(x || '').trim()).filter(Boolean))]
+      .filter((x) => !FOLDER_ORDER.some((d) => d.toLowerCase() === x.toLowerCase()));
+    setManagedFolders(clean);
+    api.updateProject(projectId, { checklist_folders: clean })
+      .then(() => qc.invalidateQueries({ queryKey: ['project', projectId] }))
+      .catch(() => {});
+  };
+  const ensureFolder = (name) => {
+    const clean = String(name || '').trim();
+    if (!clean) return false;
+    if (folderOptions.some(x => x.toLowerCase() === clean.toLowerCase())) return true;
+    saveFolders([...managedFolders, clean]);
+    return true;
+  };
+  const addFolder = () => { if (!ensureFolder(newFolderName)) return; setFolder(String(newFolderName || '').trim()); setNewFolderName(''); };
+  const renameFolder = async () => {
+    const from = String(renameFrom || '').trim(); const to = String(renameTo || '').trim();
+    if (!from || !to || from.toLowerCase() === to.toLowerCase()) return;
+    ensureFolder(to);
+    const hits = (checklist || []).filter(x => String(x.subfolder || '').trim().toLowerCase() === from.toLowerCase());
+    await Promise.all(hits.map(x => api.updateChecklistItem(x.id, { subfolder: to })));
+    saveFolders([...managedFolders, to].map(x => x.toLowerCase() === from.toLowerCase() ? to : x));
+    if (folder.toLowerCase() === from.toLowerCase()) setFolder(to);
+    setRenameFrom(''); setRenameTo('');
+    qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+  };
+  const moveFolderItems = async () => {
+    const from = String(moveFrom || '').trim(); const to = String(moveTo || '').trim();
+    if (!from || !to || from.toLowerCase() === to.toLowerCase()) return;
+    ensureFolder(to);
+    const hits = (checklist || []).filter(x => String(x.subfolder || '').trim().toLowerCase() === from.toLowerCase());
+    await Promise.all(hits.map(x => api.updateChecklistItem(x.id, { subfolder: to })));
+    setMoveFrom(''); setMoveTo('');
+    qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+  };
+  const deleteFolder = async () => {
+    const name = String(deleteFolderName || '').trim();
+    if (!name) return;
+    if (FOLDER_ORDER.some(x => x.toLowerCase() === name.toLowerCase())) { pushToast({ type: 'error', message: 'Default folders cannot be deleted.' }); return; }
+    const hits = (checklist || []).filter(x => String(x.subfolder || '').trim().toLowerCase() === name.toLowerCase());
+    if (hits.length > 0) { const target = folderOptions.find(x => x.toLowerCase() !== name.toLowerCase()) || 'Ready Docs'; await Promise.all(hits.map(x => api.updateChecklistItem(x.id, { subfolder: target }))); }
+    saveFolders(managedFolders.filter(x => x.toLowerCase() !== name.toLowerCase()));
+    if (folder.toLowerCase() === name.toLowerCase()) setFolder('Ready Docs');
+    setDeleteFolderName('');
+    qc.invalidateQueries({ queryKey: ['project-checklist', projectId] });
+  };
+
+  useEffect(() => {
+    if (!embedded) return;
+    // Leaving edit mode is a cancel: put the loaded values back rather than
+    // leaving unsaved edits sitting there read-only.
+    const onEditToggle = () => {
+      if (infoEditable) cancelInfoEdit();
+      else setInfoEditable(true);
+    };
+    const onSave = () => { if (!infoEditable || !isInfoDirty || updateProjectInfo.isPending) return; updateProjectInfo.mutate(); };
+    const onOpenFolder = () => { void openProjectFolder(); };
+    window.addEventListener('bm-workspace-edit-toggle', onEditToggle);
+    window.addEventListener('bm-workspace-save', onSave);
+    window.addEventListener('bm-workspace-open-folder', onOpenFolder);
+    return () => {
+      window.removeEventListener('bm-workspace-edit-toggle', onEditToggle);
+      window.removeEventListener('bm-workspace-save', onSave);
+      window.removeEventListener('bm-workspace-open-folder', onOpenFolder);
+    };
+  }, [embedded, infoEditable, isInfoDirty, cancelInfoEdit, updateProjectInfo.isPending, projectFolderPath]);
+
+  // The drawer header lives in App() and can only learn about this component
+  // through events — same one-way channel the countdown already uses. Without
+  // this it can't tell whether Save has anything to save.
+  useEffect(() => {
+    if (!embedded) return undefined;
+    const detail = { editable: infoEditable, dirty: isInfoDirty, saving: updateProjectInfo.isPending };
+    window.dispatchEvent(new CustomEvent('bm-workspace-state', { detail }));
+    return () => { window.dispatchEvent(new CustomEvent('bm-workspace-state', { detail: { editable: false, dirty: false, saving: false } })); };
+  }, [embedded, infoEditable, isInfoDirty, updateProjectInfo.isPending]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(WORKSPACE_VIEW_KEY(projectId));
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      if (typeof saved.selectedId === 'number' || saved.selectedId === null) setSelectedId(saved.selectedId ?? null);
+      if (typeof saved.folder === 'string' && saved.folder.trim()) setFolder(saved.folder.trim());
+      if (typeof saved.previewWidth === 'number' && Number.isFinite(saved.previewWidth)) setPreviewWidth(Math.max(240, Math.min(680, saved.previewWidth)));
+      if (typeof saved.previewCollapsed === 'boolean') setPreviewCollapsed(saved.previewCollapsed);
+      // infoEditable is deliberately NOT restored — reopening straight into
+      // edit mode around a form loaded from a since-changed project is how
+      // stale values get saved over fresh ones.
+      if (Array.isArray(saved.managedFolders)) setManagedFolders(saved.managedFolders.map((x) => String(x || '').trim()).filter(Boolean));
+    } catch { /* ignore */ }
+  }, [projectId]);
+
+  // Folders saved on the project (by this or another desktop) are added to
+  // the local list; nothing is removed here.
+  useEffect(() => {
+    const synced = Array.isArray(project?.checklist_folders) ? project.checklist_folders : [];
+    if (!synced.length) return;
+    setManagedFolders((prev) => {
+      const next = [...prev];
+      for (const f of synced) {
+        const clean = String(f || '').trim();
+        if (clean && !next.some((x) => x.toLowerCase() === clean.toLowerCase())) next.push(clean);
+      }
+      return next.length === prev.length ? prev : next;
+    });
+  }, [project?.id, JSON.stringify(project?.checklist_folders || [])]);
+
+  useEffect(() => {
+    localStorage.setItem(WORKSPACE_VIEW_KEY(projectId), JSON.stringify({ selectedId, folder, previewWidth, previewCollapsed, managedFolders }));
+  }, [projectId, selectedId, folder, previewWidth, previewCollapsed, managedFolders]);
+
+  // nowTick (one minute) is what actually re-runs this — the deadline itself
+  // rarely changes, so without it the countdown froze at its first value.
+  const timeRemaining = useMemo(() => getTimeRemaining(infoForm.deadline), [infoForm.deadline, nowTick]);
+
+  useEffect(() => {
+    const label = timeRemaining.expired ? 'Expired' : timeRemaining.label !== '—' ? `Time Remaining: ${timeRemaining.label}` : 'Time Remaining: -';
+    window.dispatchEvent(new CustomEvent('bm-workspace-time-remaining', { detail: { label, urgent: Boolean(timeRemaining.urgent), expired: Boolean(timeRemaining.expired) } }));
+    return () => { window.dispatchEvent(new CustomEvent('bm-workspace-time-remaining', { detail: { label: '', urgent: false, expired: false } })); };
+  }, [timeRemaining]);
+
+  if (projectLoading) return <div className="flex h-full items-center justify-center"><Spinner size={24} className="text-[var(--accent)]" /></div>;
+
+  return (
+    <div className={cn('flex flex-col bg-[var(--bg)] text-[var(--text)]', embedded ? 'h-full' : 'h-screen')}>
+      {/* ── Info Panel ─────────────────────────────────────────────────────── */}
+      <div className="border-b border-[var(--border)] bg-[var(--surface-0)] px-5 py-3">
+        <div className="flex flex-wrap items-end gap-x-4 gap-y-2 mb-3">
+          <div className="min-w-[190px] flex-[2.3]">
+            <InfoField label="Tender ID">
+              <div className="relative">
+                <input value={infoForm.source_tender_id} readOnly={!infoEditable} onChange={e => uf('source_tender_id', e.target.value)} className="input-field h-8 w-full text-xs" style={{ paddingRight: '2rem' }} />
+                <WorkspaceCopyBtn val={infoForm.source_tender_id} />
+              </div>
+            </InfoField>
+          </div>
+          <div className="min-w-[200px] flex-[3]">
+            <InfoField label="Client">
+              <div className="relative">
+                <input value={infoForm.client_name} readOnly={!infoEditable} onChange={e => uf('client_name', e.target.value)} className="input-field h-8 w-full text-xs" style={{ paddingRight: '2rem' }} />
+                <WorkspaceCopyBtn val={infoForm.client_name} />
+              </div>
+            </InfoField>
+          </div>
+          <div className="min-w-[120px] flex-[1.2]">
+            <InfoField label="Value">
+              <div className="relative">
+                <input value={addIndianCommas(infoForm.project_value)} readOnly={!infoEditable} onChange={e => uf('project_value', e.target.value.replace(/,/g, ''))} className="input-field h-8 w-full text-xs" style={{ paddingRight: '2rem' }} />
+                <WorkspaceCopyBtn val={infoForm.project_value} />
+              </div>
+            </InfoField>
+          </div>
+          <div className="min-w-[180px] flex-[1.7]">
+            <InfoField label="Prebid">
+              <div className="relative">
+                <input value={infoForm.prebid} readOnly={!infoEditable} onChange={e => uf('prebid', e.target.value)} className="input-field h-8 w-full text-xs" style={{ paddingRight: '2rem' }} />
+                <WorkspaceCopyBtn val={infoForm.prebid} />
+              </div>
+            </InfoField>
+          </div>
+          <div className="min-w-[160px] flex-[1.5]">
+            <InfoField label="Deadline">
+              <div className="relative">
+                <input value={infoForm.deadline} readOnly={!infoEditable} onChange={e => uf('deadline', e.target.value)} className="input-field h-8 w-full text-xs" style={{ paddingRight: '2rem' }} />
+                <WorkspaceCopyBtn val={infoForm.deadline} />
+              </div>
+            </InfoField>
+          </div>
+        </div>
+
+        <div className="flex gap-4 items-start">
+          <div className="flex-1 min-w-0">
+            <InfoField label="Name of Work">
+              <div className="relative">
+                <textarea value={infoForm.title} readOnly={!infoEditable} onChange={e => uf('title', e.target.value)} rows={2} className="input-field w-full resize-none py-2 pr-8 text-xs leading-5" style={{ minHeight: 56, paddingRight: '2rem' }} />
+                <WorkspaceCopyBtn val={infoForm.title} className="top-3 -translate-y-0" />
+              </div>
+            </InfoField>
+          </div>
+          <div className="shrink-0 w-48 flex flex-col gap-2.5 pt-0.5">
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-[10px] font-medium uppercase tracking-wider text-[var(--text-muted)]">Progress</span>
+                <span className="text-xs font-bold text-[var(--text)]">{progressPct}%</span>
+              </div>
+              <div className="h-1.5 w-full rounded-full bg-[var(--surface-2)]">
+                <div className={cn('h-1.5 rounded-full transition-all', progressPct === 100 ? 'bg-emerald-500' : 'bg-[var(--accent)]')} style={{ width: `${progressPct}%` }} />
+              </div>
+              <p className="mt-1 text-[10px] text-[var(--text-muted)]">{completedItems} of {totalItems} docs ready</p>
+            </div>
+            {/* In the drawer the header already carries Edit/Save, so this
+                second copy is hidden; the standalone window has no header
+                and keeps it. */}
+            {!embedded && (!infoEditable ? (
+              <button onClick={() => setInfoEditable(true)} className="btn-secondary gap-1.5 text-xs w-full justify-center"><Pencil size={12} />Edit Info</button>
+            ) : (
+              <div className="flex gap-1.5">
+                <button onClick={cancelInfoEdit} className="btn-ghost text-xs flex-1 justify-center">Cancel</button>
+                {isInfoDirty && (
+                  <button onClick={() => updateProjectInfo.mutate()} disabled={updateProjectInfo.isPending} className="btn-primary gap-1 text-xs flex-1 justify-center">
+                    <Save size={12} />{updateProjectInfo.isPending ? 'Saving…' : 'Save'}
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Add Item Toolbar ────────────────────────────────────────────────── */}
+      <div className="border-b border-[var(--border)] bg-[var(--surface-1)] px-5 py-2.5">
+        <div className="flex flex-wrap items-center gap-2">
+          <input value={docName} onChange={e => setDocName(e.target.value)} placeholder="Document Name" className="input-field h-9 min-w-[160px] flex-1 text-sm" />
+          <input value={desc} onChange={e => setDesc(e.target.value)} placeholder="Description" className="input-field h-9 min-w-[140px] flex-[1.2] text-sm" />
+          <select value={folder} onChange={e => setFolder(e.target.value)} className="input-field h-9 text-sm min-w-[130px]">
+            {folderOptions.map(f => <option key={f}>{f}</option>)}
+          </select>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button disabled={!docName.trim() || createItem.isPending} onClick={() => createItem.mutate()} className="btn-primary gap-1 text-xs h-9"><Plus size={13} />Add Item</button>
+            <button
+              onClick={attachFile}
+              disabled={!desktop || attaching}
+              title={desktop ? 'Copy a file into the project folder, link it, and share it with your other devices' : 'Available in the desktop app only'}
+              className="btn-secondary gap-1 text-xs h-9"
+            >
+              {attaching ? <Spinner size={13} /> : <Paperclip size={13} />}{attaching ? 'Attaching…' : 'Attach File'}
+            </button>
+            <button disabled={!selectedItem || updateItem.isPending} onClick={() => selectedItem && updateItem.mutate(selectedItem.id)} className="btn-secondary text-xs h-9 px-3">Update</button>
+            <button disabled={!selectedItem || deleteItem.isPending} onClick={deleteSelectedItem} className="btn-danger gap-1 text-xs h-9"><Trash2 size={13} />Delete Item</button>
+          </div>
+        </div>
+
+
+        <div className="mt-2 flex items-center gap-0.5 flex-wrap">
+          {/* localFilePresence === false means the path is recorded but the
+              file isn't there, so Open/Rename would both fail. */}
+          <ToolBtn icon={Link2} label="Open File" disabled={!attachmentPath || localFilePresence[selectedItem?.id] === false} onClick={() => openPath(attachmentPath)} />
+          <ToolBtn icon={Pencil} label="Rename File" disabled={!attachmentPath || localFilePresence[selectedItem?.id] === false} onClick={renameAttachedFile} />
+          {serverFileNeedsDownload && (
+            <ToolBtn
+              icon={Download}
+              label={downloadingFileId === selectedItem?.id ? 'Downloading…' : 'Download File'}
+              spinning={downloadingFileId === selectedItem?.id}
+              disabled={Boolean(downloadingFileId) || !desktop}
+              onClick={() => downloadRowFile(selectedItem)}
+            />
+          )}
+          <ToolBtn icon={Trash2} label="Delete File" disabled={!attachmentPath && !selectedServerFile} onClick={deleteAttachedFile} danger />
+          <span className="mx-1 h-4 w-px bg-[var(--border)] shrink-0" />
+          <ToolBtn icon={FolderCog} label="Manage Folders" onClick={() => setManageFoldersOpen(true)} />
+          <ToolBtn icon={RefreshCw} label={checklistFetching ? 'Refreshing…' : 'Refresh'} spinning={checklistFetching} disabled={checklistFetching} onClick={() => qc.invalidateQueries({ queryKey: ['project-checklist', projectId] })} />
+          <ToolBtn icon={BookOpen} label="Apply Template" onClick={() => { setTemplateSearch(''); setApplyTemplateOpen(true); }} />
+          {/* The tender's own scraped documents — the server holds one global
+              set per tender, so files fetched on another device are here too. */}
+          <ToolBtn
+            icon={FileDown}
+            label={tenderDocs.length ? `Tender Docs (${tenderDocs.length})` : 'Tender Docs'}
+            spinning={tenderDocsFetching}
+            disabled={!sourceTenderId}
+            title={sourceTenderId ? undefined : 'This project has no tender ID'}
+            onClick={() => { setTenderDocsOpen(true); refreshTenderDocPresence(tenderDocs); }}
+          />
+          <span className="mx-1 h-4 w-px bg-[var(--border)] shrink-0" />
+          <ToolBtn icon={Save} label="Save Template" disabled={!(checklist || []).length} onClick={() => { setSaveTemplateForm(f => ({ ...f, template_name: String(project?.title || ''), organization: String(project?.client_name || '') })); setSaveTemplateOpen(true); }} />
+        </div>
+      </div>
+
+      {/* ── Bid Agent chat (above the Ready Docs checklist) ─────────────────── */}
+      {project && (
+        <AgentChatPanel
+          project={project}
+          resolveProjectFolder={resolveExistingProjectFolder}
+          folderFor={folderForSubfolder}
+          pushToast={pushToast}
+        />
+      )}
+
+      {/* ── Main Content ────────────────────────────────────────────────────── */}
+      <div className="flex min-h-0 flex-1">
+        {/* Clicking the empty space below the rows deselects — "click out to
+            clear" should work by clicking away, not only by clicking the
+            selected row again. Row clicks stopPropagation so they win. */}
+        <div className="min-w-0 flex-1 overflow-auto" onClick={() => setSelectedId(null)}>
+          {checklistLoading ? (
+            <div className="flex flex-col items-center justify-center py-16 gap-3">
+              <Spinner size={18} className="text-[var(--accent)]" />
+              <p className="text-xs text-[var(--text-muted)]">Loading checklist…</p>
+            </div>
+          ) : (
+            <table className="data-table">
+              <thead>
+                <tr><th className="w-12">SR</th><th className="w-10" /><th>Document Name</th><th>Description</th><th className="w-32">Status</th><th>Attachment</th></tr>
+              </thead>
+              <tbody>
+                {grouped.map((g, gidx) => (
+                  <Fragment key={`group-${g.name}-${gidx}`}>
+                    <tr className="group/folder">
+                      {/* No number here — item numbering restarts at 1 inside
+                          each folder, so a group number in the same column
+                          just reads as a stray item. */}
+                      <td className="bg-[var(--surface-2)]/60 py-1.5" />
+                      <td colSpan={5} className="bg-[var(--surface-2)]/60 py-1.5">
+                        <div className="flex items-center gap-2">
+                          <FolderOpen size={13} className="text-[var(--accent)]/60 shrink-0" />
+                          <span className="text-xs font-semibold text-[var(--text)]">{g.name}</span>
+                          {g.rows.length === 0 ? (
+                            // Cheaper than a whole "No items in this folder"
+                            // row per empty folder, which pre-seeding every
+                            // known folder name produced a wall of.
+                            <span className="text-[10px] text-[var(--text-muted)]/50 italic ml-1">empty</span>
+                          ) : (
+                            <span className="text-[10px] text-[var(--text-muted)] ml-1">{g.rows.filter(r => r.status === 'Completed').length}/{g.rows.length}</span>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                    {g.rows.map((item, i) => (
+                      <tr key={item.id} onClick={(event) => { event.stopPropagation(); setSelectedId(item.id === selectedId ? null : item.id); }} className={cn('cursor-pointer group/row', item.id === selectedId && 'row-selected')}>
+                        <td className="text-center text-[var(--text-muted)] text-xs">{i + 1}</td>
+                        {/* Tick to mark the document ready, same gesture as the
+                            Bidwise checklist. Doesn't select the row. */}
+                        <td className="text-center">
+                          <input
+                            type="checkbox"
+                            checked={item.status === 'Completed'}
+                            onChange={() => toggleItemStatus(item)}
+                            onClick={(event) => event.stopPropagation()}
+                            disabled={togglingStatusId === item.id}
+                            title={item.status === 'Completed' ? 'Mark as pending' : 'Mark as completed'}
+                            aria-label={`${item.req_file_name || 'Item'} ready`}
+                            className="h-4 w-4 cursor-pointer accent-[var(--accent)] align-middle"
+                          />
+                        </td>
+                        <td><p className={cn('text-sm', item.status === 'Completed' && 'text-[var(--text-muted)]')}>{item.req_file_name || '-'}</p></td>
+                        <td className="text-xs text-[var(--text-muted)]">{item.description || '-'}</td>
+                        <td><Badge variant={item.status === 'Completed' ? 'success' : 'muted'}>{item.status}</Badge></td>
+                        <td>
+                          {/* Three states: the shared file needs fetching,
+                              a local file is here, or nothing is attached. */}
+                          {rowNeedsDownload(item) ? (
+                            <div className="flex items-center gap-1.5">
+                              <FileText size={11} className="shrink-0 text-[var(--text-muted)]/50" />
+                              <span className="truncate text-xs text-[var(--text-muted)]/70 max-w-[150px]" title={`Attached from another device (${item.server_file.device || 'unknown'})`}>{item.server_file.name}</span>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); downloadRowFile(item); }}
+                                disabled={Boolean(downloadingFileId) || !desktop}
+                                title={desktop ? 'Download this file to the project folder' : 'Available in the desktop app only'}
+                                className="inline-flex shrink-0 items-center gap-1 rounded-full bg-sky-500/15 px-2 py-0.5 text-[11px] font-medium text-sky-400 transition-colors hover:bg-sky-500/25 disabled:opacity-50"
+                              >
+                                {downloadingFileId === item.id ? <Spinner size={10} /> : <Download size={10} />}
+                                {downloadingFileId === item.id ? 'Downloading…' : 'Download'}
+                              </button>
+                            </div>
+                          ) : item.linked_file_path ? (
+                            <div className="flex items-center gap-1.5">
+                              <FileText size={11} className="shrink-0 text-[var(--accent)]/60" />
+                              <span className="truncate text-xs text-[var(--text-muted)] max-w-[180px]">{fileNameOnly(item.linked_file_path)}</span>
+                              {item.server_file && (
+                                <span title="Shared with your other devices" className="shrink-0 text-[10px] text-emerald-400/70">synced</span>
+                              )}
+                              {/* The file is on this PC but never reached the
+                                  server. The toast that said so is long gone,
+                                  so the row carries the warning and the retry. */}
+                              {rowShareFailed(item) && (
+                                <>
+                                  <AlertTriangle size={12} className="shrink-0 text-amber-400" title={`Not shared: ${shareErrors[item.id]}`} />
+                                  <button
+                                    onClick={(e) => { e.stopPropagation(); retryRowShare(item); }}
+                                    disabled={Boolean(retryingShareId) || !desktop}
+                                    title={desktop ? `Not shared: ${shareErrors[item.id]}` : 'Available in the desktop app only'}
+                                    className="inline-flex shrink-0 items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-400 transition-colors hover:bg-amber-500/25 disabled:opacity-50"
+                                  >
+                                    {retryingShareId === item.id ? <Spinner size={10} /> : <RefreshCw size={10} />}
+                                    {retryingShareId === item.id ? 'Retrying…' : 'Retry'}
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          ) : <span className="text-xs text-[var(--text-muted)]/40">—</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </Fragment>
+                ))}
+                {(checklist || []).length === 0 && (
+                  <tr><td colSpan={6}><EmptyState icon={FolderOpen} title="No items" description="Add first document item above." /></td></tr>
+                )}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        <div className="relative shrink-0 border-l border-[var(--border)] bg-[var(--surface-0)]" style={{ width: previewCollapsed ? 16 : previewWidth }}>
+          {/* z-20 and the wider box put this above the resize strip below —
+              at 3px wide the two overlapped and the toggle was hard to hit. */}
+          <button onClick={() => setPreviewCollapsed(v => !v)} className="absolute -left-4 top-1/2 z-20 flex h-14 w-4 -translate-y-1/2 items-center justify-center rounded-l border border-[var(--border)] bg-[var(--surface-1)] text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)] transition-colors" title={previewCollapsed ? 'Show preview' : 'Hide preview'}>
+            {previewCollapsed ? <ChevronLeft size={13} /> : <ChevronRight size={13} />}
+          </button>
+          {!previewCollapsed && (
+            <div className="absolute -left-2 top-0 z-10 h-full w-4 cursor-col-resize hover:bg-[var(--accent)]/20 transition-colors" onMouseDown={e => { e.preventDefault(); startPreviewResize(e.clientX); }} title="Resize preview" />
+          )}
+          {/* The pane shows the file itself — the row's own fields are already
+              on screen in the table and the toolbar inputs. Only the file name
+              is kept, so it's clear what is being previewed. */}
+          <aside className={cn('flex h-full min-h-0 flex-col p-4', previewCollapsed && 'hidden')}>
+            <h4 className="mb-3 shrink-0 text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)]">Preview</h4>
+            {!selectedItem ? (
+              <p className="text-xs text-[var(--text-muted)]">Select a row to preview its file.</p>
+            ) : (
+              <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-auto">
+                {(attachmentName || selectedServerFile?.name) && (
+                  <p className="shrink-0 text-xs font-medium text-[var(--text)] break-all">{attachmentName || selectedServerFile?.name}</p>
+                )}
+                {!attachmentPath && !selectedServerFile && (
+                  <p className="text-xs text-[var(--text-muted)]">No file attached to this item.</p>
+                )}
+                {/* The shared copy, when this device doesn't have it: there is
+                    nothing to render a preview from, so offer the download. */}
+                {serverFileNeedsDownload && (
+                  <div className="shrink-0 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3">
+                    <p className="mb-1 text-[10px] font-medium uppercase tracking-wider text-[var(--text-muted)]">On the server</p>
+                    <p className="mb-1 text-xs text-[var(--text)] break-all">{selectedServerFile.name}</p>
+                    <p className="mb-2 text-[11px] text-[var(--text-muted)]">
+                      {[formatBytes(selectedServerFile.size), selectedServerFile.device ? `from ${selectedServerFile.device}` : ''].filter(Boolean).join(' · ')}
+                    </p>
+                    <button
+                      onClick={() => downloadRowFile(selectedItem)}
+                      disabled={Boolean(downloadingFileId) || !desktop}
+                      className="btn-secondary gap-1 text-xs w-full justify-center"
+                    >
+                      {downloadingFileId === selectedItem.id ? <Spinner size={12} /> : <Download size={12} />}
+                      {downloadingFileId === selectedItem.id ? 'Downloading…' : 'Download to project folder'}
+                    </button>
+                  </div>
+                )}
+                {/* Only render a preview for a file confirmed on disk. An
+                    <img>/<iframe> pointed at a moved or deleted file drew a
+                    bordered empty box with no explanation — the commonest
+                    "preview is broken" report. */}
+                {canPreviewLocal && isImage && !previewLoadError && (
+                  <img src={toFileUrl(attachmentPath)} alt={attachmentName} className="min-h-[10rem] w-full flex-1 rounded-lg border border-[var(--border)] object-contain" />
+                )}
+                {canPreviewLocal && isPdf && !previewLoadError && (
+                  <iframe src={toFileUrl(attachmentPath)} className="min-h-[14rem] w-full flex-1 rounded-lg border border-[var(--border)] bg-white" title="PDF preview" />
+                )}
+                {canPreviewLocal && (isImage || isPdf) && previewLoadError && (
+                  <div className="shrink-0 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3 text-xs text-[var(--text-muted)] text-center">
+                    <AlertTriangle size={22} className="mx-auto mb-1 text-amber-400/70" />
+                    {previewLoadError}<br />Use <em>Open File</em> to open it outside the app.
+                  </div>
+                )}
+                {canPreviewLocal && isTextLike && (
+                  <div className="flex min-h-[10rem] flex-1 flex-col rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-2">
+                    {textPreview ? <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap text-[11px] text-[var(--text)]">{textPreview}</pre> : <p className="text-xs text-[var(--text-muted)]">{textPreviewError || 'Loading preview…'}</p>}
+                  </div>
+                )}
+                {fileMissingOnDisk && (
+                  <div className="shrink-0 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3 text-xs text-[var(--text-muted)] text-center">
+                    <AlertTriangle size={22} className="mx-auto mb-1 text-amber-400/70" />
+                    This file is no longer at its saved location.<br />It may have been moved, renamed or deleted outside the app.
+                  </div>
+                )}
+                {canPreviewLocal && !isImage && !isPdf && !isTextLike && (
+                  <div className="shrink-0 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3 text-xs text-[var(--text-muted)] text-center">
+                    <FileText size={24} className="mx-auto mb-1 opacity-30" />
+                    Preview not available for <code>.{ext || 'file'}</code><br />Use <em>Open File</em> instead.
+                  </div>
+                )}
+              </div>
+            )}
+          </aside>
+        </div>
+      </div>
+
+      {/* ── Tender Documents ────────────────────────────────────────────────── */}
+      {tenderDocsOpen && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+          <div className="w-full max-w-2xl rounded-xl border border-[var(--border)] bg-[var(--surface-0)] p-5 shadow-2xl">
+            <div className="mb-1 flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Tender Documents</h3>
+              <button onClick={() => setTenderDocsOpen(false)} className="text-[var(--text-muted)] hover:text-[var(--text)] transition-colors"><X size={16} /></button>
+            </div>
+            <p className="mb-4 text-[11px] text-[var(--text-muted)]">
+              Files the server has for {sourceTenderId || 'this tender'} — downloaded into this project's <span className="text-[var(--text)]">Tender Docs</span> folder.
+            </p>
+
+            {tenderDocsFetching && !tenderDocs.length ? (
+              <div className="flex items-center justify-center gap-2 py-10 text-xs text-[var(--text-muted)]">
+                <Spinner size={14} className="text-[var(--accent)]" />Loading documents…
+              </div>
+            ) : !tenderDocs.length ? (
+              <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-5 text-center">
+                <FileText size={22} className="mx-auto mb-2 opacity-30" />
+                <p className="mb-3 text-xs text-[var(--text-muted)]">The server has no documents for this tender yet.</p>
+                <button onClick={requestTenderDocs} disabled={Boolean(tenderDocBusy) || !tenderRowId} className="btn-primary gap-1 text-xs">
+                  {tenderDocBusy === 'request' ? <Spinner size={12} /> : <Download size={12} />}
+                  {tenderDocBusy === 'request' ? 'Requesting…' : 'Request download'}
+                </button>
+              </div>
+            ) : (
+              <>
+                <div className="max-h-80 overflow-auto rounded-lg border border-[var(--border)]">
+                  {tenderDocs.map((doc, i) => {
+                    const here = tenderDocPresence[doc.id];
+                    const busy = tenderDocBusy === doc.id || tenderDocBusy === 'all';
+                    return (
+                      <div key={doc.id} className={cn('flex items-center gap-3 px-3 py-2', i < tenderDocs.length - 1 && 'border-b border-[var(--border)]')}>
+                        <FileText size={14} className="shrink-0 text-[var(--text-muted)]" />
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm text-[var(--text)]">{doc.name}</p>
+                          <p className="text-[11px] text-[var(--text-muted)]">
+                            {[doc.type, doc.size_bytes ? formatBytes(doc.size_bytes) : '', doc.downloaded_at && String(doc.downloaded_at).slice(0, 10)].filter(Boolean).join(' · ')}
+                          </p>
+                        </div>
+                        {here && <span className="shrink-0 text-[10px] text-emerald-400/70">in project</span>}
+                        <button
+                          onClick={async () => {
+                            if (here) { await openPath(joinWorkspacePath(await tenderDocsDir(), sanitizeFileName(String(doc.name || '')))); return; }
+                            setTenderDocBusy(doc.id);
+                            try { await downloadTenderDoc(doc); } finally { setTenderDocBusy(null); }
+                          }}
+                          disabled={doc.downloadable === false || busy || !desktop}
+                          title={doc.downloadable === false ? 'The server cannot serve this file' : (here ? 'Open the downloaded file' : 'Download into Tender Docs')}
+                          className="btn-secondary shrink-0 gap-1 text-xs"
+                        >
+                          {busy ? <Spinner size={12} /> : (here ? <Link2 size={12} /> : <Download size={12} />)}
+                          {here ? 'Open' : 'Download'}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="mt-4 flex items-center justify-between gap-3">
+                  <span className="text-[11px] text-[var(--text-muted)]">{tenderDocs.length} document(s)</span>
+                  <button onClick={downloadAllTenderDocs} disabled={Boolean(tenderDocBusy) || !desktop} className="btn-primary gap-1 text-xs">
+                    {tenderDocBusy === 'all' ? <Spinner size={12} /> : <Download size={12} />}
+                    {tenderDocBusy === 'all' ? 'Downloading…' : 'Download all'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── File Name Clash ─────────────────────────────────────────────────── */}
+      {nameClash && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+          <div className="w-full max-w-md rounded-xl border border-[var(--border)] bg-[var(--surface-0)] p-5 shadow-2xl">
+            <div className="mb-3 flex items-center gap-2">
+              <AlertTriangle size={16} className="text-amber-400 shrink-0" />
+              <h3 className="text-sm font-semibold">That file name is already in this folder</h3>
+            </div>
+            <p className="mb-1 text-sm text-[var(--text)] break-all">{nameClash}</p>
+            <p className="mb-4 text-xs text-[var(--text-muted)]">
+              Overwriting replaces the existing file, which another checklist row may be pointing at.
+            </p>
+            <div className="flex flex-wrap justify-end gap-2">
+              <button onClick={() => settleNameClash('cancel')} className="btn-ghost text-xs">Cancel</button>
+              <button onClick={() => settleNameClash('overwrite')} className="btn-danger text-xs">Overwrite</button>
+              <button onClick={() => settleNameClash('keep-both')} className="btn-primary text-xs">Keep both</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Save Template Modal ─────────────────────────────────────────────── */}
+      {saveTemplateOpen && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+          <div className="w-full max-w-md rounded-xl border border-[var(--border)] bg-[var(--surface-0)] p-5 shadow-2xl">
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Save Checklist as Template</h3>
+              <button onClick={() => setSaveTemplateOpen(false)} className="text-[var(--text-muted)] hover:text-[var(--text)] transition-colors"><X size={16} /></button>
+            </div>
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">No.</label>
+                  <input value={saveTemplateForm.template_no} onChange={e => setSaveTemplateForm(f => ({ ...f, template_no: e.target.value }))} placeholder="1" className="input-field h-8 w-full text-xs" />
+                </div>
+                <div>
+                  <label className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">Organization *</label>
+                  <input value={saveTemplateForm.organization} onChange={e => setSaveTemplateForm(f => ({ ...f, organization: e.target.value }))} className="input-field h-8 w-full text-xs" />
+                </div>
+              </div>
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">Template Name *</label>
+                <input value={saveTemplateForm.template_name} onChange={e => setSaveTemplateForm(f => ({ ...f, template_name: e.target.value }))} className="input-field h-8 w-full text-xs" />
+              </div>
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">Description</label>
+                <input value={saveTemplateForm.description} onChange={e => setSaveTemplateForm(f => ({ ...f, description: e.target.value }))} className="input-field h-8 w-full text-xs" />
+              </div>
+            </div>
+            <div className="mt-4 flex justify-end gap-2 border-t border-[var(--border)] pt-3">
+              <button onClick={() => setSaveTemplateOpen(false)} className="btn-ghost text-xs">Cancel</button>
+              <button onClick={handleSaveTemplate} disabled={savingTemplate || !saveTemplateForm.template_name.trim() || !saveTemplateForm.organization.trim()} className="btn-primary gap-1 text-xs">
+                <Save size={12} />{savingTemplate ? 'Saving…' : 'Save Template'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Apply Template Modal ────────────────────────────────────────────── */}
+      {applyTemplateOpen && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+          <div className="w-full max-w-lg rounded-xl border border-[var(--border)] bg-[var(--surface-0)] p-5 shadow-2xl">
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Apply Template to Project</h3>
+              <button onClick={() => setApplyTemplateOpen(false)} className="text-[var(--text-muted)] hover:text-[var(--text)] transition-colors"><X size={16} /></button>
+            </div>
+            <div className="relative mb-3">
+              <Search size={13} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)]" />
+              <input value={templateSearch} onChange={e => setTemplateSearch(e.target.value)} placeholder="Search templates…" className="input-field h-9 w-full pl-9 text-sm" />
+              {templateSearch && <button onClick={() => setTemplateSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]"><X size={13} /></button>}
+            </div>
+            <div className="max-h-72 overflow-auto space-y-1.5">
+              {(allTemplates || [])
+                .filter(t => !templateSearch || t.template_name.toLowerCase().includes(templateSearch.toLowerCase()) || t.organization.toLowerCase().includes(templateSearch.toLowerCase()))
+                .map(t => (
+                  <div key={t.id} className="flex items-center justify-between rounded-lg border border-[var(--border)] px-3 py-2.5 hover:bg-[var(--surface-1)] transition-colors">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-[var(--text)] truncate">{t.template_name}</p>
+                      <p className="text-xs text-[var(--text-muted)]">{t.organization}{t.template_no ? ` · #${t.template_no}` : ''}</p>
+                    </div>
+                    <button onClick={() => handleApplyTemplate(t.id)} className="btn-primary text-xs gap-1 shrink-0 ml-3"><Plus size={12} />Apply</button>
+                  </div>
+                ))}
+              {!(allTemplates || []).filter(t => !templateSearch || t.template_name.toLowerCase().includes(templateSearch.toLowerCase()) || t.organization.toLowerCase().includes(templateSearch.toLowerCase())).length && (
+                <p className="py-6 text-center text-xs text-[var(--text-muted)]">No templates found.</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Manage Folders Modal ────────────────────────────────────────────── */}
+      {manageFoldersOpen && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+          <div className="w-full max-w-2xl rounded-xl border border-[var(--border)] bg-[var(--surface-0)] p-5 shadow-2xl">
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Manage Folders</h3>
+              <button onClick={() => setManageFoldersOpen(false)} className="text-[var(--text-muted)] hover:text-[var(--text)] transition-colors"><X size={16} /></button>
+            </div>
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+              {[
+                { title: 'Add Folder', content: (
+                  <div className="flex gap-2">
+                    <input value={newFolderName} onChange={e => setNewFolderName(e.target.value)} placeholder="Folder name" className="input-field h-8 flex-1 text-xs" />
+                    {/* Each of these four mirrors the guard its handler
+                        already has, which until now just made the click do
+                        nothing at all. */}
+                    <button onClick={addFolder} disabled={!newFolderName.trim()} className="btn-primary text-xs px-3">Add</button>
+                  </div>
+                ) },
+                { title: 'Rename Folder', content: (
+                  <>
+                    <div className="grid grid-cols-2 gap-2">
+                      <select value={renameFrom} onChange={e => setRenameFrom(e.target.value)} className="input-field h-8 text-xs"><option value="">From…</option>{folderOptions.map(f => <option key={`rf-${f}`}>{f}</option>)}</select>
+                      <input value={renameTo} onChange={e => setRenameTo(e.target.value)} placeholder="New name" className="input-field h-8 text-xs" />
+                    </div>
+                    <button onClick={renameFolder} disabled={!renameFrom.trim() || !renameTo.trim() || renameFrom.trim().toLowerCase() === renameTo.trim().toLowerCase()} className="btn-secondary mt-2 text-xs">Rename</button>
+                  </>
+                ) },
+                { title: 'Move Items Between Folders', content: (
+                  <>
+                    <div className="grid grid-cols-2 gap-2">
+                      <select value={moveFrom} onChange={e => setMoveFrom(e.target.value)} className="input-field h-8 text-xs"><option value="">From…</option>{folderOptions.map(f => <option key={`mf-${f}`}>{f}</option>)}</select>
+                      <select value={moveTo} onChange={e => setMoveTo(e.target.value)} className="input-field h-8 text-xs"><option value="">To…</option>{folderOptions.map(f => <option key={`mt-${f}`}>{f}</option>)}</select>
+                    </div>
+                    <button onClick={moveFolderItems} disabled={!moveFrom.trim() || !moveTo.trim() || moveFrom.trim().toLowerCase() === moveTo.trim().toLowerCase()} className="btn-secondary mt-2 text-xs">Move</button>
+                  </>
+                ) },
+                { title: 'Delete Folder', content: (
+                  <>
+                    <div className="flex gap-2">
+                      <select value={deleteFolderName} onChange={e => setDeleteFolderName(e.target.value)} className="input-field h-8 flex-1 text-xs"><option value="">Select folder…</option>{folderOptions.map(f => <option key={`df-${f}`}>{f}</option>)}</select>
+                      <button onClick={deleteFolder} disabled={!deleteFolderName.trim() || FOLDER_ORDER.some(x => x.toLowerCase() === deleteFolderName.trim().toLowerCase())} className="btn-danger text-xs px-3">Delete</button>
+                    </div>
+                    <p className="mt-1.5 text-[11px] text-[var(--text-muted)]">Items will be moved to another available folder.</p>
+                  </>
+                ) },
+              ].map(({ title, content }) => (
+                <div key={title} className="rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-3">
+                  <p className="mb-2 text-xs font-semibold text-[var(--text-muted)]">{title}</p>
+                  {content}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   TEMPLATES  (no scraper ties — carried over as-is)
+   ═══════════════════════════════════════════════════════════════════════════ */
+function TemplatesPage() {
+  const qc = useQueryClient();
+  const [search, setSearch] = useState('');
+  const [expandedId, setExpandedId] = useState(null);
+  const [showForm, setShowForm] = useState(false);
+  const [editId, setEditId] = useState(null);
+  const emptyForm = () => ({ template_no: '', organization: '', template_name: '', description: '', notes: '' });
+  const [form, setForm] = useState(emptyForm());
+  const [confirmDel, setConfirmDel] = useState(null);
+  const [newItem, setNewItem] = useState({ req_file_name: '', description: '', subfolder: 'Ready Docs' });
+
+  const { data: templates, isLoading } = useQuery({ queryKey: ['templates'], queryFn: () => api.listTemplates() });
+  const { data: items } = useQuery({ queryKey: ['template-items', expandedId], queryFn: () => api.listTemplateItems(expandedId), enabled: expandedId !== null });
+
+  const createTemplate = useMutation({
+    mutationFn: (d) => api.createTemplate({ template_no: d.template_no ? Number(d.template_no) : undefined, organization: d.organization, template_name: d.template_name, description: d.description || undefined, notes: d.notes || undefined }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['templates'] }); resetForm(); },
+  });
+  const updateTemplate = useMutation({
+    mutationFn: ({ id, d }) => api.updateTemplate(id, { template_no: d.template_no ? Number(d.template_no) : undefined, organization: d.organization, template_name: d.template_name, description: d.description || undefined, notes: d.notes || undefined }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['templates'] }); resetForm(); },
+  });
+  const deleteTemplate = useMutation({
+    mutationFn: (id) => api.deleteTemplate(id),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['templates'] }); setConfirmDel(null); setExpandedId(null); },
+  });
+  const createItem = useMutation({
+    mutationFn: () => api.createTemplateItem(expandedId, newItem),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['template-items', expandedId] }); setNewItem({ req_file_name: '', description: '', subfolder: 'Ready Docs' }); },
+  });
+  const deleteItem = useMutation({
+    mutationFn: (itemId) => api.deleteTemplateItem(itemId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['template-items', expandedId] }),
+  });
+
+  const resetForm = () => { setForm(emptyForm()); setShowForm(false); setEditId(null); };
+  const openEdit = (t) => {
+    setForm({ template_no: String(t.template_no ?? ''), organization: t.organization, template_name: t.template_name, description: t.description || '', notes: t.notes || '' });
+    setEditId(t.id); setShowForm(true);
+  };
+  const handleSubmit = () => {
+    if (!form.template_name.trim() || !form.organization.trim()) return;
+    if (editId !== null) updateTemplate.mutate({ id: editId, d: form });
+    else createTemplate.mutate(form);
+  };
+  const uf = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const filtered = (templates || []).filter(t =>
+    !search || t.template_name.toLowerCase().includes(search.toLowerCase()) || t.organization.toLowerCase().includes(search.toLowerCase()) || (t.description || '').toLowerCase().includes(search.toLowerCase())
+  );
+  const groupedByOrg = filtered.reduce((acc, t) => {
+    const org = t.organization || 'Uncategorized';
+    if (!acc[org]) acc[org] = [];
+    acc[org].push(t);
+    return acc;
+  }, {});
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="border-b border-[var(--border)] bg-[var(--surface-0)] px-6 py-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-lg font-bold text-[var(--text)]">Checklist Templates</h1>
+            <p className="text-sm text-[var(--text-muted)] mt-0.5">Manage document checklists for bid submissions</p>
+          </div>
+          <button onClick={() => { resetForm(); setShowForm(v => !v); }} className="btn-primary text-sm gap-1.5"><Plus size={14} /> New Template</button>
+        </div>
+        <div className="mt-3 relative max-w-sm">
+          <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)]" />
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search templates..." className="input-field h-9 w-full !pl-10 text-sm" />
+        </div>
+      </div>
+
+      {showForm && (
+        <div className="border-b border-[var(--border)] bg-[var(--surface-1)] px-6 py-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-[var(--text)]">{editId ? 'Edit Template' : 'New Template'}</h3>
+            <button onClick={resetForm} className="text-[var(--text-muted)]"><X size={16} /></button>
+          </div>
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-4">
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">No.</label>
+              <input value={form.template_no} onChange={e => uf('template_no', e.target.value)} placeholder="1" className="input-field h-9 w-full text-sm" />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Organization *</label>
+              <input value={form.organization} onChange={e => uf('organization', e.target.value)} placeholder="PWD Maharashtra" className="input-field h-9 w-full text-sm" />
+            </div>
+            <div className="lg:col-span-2">
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Template Name *</label>
+              <input value={form.template_name} onChange={e => uf('template_name', e.target.value)} placeholder="Template name" className="input-field h-9 w-full text-sm" />
+            </div>
+          </div>
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Description</label>
+              <input value={form.description} onChange={e => uf('description', e.target.value)} className="input-field h-9 w-full text-sm" />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Notes</label>
+              <input value={form.notes} onChange={e => uf('notes', e.target.value)} className="input-field h-9 w-full text-sm" />
+            </div>
+          </div>
+          <div className="flex justify-end gap-3">
+            <button onClick={resetForm} className="btn-ghost text-sm">Cancel</button>
+            <button onClick={handleSubmit} disabled={!form.template_name.trim() || !form.organization.trim()} className="btn-primary gap-1.5 text-sm">
+              <Save size={14} />{editId ? 'Update' : 'Create'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {confirmDel !== null && (
+        <div className="flex items-center justify-between border-b border-rose-500/30 bg-rose-500/10 px-6 py-3">
+          <p className="text-sm text-rose-400">Delete this template and all its items?</p>
+          <div className="flex gap-2">
+            <button onClick={() => setConfirmDel(null)} className="btn-ghost text-xs">Cancel</button>
+            <button onClick={() => deleteTemplate.mutate(confirmDel)} className="btn-danger gap-1 text-xs"><Trash2 size={12} />Delete</button>
+          </div>
+        </div>
+      )}
+
+      <div className="flex-1 overflow-auto p-6">
+        {isLoading ? (
+          <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>
+        ) : filtered.length === 0 ? (
+          <EmptyState icon={FileText} title="No templates yet" description="Create checklist templates to standardize your bid preparation workflow"
+            action={<button onClick={() => setShowForm(true)} className="btn-primary text-sm gap-1.5"><Plus size={14} /> New Template</button>} />
+        ) : (
+          <div className="space-y-6">
+            {Object.entries(groupedByOrg).map(([org, items_list]) => (
+              <div key={org}>
+                <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)]">{org}</h3>
+                <div className="space-y-2">
+                  {items_list.map(t => (
+                    <div key={t.id} className="card border border-[var(--border)] overflow-hidden">
+                      <div className="flex cursor-pointer items-center gap-3 p-4 hover:bg-[var(--surface-1)]" onClick={() => setExpandedId(expandedId === t.id ? null : t.id)}>
+                        {expandedId === t.id ? <ChevronDown size={14} className="text-[var(--text-muted)] shrink-0" /> : <ChevronRight size={14} className="text-[var(--text-muted)] shrink-0" />}
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <p className="text-sm font-medium text-[var(--text)]">{t.template_name}</p>
+                            {t.template_no && <Badge variant="muted">#{t.template_no}</Badge>}
+                          </div>
+                          {t.description && <p className="text-xs text-[var(--text-muted)] mt-0.5 truncate">{t.description}</p>}
+                        </div>
+                        <div className="flex items-center gap-1 shrink-0" onClick={e => e.stopPropagation()}>
+                          <button onClick={() => openEdit(t)} className="btn-ghost gap-1 text-xs"><Edit3 size={12} />Edit</button>
+                          <button onClick={() => setConfirmDel(t.id)} className="btn-ghost gap-1 text-xs text-rose-400 hover:text-rose-300"><Trash2 size={12} />Delete</button>
+                        </div>
+                      </div>
+                      {expandedId === t.id && (
+                        <div className="border-t border-[var(--border)] bg-[var(--surface-1)] p-4">
+                          <div className="mb-3 flex items-center gap-2">
+                            <input value={newItem.req_file_name} onChange={e => setNewItem(v => ({ ...v, req_file_name: e.target.value }))} placeholder="Document name" className="input-field h-8 flex-1 text-xs" />
+                            <input value={newItem.description} onChange={e => setNewItem(v => ({ ...v, description: e.target.value }))} placeholder="Description" className="input-field h-8 flex-1 text-xs" />
+                            <input value={newItem.subfolder} onChange={e => setNewItem(v => ({ ...v, subfolder: e.target.value }))} placeholder="Folder" className="input-field h-8 w-32 text-xs" />
+                            <button disabled={!newItem.req_file_name.trim() || createItem.isPending} onClick={() => createItem.mutate()} className="btn-primary gap-1 text-xs shrink-0"><Plus size={12} />Add</button>
+                          </div>
+                          <TemplateItemsList templateId={t.id} onDelete={(itemId) => deleteItem.mutate(itemId)} />
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TemplateItemsList({ templateId, onDelete }) {
+  const { data: items, isLoading } = useQuery({ queryKey: ['template-items', templateId], queryFn: () => api.listTemplateItems(templateId) });
+  if (isLoading) return <div className="flex justify-center py-4"><Spinner size={16} className="text-[var(--accent)]" /></div>;
+  if (!items?.length) return <p className="text-xs text-[var(--text-muted)]">No items. Add the first document above.</p>;
+  return (
+    <table className="data-table">
+      <thead><tr><th className="w-10">#</th><th>Document Name</th><th>Description</th><th className="w-32">Folder</th><th className="w-16 text-center">Del</th></tr></thead>
+      <tbody>
+        {items.map((item, i) => (
+          <tr key={item.id}>
+            <td className="text-[var(--text-muted)]">{i + 1}</td>
+            <td className="text-sm">{item.req_file_name || '-'}</td>
+            <td className="text-xs">{item.description || '-'}</td>
+            <td className="text-xs">{item.subfolder || 'Ready Docs'}</td>
+            <td className="text-center"><button onClick={() => onDelete(item.id)} className="text-rose-400 hover:text-rose-300"><Trash2 size={13} /></button></td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   FILES  (renamed from "Server Control" — a plain file browser over the
+   shared project storage)
+   — dropped: "Delete files older than N days" bulk-maintenance action. That
+     is an operator/server-hygiene tool, not something a client user should
+     be able to trigger. Browsing + single-folder delete is kept.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const STORAGE_COLUMNS = [
+  { key: 'name', label: 'Name', width: 360 },
+  { key: 'type', label: 'Type', width: 130 },
+  { key: 'size', label: 'Size', width: 140 },
+  { key: 'modified', label: 'Modified', width: 220 },
+];
+
+function formatBytes(bytes) {
+  const b = Number(bytes || 0);
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+  if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(b / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function FilesPage() {
+  const qc = useQueryClient();
+  const {
+    serverStorageTable,
+    setServerStorageHiddenColumns,
+    setServerStorageColumnOrder,
+    setServerStorageColumnWidth,
+  } = useAppStore();
+
+  const [relPath, setRelPath] = useState('');
+  const [selectedRelPath, setSelectedRelPath] = useState('');
+  const [showColsMenu, setShowColsMenu] = useState(false);
+  const [dragIdx, setDragIdx] = useState(null);
+
+  const { data, isLoading, isFetching } = useQuery({
+    queryKey: ['client-files', relPath],
+    queryFn: () => api.listServerStorage(relPath),
+  });
+
+  const selectedItem = useMemo(() => {
+    const items = data?.items || [];
+    return items.find((x) => x.rel_path === selectedRelPath) || null;
+  }, [data?.items, selectedRelPath]);
+
+  const storageColOrder = useMemo(
+    () => (serverStorageTable.columnOrder?.length ? serverStorageTable.columnOrder : STORAGE_COLUMNS.map((c) => c.key)),
+    [serverStorageTable.columnOrder]
+  );
+  const storageHidden = useMemo(() => new Set(serverStorageTable.hiddenColumns || []), [serverStorageTable.hiddenColumns]);
+  const orderedStorageCols = useMemo(() => {
+    const byKey = new Map(STORAGE_COLUMNS.map((c) => [c.key, c]));
+    return storageColOrder.map((k) => byKey.get(k)).filter(Boolean);
+  }, [storageColOrder]);
+  const visibleStorageCols = orderedStorageCols.filter((c) => c.fixed || !storageHidden.has(c.key));
+  const getStorageColWidth = (c) => {
+    const v = serverStorageTable.columnWidths?.[c.key];
+    return Number.isFinite(v) && v > 0 ? v : c.width;
+  };
+  const toggleStorageCol = (key) => {
+    const next = new Set(storageHidden);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    setServerStorageHiddenColumns(Array.from(next));
+  };
+  const moveStorageCol = (from, to) => {
+    if (from === to) return;
+    const next = [...storageColOrder];
+    const [item] = next.splice(from, 1);
+    next.splice(to, 0, item);
+    setServerStorageColumnOrder(next);
+  };
+  const startStorageColResize = (col, startX) => {
+    const startW = getStorageColWidth(col);
+    const onMove = (evt) => {
+      const next = Math.max(90, startW + (evt.clientX - startX));
+      setServerStorageColumnWidth(col.key, next);
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  const deleteFolder = useMutation({
+    mutationFn: (path) => api.deleteServerFolder(path),
+    onSuccess: () => {
+      setSelectedRelPath('');
+      qc.invalidateQueries({ queryKey: ['client-files', relPath] });
+    },
+  });
+
+  const goParent = () => {
+    const parent = data?.parent_rel_path || '';
+    setRelPath(parent);
+    setSelectedRelPath('');
+  };
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="border-b border-[var(--border)] bg-[var(--surface-0)] px-6 py-4">
+        <h1 className="text-lg font-bold text-[var(--text)]">Files</h1>
+        <p className="mt-0.5 text-sm text-[var(--text-muted)]">Browse project storage</p>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <button onClick={goParent} className="btn-ghost gap-1 text-xs" disabled={!data?.parent_rel_path}>
+            <ArrowUp size={12} />
+            Parent
+          </button>
+          <button onClick={() => qc.invalidateQueries({ queryKey: ['client-files', relPath] })} className="btn-ghost gap-1 text-xs">
+            <RefreshCw size={12} className={cn(isFetching && 'animate-spin')} />
+            Refresh
+          </button>
+          <button onClick={() => selectedItem?.is_dir && deleteFolder.mutate(selectedItem.rel_path)} className="btn-danger gap-1 text-xs" disabled={!selectedItem?.is_dir || deleteFolder.isPending}>
+            <Trash2 size={12} />
+            Delete Folder
+          </button>
+          <div className="relative ml-2">
+            <button onClick={() => setShowColsMenu((v) => !v)} className="btn-ghost gap-1 text-xs">
+              <Columns3 size={12} />
+              Columns
+            </button>
+            {showColsMenu && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setShowColsMenu(false)} />
+                <div className="card absolute right-0 top-8 z-50 max-h-72 w-60 overflow-auto border border-[var(--border)] p-2 shadow-xl">
+                  <p className="mb-1 border-b border-[var(--border)] px-2 pb-1 text-xs text-[var(--text-muted)]">Drag to reorder, toggle columns</p>
+                  {orderedStorageCols.map((c, i) => (
+                    <div key={c.key} draggable onDragStart={() => setDragIdx(i)} onDragOver={(e) => e.preventDefault()} onDrop={() => {
+                      if (dragIdx !== null) {
+                        const fromKey = orderedStorageCols[dragIdx]?.key;
+                        const toKey = orderedStorageCols[i]?.key;
+                        if (fromKey && toKey) {
+                          const fi = storageColOrder.indexOf(fromKey);
+                          const ti = storageColOrder.indexOf(toKey);
+                          if (fi >= 0 && ti >= 0) moveStorageCol(fi, ti);
+                        }
+                      }
+                      setDragIdx(null);
+                    }} className={cn('flex cursor-grab items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-[var(--surface-1)]', dragIdx === i && 'opacity-50')}>
+                      <span className="select-none cursor-grab text-[var(--text-muted)]">::</span>
+                      <input type="checkbox" checked={!storageHidden.has(c.key)} onChange={() => toggleStorageCol(c.key)} className="accent-[var(--accent)]" />
+                      <span className="flex-1">{c.label}</span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+        <div className="mt-2 text-xs text-[var(--text-muted)]">
+          Root: <span className="font-mono">{data?.root_folder || '-'}</span>
+          <br />
+          Current: <span className="font-mono">{data?.current_rel_path || '/'}</span>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-auto p-6">
+        {isLoading ? (
+          <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>
+        ) : (
+          <>
+            {!data?.items || data.items.length === 0 ? (
+              <EmptyState icon={Server} title="No items" description="This folder is empty" />
+            ) : (
+              <table className="data-table" style={{ tableLayout: 'fixed', width: '100%' }}>
+                <thead>
+                  <tr>
+                    {visibleStorageCols.map((c) => (
+                      <th key={c.key} style={{ width: getStorageColWidth(c) }} className="relative">
+                        <div className="flex items-center">{c.label}</div>
+                        <div className="absolute right-0 top-0 h-full w-2 cursor-col-resize" onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); startStorageColResize(c, e.clientX); }} />
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.items.map((item) => (
+                    <tr key={item.rel_path || item.name} onClick={() => setSelectedRelPath(item.rel_path)} onDoubleClick={() => {
+                      if (item.is_dir) {
+                        setRelPath(item.rel_path);
+                        setSelectedRelPath('');
+                      }
+                    }} className={cn('cursor-pointer', selectedRelPath === item.rel_path && 'row-selected')}>
+                      {visibleStorageCols.map((c) => {
+                        if (c.key === 'name') return <td key={c.key} className="text-sm"><span className="inline-flex items-center gap-2">{item.is_dir ? <Folder size={14} /> : <FolderOpen size={14} />}{item.name}</span></td>;
+                        if (c.key === 'type') return <td key={c.key} className="text-xs">{item.is_dir ? 'Folder' : 'File'}</td>;
+                        if (c.key === 'size') return <td key={c.key} className="text-xs">{item.is_dir ? '-' : formatBytes(item.size_bytes)}</td>;
+                        if (c.key === 'modified') return <td key={c.key} className="text-xs">{new Date(item.modified_at).toLocaleString()}</td>;
+                        return <td key={c.key} className="text-xs" />;
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SETTINGS  (client-relevant only)
+   — dropped: CAPTCHA AI provider config, Backend/Cloud Run connection
+     config (mode / URL / API & admin keys), and Update Manifest URL — all
+     operator-only concerns. Kept & expanded: appearance/theming, workspace
+     behavior, projects entry mode, the "show tender info" toggle, directory
+     paths, server connection/sync, and local data & cache controls.
+
+   Two separate stores of settings live on this page:
+     1. Server-relevant `form` fields (unchanged plumbing) — saved via
+        api.updateSettings() and shown under Workspace / Directories / Connection.
+     2. Local-only `prefs` (accent, density, UI scale, startup page) — saved to
+        localStorage via useClientPrefs(), applied instantly, never sent to
+        the backend. See DEFAULT_CLIENT_PREFS above.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const SETTINGS_TABS = [
+  { key: 'appearance', label: 'Appearance', icon: Palette },
+  { key: 'workspace', label: 'Workspace', icon: LayoutGrid },
+  { key: 'directories', label: 'Directories', icon: FolderOpen },
+  { key: 'connection', label: 'Connection & Sync', icon: Server },
+  { key: 'data', label: 'Data & Cache', icon: RotateCcw },
+];
+
+// Inline per-section (active/archived/bookmarks/projects) checkbox row —
+// used for a pending join request's initial grant and for an existing
+// member's permissions. Mirrors Server UI's own SectionToggles component
+// so admins see the same control in the admin console and here.
+const ACCOUNT_SECTIONS = [
+  { key: 'active', label: 'Active Tenders', defaultOn: true },
+  { key: 'archived', label: 'Archived', defaultOn: true },
+  { key: 'bookmarks', label: 'Bookmarks', defaultOn: true },
+  { key: 'projects', label: 'Projects', defaultOn: true },
+  // Off by default — must be explicitly granted, unlike the other four.
+  { key: 'portal_search', label: 'Portal Search', defaultOn: false },
+];
+function SectionToggles({ permissions, onChange, disabled }) {
+  return (
+    <div className="flex flex-wrap gap-3">
+      {ACCOUNT_SECTIONS.map((s) => (
+        <label key={s.key} className={cn('flex items-center gap-1.5 text-xs', disabled ? 'text-[var(--text-muted)] opacity-60' : 'text-[var(--text-muted)]')}>
+          <input
+            type="checkbox"
+            checked={s.defaultOn ? permissions?.[s.key] !== false : permissions?.[s.key] === true}
+            disabled={disabled}
+            onChange={(e) => onChange(s.key, e.target.checked)}
+            className="accent-[var(--accent)]"
+          />
+          {s.label}
+        </label>
+      ))}
+    </div>
+  );
+}
+
+// Settings' account-org management surface — shape depends entirely on
+// settings.account_type/org/pending_request (see db.js, populated from the
+// server's `account` block on sign-in/GET /client/me). Four states:
+// individual with nothing pending, individual with a pending join request,
+// org member, org admin.
+function OrganisationCard({ settings }) {
+  const qc = useQueryClient();
+  const isOrg = settings?.account_type === 'organisation';
+  const isAdmin = isOrg && settings?.org?.role === 'admin';
+  const [status, setStatus] = useState('');
+  const refreshAccount = () => { qc.invalidateQueries({ queryKey: ['settings'] }); qc.invalidateQueries({ queryKey: ['my-join-request'] }); qc.invalidateQueries({ queryKey: ['org-detail'] }); };
+
+  const { data: orgDetail, isLoading: orgLoading } = useQuery({ queryKey: ['org-detail'], queryFn: () => api.getOrgDetail(), enabled: isAdmin });
+  const { data: myRequestResult } = useQuery({ queryKey: ['my-join-request'], queryFn: () => api.getMyJoinRequest(), enabled: !isOrg });
+  const pendingRequest = settings?.pending_request || myRequestResult?.request || null;
+
+  const [createName, setCreateName] = useState('');
+  const createMut = useMutation({
+    mutationFn: () => api.createOrg(createName.trim()),
+    onSuccess: () => { refreshAccount(); setStatus('Organisation created.'); setCreateName(''); },
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+
+  const [joinCode, setJoinCode] = useState('');
+  const [joinNote, setJoinNote] = useState('');
+  const joinMut = useMutation({
+    mutationFn: () => api.requestJoinOrg(joinCode.trim(), joinNote.trim()),
+    onSuccess: () => { refreshAccount(); setStatus('Request sent — waiting for the admin to approve.'); setJoinCode(''); setJoinNote(''); },
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+  const cancelRequestMut = useMutation({
+    mutationFn: () => api.cancelJoinRequest(),
+    onSuccess: () => { refreshAccount(); setStatus('Request cancelled.'); },
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+
+  const [orgNameDraft, setOrgNameDraft] = useState('');
+  useEffect(() => { if (orgDetail?.name !== undefined) setOrgNameDraft(orgDetail.name); }, [orgDetail?.name]);
+  const renameMut = useMutation({
+    mutationFn: () => api.renameOrg(orgNameDraft.trim()),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['org-detail'] }); setStatus('Renamed.'); },
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+  const regenMut = useMutation({
+    mutationFn: () => api.regenerateJoinCode(),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['org-detail'] }),
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+
+  const [approvePerms, setApprovePerms] = useState({});
+  const approveMut = useMutation({
+    mutationFn: ({ id, permissions }) => api.approveJoinRequest(id, permissions),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['org-detail'] }); setStatus('Member approved.'); },
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+  const rejectMut = useMutation({
+    mutationFn: (id) => api.rejectJoinRequest(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['org-detail'] }),
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+  const permMut = useMutation({
+    mutationFn: ({ userId, permissions }) => api.setMemberPermissions(userId, permissions),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['org-detail'] }),
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+  const roleMut = useMutation({
+    mutationFn: ({ userId, role }) => api.setMemberRole(userId, role),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['org-detail'] }),
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+  const delinkMut = useMutation({
+    mutationFn: ({ userId, retain }) => api.delinkMember(userId, retain),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['org-detail'] }); setStatus('Member removed.'); },
+    onError: (e) => setStatus(e instanceof Error ? e.message : String(e)),
+  });
+
+  const confirmDelink = (member) => {
+    if (!window.confirm(`Remove ${member.display_name || member.email} from the organisation and keep their bookmarks (if they had bookmark access)? They become a regular individual account.`)) return;
+    delinkMut.mutate({ userId: member.user_id, retain: true });
+  };
+  const confirmWipe = (member) => {
+    if (!window.confirm(`Remove ${member.display_name || member.email} and wipe their account (no bookmarks kept)? This cannot be undone.`)) return;
+    delinkMut.mutate({ userId: member.user_id, retain: false });
+  };
+
+  return (
+    <div className="card p-5 space-y-4">
+      <div>
+        <h3 className="flex items-center gap-1.5 text-sm font-semibold text-[var(--text)]"><Users size={14} />Organisation</h3>
+        <p className="mt-1 text-xs text-[var(--text-muted)]">Share projects, bookmarks and checklists with a team. An admin approves who joins and what each member can see.</p>
+      </div>
+
+      {!isOrg && !pendingRequest && (
+        <div className="space-y-4">
+          <div className="border-t border-[var(--border)] pt-3">
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Create an organisation</label>
+            <div className="flex gap-2">
+              <input value={createName} onChange={(e) => setCreateName(e.target.value)} placeholder="Organisation name" className="input-field h-9 flex-1 text-sm" />
+              <button onClick={() => createMut.mutate()} disabled={createMut.isPending || !createName.trim()} className="btn-primary shrink-0 text-xs gap-1.5">
+                {createMut.isPending ? <Spinner size={13} /> : <Plus size={13} />}Create
+              </button>
+            </div>
+            <p className="mt-1 text-[11px] text-[var(--text-muted)]">You become the admin; your current projects/bookmarks/checklists become the org's shared data.</p>
+          </div>
+          <div className="border-t border-[var(--border)] pt-3">
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Join an organisation</label>
+            <div className="flex gap-2">
+              <input value={joinCode} onChange={(e) => setJoinCode(e.target.value)} placeholder="Join code" className="input-field h-9 w-32 font-mono text-sm uppercase" />
+              <input value={joinNote} onChange={(e) => setJoinNote(e.target.value)} placeholder="Note to admin (optional)" className="input-field h-9 flex-1 text-sm" />
+              <button onClick={() => joinMut.mutate()} disabled={joinMut.isPending || !joinCode.trim()} className="btn-secondary shrink-0 text-xs gap-1.5">
+                {joinMut.isPending ? <Spinner size={13} /> : <UserPlus size={13} />}Request
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {!isOrg && pendingRequest && (
+        <div className="border-t border-[var(--border)] pt-3 space-y-2">
+          <p className="text-sm text-[var(--text)]">Request pending for <strong>{pendingRequest.org_name}</strong></p>
+          <p className="text-[11px] text-[var(--text-muted)]">When approved, your current projects, bookmarks and checklists are discarded and you use the organisation's shared data instead.</p>
+          <button onClick={() => cancelRequestMut.mutate()} disabled={cancelRequestMut.isPending} className="btn-secondary text-xs gap-1.5">
+            {cancelRequestMut.isPending ? <Spinner size={13} /> : <X size={13} />}Cancel Request
+          </button>
+        </div>
+      )}
+
+      {isOrg && !isAdmin && (
+        <div className="border-t border-[var(--border)] pt-3 space-y-2">
+          <p className="text-sm text-[var(--text)]">{settings.org?.name}</p>
+          <p className="text-[11px] text-[var(--text-muted)]">You're a member.</p>
+          {/* No section list here on purpose: a member shouldn't be shown
+              which sections exist, or that any are being withheld from them.
+              The sidebar already reflects what they can reach. Only an admin
+              sees the full matrix (SectionToggles, in the branch below). */}
+          <p className="text-[11px] text-[var(--text-muted)]">Only an organisation admin can change your access or remove you.</p>
+        </div>
+      )}
+
+      {isAdmin && (
+        <div className="border-t border-[var(--border)] pt-3 space-y-4">
+          <div>
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Organisation name</label>
+            <div className="flex gap-2">
+              <input value={orgNameDraft} onChange={(e) => setOrgNameDraft(e.target.value)} className="input-field h-9 flex-1 text-sm" />
+              <button onClick={() => renameMut.mutate()} disabled={renameMut.isPending || !orgNameDraft.trim() || orgNameDraft.trim() === orgDetail?.name} className="btn-secondary shrink-0 text-xs gap-1.5">
+                {renameMut.isPending ? <Spinner size={13} /> : <Save size={13} />}Rename
+              </button>
+            </div>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Join code</label>
+            <div className="flex items-center gap-2">
+              <code className="input-field flex h-9 flex-1 items-center font-mono text-sm">{orgDetail?.join_code || '—'}</code>
+              <button
+                onClick={() => { if (orgDetail?.join_code) navigator.clipboard?.writeText(orgDetail.join_code); }}
+                className="btn-secondary shrink-0 text-xs gap-1.5"
+                title="Copy join code"
+              >
+                <Copy size={13} />
+              </button>
+              <button onClick={() => regenMut.mutate()} disabled={regenMut.isPending} className="btn-secondary shrink-0 text-xs gap-1.5">
+                {regenMut.isPending ? <Spinner size={13} /> : <RefreshCw size={13} />}New Code
+              </button>
+            </div>
+          </div>
+
+          {orgLoading && <Spinner size={16} />}
+
+          {!orgLoading && (orgDetail?.pending_requests || []).length > 0 && (
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Pending join requests</label>
+              <div className="space-y-2">
+                {orgDetail.pending_requests.map((req) => (
+                  <div key={req.id} className="rounded-md border border-[var(--border)] p-2.5 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-sm text-[var(--text)]">{req.display_name || req.email}</p>
+                        <p className="text-[11px] text-[var(--text-muted)]">{req.email}{req.note ? ` — "${req.note}"` : ''}</p>
+                      </div>
+                      <div className="flex gap-1.5">
+                        <button onClick={() => rejectMut.mutate(req.id)} disabled={rejectMut.isPending || approveMut.isPending} className="btn-ghost text-xs gap-1" title="Reject">
+                          <Ban size={13} />
+                        </button>
+                        <button
+                          onClick={() => approveMut.mutate({ id: req.id, permissions: approvePerms[req.id] })}
+                          disabled={approveMut.isPending || rejectMut.isPending}
+                          className="btn-primary text-xs gap-1"
+                        >
+                          <Check size={13} />Approve
+                        </button>
+                      </div>
+                    </div>
+                    <SectionToggles
+                      permissions={{ ...{ active: true, archived: true, bookmarks: true, projects: true, portal_search: false }, ...approvePerms[req.id] }}
+                      onChange={(key, value) => setApprovePerms((p) => ({ ...p, [req.id]: { ...p[req.id], [key]: value } }))}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {!orgLoading && (
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-muted)]">Members ({(orgDetail?.members || []).length})</label>
+              <div className="space-y-2">
+                {(orgDetail?.members || []).map((member) => (
+                  <div key={member.user_id} className="rounded-md border border-[var(--border)] p-2.5 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="flex items-center gap-1.5 text-sm text-[var(--text)]">
+                          {member.role === 'admin' && <Shield size={12} className="text-[var(--accent)]" />}
+                          {member.display_name || member.email}
+                        </p>
+                        <p className="text-[11px] text-[var(--text-muted)]">{member.email}</p>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <select
+                          value={member.role}
+                          onChange={(e) => roleMut.mutate({ userId: member.user_id, role: e.target.value })}
+                          disabled={roleMut.isPending}
+                          className="input-field h-8 w-auto text-xs"
+                        >
+                          <option value="admin">Admin</option>
+                          <option value="member">Member</option>
+                        </select>
+                        <button onClick={() => confirmDelink(member)} disabled={delinkMut.isPending} className="btn-ghost text-xs gap-1" title="Remove (keep bookmarks)">
+                          <UserMinus size={13} />
+                        </button>
+                        <button onClick={() => confirmWipe(member)} disabled={delinkMut.isPending} className="btn-ghost text-xs gap-1 text-rose-400" title="Remove and wipe">
+                          <Trash2 size={13} />
+                        </button>
+                      </div>
+                    </div>
+                    {member.role !== 'admin' && (
+                      <SectionToggles
+                        permissions={member.permissions}
+                        onChange={(key, value) => permMut.mutate({ userId: member.user_id, permissions: { [key]: value } })}
+                        disabled={permMut.isPending}
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {status && <p className="text-xs text-[var(--text-muted)]">{status}</p>}
+    </div>
+  );
+}
+
+function SettingsPage() {
+  const { theme, toggleTheme } = useAppStore();
+  const qc = useQueryClient();
+  const { data: settings, isLoading } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
+  const { data: health } = useQuery({ queryKey: ['health'], queryFn: () => api.health(), retry: false });
+
+  const [form, setForm] = useState({
+    parent_dir: '',
+    project_details_show_tender_info: 'true',
+    server_url: api.defaultServerUrl,
+    sync_interval_minutes: 15,
+  });
+  const [saved, setSaved] = useState(false);
+  const [pathStatus, setPathStatus] = useState('');
+  const [showChangePw, setShowChangePw] = useState(false);
+  const [pwForm, setPwForm] = useState({ current_password: '', new_password: '', confirm_password: '' });
+  const [pwStatus, setPwStatus] = useState('');
+  const desktop = window.bidmanagerDesktop;
+
+  const deriveParent = (s) => {
+    if (s.parent_dir) return String(s.parent_dir);
+    const proj = String(s.projects_dir || '');
+    const marker = `${proj.includes('\\') ? '\\' : '/'}My_Tender_Projects`;
+    if (proj.endsWith(marker)) return proj.slice(0, -marker.length);
+    const db = String(s.db_file || '');
+    const idx = Math.max(db.lastIndexOf('\\'), db.lastIndexOf('/'));
+    return idx > 0 ? db.slice(0, idx) : '';
+  };
+
+  useEffect(() => {
+    if (!settings) return;
+    setForm((f) => ({
+      ...f,
+      parent_dir: deriveParent(settings) || f.parent_dir,
+      project_details_show_tender_info: settings.project_details_show_tender_info || f.project_details_show_tender_info,
+      // Show the effective URL: the baked-in default unless the user has
+      // explicitly set one.
+      server_url: settings.server_url_user_set ? (settings.server_url || api.defaultServerUrl) : api.defaultServerUrl,
+      sync_interval_minutes: Number(settings.sync_interval_minutes) || 15,
+    }));
+  }, [settings]);
+
+  const normUrl = (u) => String(u || '').trim().replace(/\/+$/, '');
+
+  const saveMut = useMutation({
+    // A changed Backend URL is only persisted if it actually connects —
+    // otherwise a typo would break every /client/* call with no easy way
+    // back. Other settings still save; the URL just snaps back to the
+    // known-good one.
+    mutationFn: async (patch) => {
+      const effectiveStored = settings?.server_url_user_set ? (settings?.server_url || api.defaultServerUrl) : api.defaultServerUrl;
+      const storedUrl = normUrl(effectiveStored);
+      const nextUrl = normUrl(patch.server_url);
+      const urlChanged = Boolean(nextUrl) && nextUrl !== storedUrl;
+      let urlError = '';
+      if (urlChanged) {
+        try {
+          await api.testConnection({ server_url: patch.server_url });
+        } catch (error) {
+          urlError = `Could not connect to ${patch.server_url} — Backend URL not changed. (${error instanceof Error ? error.message : String(error)})`;
+        }
+      }
+      const toSave = urlError
+        ? { ...patch, server_url: effectiveStored }
+        : (urlChanged ? { ...patch, server_url_user_set: true } : patch);
+      await api.updateSettings(toSave);
+      const folders = await api.ensureParentFolders(toSave.parent_dir);
+      return { folders, urlError, savedUrl: toSave.server_url };
+    },
+    onSuccess: (result) => {
+      qc.invalidateQueries({ queryKey: ['settings'] });
+      qc.invalidateQueries({ queryKey: ['health'] });
+      window.dispatchEvent(new Event('bm-settings-updated'));
+      setForm((f) => ({ ...f, server_url: result.savedUrl }));
+      if (result.urlError) {
+        setPathStatus(result.urlError);
+      } else {
+        setPathStatus(result.folders?.ok === false ? `Saved settings, but could not create folders: ${result.folders.message}` : 'Saved.');
+        setSaved(true);
+        setTimeout(() => setSaved(false), 2000);
+      }
+    },
+    onError: (error) => setPathStatus(`Save failed: ${error instanceof Error ? error.message : String(error)}`),
+  });
+  const handleSave = () => saveMut.mutate(form);
+  const resetUrlMut = useMutation({
+    mutationFn: () => api.updateSettings({ server_url: api.defaultServerUrl, server_url_user_set: false }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['settings'] });
+      qc.invalidateQueries({ queryKey: ['health'] });
+      window.dispatchEvent(new Event('bm-settings-updated'));
+      setForm((f) => ({ ...f, server_url: api.defaultServerUrl }));
+      setPathStatus('Backend URL reset to default.');
+    },
+    onError: (error) => setPathStatus(`Reset failed: ${error instanceof Error ? error.message : String(error)}`),
+  });
+  const uf = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+  const folderPath = (name) => form.parent_dir ? `${form.parent_dir}${form.parent_dir.endsWith('\\') || form.parent_dir.endsWith('/') ? '' : '\\'}${name}` : '-';
+
+  const connectionMut = useMutation({
+    mutationFn: () => api.testConnection(form),
+    onSuccess: (result) => setPathStatus(`Connected successfully. Server version: ${result.version || 'unknown'}. Read-only access confirmed.`),
+    onError: (error) => setPathStatus(`Connection failed: ${error instanceof Error ? error.message : String(error)}`),
+  });
+  const syncMut = useMutation({
+    mutationFn: () => api.syncFromServer(form),
+    onSuccess: (result) => {
+      qc.invalidateQueries();
+      window.dispatchEvent(new Event('bm-settings-updated'));
+      setPathStatus(`Imported ${result.tenders} tenders from ${result.websites} server sources. Local changes remain on this device.`);
+    },
+    onError: (error) => setPathStatus(`Sync failed: ${error instanceof Error ? error.message : String(error)}`),
+  });
+  const signOutMut = useMutation({
+    mutationFn: () => api.signOut(),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['settings'] }); qc.clear(); },
+  });
+  const changePasswordMut = useMutation({
+    mutationFn: () => api.changePassword(pwForm),
+    onSuccess: () => {
+      setPwStatus('Password changed.');
+      setPwForm({ current_password: '', new_password: '', confirm_password: '' });
+      setTimeout(() => { setShowChangePw(false); setPwStatus(''); }, 1500);
+    },
+    onError: (err) => setPwStatus(err instanceof Error ? err.message : String(err)),
+  });
+  const submitChangePassword = () => {
+    if (pwForm.new_password.length < 8) { setPwStatus('New password must be at least 8 characters.'); return; }
+    if (pwForm.new_password !== pwForm.confirm_password) { setPwStatus('New passwords do not match.'); return; }
+    changePasswordMut.mutate();
+  };
+
+  const browseForPath = async (key, label) => {
+    try {
+      if (!desktop?.pickPath) { setPathStatus('Browse is available in the desktop app.'); return; }
+      const result = await desktop.pickPath({ file: false, title: `Select ${label}` });
+      if (result?.ok && result.path) uf(key, result.path);
+      else if (result && !result.canceled && result.message) setPathStatus(`Browse failed: ${result.message}`);
+    } catch (e) {
+      setPathStatus(`Browse failed: ${e?.message || String(e)}`);
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-full overflow-auto">
+      <div className="px-6 py-4 border-b border-[var(--border)] bg-[var(--surface-0)]">
+        <div className="flex items-center justify-between">
+          <h1 className="text-lg font-bold text-[var(--text)]">Settings</h1>
+          <div>
+            {health ? <Badge variant="success"><Wifi size={10} />Connected v{health.version}</Badge> : <Badge variant="danger"><WifiOff size={10} />Offline</Badge>}
+          </div>
+        </div>
+      </div>
+      {isLoading ? (
+        <div className="flex justify-center py-16"><Spinner size={24} className="text-[var(--accent)]" /></div>
+      ) : (
+        <div className="p-6">
+          <div className="grid grid-cols-1 gap-6 xl:grid-cols-12">
+            <div className="space-y-6 xl:col-span-7">
+              <div className="card p-5 space-y-4">
+                <h3 className="text-sm font-semibold text-[var(--text)]">Appearance</h3>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm text-[var(--text)]">Theme</p>
+                    <p className="text-xs text-[var(--text-muted)]">Light / Dark mode</p>
+                  </div>
+                  <button onClick={toggleTheme} className="btn-secondary text-sm gap-2">
+                    {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
+                    {theme === 'dark' ? 'Light' : 'Dark'}
+                  </button>
+                </div>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm text-[var(--text)]">Show Tender Info panel</p>
+                    <p className="text-xs text-[var(--text-muted)]">In project details view</p>
+                  </div>
+                  <input type="checkbox" checked={form.project_details_show_tender_info === 'true'} onChange={(e) => uf('project_details_show_tender_info', e.target.checked ? 'true' : 'false')} className="accent-[var(--accent)] w-5 h-5" />
+                </div>
+                <p className="flex items-start gap-2 text-[11px] text-[var(--text-muted)]">
+                  <Info size={12} className="mt-0.5 shrink-0" />
+                  The New/Edit Project form's Inline vs Popup mode moved to the Projects page toolbar.
+                </p>
+              </div>
+
+              <div className="card p-5 space-y-4">
+                <h3 className="text-sm font-semibold text-[var(--text)]">Directory Paths</h3>
+                <p className="text-xs text-[var(--text-muted)]">Choose one parent folder — the four folders below are created automatically under it when you save.</p>
+                <div>
+                  <label className="text-xs text-[var(--text-muted)] mb-1 block">Parent Folder</label>
+                  <div className="flex gap-2">
+                    <input value={form.parent_dir} onChange={(e) => uf('parent_dir', e.target.value)} className="input-field h-9 text-sm flex-1" placeholder="Path to parent folder" />
+                    <button onClick={() => browseForPath('parent_dir', 'Parent Folder')} className="btn-secondary text-xs px-3 gap-1 shrink-0"><FolderOpen size={13} />Browse</button>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 gap-2 text-xs text-[var(--text-muted)]">
+                  <div>Tender Downloads: <span className="text-[var(--text)]">{folderPath('Tender_Downloads')}</span></div>
+                  <div>Projects: <span className="text-[var(--text)]">{folderPath('My_Tender_Projects')}</span></div>
+                  <div>Archived: <span className="text-[var(--text)]">{folderPath('Archived Projects')}</span></div>
+                  <div>Templates: <span className="text-[var(--text)]">{folderPath('Checklist_Templates')}</span></div>
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-6 xl:col-span-5">
+              <div className="card p-5 space-y-4">
+                <h3 className="text-sm font-semibold text-[var(--text)]">Account</h3>
+                {settings?.auth_token ? (
+                  <>
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <p className="text-sm text-[var(--text)]">{settings.display_name || settings.user_email}</p>
+                        <p className="text-[11px] text-[var(--text-muted)]">{settings.user_email}</p>
+                      </div>
+                      <button onClick={() => signOutMut.mutate()} disabled={signOutMut.isPending} className="btn-secondary text-xs gap-1.5">
+                        {signOutMut.isPending ? <Spinner size={13} /> : <LogOut size={13} />}Sign Out
+                      </button>
+                    </div>
+                    <div className="border-t border-[var(--border)] pt-3">
+                      <button onClick={() => { setShowChangePw((v) => !v); setPwStatus(''); }} className="btn-ghost text-xs gap-1.5">
+                        <KeyRound size={13} />{showChangePw ? 'Cancel' : 'Change Password'}
+                      </button>
+                      {showChangePw && (
+                        <div className="mt-3 space-y-2">
+                          <input type="password" value={pwForm.current_password} onChange={(e) => setPwForm((f) => ({ ...f, current_password: e.target.value }))} placeholder="Current password" className="input-field h-9 w-full text-sm" autoComplete="current-password" />
+                          <input type="password" value={pwForm.new_password} onChange={(e) => setPwForm((f) => ({ ...f, new_password: e.target.value }))} placeholder="New password (min 8 characters)" className="input-field h-9 w-full text-sm" autoComplete="new-password" />
+                          <input type="password" value={pwForm.confirm_password} onChange={(e) => setPwForm((f) => ({ ...f, confirm_password: e.target.value }))} placeholder="Confirm new password" className="input-field h-9 w-full text-sm" autoComplete="new-password" />
+                          {pwStatus && <p className="text-xs text-rose-400">{pwStatus}</p>}
+                          <button
+                            onClick={submitChangePassword}
+                            disabled={changePasswordMut.isPending || !pwForm.current_password || !pwForm.new_password || !pwForm.confirm_password}
+                            className="btn-primary text-xs gap-1.5"
+                          >
+                            {changePasswordMut.isPending ? <Spinner size={13} /> : <KeyRound size={13} />}Update Password
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </>
+                ) : <p className="text-xs text-[var(--text-muted)]">Not signed in.</p>}
+              </div>
+
+              {settings?.auth_token && <OrganisationCard settings={settings} />}
+
+              <div className="card p-5 space-y-4">
+                <div>
+                  <h3 className="text-sm font-semibold text-[var(--text)]">Server & Sync</h3>
+                  <p className="mt-1 text-xs text-[var(--text-muted)]">The production URL is prefilled and remains editable. Only authenticated /client/* routes are used.</p>
+                </div>
+                <div>
+                  <div className="mb-1 flex items-center justify-between">
+                    <label className="text-xs text-[var(--text-muted)]">Backend URL</label>
+                    <button
+                      onClick={() => resetUrlMut.mutate()}
+                      disabled={resetUrlMut.isPending}
+                      className="text-[11px] text-[var(--accent)] hover:underline disabled:opacity-50"
+                    >
+                      Reset to default
+                    </button>
+                  </div>
+                  <input
+                    value={form.server_url}
+                    onChange={(event) => uf('server_url', event.target.value)}
+                    className="input-field h-9 w-full font-mono text-xs"
+                    placeholder={api.defaultServerUrl}
+                    spellCheck={false}
+                  />
+                  <p className="mt-1 text-[11px] text-[var(--text-muted)]">A changed URL is only saved if it connects successfully.</p>
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-[var(--text-muted)]">Sync interval</label>
+                  <select
+                    value={form.sync_interval_minutes}
+                    onChange={(event) => uf('sync_interval_minutes', Number(event.target.value))}
+                    className="input-field h-9 w-auto max-w-[180px] text-xs"
+                  >
+                    <option value={1}>Every minute</option>
+                    <option value={5}>Every 5 minutes</option>
+                    <option value={15}>Every 15 minutes</option>
+                    <option value={30}>Every 30 minutes</option>
+                    <option value={60}>Every hour</option>
+                  </select>
+                  <p className="mt-1 text-[11px] text-[var(--text-muted)]">The app also always syncs once on every launch, and immediately when the network reconnects. Every minute keeps changes the most current, at the cost of constant background traffic.</p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button onClick={() => connectionMut.mutate()} disabled={connectionMut.isPending || !settings?.auth_token} className="btn-secondary text-xs gap-1.5">
+                    {connectionMut.isPending ? <Spinner size={13} /> : <Wifi size={13} />}Test Connection
+                  </button>
+                  <button onClick={() => syncMut.mutate()} disabled={syncMut.isPending || !settings?.auth_token} className="btn-primary text-xs gap-1.5">
+                    {syncMut.isPending ? <Spinner size={13} /> : <RefreshCw size={13} />}Sync Tenders
+                  </button>
+                </div>
+                <p className="text-[11px] text-[var(--text-muted)]">Sync reads paginated tender data from Postgres through the backend and updates the offline cache. Projects, bookmarks, templates, settings, and local files are never uploaded.</p>
+                {settings?.last_sync_at && <p className="text-[11px] text-[var(--text-muted)]">Last sync: {new Date(settings.last_sync_at).toLocaleString()}</p>}
+                {pathStatus && <p className="text-xs text-rose-400">{pathStatus}</p>}
+              </div>
+
+              <div className="flex items-center gap-3 pb-6 xl:pb-0">
+                <button onClick={handleSave} disabled={saveMut.isPending} className="btn-primary text-sm gap-1.5">
+                  {saveMut.isPending ? <Spinner size={14} /> : saved ? <CheckCircle2 size={14} /> : <Save size={14} />}{saved ? 'Saved!' : 'Save Settings'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SIGN IN  — gates the whole app behind a per-user account (client_users on
+   the server). Register/login both return a personal session token stored as
+   settings.auth_token; api.js sends it as x-client-key on every /client/*
+   call. See Server UI/server/client_api.py's /client/auth/* routes.
+   ═══════════════════════════════════════════════════════════════════════════ */
+function SignInScreen() {
+  const qc = useQueryClient();
+  const [mode, setMode] = useState('login'); // 'login' | 'register'
+  const [form, setForm] = useState({ email: '', password: '', display_name: '', account_type: 'individual', org_name: '' });
+  const [remember, setRemember] = useState(true);
+  const [error, setError] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const uf = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+
+  const submitMut = useMutation({
+    mutationFn: () => api.signIn(form, mode, remember),
+    onSuccess: () => { setError(''); qc.invalidateQueries({ queryKey: ['settings'] }); },
+    onError: (err) => setError(err instanceof Error ? err.message : String(err)),
+  });
+
+  const handleSubmit = (event) => {
+    event.preventDefault();
+    if (!form.email.trim() || !form.password.trim()) { setError('Enter your email and password.'); return; }
+    if (mode === 'register' && form.account_type === 'organisation' && !form.org_name.trim()) {
+      setError('Enter an organisation name.');
+      return;
+    }
+    submitMut.mutate();
+  };
+
+  return (
+    <div className="flex h-screen items-center justify-center bg-[var(--bg)] text-[var(--text)]">
+      <form onSubmit={handleSubmit} className="card w-full max-w-sm space-y-4 p-6">
+        <div className="text-center">
+          <p className="text-sm font-bold tracking-tight text-[var(--accent)]">BID MANAGER</p>
+          <h1 className="mt-1 text-lg font-semibold text-[var(--text)]">{mode === 'register' ? 'Create an account' : 'Sign in'}</h1>
+        </div>
+
+        {mode === 'register' && (
+          <div>
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Name</label>
+            <input value={form.display_name} onChange={(e) => uf('display_name', e.target.value)} className="input-field h-9 w-full text-sm" placeholder="Your name" />
+          </div>
+        )}
+        {mode === 'register' && (
+          <div>
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">Account type</label>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => uf('account_type', 'individual')}
+                className={cn('flex-1 rounded-md border px-2 py-1.5 text-xs', form.account_type === 'individual' ? 'border-[var(--accent)] bg-[var(--accent-bg)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-muted)]')}
+              >
+                Individual
+              </button>
+              <button
+                type="button"
+                onClick={() => uf('account_type', 'organisation')}
+                className={cn('flex-1 rounded-md border px-2 py-1.5 text-xs', form.account_type === 'organisation' ? 'border-[var(--accent)] bg-[var(--accent-bg)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-muted)]')}
+              >
+                Create an organisation
+              </button>
+            </div>
+            {form.account_type === 'organisation' && (
+              <input
+                value={form.org_name}
+                onChange={(e) => uf('org_name', e.target.value)}
+                className="input-field mt-2 h-9 w-full text-sm"
+                placeholder="Organisation name"
+              />
+            )}
+            {form.account_type === 'organisation' && (
+              <p className="mt-1 text-[11px] text-[var(--text-muted)]">You'll be the organisation's admin. To join an existing one instead, create an individual account first, then use "Join an organisation" in Settings.</p>
+            )}
+          </div>
+        )}
+        <div>
+          <label className="mb-1 block text-xs text-[var(--text-muted)]">Email</label>
+          <input type="email" value={form.email} onChange={(e) => uf('email', e.target.value)} className="input-field h-9 w-full text-sm" placeholder="you@example.com" autoComplete="email" required />
+        </div>
+        <div>
+          <label className="mb-1 block text-xs text-[var(--text-muted)]">Password</label>
+          <div className="relative">
+            <input
+              type={showPassword ? 'text' : 'password'} value={form.password} onChange={(e) => uf('password', e.target.value)}
+              className="input-field h-9 w-full pr-9 text-sm" placeholder={mode === 'register' ? 'At least 8 characters' : 'Password'}
+              autoComplete={mode === 'register' ? 'new-password' : 'current-password'} required
+            />
+            <button type="button" onClick={() => setShowPassword((v) => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text)]">
+              {showPassword ? <EyeOff size={14} /> : <Eye size={14} />}
+            </button>
+          </div>
+        </div>
+
+        <label className="flex items-center gap-2 text-xs text-[var(--text-muted)]">
+          <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} className="accent-[var(--accent)]" />
+          Remember me on this device
+        </label>
+
+        {error && <p className="text-xs text-rose-400">{error}</p>}
+
+        <button type="submit" disabled={submitMut.isPending} className="btn-primary flex w-full items-center justify-center gap-2 text-sm">
+          {submitMut.isPending ? <Spinner size={14} /> : mode === 'register' ? <UserPlus size={14} /> : <LogIn size={14} />}
+          {mode === 'register' ? 'Create account' : 'Sign in'}
+        </button>
+
+        <p className="text-center text-xs text-[var(--text-muted)]">
+          {mode === 'register' ? 'Already have an account?' : "Don't have an account?"}{' '}
+          <button type="button" onClick={() => { setMode(mode === 'register' ? 'login' : 'register'); setError(''); }} className="text-[var(--accent)] hover:underline">
+            {mode === 'register' ? 'Sign in' : 'Create one'}
+          </button>
+        </p>
+      </form>
+    </div>
+  );
+}
+
+function formatAgo(dateStr) {
+  if (!dateStr) return null;
+  const then = new Date(dateStr).getTime();
+  if (!Number.isFinite(then)) return null;
+  const diffMs = Date.now() - then;
+  if (diffMs < 0) return 'just now';
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   APP SHELL
+   — dropped: the background "auto-archive" polling loop that used to call
+     api.listWebsites / api.checkArchivedTenderStatus / api.archiveCompletedTenders
+     on a timer. That whole cycle was the scraper re-checking source portals
+     for completed tenders — an operator-only background job.
+   ═══════════════════════════════════════════════════════════════════════════ */
+export default function App() {
+  const qc = useQueryClient();
+  const { theme, toggleTheme, sidebarCollapsed, toggleSidebar, notifications } = useAppStore();
+  const { data: authSettings, isLoading: authLoading } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
+  const { data: connected } = useQuery({
+    queryKey: ['client-health', authSettings?.server_url, Boolean(authSettings?.auth_token)],
+    queryFn: () => api.health(),
+    enabled: Boolean(authSettings?.auth_token),
+    retry: false,
+  });
+  const [page, setPage] = useState(() => {
+    const allowed = ['dashboard', 'tenders', 'organizations', 'bookmarks', 'projects', 'templates', 'company', 'bid_agent', 'archived_projects', 'captcha', 'files', 'settings', 'portal_search'];
+    const startupPage = readClientPrefs().startupPage;
+    if (startupPage && startupPage !== 'resume' && allowed.includes(startupPage)) return startupPage;
+    const saved = localStorage.getItem('bm-client-last-page');
+    return allowed.includes(saved) ? saved : 'dashboard';
+  });
+  const [showNotifications, setShowNotifications] = useState(false);
+  const [showDownloads, setShowDownloads] = useState(false);
+  const { data: allDocuments } = useQuery({ queryKey: ['client-documents'], queryFn: api.listAllDocuments });
+  const downloadsInProgressCount = useMemo(
+    () => (allDocuments || []).filter((d) => d.client_status === 'requested' || d.client_status === 'downloading').length,
+    [allDocuments]
+  );
+  const [workspaceProjectId, setWorkspaceProjectId] = useState(() => {
+    const value = Number(new URLSearchParams(window.location.search).get('projectId'));
+    return Number.isFinite(value) && value > 0 ? value : null;
+  });
+  const [workspaceTimeRemaining, setWorkspaceTimeRemaining] = useState('');
+  const [workspaceDeadlineTone, setWorkspaceDeadlineTone] = useState(''); // '' | 'urgent' | 'expired'
+  // Mirrors ProjectWorkspacePage's edit state so the header's Edit/Save pair
+  // can reflect it (Save only appears once something actually changed).
+  const [workspaceInfoState, setWorkspaceInfoState] = useState({ editable: false, dirty: false, saving: false });
+  // { tenderId (canonical portal id), id (row-id hint) } of the open drawer.
+  const [tenderDetailRef, setTenderDetailRef] = useState(null);
+  const { data: pendingCaptcha } = useQuery({
+    queryKey: ['captcha-pending'],
+    queryFn: () => api.getPendingCaptcha(),
+    enabled: Boolean(authSettings?.auth_token),
+    refetchInterval: 30000,
+    refetchOnWindowFocus: true,
+    retry: false,
+  });
+
+  const unreadCount = notifications.filter((n) => !n.read).length;
+
+  useEffect(() => {
+    const onOpen = (evt) => {
+      const tenderId = canonTenderId(evt.detail?.tenderId);
+      const id = Number(evt.detail?.id);
+      if (tenderId || id > 0) setTenderDetailRef({ tenderId, id: id > 0 ? id : null });
+    };
+    window.addEventListener('bm-open-tender-detail', onOpen);
+    return () => window.removeEventListener('bm-open-tender-detail', onOpen);
+  }, []);
+
+  useEffect(() => {
+    if (authSettings?.auth_token) resumePendingTenderChecks();
+  }, [Boolean(authSettings?.auth_token)]);
+
+  useEffect(() => { localStorage.setItem('bm-client-last-page', page); }, [page]);
+
+  useEffect(() => {
+    document.body.classList.toggle('dark', theme === 'dark');
+    document.body.classList.toggle('light', theme === 'light');
+  }, [theme]);
+
+  useEffect(() => {
+    const onTime = (evt) => {
+      setWorkspaceTimeRemaining(String(evt.detail?.label || ''));
+      setWorkspaceDeadlineTone(evt.detail?.expired ? 'expired' : evt.detail?.urgent ? 'urgent' : '');
+    };
+    const onState = (evt) => setWorkspaceInfoState({
+      editable: Boolean(evt.detail?.editable),
+      dirty: Boolean(evt.detail?.dirty),
+      saving: Boolean(evt.detail?.saving),
+    });
+    window.addEventListener('bm-workspace-time-remaining', onTime);
+    window.addEventListener('bm-workspace-state', onState);
+    return () => {
+      window.removeEventListener('bm-workspace-time-remaining', onTime);
+      window.removeEventListener('bm-workspace-state', onState);
+    };
+  }, []);
+
+  // Keeps the offline cache current without relying on the user remembering
+  // to press "Sync Tenders" in Settings — same sync (flush the queued
+  // pushes, then pull) fires once immediately on every launch, then again
+  // on a configurable schedule (Settings' "Sync interval", default 15 min)
+  // AND the moment the network comes back so an offline edit propagates
+  // immediately on reconnect.
+  useEffect(() => {
+    if (!authSettings?.auth_token) return undefined;
+    const run = () => { api.syncFromServer().then(() => qc.invalidateQueries()).catch(() => {}); };
+    run();
+    const intervalMinutes = Math.max(1, Number(authSettings.sync_interval_minutes) || 15);
+    const timer = setInterval(run, intervalMinutes * 60 * 1000);
+    window.addEventListener('online', run);
+    return () => { clearInterval(timer); window.removeEventListener('online', run); };
+  }, [authSettings?.auth_token, authSettings?.sync_interval_minutes, qc]);
+
+  // A "Requested…" pill (TendersPage) is backed by a placeholder row in the
+  // local `documents` store with the job id attached, but the setTimeout
+  // polling chain in api.pollTenderDownloadJob only lives as long as the app
+  // stays open — reattach it here so a still-pending request resumes polling
+  // after a reload/restart instead of getting stuck "Requested…" forever.
+  useEffect(() => {
+    if (!authSettings?.auth_token) return;
+    api.resumePendingDownloadJobs().catch(() => {});
+  }, [authSettings?.auth_token]);
+
+  // Same reattachment, for an in-flight "Request tenders" org scrape — see
+  // api.resumePendingOrgRequests.
+  useEffect(() => {
+    if (!authSettings?.auth_token) return;
+    api.resumePendingOrgRequests().catch(() => {});
+  }, [authSettings?.auth_token]);
+
+  // Same reattachment, for an in-flight portal tender search — see
+  // api.resumePendingPortalSearches.
+  useEffect(() => {
+    if (!authSettings?.auth_token) return;
+    api.resumePendingPortalSearches().catch(() => {});
+  }, [authSettings?.auth_token]);
+
+  // Heal a stale/dead Backend URL left in an old install's app data: while
+  // the user hasn't explicitly set one, the baked-in default is authoritative
+  // (connection() already ignores the stale value — this just keeps the
+  // persisted copy honest so Settings shows the real host).
+  useEffect(() => {
+    if (!authSettings?.auth_token || authSettings.server_url_user_set) return;
+    if (String(authSettings.server_url || '').replace(/\/+$/, '') !== String(api.defaultServerUrl).replace(/\/+$/, '')) {
+      api.updateSettings({ server_url: api.defaultServerUrl }).then(() => qc.invalidateQueries({ queryKey: ['settings'] })).catch(() => {});
+    }
+  }, [authSettings?.auth_token, authSettings?.server_url_user_set, authSettings?.server_url, qc]);
+
+  // First sync on any install is a PULL — a fresh (or stale) device adopts
+  // the server's data before it's ever allowed to push. pullUserData also
+  // flushes any pending edit first and re-pushes stranded local-only content.
+  useEffect(() => {
+    if (!authSettings?.auth_token || authSettings.has_synced_once) return;
+    api.pullUserData().catch(() => {});
+  }, [authSettings?.auth_token, authSettings?.has_synced_once]);
+
+  // An edit (bookmark, project, checklist, ...) that failed to push in a
+  // previous session — app closed before the retry succeeded — sits marked
+  // "pending" in local storage until something retries it. Do that now
+  // rather than waiting for the 15-minute periodic sync or a manual click.
+  useEffect(() => {
+    if (!authSettings?.auth_token || !authSettings.has_synced_once) return;
+    api.flushPendingSyncPush().catch(() => {});
+  }, [authSettings?.auth_token, authSettings?.has_synced_once]);
+
+  // A background download job completing (api.js, no React Query access of
+  // its own) can change a tender's has_documents/document_count outside of
+  // any mutation this component knows about — refresh the tender lists when
+  // it signals that, so "Request" flips to "Download" without a manual Sync.
+  useEffect(() => api.onTendersChanged(() => {
+    qc.invalidateQueries({ queryKey: ['client-tenders'] });
+    qc.invalidateQueries({ queryKey: ['client-tenders-bookmarked'] });
+  }), [qc]);
+
+  // Clears the "came from Organizations" flag, then navigates — used by
+  // every navigation path except openOrgTenders itself, so a stale "Back to
+  // Organizations" button can't linger once the user has gone somewhere else.
+  const navigate = (target) => {
+    try { sessionStorage.removeItem(TENDERS_CAME_FROM_ORG_KEY); } catch { /* ignore storage failures */ }
+    setPage(target);
+  };
+
+  // If this account's permissions change (an org admin restricts a section,
+  // or a stale saved "last page" is no longer reachable) while the gated
+  // page is still open, bounce to Dashboard instead of leaving a blocked
+  // page on screen.
+  // Must stay ABOVE the SignInScreen return below: that return skips every
+  // hook after it, and when a signed-out launch flips authLoading true ->
+  // false React sees fewer hooks on the second render and throws.
+  useEffect(() => {
+    if (!authSettings?.permissions) return;
+    if (sidebarKeyGatedOff(page, authSettings.permissions)) navigate('dashboard');
+  }, [page, authSettings?.permissions]);
+
+  if (!authLoading && !authSettings?.auth_token) return <SignInScreen />;
+
+  // Websites are now a mandatory single-select filter (no "All" option), so
+  // an org's own website must be preset explicitly — otherwise a different
+  // website left selected in Tenders could hide this org's tenders entirely.
+  const openOrgTenders = (orgName, websiteName) => {
+    try {
+      const current = loadTenderFilterState();
+      localStorage.setItem(TENDERS_FILTER_STATE_KEY, JSON.stringify({ ...current, website: websiteName || current.website }));
+      sessionStorage.setItem(TENDERS_ACTIVE_FILTER_KEY, JSON.stringify({ org: orgName, location: '', category: '' }));
+      sessionStorage.setItem(TENDERS_FILTERS_ACTIVATED_KEY, '1');
+      sessionStorage.setItem(TENDERS_FORCE_TAB_KEY, 'active');
+      sessionStorage.setItem(TENDERS_CAME_FROM_ORG_KEY, '1');
+    } catch { /* ignore storage failures */ }
+    setPage('tenders');
+  };
+
+  const openWebsiteOrganizations = (websiteName) => {
+    try { sessionStorage.setItem(ORGANIZATIONS_FORCE_WEBSITE_KEY, websiteName || ''); } catch { /* ignore storage failures */ }
+    navigate('organizations');
+  };
+
+  // Downloads panel row click — jump to Online Tenders with that tender
+  // selected/highlighted (tolerates the tender no longer being present).
+  // `ref` is { tender_id, id } — opened by tender id, the row id is a hint.
+  const openTenderDetails = (ref) => {
+    const tenderId = tenderKey(ref);
+    const id = Number(ref?.id) > 0 ? Number(ref.id) : null;
+    try { sessionStorage.setItem(TENDERS_FORCE_SELECT_KEY, JSON.stringify({ tender_id: tenderId, id })); } catch { /* ignore storage failures */ }
+    navigate('tenders');
+    if (tenderId || id) setTenderDetailRef({ tenderId, id });
+  };
+
+  // Dashboard stat cards navigate to a pre-filtered view — same cross-page
+  // mechanism as openOrgTenders, minus the org filter. Deliberately leaves
+  // `website` untouched (read-modify-write) since it's now a mandatory
+  // single-select and shouldn't get silently reset by an unrelated card.
+  const goToDashboardTarget = (target) => {
+    if (target === 'tenders-active' || target === 'tenders-archived' || target === 'tenders-closing-7d') {
+      try {
+        sessionStorage.setItem(TENDERS_ACTIVE_FILTER_KEY, JSON.stringify({ org: '', location: '', category: '' }));
+        sessionStorage.setItem(TENDERS_FORCE_TAB_KEY, target === 'tenders-archived' ? 'archived' : 'active');
+        if (target === 'tenders-closing-7d') sessionStorage.setItem(TENDERS_FORCE_CLOSING_KEY, '1');
+      } catch { /* ignore storage failures */ }
+      navigate('tenders');
+    } else if (target) {
+      navigate(target);
+    }
+  };
+
+  const pages = {
+    dashboard: <DashboardPage onNavigate={goToDashboardTarget} onOpenProjectWorkspace={(projectId) => setWorkspaceProjectId(projectId)} onOpenWebsiteOrganizations={openWebsiteOrganizations} />,
+    tenders: <TendersPage onBackToOrganizations={() => navigate('organizations')} />,
+    organizations: <OrganizationsPage onOpenOrgTenders={openOrgTenders} />,
+    bookmarks: <BookmarksPage onOpenOrgTenders={openOrgTenders} />,
+    projects: <ProjectsPage key="projects-active" onOpenProjectWorkspace={(projectId) => setWorkspaceProjectId(projectId)} />,
+    archived_projects: <ProjectsPage key="projects-archived" archived onOpenProjectWorkspace={(projectId) => setWorkspaceProjectId(projectId)} />,
+    captcha: <CaptchaPage />,
+    templates: <TemplatesPage />,
+    company: <CompanyProfilePage />,
+    bid_agent: <BidAgentPage onNavigate={navigate} />,
+    files: <FilesPage />,
+    settings: <SettingsPage />,
+    portal_search: <PortalSearchPage onOpenTender={openTenderDetails} />,
+  };
+
+  return (
+    <div className="h-screen flex flex-col bg-[var(--bg)] text-[var(--text)]">
+      <header className="h-11 flex items-center px-4 border-b border-[var(--border)] bg-[var(--surface-0)] shrink-0 relative z-30">
+        <span className="text-xs text-[var(--text-muted)] font-medium">Tender & Bid Manager</span>
+        <div className="flex-1" />
+        <div className="flex items-center gap-2">
+          {connected ? (
+            <span title="Connected to the server">
+              <Badge variant="success"><Wifi size={10} />{formatAgo(authSettings?.last_sync_at) ? `Synced ${formatAgo(authSettings.last_sync_at)}` : null}</Badge>
+            </span>
+          ) : (
+            <span title="Not connected — check Settings › Connection & Sync"><Badge variant="danger"><WifiOff size={10} />Offline</Badge></span>
+          )}
+        </div>
+        <div className="flex items-center gap-1">
+          <button onClick={() => setShowDownloads(!showDownloads)} className="relative p-1.5 rounded-md hover:bg-[var(--surface-1)] text-[var(--text-muted)]">
+            <Download size={16} />
+            {downloadsInProgressCount > 0 && (
+              <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 bg-[var(--accent)] text-white text-[10px] font-bold rounded-full flex items-center justify-center px-1">{downloadsInProgressCount}</span>
+            )}
+          </button>
+          <button onClick={() => setShowNotifications(!showNotifications)} className="relative p-1.5 rounded-md hover:bg-[var(--surface-1)] text-[var(--text-muted)]">
+            <Bell size={16} />
+            {unreadCount > 0 && (
+              <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 bg-[var(--danger)] text-white text-[10px] font-bold rounded-full flex items-center justify-center px-1">{unreadCount}</span>
+            )}
+          </button>
+          <button onClick={toggleTheme} className="p-1.5 rounded-md hover:bg-[var(--surface-1)] text-[var(--text-muted)]">
+            {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+          </button>
+        </div>
+        <DownloadsPanel open={showDownloads} onClose={() => setShowDownloads(false)} onOpenTender={(ref) => { setShowDownloads(false); openTenderDetails(ref); }} />
+        <NotificationPanel
+          open={showNotifications}
+          onClose={() => setShowNotifications(false)}
+          onOpenTender={openTenderDetails}
+          onOpenOrg={(orgName) => openOrgTenders(orgName)}
+          onOpenProject={(projectId) => setWorkspaceProjectId(projectId)}
+        />
+        <ToastHost />
+      </header>
+
+      <div className="flex flex-1 overflow-hidden">
+        <Sidebar active={page} onNavigate={navigate} collapsed={sidebarCollapsed} onToggle={toggleSidebar} badges={{ captcha: Boolean(pendingCaptcha) }} permissions={authSettings?.permissions} />
+        <main className="flex-1 overflow-hidden bg-[var(--bg)]">
+          <RenderErrorBoundary>{pages[page]}</RenderErrorBoundary>
+        </main>
+      </div>
+
+      {workspaceProjectId && (
+        <>
+          <div className="fixed inset-0 z-40 bg-black/35" onClick={() => setWorkspaceProjectId(null)} />
+          <aside className="fixed inset-y-0 right-0 z-50 w-[86vw] max-w-[1500px] border-l border-[var(--border)] bg-[var(--bg)] shadow-2xl">
+            <div className="flex h-11 items-center justify-between border-b border-[var(--border)] bg-[var(--surface-0)] px-3">
+              <div className="flex items-center gap-3">
+                <h3 className="text-sm font-semibold text-[var(--text)]">Project Workspace</h3>
+                {workspaceTimeRemaining && (
+                  <span className={cn(
+                    'text-xs',
+                    workspaceDeadlineTone === 'expired' ? 'text-[var(--danger)]'
+                      : workspaceDeadlineTone === 'urgent' ? 'text-amber-400'
+                        : 'text-[var(--text-muted)]',
+                  )}>
+                    {workspaceTimeRemaining}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <button onClick={() => window.dispatchEvent(new CustomEvent('bm-workspace-edit-toggle'))} className="btn-ghost gap-1 text-xs">
+                  {workspaceInfoState.editable ? <X size={12} /> : <Edit3 size={12} />}{workspaceInfoState.editable ? 'Cancel' : 'Edit Info'}
+                </button>
+                {/* Only shown once there is an actual unsaved change. */}
+                {workspaceInfoState.editable && workspaceInfoState.dirty && (
+                  <button
+                    onClick={() => window.dispatchEvent(new CustomEvent('bm-workspace-save'))}
+                    disabled={workspaceInfoState.saving}
+                    className="btn-primary gap-1 text-xs"
+                  >
+                    {workspaceInfoState.saving ? <Spinner size={12} /> : <Save size={12} />}{workspaceInfoState.saving ? 'Saving…' : 'Save'}
+                  </button>
+                )}
+                <button onClick={() => window.dispatchEvent(new CustomEvent('bm-workspace-open-folder'))} className="btn-ghost gap-1 text-xs"><FolderOpen size={12} />Open Folder</button>
+                <button onClick={() => setWorkspaceProjectId(null)} className="rounded p-1 text-[var(--text-muted)] hover:bg-[var(--surface-1)] hover:text-[var(--text)]"><X size={16} /></button>
+              </div>
+            </div>
+            <div className="h-[calc(100%-44px)]">
+              <ProjectWorkspacePage projectId={workspaceProjectId} embedded />
+            </div>
+          </aside>
+        </>
+      )}
+
+      {tenderDetailRef && (
+        <TenderDetailDrawer key={`${tenderDetailRef.tenderId}|${tenderDetailRef.id}`} tenderRef={tenderDetailRef} onClose={() => setTenderDetailRef(null)} />
+      )}
+    </div>
+  );
+}

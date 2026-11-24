@@ -1,0 +1,14 @@
+----
+2026-11-24 12:03  CLAUDE.md (OCI Server Manager session)
+  Server rule: deploys and server edits may now run from the Windows PC or the Mac mini (whole repo moved to the Mac); keep the two in step through git. Backup: restore/2026-11-24/CLAUDE.md.
+----
+2026-11-24 12:25  server/app_core.py, server/API_CHANGES.md, new server/test_download_integrity.py (OCI Server Manager session, asked by the Bidwise app session)
+  Downloads: after an unsolved document CAPTCHA the Tender Notice and Zip file are no longer fetched, and the job fails with the reason (job_b830 had stored the portal page as 2026_DTEDM_1350593_1.zip). Each saved file is checked (PK / Rar! / %PDF, no HTML page, not empty) before it is stored or logged complete. API_CHANGES section 6. Backups: restore/2026-11-24/server/. Tests 335/335. NOT deployed.
+----
+2026-11-24 12:40  DEPLOYED 7beea06 (CAPTCHA / file-check download fix) from the Mac mini with deploy/oci/deploy-backend.sh, full rebuild. VM *.py matched the repo apart from this change (line endings aside); health OK; new code in the container; no ._* files; Bid Agent mounted. The 2026_DTEDM_1350593_1 data fix is not done yet.
+----
+2026-11-24 10:02  server/client_api.py, server/test_client_api.py, server/API_CHANGES.md (OCI Server Manager session, on the Mac mini)
+  Tender list: sort_by=tender_value now numeric, new sort_by=emd, new min_value_cr/max_value_cr range. Runs in a per-request in-memory SQLite temp DB built from the filtered rows; the main DB is only read. NA/N/A sort after 0 both ways and count as 0 for the range. API_CHANGES section 7 + Bidwise to-do. Backups: restore/2026-11-24/server/. Tests 341/341. NOT deployed.
+----
+2026-11-24 10:56  server/app_core.py, server/scrapers/nprocure.py, server/client_api.py, tests (test_client_api.py, test_nprocure.py, test_orgs.py), server/API_CHANGES.md (OCI Server Manager session, on the Mac mini; asked by the Bidwise app session)
+  organizations.site_order (new column, migration with the other org columns): NIC stores the org page S.No, nProcure the 1-based client-list position, on every org-list fetch. GET /client/organizations returns site_order and orders by website, site_order (NULLs last), name. API_CHANGES section 8. Backups: restore/2026-11-24/server/ (test_nprocure.py backup taken from git HEAD after the first edit). Tests 344/344. NOT deployed.

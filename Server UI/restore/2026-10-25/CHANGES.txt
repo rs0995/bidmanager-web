@@ -1,0 +1,24 @@
+Change log — 2026-10-25
+Files in this folder are the ORIGINAL (pre-change) copies, same paths relative to "Server UI/". Restore by copying back
+(and delete the new files listed at the end).
+
+Request: (1) files attached to project checklist rows are not pushed to the server, so other platforms show the row
+text but not the file; (2) if two platforms attach different files to the same row, the server keeps the first one
+and syncs it back to the other platform. Server only; the apps follow server/API_CHANGES.md section 3.
+
+Files backed up (pre-change) and change:
+ - server/org_access.py : new table client_project_files (scope org:<id>/user:<id>, one live file per checklist row
+   via unique index (scope, checklist_item_id) WHERE trashed_at IS NULL). _link_member trashes the joining user's own
+   files; dissolve_org trashes the org's; create_org moves the creator's files to the org scope.
+ - server/client_api.py : _keep_server_file -- a pushed checklist row can't set/clear server_file (server-owned).
+   PUT /client/sync trashes the file of a checklist row it removed. Download streaming factored into
+   _stored_file_response (shared by tender documents and project files; behaviour unchanged). New routes:
+   POST /client/project-files (multipart; reserve -> store -> active; 409 file_exists = first wins; 404
+   row_not_found; 413 over max_file_size_mb), GET /client/project-files, POST /client/project-files/{id}/download-request,
+   GET /client/project-files/{id}/download?token=, DELETE /client/project-files/{id}.
+ - server/db_compat.py : client_project_files in ID_TABLES.
+ - server/app_core.py : Postgres REAL repair list += client_project_files.
+ - server/API_CHANGES.md : new section 3 (project checklist files, READY), to-dos renumbered to section 4 (+ BM Pro).
+New files: server/project_files.py (file logic), server/test_project_files.py (11 tests).
+Pointer lines updated in Bidwise/AGENTS.md + CLAUDE.md, Server Mobile App/AGENTS.md, Client UI/CLAUDE.md,
+Server UI/CLAUDE.md; a pointer section added to Mobile App RN/CLAUDE.md.

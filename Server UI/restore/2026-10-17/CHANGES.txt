@@ -1,0 +1,18 @@
+Change log — 2026-10-17
+Files in this folder are the ORIGINAL (pre-change) copies, same paths relative to "Server UI/". Restore by copying back.
+
+Request: nProcure links. The portal's tender page only opens via a form POST (a plain GET returns 500),
+and some client subdomains don't exist in DNS.
+
+Files backed up (pre-change) and intended change:
+ - server/api_server.py : new public GET /portal/nprocure/tender/{tender_id} page that auto-submits the
+   portal's view-nit-home form (opens the tender on tender.nprocure.com).
+ - server/client_api.py : /client tender payloads rewrite nProcure tender_url to that page.
+ - server/scrapers/nprocure.py : organizations' tenders_url = main site (not the client subdomain);
+   listing always uses the client id (subdomain fallback removed).
+ - server/test_nprocure.py : tests for the above.
+
+Status: completed 2026-10-17. test_nprocure.py (20 tests) passes; full suite 231/233 — the 2 failures are timing-sensitive tests (client changes feed, job restart) that pass when re-run on their own. Portal accepts the hand-off form POST from another origin (verified live).
+2026-10-17 10:49:02 app_core.py: nProcure seed LIKE pattern moved into a parameter (literal %n crashed Postgres startup)
+ - server/scrapers/nprocure.py (follow-up): per-tender '  > <id>  [Ns]' log lines like NIC; dropped the portal-request count from the completion message.
+ - server/scrapers/nprocure.py (follow-up): detail/corrigendum pages fetched in parallel (setting nprocure_parallel_requests, default 4); GMRC 11 tenders 52s -> 12.6s live. Tests: test_nprocure.py 22 OK.

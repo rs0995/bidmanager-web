@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.db
+*.db-*
+.pytest_cache/
+.git/
+build/
+dist/
+Tender_Downloads/
+My_Tender_Projects/
+Checklist_Templates/
+user_settings.json

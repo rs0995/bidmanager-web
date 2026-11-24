@@ -7,6 +7,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# This legacy backend is intentionally not deployable. The maintained backend,
+# including /admin and /client boundaries, lives in Server UI/server/.
+RUN echo "ERROR: backend/ is disabled; build Server UI/server/ instead." >&2 && exit 1
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends firefox-esr ca-certificates \
     && rm -rf /var/lib/apt/lists/*

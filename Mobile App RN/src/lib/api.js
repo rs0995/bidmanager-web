@@ -1,0 +1,60 @@
+import { request } from "./http.js";
+
+function clean(params = {}) {
+  return Object.fromEntries(
+    Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== "" && v !== "any"),
+  );
+}
+
+export const api = {
+  register: (body) => request("/client/auth/register", { method: "POST", body, auth: false }),
+  login: (body) => request("/client/auth/login", { method: "POST", body, auth: false }),
+  logout: () => request("/client/auth/logout", { method: "POST" }),
+  registerPushToken: (token, platform = "ios") => request("/client/push-token", { method: "POST", body: { token, platform } }),
+  unregisterPushToken: (token) => request("/client/push-token", { method: "DELETE", body: { token } }),
+  syncBadge: (count) => request("/client/badge", { method: "PUT", body: { count } }),
+  captchaPending: () => request("/client/captcha/pending"),
+  answerCaptcha: (id, text) => request(`/client/captcha/${id}/answer`, { method: "POST", body: { text } }),
+  changePassword: (body) => request("/client/auth/change-password", { method: "POST", body }),
+
+  health: () => request("/client/health"),
+  stats: () => request("/client/stats"),
+
+  tenders: (params) => request(`/client/tenders?${new URLSearchParams(clean(params))}`),
+  tender: (id) => request(`/client/tenders/${Number(id)}`),
+  // Portal tender ids -> current rows; see lib/tenderKey.js.
+  resolveTenders: (ids) => request("/client/tenders/resolve", { method: "POST", body: { tender_ids: ids } }),
+  tenderDocuments: (id, params = {}) => request(
+    `/client/tenders/${Number(id)}/documents?${new URLSearchParams(clean({ page: 1, page_size: 50, ...params }))}`,
+  ),
+
+  fetchTenderStatus: (tenderId) => request(
+    `/client/tenders/${Number(tenderId)}/fetch-status`,
+    { method: "POST", body: {} },
+  ),
+  downloadRequest: (tenderId, documentId) => request(
+    `/client/tenders/${Number(tenderId)}/download-request`,
+    { method: "POST", body: { document_id: Number(documentId) } },
+  ),
+  requestDownloadJob: (tenderId, mode) => request(
+    `/client/tenders/${Number(tenderId)}/request-download`,
+    { method: "POST", body: mode ? { mode } : {} },
+  ),
+  downloadStatus: (tenderId, jobId) => request(
+    `/client/tenders/${Number(tenderId)}/download-status?job_id=${encodeURIComponent(jobId)}`,
+  ),
+
+  organizations: (params) => request(`/client/organizations?${new URLSearchParams(clean(params))}`),
+  websites: () => request("/client/websites"),
+  requestOrgTenders: (orgId) => request(`/client/organizations/${Number(orgId)}/request-tenders`, { method: "POST", body: {} }),
+  orgRequestStatus: (orgId, jobId) => request(
+    `/client/organizations/${Number(orgId)}/request-tenders-status?job_id=${encodeURIComponent(jobId)}`,
+  ),
+
+  getSync: () => request("/client/sync"),
+  putSync: (data, removed, baseUpdatedAt) => request("/client/sync", {
+    method: "PUT", body: { data, removed, base_updated_at: baseUpdatedAt },
+  }),
+
+  changes: (since) => request(`/client/changes?since=${encodeURIComponent(Number(since) || 0)}`),
+};

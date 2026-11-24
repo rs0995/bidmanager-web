@@ -1,0 +1,340 @@
+# Server API changes — handoff for app sessions
+
+This document lists server features that the apps (Client UI, Bidwise, the Server UI console and the Server Mobile App) still need to adopt. The server session owns this file and keeps it current.
+
+**Rules for app sessions**
+- Never edit `Server UI/server/` from an app session. If you need an API change, ask in the server session.
+- Code only. Builds, version bumps, TestFlight and installers happen only when the user asks.
+- The base URL is `https://161.118.170.233.sslip.io`.
+  - Client routes send `x-client-key: <token>`.
+  - Operator routes send `x-admin-key: <key>`.
+
+Status key: **LIVE** = deployed; **READY** = coded and tested on the server, deployed when the user asks.
+
+---
+
+## 1. Accounts, organisations and section permissions (LIVE since 2026-10-23)
+
+### Concepts
+- Every account is an **individual** unless it belongs to an **organisation**. All existing accounts are individuals and work exactly as before.
+- **An organisation** shares one set of projects, checklists, templates and bookmarks across its members.
+  - `/client/sync` is unchanged for apps. For members, the server stores the shared keys (`projects`, `checklist`, `templates`, `templateItems`, `bookmarkTenderIds`, `bookmarks`, `bookmarkedOrgs`, `bookmarkedOrgIds`) in the org's pool. Personal keys (`tenderColumnPrefs`, `notificationPrefs`, …) stay per user.
+- The account that creates an org is its **admin**. An org always keeps at least one admin.
+- **Sections** are per-user on/off switches. Org admins always have every section. Captcha is never gated.
+
+| Section | Covers | Default |
+|---|---|---|
+| `active` | active tenders + organisations list | on |
+| `archived` | archived tenders | on |
+| `bookmarks` | bookmarked tenders + bookmarked organisations | on |
+| `projects` | projects, checklists, templates, archived projects, project files | on |
+| `portal_search` | search a tender ID on a NIC portal (§2) | **off** |
+
+- **A section that is off:** the server stops sending its data.
+  - Tender lists, search, stats and organisations leave out tenders outside the user's sections.
+  - Tender detail, documents and download routes return 404 for those tenders.
+  - `/client/sync` leaves that section's keys out of GET and ignores them on PUT. Nothing stored is deleted, so switching the section back on brings the data back.
+  - **Apps should hide the tab.**
+- **What still shows with a section off:** Dashboard, Captcha, Settings, Alerts and Files stay visible.
+  - Dashboard numbers cover only what the user can see.
+  - Bookmark alerts need the `bookmarks` section.
+- **Joining an org** (when the request is approved) discards the user's own projects, bookmarks and checklists, and **signs out all their devices**. Their next login loads the org's data.
+- **De-link with `retain: true`** keeps only the org's bookmarked tenders and organisations. **`retain: false`** wipes the account. Either way the user's devices are signed out, and the user becomes an individual with the default sections.
+- Devices that are signed out get 401 and must sign in again. Client UI already does this.
+
+- **Project tenders are always bookmarked** (LIVE since 2026-10-26). The server adds every project's `source_tender_id` to `bookmarkTenderIds` (on push and on pull), and ignores a removal of that bookmark while the project exists. Deleting the project frees the bookmark. As bookmarks, these tenders get the 24-hour update jobs and bookmark alerts. **Apps:**
+  - when creating a project, bookmark its tender locally too;
+  - when un-bookmarking a tender that is in any project (match the canonical `source_tender_id`), block it and show: "Tenders in projects can't be removed from bookmarks. Remove the project first."
+
+### Client routes (`x-client-key`)
+
+| Method & path | Body → response |
+|---|---|
+| `POST /client/auth/register` | Optional new fields `account_type: "individual" \| "organisation"` and `org_name` (required for an organisation). The response gains `account`. |
+| `POST /client/auth/login` | The response gains `account`. |
+| `GET /client/me` | → `{user_id, email, display_name, account_type, org: {id, name, role} \| null, permissions: {active, archived, bookmarks, projects, portal_search}, pending_request}`. **Use this to show or hide tabs**, and refresh it on app start and after login. |
+| `POST /client/org` | `{name}`: an individual creates an org and becomes admin; their data becomes the org's. → org detail |
+| `POST /client/org/join-requests` | `{join_code, note?}` → `{request, warning}`. **Show the warning** (personal data will be discarded on approval). |
+| `GET /client/org/join-requests/mine` | → `{request \| null}` |
+| `DELETE /client/org/join-requests/mine` | Cancel the user's pending request |
+
+**Org admin only** (403 otherwise):
+
+| Method & path | Body → response |
+|---|---|
+| `GET /client/org` | → `{id, name, join_code, members: [{user_id, email, display_name, role, permissions, joined_at, last_seen_at, status}], pending_requests: [...]}` |
+| `PUT /client/org` | `{name}` (rename) |
+| `POST /client/org/join-code/regenerate` | → `{join_code}` |
+| `GET /client/org/join-requests` | → `{items: [{id, user_id, email, display_name, note, created_at, …}]}` |
+| `POST /client/org/join-requests/{id}/approve` | `{permissions?: {section: bool}}`; sections left out take their defaults |
+| `POST /client/org/join-requests/{id}/reject` | Reject a request |
+| `PUT /client/org/members/{user_id}/permissions` | `{active?, archived?, bookmarks?, projects?, portal_search?}`; omitted sections are unchanged |
+| `PUT /client/org/members/{user_id}/role` | `{role: "admin" \| "member"}`; demoting the last admin returns 409 |
+| `POST /client/org/members/{user_id}/delink` | `{retain: bool}`; removing the last admin returns 409 |
+
+### Operator routes (`x-admin-key`)
+
+| Method & path | Body → response |
+|---|---|
+| `GET /admin/users`, `GET /admin/users/{id}` | Each user also has `account_type`, `org: {id, name, role} \| null` and `permissions`. A member's `sync` view shows the org's data. |
+| `PUT /admin/users/{id}/permissions` | `{active?, archived?, bookmarks?, projects?, portal_search?}`, for **any** user, individuals included |
+| `GET /admin/orgs` | → `{items: [{id, name, join_code, created_at, member_count, pending_requests}]}` |
+| `POST /admin/orgs` | `{name, admin_user_id}`: make an existing user the admin of a new org |
+| `GET /admin/orgs/{id}` | Org detail plus a `sync` view of the org's shared data |
+| `PUT /admin/orgs/{id}` | `{name}` |
+| `DELETE /admin/orgs/{id}?retain=true\|false` | Dissolve the org: every member becomes an individual |
+| `POST /admin/orgs/{id}/join-code/regenerate` | Issue a new join code |
+| `POST /admin/orgs/{id}/members` | `{user_id, role?, permissions?}`: link a user directly (same effect as an approval) |
+| `POST /admin/orgs/{id}/join-requests/{rid}/approve` | `{permissions?}` |
+| `POST /admin/orgs/{id}/join-requests/{rid}/reject` | Reject a request |
+| `PUT /admin/orgs/{id}/members/{uid}/permissions` | Same body as the client route |
+| `PUT /admin/orgs/{id}/members/{uid}/role` | Same body as the client route |
+| `POST /admin/orgs/{id}/members/{uid}/delink` | `{retain}` |
+
+---
+
+## 2. Portal tender search (LIVE since 2026-10-24)
+
+### Concepts
+- A user picks a **NIC portal** and enters a **tender ID**. The server searches that portal's **Tender Status** page, running a browser and solving the captcha.
+- The update is **global**: it changes the shared tender table that every user sees.
+  - **Already in the DB** (current or archive): the status/stage is updated, empty title or org fields are filled in, and the tender stays where it is.
+  - **Not in the DB:** it is added to the **archive** when its stage is past bidding (Technical/Financial Bid Opening or Evaluation, AOC, Concluded, Cancelled, Retender). Otherwise it goes to the **current** list.
+  - **Result stages** (Financial Bid Opening/Evaluation, AOC, Concluded): result documents are also downloaded into the tender's "Results" folder.
+- **History is per user**: each user sees their own past searches in the search tab.
+- **Access** is the `portal_search` section. It is **off by default** and switched on by the operator (`PUT /admin/users/{id}/permissions`) or an org admin (`PUT /client/org/members/{id}/permissions`). Org admins always have it. Apps show the search tab only when `GET /client/me` → `permissions.portal_search` is true.
+- **Captcha:** handled exactly like a tender document download. AI solving is tried first; if it fails, a **manual captcha** (up to 5 tries) goes to **the searching user**: a "CAPTCHA needed" push, then `GET /client/captcha/pending` (context `"Portal search <tender id>"`), answered with `POST /client/captcha/{id}/answer`. Reuse the download flow's captcha UI. While a search is `pending`, poll `/client/captcha/pending` alongside the search and open the Captcha screen when one appears.
+
+### Client routes (`x-client-key`; 403 `{detail: {reason: "section_forbidden", section: "portal_search"}}` without access)
+
+| Method & path | Body → response |
+|---|---|
+| `GET /client/portal-search/portals` | → `{allowed, items: [{id, name, url}]}`: NIC portals that can be searched. `items` is empty when not allowed. |
+| `POST /client/portal-search` | `{website_id, tender_id}` → `{search, job_id, created}`. 400 if the portal can't be searched; 423/429 when the server is busy or read-only. |
+| `GET /client/portal-search/{search_id}` | → `{search}`. **Poll this every 2–3 s** until `status` is no longer `"pending"`. |
+| `GET /client/portal-search/history?limit=50` | → `{items: [search, …]}`, newest first (max 200). This is the search tab's history list. |
+| `DELETE /client/portal-search/history/{search_id}` | Remove one entry |
+| `DELETE /client/portal-search/history` | Clear the user's history |
+
+**The `search` object**
+
+```
+{ id, website_id, website_name, tender_id, job_id,
+  status: "pending" | "found" | "not_found" | "failed",
+  job_status: "queued" | "running" | "completed" | "failed" | "cancelled",
+  stage,            // portal "Tender Stage", e.g. "AOC" (when found)
+  tender_db_id,     // row id, for /client/tenders/{id}
+  created,          // true = added by this search, false = existing tender updated
+  is_archived,      // true = in the archive list
+  error,            // when failed (e.g. captcha failed)
+  created_at, finished_at,
+  tender }          // full tender object (same as /client/tenders/{id}), or null when the
+                    // tender is outside the user's sections
+```
+
+**Suggested UI**
+- A "Search on portal" tab or screen with a portal picker, a tender ID input and a Search button.
+- Under it, the history list showing each tender ID, its portal, a status chip and the stage, with "Added to current", "Added to archive" or "Updated".
+- Tapping a found entry opens the tender.
+- While a search is pending, poll it and surface the Captcha screen.
+- After a search is found, refresh the app's tender caches so the new or updated tender shows up in its list.
+
+### Operator
+There are no operator search routes: searches come from users. The operator only grants access: `PUT /admin/users/{id}/permissions {portal_search: true}`, and the user list shows `permissions.portal_search`.
+
+---
+
+## 3. Project checklist files (LIVE since 2026-10-26)
+
+### Concepts
+- A file attached to a checklist row is **uploaded to the server**, and every platform of the same account (or every member of the same org) can open it. Today only the row text syncs: the desktop's `linked_file_path` and the phones' `attachment.uri` are device-local.
+- The row's file is described by **`server_file`** on the checklist row in `/client/sync`:
+  `{id, name, size, type, sha256, uploaded_at, uploaded_by, device}`.
+  - **The server owns this field.** A sync push can't set, change or clear it; the server ignores whatever a device sends. Only the upload and delete routes change it.
+  - Keep sending rows as usual; you don't need to strip it.
+- **One file per row, and the first upload wins.** If another platform already uploaded a file for the row, an upload gets **409** with that file. The losing platform must **download the server's file and replace its own local copy**, so every platform ends up with the same file.
+- **To replace a file on purpose:** delete it, then upload the new one.
+- **Removing a checklist row** (a sync `removed` delta) also removes its file.
+- **Joining an org** discards the user's own files along with their own projects. **Creating an org** keeps them as the org's files.
+- **Access:** the `projects` section. Org members share the org's files.
+- **Size cap:** the server setting `max_file_size_mb` (default 80 MB) → 413.
+- **Where files are stored** (server-side only; the apps never see the path): `project-files/P - <tender id>/<Owner (org N | user N)>/<Project title (project id)>/<name>`.
+  - Projects with no tender go under `project-files/P - No tender/…`, beside the tender folders.
+  - All projects for one tender, from any user, sit under that tender's `P - <tender id>` folder. Each user, or each org (one folder for all its members), has its own folder inside it.
+  - A second file with the same name in a project is stored as `name (2).ext`, but the apps still show and download it under the user's original `name`.
+  - Archiving a tender or a project doesn't move files.
+
+### Client routes (`x-client-key`; 403 `section_forbidden` without `projects`)
+
+| Method & path | Body → response |
+|---|---|
+| `POST /client/project-files` | **multipart**: `checklist_item_id` (the row id), `project_id` (optional), `device` (`"desktop"` / `"phone"`), `file`. → `{file}`. Errors: **404 `{detail:{reason:"row_not_found"}}`** = the row isn't on the server yet (push `/client/sync`, then retry); **409 `{detail:{reason:"file_exists", file}}`** = the first-wins file, so download it and use it; **409 `upload_in_progress`** = retry in a few seconds; 413 = too large; 400 = empty file. |
+| `GET /client/project-files?project_id=` | → `{items: [file, …]}` |
+| `POST /client/project-files/{id}/download-request` | → `{file, url, expires_at}` (a signed URL valid for about 15 min; it needs no auth header, same as tender documents) |
+| `GET <url>` | The file bytes (attachment) |
+| `DELETE /client/project-files/{id}` | Removes the file and clears `server_file` |
+
+`file` = `{id, project_id, checklist_item_id, name, size, type, sha256, uploaded_at, uploaded_by, device}`.
+
+### Flow every app should follow
+1. **On attach:** save locally as today, push the sync data so the row exists on the server, then upload. **On 409 `file_exists`:** download the returned file, replace the local copy, and show "Another device attached a file to this row first — using that one."
+2. **After a pull:** for each row with `server_file` whose file isn't on this device, or whose local file differs (compare `sha256` or the name), show the file name with a **Download** or open action. Download through the signed URL into:
+   - the desktop: the project folder or subfolder, and set `linked_file_path`;
+   - a phone: `attachments/<itemId>/`, and set the `attachment` uri.
+3. **Remove file** → `DELETE`, then clear the local copy.
+4. **Existing attachments (one-off backfill):** after updating, upload every locally attached file whose row has no `server_file`. If two platforms attached different files before this change, the first to upload wins and the other gets 409 and follows step 1.
+
+---
+
+## 4. To-do per app
+
+### Client UI (`Client UI/src/`)
+- [ ] `lib/api.js`: `getAccount()` → `GET /client/me` (cache it in settings or the store and refresh it after login); org routes; portal search routes (§2).
+- [ ] Sign-in screen (`SignInScreen` in `App.jsx`): register as individual or organisation (with org name); a "join an organisation" flow (join code, warning, pending state, cancel).
+- [ ] Sidebar (`Sidebar` `mainItems` / `bottomItems`, the `allowed` page list ~L4702, `pages` map, dashboard targets): hide tabs by `permissions`.
+  - `active` → Online Tenders' active tab + Organizations
+  - `archived` → archived tab
+  - `bookmarks` → Bookmarks
+  - `projects` → Projects, Templates, Archived Projects
+  - `portal_search` → new "Portal Search" page
+- [ ] An org admin page (Settings or a new page): members (role and section toggles), join code (copy, regenerate), pending requests (approve with sections, reject), de-link (retain or clear).
+- [ ] A "Portal Search" page with search and history (§2), using the existing job/captcha patterns (`fetchTenderStatus` / poller / captcha in `lib/api.js`).
+- [ ] Checklist files (§3): `attachFile` (`App.jsx` ~L3542) uploads after the local copy. `pullUserData` (`api.js` ~L1567) keeps `linked_file_path`, but rows with a `server_file` that isn't on disk get a Download action. The checklist table and preview show `server_file.name`. Delete File calls `DELETE`. Add the one-off backfill of existing `linked_file_path` files. Uploads need a multipart `fetch` (`FormData`) from the Electron renderer.
+- [ ] Project tenders stay bookmarked (§1): bookmark the tender locally when a project is created; block un-bookmarking a project's tender with the warning "Tenders in projects can't be removed from bookmarks. Remove the project first."
+- [x] Bid Agent (§5): chat above the Ready Docs checklist in the project workspace (agent files saved into the project's Working Docs folder), Company Profile page (done on branch `feat/bid-agent`).
+
+### Bidwise (`Bidwise/src/`)
+- [ ] `lib/api.ts`: `me()`, org routes, portal search routes.
+- [ ] `live/LiveProviders.tsx`: load `me()` into the session after sign-in and on launch, and expose `permissions` through `useSession()`.
+- [ ] `TabNavigator` / `RootNavigator` / `MoreScreen`: hide screens by `permissions` (same mapping as Client UI).
+- [ ] A new **PortalSearch** screen (search and history), reached from Tenders or More, using `CaptchaScreen` for manual captchas.
+- [ ] Sign-in/More: organisation sign-up, join by code, and an org admin screen (optional on mobile; can be phase 2).
+- [ ] Checklist files (§3):
+  - `attachToItem` (`lib/sharedProjects.ts` ~L224) uploads after the local copy, as a multipart POST through `react-native-blob-util`.
+  - `attachmentPath` and `ReadyChecklist` use `server_file`. "On another device" becomes a Download action, using the existing signed-URL `files.download`.
+  - `removeAttachment` calls `DELETE`.
+  - Add the one-off backfill of existing `attachment` files.
+- [ ] Project tenders stay bookmarked (§1): bookmark the tender locally when a project is created; block un-bookmarking a project's tender with the warning "Tenders in projects can't be removed from bookmarks. Remove the project first."
+- [x] Bid Agent (§5): chat card above Ready for Bid on tender/project detail; Docs for Preparation uploaded to / listed from Drive (done on branch `feat/bid-agent`).
+- [ ] Value range on the server (§7): `data/tenderSource.tsx` `useTenderList` sends the Filter sheet's `minCr` / `maxCr` as `min_value_cr` / `max_value_cr`. Drop the client-side range check and `clientFiltered` for server-paged lists, so `total` comes from the server. Keep the client check for the saved-only list. The value and EMD sorts need no app change: the `sort_by=tender_value` / `emd` the app already sends now sort numerically across every tender.
+
+### BM Pro (`Mobile App RN/src/`)
+- [ ] Checklist files (§3): the same as Bidwise, in `lib/projects.js` (`attachFile`, `getAttachedFile`, `mergeFromServer`) and `ChecklistItem.tsx`.
+- [ ] Project tenders stay bookmarked (§1): bookmark the tender locally when a project is created; block un-bookmarking a project's tender with the warning "Tenders in projects can't be removed from bookmarks. Remove the project first."
+- [ ] Bid Agent (§5): optional; Bidwise's `components/project/AgentChat.tsx` + `data/bidAgent.tsx` + `lib/bidAgent.ts` can be copied over.
+
+### Server UI console (`Server UI/BidManagerControl.jsx`)
+- [ ] `UsersPanel`: show org and role; **section toggles** (5, including Portal search) → `PUT /admin/users/{id}/permissions`.
+- [ ] A new **Orgs** panel: list, detail (members, requests, sync view), create for a user, rename, regenerate code, add member, approve/reject, member permissions/role, de-link (retain/clear), dissolve.
+- [ ] Follow the `Server UI/restore/<date>/` backup rule and the `CHANGELOG_PENDING.txt` note.
+- [x] Bid Agent tab (§5): API key / model, learned employers, form library (done on branch `feat/bid-agent`).
+- [x] Bid Agent AI provider (§5, 2026-11-07): provider + model dropdowns, `keys` per provider, `POST /admin/bid-agent/models` (server side live once deployed).
+
+### Server Mobile App (`Server Mobile App/src/`)
+- [ ] `lib/api.ts`: `setUserPermissions`, org routes.
+- [ ] `UserDetailScreen`: org and role, plus section toggles (5).
+- [ ] An Orgs screen (list, detail, approve/reject, member toggles, de-link, dissolve).
+- [ ] Bid Agent (§5): optional read-only view of `/admin/bid-agent/config` and employers.
+
+---
+
+## 5. Bid Agent (READY since 2026-11-05)
+
+### Concepts
+- **A chat per tender**, shared by everyone who owns the tender's project (the organisation, or an individual). Each message runs one agent turn on the server; the agent **does what it is asked**:
+  - "show / fetch the prequal(ification)" → the criteria table (single entity / JV, thresholds, forms), key personnel and equipment, shown in the chat;
+  - "save the prequal (as Excel / Word / PDF)" → saved to **Docs for Preparation**;
+  - "extract the tender forms" or a specific form ("FIN-3.2", "letter of bid") → editable files pre-filled from the company profile, saved to **Docs for Preparation** and attached to the matching Ready Docs row if there is one;
+  - "prepare the checklist (of documents required)" → **Ready Docs** rows for every form and evidence document the tender asks for (Pending), with the forms the agent prepares **attached automatically**;
+  - "can we qualify?" → criteria checked against the company profile.
+  - "the criteria are on pages 12–14 (of <file>)" → re-reads the criteria from those pages and keeps them for later saves; "which files are in the tender" lists files, pages and sections. Criteria are found under any heading ("Eligibility Criteria", "Qualifying requirements", tables or numbered paragraphs; scanned pages are read as images when AI is on).
+- With an AI key (console → Bid Agent tab) the AI reads the documents and chooses the tools; without one a keyword router handles the same requests (basic mode; `ai_enabled: false`).
+- **AI provider** (2026-11-07): the operator picks **Claude** (`anthropic`, default), **Gemini** (`gemini`) or **ChatGPT** (`openai`) and its models in the console; every provider keeps its own key and models, so switching loses nothing. All features work on all three: structured reading of criteria / forms (JSON schema), scanned pages sent as PDF, and the chat's tools with streamed replies. Only Claude caches the tender's key pages between turns (Files API); Gemini / ChatGPT get them inline each turn. Apps need no change: `ai_enabled` and `partial` behave the same, and `/client/bid-agent/status` also returns `provider`.
+- The tender's documents are read from `downloaded_files` (local or Drive). **ZIPs are unpacked** (also ZIPs inside ZIPs); old `.xls` / `.rtf` and, with LibreOffice in the image, `.doc` / `.odt` / `.ods` are converted; unreadable files are listed with the reason.
+- **Where files go** (Drive, same storage as checklist files §3):
+  `project-files/P - <tender id>/<owner>/<project>/` — files attached to Ready Docs rows
+  `project-files/P - <tender id>/<owner>/<project>/Docs for Preparation/` — prequal, extracted forms, users' prep docs
+  `project-files/P - <tender id>/<owner>/<project>/Bid Agent index.json` — the key: every file → kind, folder, checklist row
+  The same map is in the table `bid_agent_files`. All files are `client_project_files` rows, so they download through `POST /client/project-files/{id}/download-request`.
+- **Checklist rows and projects** the agent creates are written into the owner's `/client/sync` data (rows: `subfolder: "Ready Docs"`, `status: "Pending"`; files as `server_file`). Apps see them on their next pull. If the tender has no project yet, the agent creates it. Server-made ids start at 9,000,000.
+- **Company profile** (per owner) is used to pre-fill forms and to check criteria. Only org admins (or individuals) can edit it.
+- **Fast, short answers** (2026-11-05 update): chat turns run on the *chat model* (`bid_agent_chat_model`, default `claude-sonnet-5-5`, effort low); reading documents (criteria, forms, scanned pages) stays on the *document model* (`bid_agent_model`). The tender's key pages are given to the chat model as documents (uploaded once with the Files API, prompt-cached), and the reply **streams**: while `status == "working"`, GET chat returns `partial` = the reply so far. Show it as the assistant's bubble in progress; poll every ~0.9 s while working.
+- **Open anywhere**: the chat is per tender and works without a project (a project is made only when the agent saves files or checklist rows). `GET /client/bid-agent/recent` lists the tenders the owner chatted about.
+- **Training** (shared by the owner; members read, org admins / individuals edit; 403 `org_admin_only` otherwise):
+  - *Standing instructions*: free text added to every chat's instructions (after the operator's global instructions).
+  - *Learned*: when a user corrects the agent and says "remember …", the agent stores a note (for that employer's tenders or for all) and applies it in later chats. Users can pause or delete notes.
+  - *Reference documents*: files kept on Drive in `project-files/Bid Agent Library/<owner>/`; the agent lists them and attaches one to a Ready Docs row on request ("attach the GST certificate").
+  - *Checklist templates*: "prepare the checklist" starts from the owner's checklist template whose `organization` matches the employer, else a template named "Bid Agent default" (sync data `templates` / `templateItems`).
+
+### Client routes (`x-client-key`; 403 `section_forbidden` without `projects`; 404 for tenders outside the account's sections)
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/client/tenders/{id}/bid-agent/chat?since=n` | `{messages: [... id > n], next, status: "idle"\|"working", progress, ai_enabled, suggestions}`. Poll every ~1.5 s while `working`. |
+| POST | `/client/tenders/{id}/bid-agent/chat?since=n` | `{message}` → same shape, `status: "working"`. **409 `{reason:"busy"}`** while the last request runs. |
+| DELETE | `/client/tenders/{id}/bid-agent/chat` | Clears the conversation. |
+| GET | `/client/tenders/{id}/bid-agent/files?folder=prep\|ready` | `{items: [{file_id, name, kind: "prequalification"\|"form"\|"user", folder, checklist_item_id, size, created_at}]}` |
+| POST | `/client/tenders/{id}/bid-agent/prep-files` | **multipart** `file` → `{file}`: a user's own Docs for Preparation file, stored beside the agent's. 413 too large, 400 empty. |
+| DELETE | `/client/tenders/{id}/bid-agent/prep-files/{file_id}` | Removes a Docs for Preparation file. |
+| GET / PUT | `/client/company-profile` | `{profile: {general, financials, experience, works_in_hand, personnel, equipment, certificates, litigation}, schema, can_edit}`; PUT by section; 403 `{reason:"org_admin_only"}` for members. |
+| GET | `/client/bid-agent/status` | `{ai_enabled, provider, model, owner, can_edit_profile, roles}` |
+| GET | `/client/bid-agent/recent` | `{items: [{id, tender_id, title, organisation, closing_date, last, count, updated_at}]}` — newest first; `id` is the tender row id for the chat routes. |
+| GET / PUT | `/client/bid-agent/instructions` | `{text}` (≤ 8000 chars) → `{text, can_edit}` |
+| GET | `/client/bid-agent/learnings` | `{items: [{id, employer_key, text, source, tender_id, created_at, active}], can_edit}` |
+| PATCH / DELETE | `/client/bid-agent/learnings/{id}` | PATCH `{active?, text?}`; both return the list. 404 unknown id. |
+| GET | `/client/bid-agent/references` | `{items: [{file_id, name, label, created_at, size, type}]}` |
+| POST | `/client/bid-agent/references` | **multipart** `file` (optional query `label`) → the list. 413 too large, 400 empty. |
+| DELETE | `/client/bid-agent/references/{file_id}` | → the list. 404 unknown. |
+
+`message` = `{id, role: "user"|"assistant", text, at, cards?, error?}`; `cards`:
+- `{type: "table", title, columns, rows}` — e.g. the prequalification, eligibility check;
+- `{type: "files", title, folder, files: [{file_id, name, kind}], attached: [{row, file}]}` — files just saved;
+- `{type: "checklist", title, folder: "Ready Docs", rows: [{id, name, added, file}]}` — rows added / already there, with the attached file name.
+After an answer with a `files` or `checklist` card, **pull `/client/sync`** so Ready Docs shows the new rows and files.
+
+Older one-shot routes (still served): `POST/GET /client/tenders/{id}/bid-pack`, `PUT .../bid-pack/documents` (correct a file's sections), `GET .../bid-pack/files/{name}`, `GET /client/bid-agent/analyses`.
+
+### Operator routes (`x-admin-key`)
+| Method | Path | Notes |
+|---|---|---|
+| GET / PUT | `/admin/bid-agent/config` | PUT `{provider?, api_key?, model?, chat_model?}` → `{provider, providers, provider_labels, keys: {anthropic\|gemini\|openai: {set, hint, source: "settings"\|"env"\|""}}, api_key_set, api_key_hint, api_key_source, model, default_model, chat_model, default_chat_model}`. `providers` = the ones this server can run. The `api_key_*`, `model` and `chat_model` fields describe the **active** provider. PUT: `api_key` / `model` / `chat_model` apply to `provider` (else the active one); `""` removes the key / restores that provider's default model. A PUT with `provider` **makes it active**, except one that only removes a key (`{provider, api_key: ""}`). 400 `{reason: "unknown_provider"}`. Defaults: Claude `claude-opus-5-5` / `claude-sonnet-5-5`, Gemini `gemini-2.5-pro` / `gemini-2.5-flash`, ChatGPT `gpt-5` / `gpt-5-mini`. Env keys: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), `OPENAI_API_KEY`. Keys are never returned |
+| POST | `/admin/bid-agent/models` | `{provider, api_key?}` → `{models: [{id, label}], source: "live"}`, listed live from the provider with the given key (else the saved / env key): Claude all models, Gemini the `generateContent` models (no embedding / image / TTS), ChatGPT chat models (no audio / realtime / image / embedding). No key → `{models: [], source: "none", error}`; provider error → `{models: [], source: "error", error}` (always 200, never echoes the key) |
+| GET / PUT | `/admin/bid-agent/instructions` | global instructions `{text}` for every chat |
+| GET | `/admin/bid-agent/learnings?owner=` | learned notes of one owner (`org:N` / `user:N`) or of everyone (`owner` field per item) |
+| GET / POST / DELETE | `/admin/bid-agent/tenders/{id}/chat` | console chat (owner `admin`), same shapes as the client chat; read and answer only (saving is refused: "done from the apps"); "remember …" here adds to the global instructions |
+| GET | `/admin/bid-agent/employers` | learned employers: `{org_key, org_name, aliases {role: [terms]}, form_codes, tender_count}` |
+| DELETE | `/admin/bid-agent/employers/{org_key}` | forget an employer (aliases + its form templates) |
+| GET | `/admin/bid-agent/forms?org_key=` | form template library |
+
+---
+
+## 6. Tender document downloads: CAPTCHA and file checks (READY since 2026-11-24)
+
+No route or response shape changes. What changes is when a download job fails:
+- **Unsolved CAPTCHA:** if the portal's document CAPTCHA isn't solved (AI tries and manual tries used up, or the manual request timed out), the Tender Notice and Zip file are no longer fetched. Pre-bid and corrigendum files, which have no CAPTCHA, are still checked. The job then **fails** instead of "completed", and `GET /client/tenders/{id}/download-status` returns `status: "failed"` with an `error` such as "Download failed for <tender_id>: the portal CAPTCHA was not solved, so the Tender Notice and Zip file could not be downloaded. Retry limit (3) reached." If both files are already stored, an unsolved CAPTCHA doesn't fail the job.
+- **Retries first:** a failed job is retried up to the `retry_attempts` setting (3 by default), so the client sees `queued`/`running` again before the final `failed`. Each retry asks for the CAPTCHA again.
+- **Not-real files:** every saved file is checked before it is stored. A `.zip`/`.xlsx`/`.docx` must start with `PK`, a `.rar` with `Rar!`, a `.pdf` must contain `%PDF` in its first 1 KB, and none of them may be an HTML page. Empty files of any type are refused. `.xls`/`.doc` only get the empty check, because portals serve real HTML-table versions. A refused file isn't stored on Drive or logged complete, and the tender's job fails with "the portal sent a page instead of the real file for <name>".
+- On failure, the tender row gets `download_status='failed'` and `last_download_error` set to the reason.
+- `mode: "redownload"` is unchanged: it re-fetches every file, and now refuses a portal page in place of the real file.
+
+---
+
+## 7. Tender list: numeric value/EMD sort and value range (READY since 2026-11-24)
+
+`GET /client/tenders` and `GET /client/search`:
+- **`sort_by=tender_value`** now sorts by the amount, not the text. Before, "9,98,980" sorted above "34,57,94,756".
+- **`sort_by=emd`** is new; before, it was rejected with 422. It sorts by the EMD amount.
+- **No figure:** a tender with no figure ("NA", "N/A", empty) always comes after every number, `0.00` included, in both `asc` and `desc`.
+- **New `min_value_cr` / `max_value_cr`** (numbers ≥ 0, in crores; either one or both): keep tenders whose value is in the range, inclusive. A tender with no figure counts as 0, as the apps' `parseCrores` treats it. `total` / `pages` count the rows after the range.
+- **Scope:** the sort and the range cover every tender that matches the other filters (search, portal, organisation, archived, category, location, section permissions), not just one page. Other sorts and their filters behave as before.
+- **How it runs:** the server sorts and filters in a temporary in-memory database built for each request. The main database is only read, never changed.
+- Values are stored as text such as "34,57,94,756". Units "Cr" and "Lakh" are understood when present.
+
+---
+
+## 8. Organisations in portal order (READY since 2026-11-24)
+
+`GET /client/organizations`:
+- **New field:** each item has **`site_order`** (int or `null`): the organisation's position in the portal's own organisation list. On NIC portals it's the S.No column of the organisation page; on nProcure, the 1-based place in the client list.
+- **New order:** items come back in portal order: by `website_id`, then `site_order`. Organisations without a `site_order` follow, A–Z by name. Before, the list was A–Z by name across all portals. Paging and `total` are unchanged.
+- **When it fills in:** `site_order` is stored on each portal's next organisation-list fetch (the daily list update), and is renumbered on every fetch. Until then it is `null`, and those organisations keep the A–Z order.
+- Bidwise, BM Pro and Client UI can show organisations in the portal's order. Bidwise already reads `site_order` (sorted: available first, then by portal, then `site_order`). The operator `/v1` organisation list is unchanged.
